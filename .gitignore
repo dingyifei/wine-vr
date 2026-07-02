@@ -1,0 +1,28 @@
+# External cloned/built repos + downloaded CI artifacts (huge, not our code)
+ext/
+
+# Build outputs
+build/
+*.exe
+*.dll
+*.so
+*.dylib
+*.o
+*.obj
+
+# Caches / generated logs
+*.dxvk-cache
+*.log
+
+# Stray runtime state markers
+BeatSaberVersion.txt
+
+# Tooling scratch
+tools/
+.remember/
+
+# macOS
+.DS_Store
+
+# Claude session state
+.claude/
