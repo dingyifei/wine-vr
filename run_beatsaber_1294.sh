@@ -48,7 +48,28 @@ echo "goldberg steam_settings: offline + no networking + no overlay"
 
 # ---- 3. Quest client (best-effort; needs headset worn to start immersive) ---
 echo "\n===== 3. QUEST CLIENT ====="
-if [ -n "$SER" ]; then
+# Streaming protocol from oxrsys config: "alvr" uses the stock ALVR client and
+# ALVR's own adb management; the oxrsys reverse tunnels below would squat the
+# ALVR client's stream port (9944 EADDRINUSE on the headset), so skip them.
+OXR_TOML="$HOME/Library/Application Support/OXRSys/oxrsys-runtime.toml"
+PROTOCOL=$(grep -E '^protocol *= *' "$OXR_TOML" 2>/dev/null | sed -E 's/.*"(.*)".*/\1/')
+if [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
+  # Route game audio into the BlackHole loopback so ALVR can capture it and
+  # stream it to the headset. Restore the previous output on exit.
+  if SwitchAudioSource -a -t output | grep -q "BlackHole"; then
+    PREV_AUDIO_OUT=$(SwitchAudioSource -c -t output)
+    SwitchAudioSource -t output -s "BlackHole 2ch" >/dev/null && \
+      echo "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
+    trap '[ -n "$PREV_AUDIO_OUT" ] && SwitchAudioSource -t output -s "$PREV_AUDIO_OUT" >/dev/null 2>&1 && echo "audio: restored output -> $PREV_AUDIO_OUT"' EXIT
+  else
+    echo "audio: BlackHole device not present yet (reboot needed after install); skipping headset audio routing"
+  fi
+fi
+if [ -n "$SER" ] && [ "$PROTOCOL" = "alvr" ]; then
+  echo "Quest: $SER (protocol=alvr — stock ALVR client, server manages adb itself)"
+  "$ADB" -s "$SER" reverse --remove-all 2>/dev/null
+  echo "  cleared oxrsys reverse tunnels; ALVR server_core sets up its own forwards"
+elif [ -n "$SER" ]; then
   echo "Quest: $SER"
   "$ADB" -s "$SER" reverse --remove-all 2>/dev/null
   for p in 9944 9945 9946 9948; do "$ADB" -s "$SER" reverse tcp:$p tcp:$p >/dev/null && echo "  reverse $p ok"; done
