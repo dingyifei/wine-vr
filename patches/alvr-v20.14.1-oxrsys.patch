@@ -1,0 +1,692 @@
+diff --git a/alvr/adb/src/lib.rs b/alvr/adb/src/lib.rs
+index 9d11096..00557de 100644
+--- a/alvr/adb/src/lib.rs
++++ b/alvr/adb/src/lib.rs
+@@ -11,6 +11,9 @@ use std::collections::HashSet;
+ pub enum WiredConnectionStatus {
+     Ready,
+     NotReady(String),
++    // No USB device attached at all; unlike NotReady, this should not block other
++    // connection methods (manual IPs, local discovery) from being tried.
++    NoDevice,
+ }
+ 
+ pub struct WiredConnection {
+@@ -39,9 +42,7 @@ impl WiredConnection {
+             .filter_map(|d| d.serial)
+             .find(|s| !s.starts_with("127.0.0.1"))
+         else {
+-            return Ok(WiredConnectionStatus::NotReady(
+-                "No wired devices found".to_owned(),
+-            ));
++            return Ok(WiredConnectionStatus::NoDevice);
+         };
+ 
+         let ports = HashSet::from([control_port, stream_port]);
+diff --git a/alvr/audio/src/lib.rs b/alvr/audio/src/lib.rs
+index ca76d26..9a51654 100644
+--- a/alvr/audio/src/lib.rs
++++ b/alvr/audio/src/lib.rs
+@@ -358,7 +358,13 @@ pub fn record_audio_blocking(
+                 if is_running() {
+                     let mut buffer = sender.get_buffer(&()).unwrap();
+                     buffer.get_range_mut(0, data.len()).copy_from_slice(&data);
+-                    sender.send(buffer).ok();
++                    // A send error means the socket is gone; stop capturing so this
++                    // callback (and its StreamSender clone pinning the shared UDP
++                    // socket) is dropped promptly instead of waiting for
++                    // is_running() to flip.
++                    if let Err(e) = sender.send(buffer) {
++                        *state.lock() = AudioRecordState::Err(Some(e));
++                    }
+                 } else {
+                     *state.lock() = AudioRecordState::ShouldStop;
+                 }
+@@ -379,8 +385,11 @@ pub fn record_audio_blocking(
+     let mut res = stream.play().to_any();
+ 
+     if res.is_ok() {
++        // 50ms: this loop gates how long the stream (and its StreamSender's
++        // Arc on the shared UDP socket) outlives a disconnect. At 500ms the
++        // old socket regularly collided with the reconnect's bind (EADDRINUSE).
+         while matches!(*state.lock(), AudioRecordState::Recording) && is_running() {
+-            thread::sleep(Duration::from_millis(500))
++            thread::sleep(Duration::from_millis(50))
+         }
+ 
+         if let AudioRecordState::Err(e) = &mut *state.lock() {
+diff --git a/alvr/events/src/lib.rs b/alvr/events/src/lib.rs
+index acc8659..8779a28 100644
+--- a/alvr/events/src/lib.rs
++++ b/alvr/events/src/lib.rs
+@@ -132,7 +132,8 @@ impl Event {
+             EventType::Log(log_entry) => log_entry.content.clone(),
+             EventType::DebugGroup { message, .. } => message.clone(),
+             EventType::Session(_) => "Updated".into(),
+-            EventType::StatisticsSummary(_) | EventType::GraphStatistics(_) => "".into(),
++            EventType::StatisticsSummary(stats) => serde_json::to_string(stats).unwrap(),
++            EventType::GraphStatistics(graph) => serde_json::to_string(graph).unwrap(),
+             EventType::Tracking(tracking) => serde_json::to_string(tracking).unwrap(),
+             EventType::Buttons(buttons) => serde_json::to_string(buttons).unwrap(),
+             EventType::Haptics(haptics) => serde_json::to_string(haptics).unwrap(),
+diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
+index 3144dfe..5e1171d 100644
+--- a/alvr/server_core/src/connection.rs
++++ b/alvr/server_core/src/connection.rs
+@@ -28,14 +28,18 @@ use alvr_session::{
+     H264Profile, OpenvrConfig, SessionConfig, SocketProtocol,
+ };
+ use alvr_sockets::{
+-    PeerType, ProtoControlSocket, StreamSocketBuilder, CONTROL_PORT, KEEPALIVE_INTERVAL,
+-    KEEPALIVE_TIMEOUT, WIRED_CLIENT_HOSTNAME,
++    PeerType, ProtoControlSocket, StreamSocketBuilder, StreamWriterCloseHandle, CONTROL_PORT,
++    KEEPALIVE_INTERVAL, KEEPALIVE_TIMEOUT, WIRED_CLIENT_HOSTNAME,
+ };
+ use std::{
+     collections::HashMap,
+     net::{IpAddr, Ipv4Addr},
+     process::Command,
+-    sync::{mpsc::RecvTimeoutError, Arc},
++    sync::{
++        atomic::{AtomicBool, Ordering},
++        mpsc::RecvTimeoutError,
++        Arc,
++    },
+     thread,
+     time::{Duration, Instant},
+ };
+@@ -64,6 +68,20 @@ fn is_streaming(client_hostname: &str) -> bool {
+         .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
+ }
+ 
++// Non-blocking variant for the CoreAudio capture callback ONLY. The callback
++// runs on the HAL IO thread while CoreAudio holds its proxy mutex; a blocking
++// read here deadlocks against connection_pipeline, which holds the session
++// write lock across cpal device enumeration (which needs that HAL mutex).
++// On lock contention assume still-streaming: worst case one extra audio
++// buffer is sent, and a send error stops the capture anyway.
++fn is_streaming_nonblocking(client_hostname: &str) -> bool {
++    SESSION_MANAGER.try_read().is_none_or(|sm| {
++        sm.client_list()
++            .get(client_hostname)
++            .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
++    })
++}
++
+ pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
+     let old_config = session.openvr_config.clone();
+     let settings = session.to_settings();
+@@ -321,15 +339,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+                 }
+             };
+ 
+-            #[cfg_attr(not(debug_assertions), expect(unused_variables))]
+-            if let WiredConnectionStatus::NotReady(s) = status {
+-                dbg_connection!("handshake_loop: Wired connection not ready: {s}");
+-                thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
+-                continue;
++            match status {
++                WiredConnectionStatus::Ready => {
++                    let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
++                    wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
++                }
++                #[cfg_attr(not(debug_assertions), expect(unused_variables))]
++                WiredConnectionStatus::NotReady(s) => {
++                    dbg_connection!("handshake_loop: Wired connection not ready: {s}");
++                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
++                    continue;
++                }
++                // No USB device attached: fall through (no sleep, no continue) so
++                // manual IPs and local discovery still run in this same iteration.
++                WiredConnectionStatus::NoDevice => {
++                    dbg_connection!("handshake_loop: No wired devices found");
++                }
+             }
+-
+-            let client_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+-            wired_client_ips.insert(client_ip, WIRED_CLIENT_HOSTNAME.to_owned());
+         }
+ 
+         if !wired_client_ips.is_empty()
+@@ -365,16 +391,20 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+             manual_client_ips
+         };
+ 
+-        if !available_manual_client_ips.is_empty()
+-            && try_connect(
++        if !available_manual_client_ips.is_empty() {
++            match try_connect(
+                 Arc::clone(&ctx),
+                 Arc::clone(&lifecycle_state),
+                 available_manual_client_ips,
+-            )
+-            .is_ok()
+-        {
+-            thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
+-            continue;
++            ) {
++                Ok(()) => {
++                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
++                    continue;
++                }
++                // Was silent: retry loops that fail here (e.g. EADDRINUSE from
++                // a lingering previous stream socket) looked like no retries.
++                Err(e) => warn!("Manual IP connection attempt failed: {e}"),
++            }
+         }
+ 
+         let discovery_config = SESSION_MANAGER
+@@ -507,6 +537,37 @@ fn try_connect(
+     Ok(())
+ }
+ 
++// RAII cleanup for every exit path of connection_pipeline after the stream socket exists:
++// closes the stream writer fd and clears the global sender slots, so early `?` returns (e.g.
++// virtual microphone creation failing on macOS) can't leave a StreamSender in ConnectionContext
++// pinning the writer Arc and keeping the UDP port bound, which would make every subsequent
++// connect_to_client fail with EADDRINUSE until process restart.
++struct StreamCleanupGuard {
++    close_handle: StreamWriterCloseHandle,
++    ctx: Arc<ConnectionContext>,
++    armed: bool,
++}
++
++impl StreamCleanupGuard {
++    // Called by the normal teardown tail, which performs the same cleanup explicitly while the
++    // session lock is still held. Disarming prevents this guard's late drop (at function end,
++    // after the lock is released and threads are joined) from clobbering sender slots already
++    // installed by a subsequent connection.
++    fn disarm(&mut self) {
++        self.armed = false;
++    }
++}
++
++impl Drop for StreamCleanupGuard {
++    fn drop(&mut self) {
++        if self.armed {
++            self.close_handle.close();
++            *self.ctx.video_channel_sender.lock() = None;
++            *self.ctx.haptics_sender.lock() = None;
++        }
++    }
++}
++
+ fn connection_pipeline(
+     ctx: Arc<ConnectionContext>,
+     lifecycle_state: Arc<RwLock<LifecycleState>>,
+@@ -864,6 +925,24 @@ fn connection_pipeline(
+     let mut statics_receiver =
+         stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
+ 
++    // The socket itself is moved into stream_receive_thread; keep a handle so the teardown tail
++    // can drop the writer fd on every disconnect flavor, not only stream-recv errors.
++    let stream_writer_close_handle = stream_socket.writer_close_handle();
++
++    // Covers early `?` returns between here and the teardown tail (which disarms it).
++    let mut stream_cleanup_guard = StreamCleanupGuard {
++        close_handle: stream_writer_close_handle.clone(),
++        ctx: Arc::clone(&ctx),
++        armed: true,
++    };
++
++    // Lock-free exit signal for stream_receive_thread. Its loop must be able to observe a
++    // disconnect WITHOUT SESSION_MANAGER.read(): the next connection's bind-retry loop
++    // (connect_to_client) runs while holding the SESSION_MANAGER write lock and waits for this
++    // thread to drop the old receive fd, so gating the exit on is_streaming() alone would
++    // deadlock the retry window (fd held until read lock acquired, read lock blocked by retry).
++    let stream_disconnecting = Arc::new(AtomicBool::new(false));
++
+     let (video_channel_sender, video_channel_receiver) =
+         std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
+     *ctx.video_channel_sender.lock() = Some(video_channel_sender);
+@@ -872,6 +951,7 @@ fn connection_pipeline(
+     let video_send_thread = thread::spawn({
+         let client_hostname = client_hostname.clone();
+         move || {
++            let mut send_error_count = 0_usize;
+             while is_streaming(&client_hostname) {
+                 let VideoPacket { header, payload } =
+                     match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+@@ -885,7 +965,19 @@ fn connection_pipeline(
+                 buffer
+                     .get_range_mut(0, payload.len())
+                     .copy_from_slice(&payload);
+-                video_sender.send(buffer).ok();
++                if let Err(e) = video_sender.send(buffer) {
++                    // Only report errors while not shutting down; log the first error and
++                    // then every 100th to avoid log spam.
++                    if is_streaming(&client_hostname) {
++                        if send_error_count % 100 == 0 {
++                            warn!(
++                                "Failed to send video packet (error count: {}): {e:?}",
++                                send_error_count + 1
++                            );
++                        }
++                        send_error_count += 1;
++                    }
++                }
+             }
+         }
+     });
+@@ -943,7 +1035,8 @@ fn connection_pipeline(
+                     if let Err(e) = alvr_audio::record_audio_blocking(
+                         Arc::new({
+                             let client_hostname = client_hostname.clone();
+-                            move || is_streaming(&client_hostname)
++                            // Must not block: runs on the CoreAudio HAL IO thread.
++                            move || is_streaming_nonblocking(&client_hostname)
+                         }),
+                         game_audio_sender.clone(),
+                         &device,
+@@ -1054,10 +1147,16 @@ fn connection_pipeline(
+                 let data = match statics_receiver.recv(STREAMING_RECV_TIMEOUT) {
+                     Ok(stats) => stats,
+                     Err(ConnectionError::TryAgain(_)) => continue,
+-                    Err(ConnectionError::Other(_)) => return,
++                    Err(ConnectionError::Other(e)) => {
++                        // Same as the tracking loop: survive headset sleep so
++                        // statistics resume on wake instead of dying forever.
++                        warn!("Statistics receive error (retrying): {e}");
++                        thread::sleep(Duration::from_millis(100));
++                        continue;
++                    }
+                 };
+                 let Ok(client_stats) = data.get_header() else {
+-                    return;
++                    continue;
+                 };
+ 
+                 if let Some(stats) = &mut *ctx.statistics_manager.write() {
+@@ -1352,21 +1451,30 @@ fn connection_pipeline(
+ 
+     let stream_receive_thread = thread::spawn({
+         let disconnect_notif = Arc::clone(&disconnect_notif);
++        let disconnecting = Arc::clone(&stream_disconnecting);
+         let client_hostname = client_hostname.clone();
+         move || {
+-            while is_streaming(&client_hostname) {
++            // The flag check MUST come first (short-circuit): during teardown the next
++            // connection may hold the SESSION_MANAGER write lock across its bind-retry loop,
++            // so is_streaming() would block and keep this thread's receive fd (a dup of the
++            // bound stream port) alive for the whole retry window.
++            while !disconnecting.load(Ordering::Relaxed) && is_streaming(&client_hostname) {
+                 match stream_socket.recv() {
+                     Ok(()) => (),
+                     Err(ConnectionError::TryAgain(_)) => continue,
+                     Err(e) => {
+                         info!("Client disconnected. Cause: {e}");
+ 
+-                        disconnect_notif.notify_one();
+-
+-                        return;
++                        break;
+                     }
+                 }
+             }
++
++            // Drop the writer fd on every exit path (hard error and graceful loop exit), so
++            // stale StreamSender clones can't keep the port bound and break the next re-dial.
++            stream_socket.close_writer();
++
++            disconnect_notif.notify_one();
+         }
+     });
+ 
+@@ -1426,6 +1534,19 @@ fn connection_pipeline(
+     *ctx.video_channel_sender.lock() = None;
+     *ctx.haptics_sender.lock() = None;
+ 
++    // Release stream_receive_thread without it needing SESSION_MANAGER (see flag declaration),
++    // so its receive fd drops within one recv timeout even while the next connection's
++    // bind-retry loop holds the session write lock.
++    stream_disconnecting.store(true, Ordering::Relaxed);
++
++    // Drop the stream writer fd right away, so control-timeout/keepalive/lifecycle disconnects
++    // (which never hit the stream thread's error branch) also free the port for the re-dial.
++    stream_writer_close_handle.close();
++
++    // This tail performs the guard's cleanup explicitly (and at the right time, under the
++    // session lock); disarm it so its drop at function end can't race a new connection.
++    stream_cleanup_guard.disarm();
++
+     *ctx.video_recording_file.lock() = None;
+ 
+     session_manager_lock.update_client_list(
+@@ -1459,15 +1580,26 @@ fn connection_pipeline(
+ 
+     // Ensure shutdown of threads
+     dbg_connection!("connection_pipeline: Shutdown threads");
++
++    // Drop the pipeline's clone of the control socket sender now, so the control
++    // socket closes as soon as the worker threads holding the other clones exit,
++    // instead of when this function returns.
++    drop(control_sender);
++
++    // Join the socket-owning threads first: stream_receive_thread owns the
++    // StreamSocket, whose UDP writer is pinned via Arc by every StreamSender clone.
++    // The audio threads may lag up to one capture poll interval behind the
++    // disconnect, and joining them first would keep the old socket alive while the
++    // client re-dials, stalling the next stream handshake.
++    control_receive_thread.join().ok();
++    stream_receive_thread.join().ok();
+     video_send_thread.join().ok();
+-    game_audio_thread.join().ok();
+-    microphone_thread.join().ok();
+     tracking_receive_thread.join().ok();
+     statistics_thread.join().ok();
+     real_time_update_thread.join().ok();
+-    control_receive_thread.join().ok();
+-    stream_receive_thread.join().ok();
+     keepalive_thread.join().ok();
++    game_audio_thread.join().ok();
++    microphone_thread.join().ok();
+     lifecycle_check_thread.join().ok();
+ 
+     ctx.events_sender
+diff --git a/alvr/server_core/src/tracking/mod.rs b/alvr/server_core/src/tracking/mod.rs
+index c6e7d02..ce47ee1 100644
+--- a/alvr/server_core/src/tracking/mod.rs
++++ b/alvr/server_core/src/tracking/mod.rs
+@@ -354,10 +354,17 @@ pub fn tracking_loop(
+         let data = match tracking_receiver.recv(STREAMING_RECV_TIMEOUT) {
+             Ok(tracking) => tracking,
+             Err(ConnectionError::TryAgain(_)) => continue,
+-            Err(ConnectionError::Other(_)) => return,
++            Err(ConnectionError::Other(e)) => {
++                // The client stops sending while the headset sleeps; a socket
++                // error here must not kill the thread or tracking never
++                // recovers on wake. Back off briefly to avoid a hot spin.
++                alvr_common::warn!("Tracking receive error (retrying): {e}");
++                std::thread::sleep(Duration::from_millis(100));
++                continue;
++            }
+         };
+         let Ok(mut tracking) = data.get_header() else {
+-            return;
++            continue;
+         };
+ 
+         let timestamp = tracking.target_timestamp;
+diff --git a/alvr/sockets/src/lib.rs b/alvr/sockets/src/lib.rs
+index ed9ffb2..90e12ce 100644
+--- a/alvr/sockets/src/lib.rs
++++ b/alvr/sockets/src/lib.rs
+@@ -2,10 +2,11 @@ mod backend;
+ mod control_socket;
+ mod stream_socket;
+ 
+-use alvr_common::{anyhow::Result, info};
++use alvr_common::{anyhow::Result, info, warn};
+ use alvr_session::{DscpTos, SocketBufferSize};
+ use socket2::Socket;
+ use std::{
++    io,
+     net::{IpAddr, Ipv4Addr},
+     time::Duration,
+ };
+@@ -25,6 +26,55 @@ pub const MDNS_DEVICE_ID_KEY: &str = "device_id";
+ 
+ pub const WIRED_CLIENT_HOSTNAME: &str = "client.wired";
+ 
++// Finite fallback sizes for SocketBufferSize::Maximum. Some platforms (e.g. macOS) reject
++// sizes above their limit (kern.ipc.maxsockbuf) with EINVAL instead of clamping, which would
++// leave the buffer at the small default. Retry with halved sizes until one is accepted.
++const MAXIMUM_BUFFER_SIZE_ATTEMPTS: &[usize] = &[
++    8 * 1024 * 1024,
++    4 * 1024 * 1024,
++    2 * 1024 * 1024,
++    1024 * 1024,
++    512 * 1024,
++    256 * 1024,
++    128 * 1024,
++];
++
++fn set_buffer_size(
++    direction: &str,
++    buffer_bytes: SocketBufferSize,
++    set_size: impl Fn(usize) -> io::Result<()>,
++    get_size: impl Fn() -> io::Result<usize>,
++) -> Result<()> {
++    let attempts: &[usize] = match buffer_bytes {
++        SocketBufferSize::Default => return Ok(()),
++        SocketBufferSize::Maximum => MAXIMUM_BUFFER_SIZE_ATTEMPTS,
++        SocketBufferSize::Custom(size) => &[size as usize],
++    };
++
++    for &size in attempts {
++        match set_size(size) {
++            Ok(()) => {
++                // Note: the actual size may differ from the requested one (e.g. doubled on Linux)
++                info!(
++                    "Set socket {direction} buffer succeeded: requested: {size}B, actual: {}B",
++                    get_size()?
++                );
++                return Ok(());
++            }
++            Err(e) => {
++                warn!("Error setting socket {direction} buffer to {size}B: {e}");
++            }
++        }
++    }
++
++    warn!(
++        "Failed to set socket {direction} buffer, still at {}B",
++        get_size()?
++    );
++
++    Ok(())
++}
++
+ fn set_socket_buffers(
+     socket: &socket2::Socket,
+     send_buffer_bytes: SocketBufferSize,
+@@ -36,43 +86,19 @@ fn set_socket_buffers(
+         socket.recv_buffer_size()?
+     );
+ 
+-    {
+-        let maybe_size = match send_buffer_bytes {
+-            SocketBufferSize::Default => None,
+-            SocketBufferSize::Maximum => Some(u32::MAX),
+-            SocketBufferSize::Custom(size) => Some(size),
+-        };
+-
+-        if let Some(size) = maybe_size {
+-            if let Err(e) = socket.set_send_buffer_size(size as usize) {
+-                info!("Error setting socket send buffer: {e}");
+-            } else {
+-                info!(
+-                    "Set socket send buffer succeeded: {}",
+-                    socket.send_buffer_size()?
+-                );
+-            }
+-        }
+-    }
++    set_buffer_size(
++        "send",
++        send_buffer_bytes,
++        |size| socket.set_send_buffer_size(size),
++        || socket.send_buffer_size(),
++    )?;
+ 
+-    {
+-        let maybe_size = match recv_buffer_bytes {
+-            SocketBufferSize::Default => None,
+-            SocketBufferSize::Maximum => Some(u32::MAX),
+-            SocketBufferSize::Custom(size) => Some(size),
+-        };
+-
+-        if let Some(size) = maybe_size {
+-            if let Err(e) = socket.set_recv_buffer_size(size as usize) {
+-                info!("Error setting socket recv buffer: {e}");
+-            } else {
+-                info!(
+-                    "Set socket recv buffer succeeded: {}",
+-                    socket.recv_buffer_size()?
+-                );
+-            }
+-        }
+-    }
++    set_buffer_size(
++        "recv",
++        recv_buffer_bytes,
++        |size| socket.set_recv_buffer_size(size),
++        || socket.recv_buffer_size(),
++    )?;
+ 
+     Ok(())
+ }
+diff --git a/alvr/sockets/src/stream_socket.rs b/alvr/sockets/src/stream_socket.rs
+index ce882fc..e300d0f 100644
+--- a/alvr/sockets/src/stream_socket.rs
++++ b/alvr/sockets/src/stream_socket.rs
+@@ -18,18 +18,23 @@
+ 
+ use crate::backend::{tcp, udp, SocketReader, SocketWriter};
+ use alvr_common::{
+-    anyhow::Result, debug, parking_lot::Mutex, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
++    anyhow::{bail, Result},
++    debug,
++    parking_lot::Mutex,
++    warn, AnyhowToCon, ConResult, HandleTryAgain, ToCon,
+ };
+ use alvr_session::{DscpTos, SocketBufferSize, SocketProtocol};
+ use serde::{de::DeserializeOwned, Serialize};
+ use std::{
+     cmp::Ordering,
+     collections::{HashMap, HashSet},
++    io,
+     marker::PhantomData,
+     mem,
+     net::{IpAddr, TcpListener, UdpSocket},
+     sync::{mpsc, Arc},
+-    time::Duration,
++    thread,
++    time::{Duration, Instant},
+ };
+ 
+ const SHARD_PREFIX_SIZE: usize = mem::size_of::<u32>() // packet length - field itself (4 bytes)
+@@ -86,7 +91,9 @@ impl<H> Buffer<H> {
+ 
+ #[derive(Clone)]
+ pub struct StreamSender<H> {
+-    inner: Arc<Mutex<Box<dyn SocketWriter>>>,
++    // Note: the writer is Option so that it can be dropped (closing the socket fd) even while
++    // stale StreamSender clones are still alive.
++    inner: Arc<Mutex<Option<Box<dyn SocketWriter>>>>,
+     stream_id: u16,
+     max_packet_size: usize,
+     // if the packet index overflows the worst that happens is a false positive packet loss
+@@ -125,7 +132,11 @@ impl<H> StreamSender<H> {
+             sub_buffer[10..14].copy_from_slice(&(shards_count as u32).to_be_bytes());
+             sub_buffer[14..18].copy_from_slice(&(idx as u32).to_be_bytes());
+ 
+-            self.inner.lock().send(&sub_buffer[..packet_length])?;
++            if let Some(socket) = &mut *self.inner.lock() {
++                socket.send(&sub_buffer[..packet_length])?;
++            } else {
++                bail!("Stream writer socket has been closed");
++            }
+         }
+ 
+         self.next_packet_index += 1;
+@@ -319,7 +330,7 @@ impl StreamSocketBuilder {
+             // +4 is a workaround to retain compatibilty with old protocol
+             // todo: remove +4
+             max_packet_size: max_packet_size + 4,
+-            send_socket: Arc::new(Mutex::new(send_socket)),
++            send_socket: Arc::new(Mutex::new(Some(send_socket))),
+             receive_socket,
+             shard_recv_state: None,
+             stream_recv_components: HashMap::new(),
+@@ -340,8 +351,32 @@ impl StreamSocketBuilder {
+         let (send_socket, receive_socket): (Box<dyn SocketWriter>, Box<dyn SocketReader>) =
+             match protocol {
+                 SocketProtocol::Udp => {
+-                    let socket =
+-                        udp::bind(port, dscp, send_buffer_bytes, recv_buffer_bytes).to_con()?;
++                    // The previous connection's writer socket may still be open for a short
++                    // while (e.g. lingering StreamSender clones); retry the bind for a bounded
++                    // time instead of failing immediately with EADDRINUSE.
++                    let bind_deadline = Instant::now() + Duration::from_secs(3);
++                    let mut logged_addr_in_use = false;
++                    let socket = loop {
++                        match udp::bind(port, dscp, send_buffer_bytes, recv_buffer_bytes) {
++                            Ok(socket) => break socket,
++                            Err(e)
++                                if e.downcast_ref::<io::Error>()
++                                    .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse)
++                                    && Instant::now() < bind_deadline =>
++                            {
++                                if !logged_addr_in_use {
++                                    warn!(
++                                        "UDP port {port} is still bound by the previous \
++                                        connection's stream socket, retrying bind: {e}"
++                                    );
++                                    logged_addr_in_use = true;
++                                }
++
++                                thread::sleep(Duration::from_millis(250));
++                            }
++                            Err(e) => return Err(e).to_con(),
++                        }
++                    };
+                     let (send_socket, receive_socket) =
+                         udp::connect(&socket, client_ip, port, timeout).to_con()?;
+ 
+@@ -364,7 +399,7 @@ impl StreamSocketBuilder {
+             // +4 is a workaround to retain compatibilty with old protocol
+             // todo: remove +4
+             max_packet_size: max_packet_size + 4,
+-            send_socket: Arc::new(Mutex::new(send_socket)),
++            send_socket: Arc::new(Mutex::new(Some(send_socket))),
+             receive_socket,
+             shard_recv_state: None,
+             stream_recv_components: HashMap::new(),
+@@ -397,11 +432,26 @@ struct StreamRecvComponents {
+     discarded_shards_sink: InProgressPacket,
+ }
+ 
++/// Handle for dropping the shared writer socket from outside `StreamSocket`, even after the
++/// socket itself has been moved into another thread.
++#[derive(Clone)]
++pub struct StreamWriterCloseHandle {
++    send_socket: Arc<Mutex<Option<Box<dyn SocketWriter>>>>,
++}
++
++impl StreamWriterCloseHandle {
++    /// Drop the writer socket (closing its file descriptor) even if StreamSender clones are
++    /// still alive. Subsequent sends will fail.
++    pub fn close(&self) {
++        self.send_socket.lock().take();
++    }
++}
++
+ // Note: used buffers don't *have* to be split by stream ID, but doing so improves memory usage
+ // todo: impose cap on number of created buffers to avoid OOM crashes
+ pub struct StreamSocket {
+     max_packet_size: usize,
+-    send_socket: Arc<Mutex<Box<dyn SocketWriter>>>,
++    send_socket: Arc<Mutex<Option<Box<dyn SocketWriter>>>>,
+     receive_socket: Box<dyn SocketReader>,
+     shard_recv_state: Option<RecvState>,
+     stream_recv_components: HashMap<u16, StreamRecvComponents>,
+@@ -419,6 +469,18 @@ impl StreamSocket {
+         }
+     }
+ 
++    /// Drop the writer socket (closing its file descriptor) even if StreamSender clones are
++    /// still alive. Subsequent sends will fail.
++    pub fn close_writer(&self) {
++        self.send_socket.lock().take();
++    }
++
++    pub fn writer_close_handle(&self) -> StreamWriterCloseHandle {
++        StreamWriterCloseHandle {
++            send_socket: Arc::clone(&self.send_socket),
++        }
++    }
++
+     // max_concurrent_buffers: number of buffers allocated by this call which will be reused to
+     // receive packets for this stream ID. If packets are not read fast enough, the shards received
+     // for this particular stream will be discarded
