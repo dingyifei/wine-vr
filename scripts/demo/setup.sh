@@ -5,9 +5,10 @@ set -e
 print "== wine-vr demo setup =="
 
 # 1. submodules (oxrsys, wineopenxr, patched ALVR — pinned by the superproject)
-info "initializing submodules (first ALVR fetch is large)..."
+info "initializing submodules (first fetch is large: ALVR + the wine source tree)..."
 git -C "$ROOT" submodule update --init ext/oxrsys ext/wineopenxr ext/ALVR
-git -C "$WOXR" submodule update --init          # OpenXR-SDK + wine headers (build deps)
+# blob:none keeps the wine-mirror clone to tens of MB instead of full history
+git -C "$WOXR" submodule update --init --filter=blob:none   # OpenXR-SDK + wine headers (build deps)
 git -C "$ALVR" submodule update --init          # openvr (alvr_session build dep)
 [ -f "$ALVR/openvr/headers/openvr_driver.h" ] || \
   die "ALVR openvr submodule did not materialize — check network/auth and re-run setup"

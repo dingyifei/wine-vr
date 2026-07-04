@@ -22,12 +22,13 @@ See [docs/architecture.md](docs/architecture.md) for how the pieces fit.
 - A **Steam account that owns Beat Saber** (game files only; Steam never runs)
 - **Meta Quest 3** with the **ALVR client v20.14.1** on the same 5/6 GHz WiFi
   as the Mac (install in step 4 below)
-- Toolchain (git/python3/clang come with the Xcode Command Line Tools:
-  `xcode-select --install`):
+- Toolchain — requires [Homebrew](https://brew.sh); git/python3/clang come
+  with the Xcode Command Line Tools (`xcode-select --install`):
 
   ```sh
-  brew install cmake ninja mingw-w64 android-platform-tools rustup
+  brew install cmake ninja mingw-w64 android-platform-tools
   brew install switchaudio-osx blackhole-2ch   # optional: in-headset audio (reboot after)
+  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # rustup (brew's is keg-only/not on PATH)
   rustup toolchain install stable && rustup target add x86_64-apple-darwin
   ```
 
@@ -48,6 +49,10 @@ login:
 DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 \
   -username <steam-user> -dir "<beat-saber-dir>"
 ```
+
+(DepotDownloader has no brew formula: grab the `macos-arm64` release zip,
+`chmod +x DepotDownloader && xattr -d com.apple.quarantine DepotDownloader`,
+run as `./DepotDownloader`.)
 
 Any `<beat-saber-dir>` works — pass it as `--bs-dir` below (default:
 `<bottle>/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294`;
@@ -75,8 +80,10 @@ auto-trusted, so no pairing dance is needed.
 **4. Quest client:** install **ALVR v20.14.1** on the headset — grab
 `alvr_client_android.apk` from the
 [ALVR v20.14.1 release](https://github.com/alvr-org/ALVR/releases/tag/v20.14.1)
-and `adb install` it (or use SideQuest). The client version must match the
-embedded server core; a newer store/app-lab client may refuse to pair.
+and `adb install` it (or use SideQuest). Sideloading needs Developer Mode:
+enable it in the Meta Horizon phone app (free developer account required) and
+accept the USB-debugging prompt in the headset. The client version must match
+the embedded server core; a newer store/app-lab client may refuse to pair.
 
 ## Run it
 
