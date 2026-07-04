@@ -8,7 +8,7 @@ for tool in cmake ninja x86_64-w64-mingw32-gcc; do
   command -v $tool >/dev/null 2>&1 || die "$tool missing — brew install cmake ninja mingw-w64"
 done
 rustup target list --installed 2>/dev/null | grep -q x86_64-apple-darwin || \
-  die "rustup x86_64-apple-darwin target missing — install rustup via https://rustup.rs, then: rustup toolchain install stable && rustup target add x86_64-apple-darwin"
+  die "rustup x86_64-apple-darwin target missing — install rustup via https://rustup.rs and source ~/.cargo/env, then: rustup toolchain install stable && rustup target add x86_64-apple-darwin"
 [ -d "$OXRSYS/runtime" ] || die "submodules not initialized — ./demo.sh setup"
 
 # oxrsys: x86_64 (the game runs under Rosetta in wine; the runtime loads in-process),

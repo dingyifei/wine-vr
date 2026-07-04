@@ -29,6 +29,7 @@ See [docs/architecture.md](docs/architecture.md) for how the pieces fit.
   brew install cmake ninja mingw-w64 android-platform-tools
   brew install switchaudio-osx blackhole-2ch   # optional: in-headset audio (reboot after)
   curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh   # rustup (brew's is keg-only/not on PATH)
+  source "$HOME/.cargo/env"                                        # put rustup on PATH in THIS shell
   rustup toolchain install stable && rustup target add x86_64-apple-darwin
   ```
 

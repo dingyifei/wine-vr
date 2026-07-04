@@ -49,7 +49,7 @@ done
 # 5. rust (AlvrServerCore.cmake requires a rustup toolchain with the x86_64 target)
 if command -v rustup >/dev/null 2>&1 && rustup target list --installed 2>/dev/null | grep -q x86_64-apple-darwin; then
   ok "rustup with x86_64-apple-darwin target"
-else fail "rustup x86_64-apple-darwin target missing" "install rustup via https://rustup.rs (brew's rustup is keg-only/not on PATH), then: rustup toolchain install stable && rustup target add x86_64-apple-darwin"; fi
+else fail "rustup x86_64-apple-darwin target missing" "install rustup via https://rustup.rs and source ~/.cargo/env (brew's rustup is keg-only/not on PATH), then: rustup toolchain install stable && rustup target add x86_64-apple-darwin"; fi
 
 # 6. submodules
 for sm in "$OXRSYS" "$WOXR" "$ALVR"; do
