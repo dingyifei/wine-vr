@@ -4,7 +4,7 @@
 # Creator makes a global IOSurface (Metal-filled checkerboard); importer looks it up by ID,
 # imports via VK_EXT_metal_objects, reads back, verifies. Tests the Rosetta-x86 <-> arm64 boundary.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root (script moved to scripts/dev/)
 CA="${1:-arm64}"; IA="${2:-x86_64}"
 IDF="/tmp/gate0_surfid_${CA}_${IA}.txt"
 rm -f "$IDF"

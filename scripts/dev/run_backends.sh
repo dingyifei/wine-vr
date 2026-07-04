@@ -4,7 +4,7 @@
 # Mechanism: CX_GRAPHICS_BACKEND selects the D3D11->{Metal|Vulkan} translator.
 #   values: wined3d | dxvk | dxmt | d3dmetal
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root (script moved to scripts/dev/)
 CXAPP=~/Applications/CrossOver.app/Contents/SharedSupport/CrossOver
 WINE="$CXAPP/bin/wine"
 BOTTLE="Steam"

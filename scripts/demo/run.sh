@@ -11,8 +11,17 @@ require_bottle
        (or pass --bs-dir / set WINEVR_BS_DIR)"
 BSVER="$(bs_version)"
 case "$BSVER" in 1.29.4*) : ;; *) warn "Beat Saber version '$BSVER' != 1.29.4 — the Meta gate may block startup" ;; esac
+[ -x "$WINE" ] || die "CrossOver wine not found at $WINE — is CrossOver installed?"
 [ -f "$OXR_DYLIB" ] && [ -f "$WOXR_DLL" ] || die "bridge not built — ./demo.sh build"
 [ -f "$HOST_XR_JSON" ] || die "host OpenXR registration missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+# bottle + global overlay currency (a fresh bottle or a CrossOver update passes every
+# machine-global check yet launches with no VR — catch it here, not as a black window)
+cmp -s "$WOXR_DLL" "$SYS32/wineopenxr.dll" || die "bottle wineopenxr.dll stale/missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+[ -f "$PREFIX/drive_c/openxr/wineopenxr64.json" ] || die "bottle OpenXR manifest missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json' "$PREFIX/system.reg" 2>/dev/null || \
+  die "bottle ActiveRuntime registry key missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+cmp -s "$DXMT_ART/x86_64-windows/d3d11.dll" "$CX/lib/dxmt/x86_64-windows/d3d11.dll" || \
+  die "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle $WINEVR_BOTTLE"
 sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256" || [ -f "$GBE_DLL" ] || die "Goldberg dll missing — ./demo.sh setup"
 [ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"
 PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
@@ -58,12 +67,20 @@ restore_audio() {
     PREV_AUDIO_OUT=""
   fi
 }
-trap 'restore_audio' EXIT INT TERM
+# zsh runs signal traps only after the foreground pipeline finishes; resignal so a
+# directed INT/TERM actually terminates the script with the right status.
+trap 'restore_audio' EXIT
+trap 'restore_audio; trap - INT;  kill -INT  $$' INT
+trap 'restore_audio; trap - TERM; kill -TERM $$' TERM
 if [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
-  if SwitchAudioSource -a -t output | grep -q "BlackHole"; then
+  if SwitchAudioSource -a -t output | grep -qx "BlackHole 2ch"; then
     PREV_AUDIO_OUT="$(SwitchAudioSource -c -t output)"
-    SwitchAudioSource -t output -s "BlackHole 2ch" >/dev/null && \
-      print "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
+    if SwitchAudioSource -t output -s "BlackHole 2ch" >/dev/null 2>&1; then
+      print -r -- "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
+    else
+      warn "could not switch output to BlackHole 2ch — audio stays on the Mac"
+      PREV_AUDIO_OUT=""
+    fi
   else
     warn "BlackHole 2ch not present (brew install blackhole-2ch + reboot) — audio stays on the Mac"
   fi

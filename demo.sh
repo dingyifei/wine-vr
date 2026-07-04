@@ -36,6 +36,7 @@ case "$CMD" in
   doctor|setup|build|install|run)
     source "$ROOT/scripts/demo/$CMD.sh" ;;
   all)
+    require_bottle   # fail fast before the expensive fetch/build stages
     for stage in setup build install run; do
       echo "\n##### demo.sh: $stage #####"
       "$ROOT/demo.sh" "$stage" || exit $?   # WINEVR_* travel via the environment

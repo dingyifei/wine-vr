@@ -4,7 +4,7 @@
 # launch the client on the Quest, and run the native cubes app so oxrsys streams to the headset.
 # Prereq: Quest connected via USB-C, developer mode on, USB debugging authorized.
 set -u
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root (script moved to scripts/dev/)
 ADB=~/Library/Android/sdk/platform-tools/adb
 APK=ext/oxrsys/clients/Android/android-vr/app/build/outputs/apk/debug/app-debug.apk
 PKG=net.demonixis.oxrsys.android

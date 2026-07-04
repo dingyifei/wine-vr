@@ -44,9 +44,10 @@ if grep -q is_streaming_nonblocking "$ALVR/alvr/server_core/src/connection.rs" 2
 else fail "ALVR submodule missing the oxrsys patches" "./demo.sh setup (checks out the pinned oxrsys-v20.14.1 branch)"; fi
 
 # 7. pinned binaries
-if [ -f "$DXMT_ART/x86_64-windows/d3d11.dll" ] && [ -f "$DXMT_ART/x86_64-unix/winemetal.so" ]; then
-  ok "dxmt-artifacts (monofunc fork) present"
-else fail "ext/dxmt-artifacts missing" "./demo.sh setup"; fi
+if dxmt_files_ok; then
+  if dxmt_ok; then ok "dxmt-artifacts (monofunc fork) present, provenance verified"
+  else warn "dxmt-artifacts present but provenance marker missing/stale — ./demo.sh setup re-fetches the pinned set"; fi
+else fail "ext/dxmt-artifacts missing or incomplete" "./demo.sh setup"; fi
 if sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256"; then ok "Goldberg steam_api64.dll (sha256 verified)"
 elif [ -f "$GBE_DLL" ]; then warn "Goldberg dll present but hash differs from the pinned build"
 else fail "Goldberg dll missing" "./demo.sh setup"; fi
@@ -90,8 +91,11 @@ else fail "bottle ActiveRuntime registry key missing" "./demo.sh install --bottl
 
 # 12. host loader registration (wine secure-exec ignores XR_RUNTIME_JSON; this file is load-bearing)
 if [ -f "$HOST_XR_JSON" ]; then
-  LP="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$HOST_XR_JSON" 2>/dev/null || true)"
-  if [ "$LP" = "$OXR_DYLIB" ] && [ -f "$LP" ]; then ok "host OpenXR registration -> $LP"
+  LP="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$HOST_XR_JSON" 2>/dev/null)"
+  PYRC=$?
+  if [ $PYRC -ne 0 ]; then
+    fail "cannot parse $HOST_XR_JSON (broken python3 or malformed JSON)" "check 'python3 -V' works (xcode-select --install), then inspect the file"
+  elif [ "$LP" = "$OXR_DYLIB" ] && [ -f "$LP" ]; then ok "host OpenXR registration -> $LP"
   elif [ -n "$LP" ] && [ -f "$LP" ]; then warn "host registration points at $LP (expected $OXR_DYLIB)"
   else fail "host registration points at a missing dylib" "./demo.sh install --bottle $WINEVR_BOTTLE (sudo rewrites $HOST_XR_JSON)"; fi
 else fail "$HOST_XR_JSON missing" "./demo.sh install --bottle $WINEVR_BOTTLE (sudo writes it)"; fi
@@ -111,8 +115,11 @@ try: s = json.load(open(sys.argv[1]))
 except Exception: sys.exit(0)
 for n, c in (s.get("client_connections") or {}).items():
     ips = c.get("manual_ips") or []
-    if ips: print(n + "=" + ",".join(ips))' "$SESSJSON" 2>/dev/null | tr '\n' ' ')"
-  if [ -n "$PINNED" ]; then
+    if ips: print(n + "=" + ",".join(ips))' "$SESSJSON" 2>/dev/null)"
+  PYRC=$?
+  PINNED="$(print -r -- "$PINNED" | tr '\n' ' ' | sed 's/^ *$//')"
+  if [ $PYRC -ne 0 ]; then warn "could not inspect $SESSJSON (broken python3?)"
+  elif [ -n "$PINNED" ]; then
     warn "session.json pins client IP(s): $PINNED— fine while the Quest keeps that IP; if streaming stops after a DHCP change, delete '$SESSJSON' (recreated with discovery+auto-trust)"
   else ok "ALVR session state has no stale manual-IP pins"
   fi
@@ -128,7 +135,7 @@ else warn "no Quest over adb (fine for WiFi streaming; connect USB once to insta
 
 # 15. audio loopback (optional)
 if command -v SwitchAudioSource >/dev/null 2>&1; then
-  if SwitchAudioSource -a -t output 2>/dev/null | grep -q "BlackHole"; then ok "BlackHole 2ch + switchaudio-osx"
+  if SwitchAudioSource -a -t output 2>/dev/null | grep -qx "BlackHole 2ch"; then ok "BlackHole 2ch + switchaudio-osx"
   else warn "BlackHole 2ch not present — no in-headset audio (brew install blackhole-2ch, then reboot)"; fi
 else warn "switchaudio-osx not installed — audio stays on the Mac (brew install switchaudio-osx blackhole-2ch)"; fi
 

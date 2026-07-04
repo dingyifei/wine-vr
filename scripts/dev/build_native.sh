@@ -6,7 +6,7 @@
 #                                 the exact MoltenVK the Wine bottle uses)
 # Both link MoltenVK DIRECTLY (no Vulkan loader) so the same binary needs no ICD env.
 set -eu
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root (script moved to scripts/dev/)
 ARCH="${1:-arm64}"
 HDR=/opt/homebrew/Cellar/vulkan-headers/1.4.350.1/include   # headers are arch-independent
 OUT="build/gate0_iosurf.$ARCH"

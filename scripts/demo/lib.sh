@@ -90,11 +90,17 @@ install_if_changed() { # src dst  -> copies only when content differs; prints ac
 win_path() { # unix absolute path -> windows path: C:\ inside the bottle's drive_c, else Z:\ (z: -> /)
   if [ -n "${PREFIX:-}" ] && [[ "$1" == "$PREFIX/drive_c/"* ]]; then
     local rel="${1#$PREFIX/drive_c/}"
-    print -- "C:\\${rel//\//\\}"
+    print -r -- "C:\\${rel//\//\\}"
   else
-    print -- "Z:${1//\//\\}"
+    print -r -- "Z:${1//\//\\}"
   fi
 }
+
+# The complete DXMT artifact set install.sh deploys; presence gates key on ALL of
+# these plus the .sha256 provenance marker written by setup after extraction.
+DXMT_FILES=(x86_64-windows/d3d10core.dll x86_64-windows/d3d11.dll x86_64-windows/dxgi.dll x86_64-windows/winemetal.dll x86_64-unix/winemetal.so)
+dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
+dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
 
 fetch_pinned() { # url dest expected-sha256 label
   local url="$1" dest="$2" sha="$3" label="$4"

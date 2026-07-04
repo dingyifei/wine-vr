@@ -8,7 +8,9 @@ print "== wine-vr demo setup =="
 info "initializing submodules (first ALVR fetch is large)..."
 git -C "$ROOT" submodule update --init ext/oxrsys ext/wineopenxr ext/ALVR
 git -C "$WOXR" submodule update --init          # OpenXR-SDK + wine headers (build deps)
-git -C "$ALVR" submodule update --init 2>/dev/null || true   # openvr (server_core dep)
+git -C "$ALVR" submodule update --init          # openvr (alvr_session build dep)
+[ -f "$ALVR/openvr/headers/openvr_driver.h" ] || \
+  die "ALVR openvr submodule did not materialize — check network/auth and re-run setup"
 ok "submodules ready"
 if grep -q is_streaming_nonblocking "$ALVR/alvr/server_core/src/connection.rs"; then
   ok "ALVR checkout carries the oxrsys patch set (branch oxrsys-v20.14.1)"
@@ -17,16 +19,23 @@ else
 fi
 
 # 2. pinned binaries (sha256-verified from the deps-v1 release)
-fetch_pinned "$DEPS_URL/gbe-steam_api64-regular-x64.dll" "$GBE_DLL" "$GBE_DLL_SHA256" \
-  "Goldberg Steam emulator dll"
-if [ -f "$DXMT_ART/x86_64-windows/d3d11.dll" ] && [ -f "$DXMT_ART/x86_64-unix/winemetal.so" ]; then
-  info "already present: dxmt-artifacts"
+if [ -f "$GBE_DLL" ] && ! sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256"; then
+  warn "Goldberg dll present with a non-pinned hash — keeping it (delete $GBE_DLL to re-fetch the pinned build)"
+else
+  fetch_pinned "$DEPS_URL/gbe-steam_api64-regular-x64.dll" "$GBE_DLL" "$GBE_DLL_SHA256" \
+    "Goldberg Steam emulator dll"
+fi
+if dxmt_ok; then
+  info "already present: dxmt-artifacts (sha256 marker matches)"
 else
   fetch_pinned "$DEPS_URL/dxmt-artifacts-monofunc.tar.gz" \
     "$ROOT/third_party/downloads/dxmt-artifacts-monofunc.tar.gz" "$DXMT_TGZ_SHA256" \
     "DXMT fork artifacts"
-  tar -xzf "$ROOT/third_party/downloads/dxmt-artifacts-monofunc.tar.gz" -C "$ROOT/ext"
-  ok "extracted ext/dxmt-artifacts"
+  rm -rf "$DXMT_ART"
+  tar -xzf "$ROOT/third_party/downloads/dxmt-artifacts-monofunc.tar.gz" -C "$ROOT/ext" || die "extraction failed"
+  dxmt_files_ok || die "extracted dxmt-artifacts are incomplete — delete $DXMT_ART and re-run setup"
+  print -r -- "$DXMT_TGZ_SHA256" > "$DXMT_ART/.sha256"
+  ok "extracted ext/dxmt-artifacts (provenance marker written)"
 fi
 
 # 3. runtime config (~/Library/Application Support/OXRSys) — never clobber an existing file

@@ -2,7 +2,7 @@
 # ROLE: BUILD TOOL — builds the native Gate 1 Metal OpenXR cubes client.
 # Build the native macOS Metal OpenXR cubes client (Gate 1), linking the oxrsys-fetched OpenXR loader.
 set -eu
-cd "$(dirname "$0")"
+cd "$(dirname "$0")/../.."   # repo root (script moved to scripts/dev/)
 OX=ext/oxrsys
 OXR_INC="$OX/build/_deps/openxr-src/include"
 OXR_LOADER_DIR="$OX/build/_deps/openxr-build/src/loader"
