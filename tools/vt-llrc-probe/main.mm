@@ -6,9 +6,11 @@
 // statistics. Diagnoses the "all-zero chroma -> green" LL-RC bug and tests
 // whether pre-converted NV12 input bypasses it.
 //
-// --cbr mode: additionally sets kVTCompressionPropertyKey_ConstantBitRate.
-// Under Rosetta the property is accepted (noErr) but output callbacks cease
-// after the first few frames; the probe reports submitted-vs-callback counts.
+// --cbr mode: additionally sets kVTCompressionPropertyKey_ConstantBitRate and
+// accounts for every callback outcome (output/dropped/error/silent). Written to
+// reproduce a suspected accepted-then-stall bug; that claim was RETRACTED
+// 2026-07-04 — no config stalls (classic RC accepts-and-ignores CBR, LL-RC
+// rejects it -12900). See docs/apple-feedback-2-constantbitrate-pipeline-stall.md.
 //
 // Built x86_64 so it reproduces the Rosetta translation environment of the
 // wine-hosted encoder.
@@ -531,7 +533,7 @@ int main(int argc, char** argv)
             fprintf(stderr,
                     "usage: %s [--cbr]\n"
                     "  (default)  chroma matrix: {LL-RC on/off} x {BGRA/NV12 input}\n"
-                    "  --cbr      ConstantBitRate stall repro (accepted but callbacks cease)\n",
+                    "  --cbr      ConstantBitRate callback accounting (stall claim retracted)\n",
                     argv[0]);
             return 2;
         }
