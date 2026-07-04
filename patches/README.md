@@ -1,22 +1,18 @@
 # ALVR patches for the oxrsys embedded backend
 
-`ext/ALVR` is a plain clone of [ALVR](https://github.com/alvr-org/ALVR) pinned at
-tag **v20.14.1** (`a9f6542`, "Bump to 20.14.1"). It is not a git submodule and its
-local modifications are not tracked anywhere else — this directory is the source
-of truth for them.
+`ext/ALVR` is a git submodule pinned to the
+[dingyifei/ALVR](https://github.com/dingyifei/ALVR) fork, branch
+**oxrsys-v20.14.1** (based on upstream tag `v20.14.1`, `a9f6542`). The branch
+commit *is* the patch set already applied — a fresh
+`git submodule update --init --recursive` gives you patched sources with
+nothing to apply. [`alvr-v20.14.1-oxrsys.patch`](alvr-v20.14.1-oxrsys.patch)
+is a reviewable mirror of that branch: one file to read the whole delta
+against stock ALVR, or to reapply onto a plain upstream checkout.
 
-## Applying on a fresh clone
+## Building
 
-```sh
-git clone https://github.com/alvr-org/ALVR ext/ALVR
-cd ext/ALVR
-git checkout v20.14.1
-git submodule update --init openvr
-git apply ../../patches/alvr-v20.14.1-oxrsys.patch
-```
-
-Then build with the direct-toolchain cargo (Homebrew rustup's shim resolves the
-wrong cargo):
+Use the direct-toolchain cargo (Homebrew rustup's shim resolves the wrong
+cargo); `./demo.sh build` does this for you:
 
 ```sh
 RUSTC=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
@@ -48,6 +44,11 @@ RUSTC=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
   re-bind with EADDRINUSE. Plus a lock-free `disconnecting` flag so the old
   receive thread exits without the session lock, and a bounded (~3 s)
   EADDRINUSE retry on the stream bind for normal close races.
+- `alvr/sockets/src/stream_socket.rs` — bounded close: `close()` /
+  `close_writer()` take the send mutex with `try_lock_for(250 ms)` instead of
+  blocking, so a stalled TCP send cannot hang a caller holding the session
+  write lock; on timeout the close is deferred to the sender drop (July 4
+  review fix).
 - `alvr/server_core/src/connection.rs` — video send errors are logged
   rate-limited (upstream ignored them silently); manual-IP dial failures are
   logged (upstream retried in total silence, indistinguishable from a hang).
@@ -62,8 +63,11 @@ RUSTC=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
   path forever, so a `client.wired` entry no longer starves WiFi connections
   when no USB device is attached.
 
-Regenerate after changing anything in `ext/ALVR`:
+## Regenerating the mirror
+
+After changing the branch in `ext/ALVR`, refresh the patch file so the two
+stay in sync:
 
 ```sh
-cd ext/ALVR && git diff > ../../patches/alvr-v20.14.1-oxrsys.patch
+(cd ext/ALVR && git diff v20.14.1 oxrsys-v20.14.1 > ../../patches/alvr-v20.14.1-oxrsys.patch)
 ```
