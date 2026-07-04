@@ -70,7 +70,7 @@ index acc8659..8779a28 100644
              EventType::Buttons(buttons) => serde_json::to_string(buttons).unwrap(),
              EventType::Haptics(haptics) => serde_json::to_string(haptics).unwrap(),
 diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
-index 3144dfe..5e1171d 100644
+index 3144dfe..59c0e14 100644
 --- a/alvr/server_core/src/connection.rs
 +++ b/alvr/server_core/src/connection.rs
 @@ -28,14 +28,18 @@ use alvr_session::{
@@ -95,7 +95,7 @@ index 3144dfe..5e1171d 100644
      thread,
      time::{Duration, Instant},
  };
-@@ -64,6 +68,20 @@ fn is_streaming(client_hostname: &str) -> bool {
+@@ -64,6 +68,23 @@ fn is_streaming(client_hostname: &str) -> bool {
          .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
  }
  
@@ -105,6 +105,9 @@ index 3144dfe..5e1171d 100644
 +// write lock across cpal device enumeration (which needs that HAL mutex).
 +// On lock contention assume still-streaming: worst case one extra audio
 +// buffer is sent, and a send error stops the capture anyway.
++// Only called from the record_audio_blocking closure, which is itself
++// cfg(not(target_os = "linux")); match that so Linux builds don't warn.
++#[cfg(not(target_os = "linux"))]
 +fn is_streaming_nonblocking(client_hostname: &str) -> bool {
 +    SESSION_MANAGER.try_read().is_none_or(|sm| {
 +        sm.client_list()
@@ -116,7 +119,7 @@ index 3144dfe..5e1171d 100644
  pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
      let old_config = session.openvr_config.clone();
      let settings = session.to_settings();
-@@ -321,15 +339,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+@@ -321,15 +342,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                  }
              };
  
@@ -148,7 +151,7 @@ index 3144dfe..5e1171d 100644
          }
  
          if !wired_client_ips.is_empty()
-@@ -365,16 +391,20 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+@@ -365,16 +394,28 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
              manual_client_ips
          };
  
@@ -169,14 +172,22 @@ index 3144dfe..5e1171d 100644
 +                    thread::sleep(RETRY_CONNECT_MIN_INTERVAL);
 +                    continue;
 +                }
-+                // Was silent: retry loops that fail here (e.g. EADDRINUSE from
-+                // a lingering previous stream socket) looked like no retries.
-+                Err(e) => warn!("Manual IP connection attempt failed: {e}"),
++                // Routine when a manual-IP headset is off/asleep/out of the app:
++                // connect_timeout maps to TryAgain and fires every ~2s, so keep it
++                // at debug rather than warning indefinitely.
++                Err(ConnectionError::TryAgain(e)) => {
++                    dbg_connection!("Manual IP connection not ready (retrying): {e}")
++                }
++                // Was silent: genuine failures here (e.g. ECONNREFUSED while the
++                // client app restarts) looked like no retries. Keep them visible.
++                Err(ConnectionError::Other(e)) => {
++                    warn!("Manual IP connection attempt failed: {e}")
++                }
 +            }
          }
  
          let discovery_config = SESSION_MANAGER
-@@ -507,6 +537,37 @@ fn try_connect(
+@@ -507,6 +548,37 @@ fn try_connect(
      Ok(())
  }
  
@@ -214,7 +225,7 @@ index 3144dfe..5e1171d 100644
  fn connection_pipeline(
      ctx: Arc<ConnectionContext>,
      lifecycle_state: Arc<RwLock<LifecycleState>>,
-@@ -864,6 +925,24 @@ fn connection_pipeline(
+@@ -864,6 +936,24 @@ fn connection_pipeline(
      let mut statics_receiver =
          stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
  
@@ -239,7 +250,7 @@ index 3144dfe..5e1171d 100644
      let (video_channel_sender, video_channel_receiver) =
          std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
      *ctx.video_channel_sender.lock() = Some(video_channel_sender);
-@@ -872,6 +951,7 @@ fn connection_pipeline(
+@@ -872,6 +962,7 @@ fn connection_pipeline(
      let video_send_thread = thread::spawn({
          let client_hostname = client_hostname.clone();
          move || {
@@ -247,7 +258,7 @@ index 3144dfe..5e1171d 100644
              while is_streaming(&client_hostname) {
                  let VideoPacket { header, payload } =
                      match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-@@ -885,7 +965,19 @@ fn connection_pipeline(
+@@ -885,7 +976,19 @@ fn connection_pipeline(
                  buffer
                      .get_range_mut(0, payload.len())
                      .copy_from_slice(&payload);
@@ -268,7 +279,7 @@ index 3144dfe..5e1171d 100644
              }
          }
      });
-@@ -943,7 +1035,8 @@ fn connection_pipeline(
+@@ -943,7 +1046,8 @@ fn connection_pipeline(
                      if let Err(e) = alvr_audio::record_audio_blocking(
                          Arc::new({
                              let client_hostname = client_hostname.clone();
@@ -278,7 +289,7 @@ index 3144dfe..5e1171d 100644
                          }),
                          game_audio_sender.clone(),
                          &device,
-@@ -1054,10 +1147,16 @@ fn connection_pipeline(
+@@ -1054,10 +1158,16 @@ fn connection_pipeline(
                  let data = match statics_receiver.recv(STREAMING_RECV_TIMEOUT) {
                      Ok(stats) => stats,
                      Err(ConnectionError::TryAgain(_)) => continue,
@@ -297,7 +308,7 @@ index 3144dfe..5e1171d 100644
                  };
  
                  if let Some(stats) = &mut *ctx.statistics_manager.write() {
-@@ -1352,21 +1451,30 @@ fn connection_pipeline(
+@@ -1352,21 +1462,30 @@ fn connection_pipeline(
  
      let stream_receive_thread = thread::spawn({
          let disconnect_notif = Arc::clone(&disconnect_notif);
@@ -332,7 +343,7 @@ index 3144dfe..5e1171d 100644
          }
      });
  
-@@ -1426,6 +1534,19 @@ fn connection_pipeline(
+@@ -1426,6 +1545,19 @@ fn connection_pipeline(
      *ctx.video_channel_sender.lock() = None;
      *ctx.haptics_sender.lock() = None;
  
@@ -352,7 +363,7 @@ index 3144dfe..5e1171d 100644
      *ctx.video_recording_file.lock() = None;
  
      session_manager_lock.update_client_list(
-@@ -1459,15 +1580,26 @@ fn connection_pipeline(
+@@ -1459,15 +1591,26 @@ fn connection_pipeline(
  
      // Ensure shutdown of threads
      dbg_connection!("connection_pipeline: Shutdown threads");
@@ -537,7 +548,7 @@ index ed9ffb2..90e12ce 100644
      Ok(())
  }
 diff --git a/alvr/sockets/src/stream_socket.rs b/alvr/sockets/src/stream_socket.rs
-index ce882fc..e300d0f 100644
+index ce882fc..003c213 100644
 --- a/alvr/sockets/src/stream_socket.rs
 +++ b/alvr/sockets/src/stream_socket.rs
 @@ -18,18 +18,23 @@
@@ -643,7 +654,7 @@ index ce882fc..e300d0f 100644
              receive_socket,
              shard_recv_state: None,
              stream_recv_components: HashMap::new(),
-@@ -397,11 +432,26 @@ struct StreamRecvComponents {
+@@ -397,11 +432,40 @@ struct StreamRecvComponents {
      discarded_shards_sink: InProgressPacket,
  }
  
@@ -654,11 +665,25 @@ index ce882fc..e300d0f 100644
 +    send_socket: Arc<Mutex<Option<Box<dyn SocketWriter>>>>,
 +}
 +
++/// Upper bound on how long `close`/`close_writer` may wait for the send mutex. Callers hold
++/// the SESSION_MANAGER write lock across this, so it must never block indefinitely: a stalled
++/// TCP (wired) sender parked inside `write_all` holds the shard mutex until the write errors
++/// out (minutes), and blocking on it here would freeze every session-lock waiter behind it.
++const CLOSE_LOCK_TIMEOUT: Duration = Duration::from_millis(250);
++
 +impl StreamWriterCloseHandle {
 +    /// Drop the writer socket (closing its file descriptor) even if StreamSender clones are
 +    /// still alive. Subsequent sends will fail.
++    ///
++    /// Bounded: if the send mutex is held by a stalled sender past `CLOSE_LOCK_TIMEOUT`, give up
++    /// the take instead of blocking the session lock. The writer then drops normally once the
++    /// StreamSender clones drop after the stream threads join (past the lock release).
 +    pub fn close(&self) {
-+        self.send_socket.lock().take();
++        if let Some(mut socket) = self.send_socket.try_lock_for(CLOSE_LOCK_TIMEOUT) {
++            socket.take();
++        } else {
++            warn!("Stream writer close timed out on send lock; deferring to sender drop");
++        }
 +    }
 +}
 +
@@ -671,14 +696,18 @@ index ce882fc..e300d0f 100644
      receive_socket: Box<dyn SocketReader>,
      shard_recv_state: Option<RecvState>,
      stream_recv_components: HashMap<u16, StreamRecvComponents>,
-@@ -419,6 +469,18 @@ impl StreamSocket {
+@@ -419,6 +483,22 @@ impl StreamSocket {
          }
      }
  
 +    /// Drop the writer socket (closing its file descriptor) even if StreamSender clones are
-+    /// still alive. Subsequent sends will fail.
++    /// still alive. Subsequent sends will fail. Bounded like [`StreamWriterCloseHandle::close`].
 +    pub fn close_writer(&self) {
-+        self.send_socket.lock().take();
++        if let Some(mut socket) = self.send_socket.try_lock_for(CLOSE_LOCK_TIMEOUT) {
++            socket.take();
++        } else {
++            warn!("Stream writer close timed out on send lock; deferring to sender drop");
++        }
 +    }
 +
 +    pub fn writer_close_handle(&self) -> StreamWriterCloseHandle {
