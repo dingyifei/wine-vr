@@ -68,8 +68,8 @@ means vary with the noise seed):
 
 === LOW-LATENCY RC + BGRA input ===
   Y : min=<16..> max=<..235> mean=<mid>    <- luma correct
-  Cb: min=  0 max=  0 mean=   0.0          <- chroma planes entirely zero
-  Cr: min=  0 max=  0 mean=   0.0
+  Cb: min=  0 max=  3 mean=   0.0          <- chroma planes essentially zero
+  Cr: min=  0 max=  3 mean=   0.0             (max <= 3 is quantization residue)
   VERDICT: CHROMA DEAD (green bug)
 
 === classic RC + NV12 input ===
@@ -104,5 +104,3 @@ compute pass before submission — with it, low-latency RC works well under Rose
 → 10.3 ms in our VR streaming pipeline), which shows the encoder itself is healthy apart from its
 RGB input path.
 
-*Related report filed separately: `kVTCompressionPropertyKey_ConstantBitRate` accepted but stalls
-the session in the same environment.*

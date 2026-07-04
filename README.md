@@ -64,8 +64,10 @@ and was gated off. The bug is now root-caused and bypassed: the offline probe
 proved the fault is isolated to the low-latency (`rtvc`) encoder's **internal RGB→YCbCr conversion**
 under x86_64 translation — feed it pre-converted NV12 (`420v` biplanar) and chroma is healthy. No
 production VT consumer (ffmpeg/Chromium/OBS/Sunshine) feeds BGRA to LL sessions, which is why the
-bug was publicly undocumented (`docs/apple-feedback-vt-rosetta.md` is a ready-to-file report; it
-also documents a second bug — `ConstantBitRate` is accepted then stalls the encode pipeline).
+bug was publicly undocumented (`docs/apple-feedback-1-lowlatency-bgra-zero-chroma.md` is a
+ready-to-file report; a suspected second bug — `ConstantBitRate` accepted then stalling the
+pipeline — was retracted after instrumented re-testing, see
+`docs/apple-feedback-2-constantbitrate-pipeline-stall.md`).
 
 oxrsys now composites to a BGRA texture and runs a BT.709 `rgb_to_nv12` Metal kernel before
 VideoToolbox, with LL-RC enabled: encode 33 ms → **10.3 ms p50** live. The native-arm64

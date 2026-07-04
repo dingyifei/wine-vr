@@ -1,85 +1,57 @@
-# Feedback Assistant report — VideoToolbox ConstantBitRate accepted, then output callbacks cease, under Rosetta 2
+# RETRACTED — do not submit: "ConstantBitRate accepted, then output callbacks cease"
 
-**Title:** VideoToolbox HW H.264 encoder accepts kVTCompressionPropertyKey_ConstantBitRate but
-output callbacks permanently cease after a few frames in x86_64 (Rosetta 2) processes on Apple
-Silicon
+**Status (2026-07-04): retracted after instrumented re-testing. Not filed with Apple.**
 
-**Area:** VideoToolbox
-**Reproducibility:** Always
-**macOS version:** macOS 26.5.2 (build 25F84)
-**Hardware:** Apple Silicon Mac (observed on M3 Max); calling process running as x86_64 under Rosetta 2
+This report originally claimed that setting `kVTCompressionPropertyKey_ConstantBitRate` on a
+hardware H.264 `VTCompressionSession` under Rosetta 2 is accepted (`noErr`) and then permanently
+stalls the pipeline (output callbacks cease, submitted pixel buffers leak). Preparing the probe
+attachment for submission falsified the claim. Keep this file as the record of why.
 
-## Summary
+## What the instrumented probe shows (`tools/vt-llrc-probe --cbr`)
 
-In an x86_64 process translated by Rosetta 2, setting `kVTCompressionPropertyKey_ConstantBitRate`
-on a hardware H.264 `VTCompressionSession` is **accepted** (`VTSessionSetProperty` returns
-`noErr`), but output callbacks then **cease after the first few frames**. The compression pipeline
-stalls permanently: `VTCompressionSessionEncodeFrame` keeps returning `noErr` for subsequent
-frames, the output callback is never invoked for them, `VTCompressionSessionCompleteFrames` does
-not flush them, and no error is reported through any channel. Submitted pixel buffers are retained
-forever, so a pool-based producer leaks every slot and encoding halts.
+The probe gained a built-in `--cbr` mode that accounts for every callback outcome separately
+(real output vs. `kVTEncodeInfo_FrameDropped` vs. error vs. *silent* — no callback at all).
+On macOS 26.5.2 / M3 Max, x86_64 under Rosetta, 240 frames per config at 72 fps:
 
-A silently-accepted property that permanently stalls the pipeline is significantly harder to
-diagnose than a rejection; if CBR is unsupported for this encoder under translation, the
-`VTSessionSetProperty` call should fail (as other unsupported properties do with `-12900`).
+| Config | CBR property set | Result |
+|---|---|---|
+| classic RC + NV12 + CBR | **accepted** (noErr) | no stall: 240/240 callbacks, 0 dropped, 0 silent |
+| classic RC + BGRA + CABAC + 1.5× DataRateLimits + CBR (exact production mirror) | **accepted** (noErr) | no stall: 240/240 callbacks, 0 dropped, 0 silent |
+| low-latency RC + NV12 + CBR | **rejected** (-12900 `kVTPropertyNotSupportedErr`) | property never applies |
+| low-latency RC + NV12, no CBR (control) | — | 194 output + 46 *reported drops* (over-budget RealTime dropping), 0 silent |
 
-## Repro tool
+Three findings kill the report:
 
-Self-contained probe (single ObjC++ file, no dependencies): `tools/vt-llrc-probe/main.mm` from the
-wine-vr project (file can be attached directly to this report). It encodes 48 synthetic 2496×1312
-frames at 72 fps through the HW H.264 encoder and prints per-config callback counts and encode
-statistics.
+1. **No stall reproduces in any configuration**, including an exact mirror of the production
+   session (classic RC, BGRA IOSurface input, CABAC, MaxKeyFrameInterval, 1.5× DataRateLimits)
+   with CBR accepted.
+2. **The original "callbacks=34 / 14 never produced output" evidence was misattributed.** Those
+   14 frames are `kVTEncodeInfo_FrameDropped` callbacks — ordinary RealTime rate-control drops
+   that occur identically *without* CBR (the content runs 122 Mbps against a 42 Mbps budget).
+   The old accounting treated a drop callback as "no callback". Drops release their pixel
+   buffers; they are not a stall.
+3. **The low-latency encoder already rejects CBR with -12900** — exactly the behavior the report
+   demanded Apple implement.
 
-Build (must be x86_64 so it runs under Rosetta on Apple Silicon):
+## Why the property is wrong for us anyway
 
-```
-clang++ -arch x86_64 -std=c++17 -fobjc-arc -O2 main.mm -o vt-llrc-probe \
-  -framework Foundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo
-```
+The SDK header (`VTCompressionProperties.h`) documents that `ConstantBitRate` **is not compatible
+with `DataRateLimits`, `AverageBitRate`, and `VariableBitRate`** — the production experiment set
+it on top of AverageBitRate + DataRateLimits, a documented-invalid combination — and that it "is
+not supported in all encoders or in all encoder operating modes" with `kVTPropertyNotSupportedErr`
+returned when unsupported. In classic mode the accepted property appears to be silently ignored
+(output measured 29.3 Mbps against a 42 Mbps constant rate — true CBR pads up). CBR is also the
+wrong tool here: it exists for legacy CDN interop, and ALVR's adaptive-bitrate loop handles rate
+adaptation. `AverageBitRate` + exact-budget `DataRateLimits` remains the correct configuration.
 
-## Steps to reproduce
+## What the live 2026-07-03 stall probably was
 
-1. On an Apple Silicon Mac, build the probe for x86_64 (command above).
-2. Add one line to the probe's `RunConfig`, next to the existing `AverageBitRate` set:
+The production observation (output ceased after a burst, encoder slots leaked, 100% drops) was
+real, but it happened in the same working tree that contained the use-after-free fixed in oxrsys
+`47dc2a2`: frame-context fields were written *after* `VTCompressionSessionEncodeFrame` handed the
+refcon to VT, corrupting the malloc tiny zone and wedging the encode thread — which produces
+exactly "callbacks cease and slots leak". With CBR removal bundled into the same round of changes,
+the stall was misattributed to CBR.
 
-   ```objc
-   int cbr = kBitrate;
-   CFNumberRef cbrRef = CFNumberCreate(nullptr, kCFNumberIntType, &cbr);
-   setProp(kVTCompressionPropertyKey_ConstantBitRate, cbrRef);  // returns noErr
-   CFRelease(cbrRef);
-   ```
-
-3. Run under Rosetta. The session is a standard HW H.264 `VTCompressionSession`
-   (`EnableHardwareAcceleratedVideoEncoder=YES`, H.264 High profile, RealTime, no frame
-   reordering); the stall reproduces with or without low-latency rate control.
-4. Submit frames at a steady 72 fps cadence with `VTCompressionSessionEncodeFrame`.
-
-## Expected
-
-Either the property set is rejected (as unsupported properties are, e.g. `-12900`
-`kVTPropertyNotSupportedErr`), or the session honors it and continues delivering one output
-callback per submitted frame.
-
-## Actual
-
-The first few frames produce output callbacks, then callbacks stop entirely with no error
-surfaced. The probe reports far fewer callbacks than submitted frames, e.g.:
-
-```
-  encoded: callbacks=34 frames=34 ...   <- 48 frames were submitted; 14 never produced output
-```
-
-In a real streaming pipeline the effect is total: in-flight pixel buffers are never released,
-every encoder pool slot leaks within a fraction of a second, and video output halts permanently
-(observed live in our VR streaming application before the property was removed — the encoder went
-from a brief burst of output to 100% dropped frames with zero callbacks).
-
-## Impact
-
-Any translated x86_64 application attempting true constant-bitrate encoding (game/VR streaming
-under Wine/CrossOver) hits an undiagnosable pipeline freeze instead of a property rejection. The
-workaround is to avoid `ConstantBitRate` entirely and approximate CBR with
-`AverageBitRate` + `DataRateLimits`.
-
-*Related report filed separately: the low-latency encoder
-(`EnableLowLatencyRateControl`) emits all-zero chroma for BGRA input in the same environment.*
+*The companion report `apple-feedback-1-lowlatency-bgra-zero-chroma.md` is unaffected: its bug
+(LL-RC + BGRA → all-zero chroma) reproduces on every run of the probe's default mode.*

@@ -191,9 +191,13 @@ re-enabled with a retry-without fallback. Encode total p50 **33 → 10.3 ms**, l
 **311 → 79 ms**.
 
 New Rosetta/VT gotchas found on the way:
-- `kVTCompressionPropertyKey_ConstantBitRate` is **accepted** by the session, then **stalls the VT
-  pipeline** under Rosetta — output callbacks cease after a few frames and encoder slots leak.
-  Never use.
+- `kVTCompressionPropertyKey_ConstantBitRate`: still never use, but the original "accepted then
+  stalls the pipeline" claim was **retracted 2026-07-04** — the instrumented probe (`--cbr` mode,
+  including an exact production-config mirror) shows classic RC accepts-and-ignores it while LL-RC
+  rejects it (-12900); the "stall" evidence was RealTime frame *drops* miscounted as missing
+  callbacks, and the live freeze matches the same-day use-after-free. The header also documents
+  CBR as incompatible with `AverageBitRate`/`DataRateLimits` (which we set). See
+  `docs/apple-feedback-2-constantbitrate-pipeline-stall.md`.
 - VT does **not** reliably enforce `AverageBitRate`/`DataRateLimits` on hard content in *any* mode
   under Rosetta (probe: 77–122 Mbps at a 42 Mbps target on noise). Mitigated with ALVR's Adaptive
   bitrate feedback loop rather than VT-side caps.

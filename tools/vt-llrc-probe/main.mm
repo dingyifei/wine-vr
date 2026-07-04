@@ -1,11 +1,17 @@
 // VT low-latency rate-control probe.
 //
-// Encodes synthetic high-chroma frames through VideoToolbox H.264 HW under a
-// matrix of {low-latency RC on/off} x {BGRA input / NV12 input}, decodes the
-// bitstream back in-process, and reports per-plane chroma statistics.
+// Default mode: encodes synthetic high-chroma frames through VideoToolbox
+// H.264 HW under a matrix of {low-latency RC on/off} x {BGRA input / NV12
+// input}, decodes the bitstream back in-process, and reports per-plane chroma
+// statistics. Diagnoses the "all-zero chroma -> green" LL-RC bug and tests
+// whether pre-converted NV12 input bypasses it.
+//
+// --cbr mode: additionally sets kVTCompressionPropertyKey_ConstantBitRate.
+// Under Rosetta the property is accepted (noErr) but output callbacks cease
+// after the first few frames; the probe reports submitted-vs-callback counts.
+//
 // Built x86_64 so it reproduces the Rosetta translation environment of the
-// wine-hosted encoder. Diagnoses the "all-zero chroma -> green" LL-RC bug and
-// tests whether pre-converted NV12 input bypasses it.
+// wine-hosted encoder.
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
@@ -31,6 +37,10 @@ struct EncodedStream
     std::vector<uint8_t> avccExtradata;       // from format description (SPS/PPS)
     CMFormatDescriptionRef formatDesc = nullptr;
     int callbackCount = 0;
+    int droppedCount = 0;   // callback fired with kVTEncodeInfo_FrameDropped / no sample
+    int errorCount = 0;     // callback fired with status != noErr
+    std::vector<int64_t> outputPts;  // pts of frames that produced real output
+    std::vector<int64_t> droppedPts; // pts of frames the encoder reported dropped
     int64_t totalBytes = 0;
     // Encode latency: submit time per frame index (pts.value), delta measured
     // in the output callback. This is the stage where low-latency RC differs.
@@ -38,18 +48,29 @@ struct EncodedStream
     std::vector<double> latenciesMs;
 };
 
-static void EncodeOutput(void* refCon, void*, OSStatus status, VTEncodeInfoFlags,
+static void EncodeOutput(void* refCon, void* frameRefCon, OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer)
 {
     auto* stream = (EncodedStream*)refCon;
-    if (status != noErr || sampleBuffer == nullptr || !CMSampleBufferDataIsReady(sampleBuffer))
+    if (status != noErr)
     {
+        stream->errorCount++;
+        printf("    [cb] frame %ld status=%d\n", (long)(intptr_t)frameRefCon, (int)status);
+        return;
+    }
+    if ((infoFlags & kVTEncodeInfo_FrameDropped) != 0 || sampleBuffer == nullptr ||
+        !CMSampleBufferDataIsReady(sampleBuffer))
+    {
+        // A drop still releases the pixel buffer; a true stall never calls back.
+        stream->droppedCount++;
+        stream->droppedPts.push_back((int64_t)(intptr_t)frameRefCon);
         return;
     }
     stream->callbackCount++;
     CMTime cbPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     if (cbPts.value >= 0 && (size_t)cbPts.value < stream->submitTimes.size())
     {
+        stream->outputPts.push_back(cbPts.value);
         stream->latenciesMs.push_back(
             std::chrono::duration<double, std::milli>(
                 std::chrono::steady_clock::now() - stream->submitTimes[(size_t)cbPts.value])
@@ -238,9 +259,16 @@ static void DecodeOutput(void* refCon, void*, OSStatus status, VTDecodeInfoFlags
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
 
-static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
+// stallMode: 0 = chroma matrix (decode + plane stats),
+//            1 = callback accounting only (control for --cbr),
+//            2 = callback accounting + set kVTCompressionPropertyKey_ConstantBitRate,
+//            3 = mode 2 plus the full oxrsys production property set at the time
+//                the live stall was observed (CABAC, keyframe interval,
+//                MaxFrameDelayCount=0, 1.5x DataRateLimits headroom).
+static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int stallMode = 0)
 {
     printf("\n=== %s ===\n", label);
+    const int frameCount = (stallMode != 0) ? kFrames * 5 : kFrames;
 
     EncodedStream stream;
     NSMutableDictionary* encoderSpec = [@{
@@ -278,11 +306,51 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
     CFNumberRef brRef = CFNumberCreate(nullptr, kCFNumberIntType, &br);
     setProp(kVTCompressionPropertyKey_AverageBitRate, brRef);
     CFRelease(brRef);
+    if (stallMode == 3)
+    {
+        // Match the oxrsys VideoEncoder property set from the 2026-07-03 live
+        // CBR experiment (classic RC, BGRA input, balanced preset).
+        setProp(kVTCompressionPropertyKey_H264EntropyMode, kVTH264EntropyMode_CABAC);
+        int keyframeInterval = 10 * kFps;
+        CFNumberRef kfRef = CFNumberCreate(nullptr, kCFNumberIntType, &keyframeInterval);
+        setProp(kVTCompressionPropertyKey_MaxKeyFrameInterval, kfRef);
+        CFRelease(kfRef);
+        double keyframeDuration = 10.0;
+        CFNumberRef kfdRef = CFNumberCreate(nullptr, kCFNumberFloat64Type, &keyframeDuration);
+        setProp(kVTCompressionPropertyKey_MaxKeyFrameIntervalDuration, kfdRef);
+        CFRelease(kfdRef);
+        int maxFrameDelay = 0;
+        CFNumberRef delayRef = CFNumberCreate(nullptr, kCFNumberIntType, &maxFrameDelay);
+        setProp(kVTCompressionPropertyKey_MaxFrameDelayCount, delayRef);
+        CFRelease(delayRef);
+    }
+    if (stallMode >= 2)
+    {
+        // Print the status unconditionally: the bug is that this set is
+        // ACCEPTED (noErr) under Rosetta yet the pipeline then stalls.
+        if (@available(macOS 13.0, *))
+        {
+            int cbrBits = kBitrate;
+            CFNumberRef cbrRef = CFNumberCreate(nullptr, kCFNumberIntType, &cbrBits);
+            OSStatus s = VTSessionSetProperty(session, kVTCompressionPropertyKey_ConstantBitRate, cbrRef);
+            CFRelease(cbrRef);
+            printf("  ConstantBitRate=%d -> VTSessionSetProperty status=%d (%s)\n",
+                   kBitrate, (int)s, s == noErr ? "accepted" : "rejected");
+        }
+        else
+        {
+            printf("  ConstantBitRate unavailable before macOS 13 — skipping config\n");
+            VTCompressionSessionInvalidate(session);
+            CFRelease(session);
+            return false;
+        }
+    }
     // Chromium: DataRateLimits is incompatible with EnableLowLatencyRateControl
     // (undocumented). Only set it in classic mode.
     if (!lowLatency)
     {
-        double peak = kBitrate / 8.0;
+        // Production used 1.5x headroom at the time of the CBR experiment.
+        double peak = kBitrate * (stallMode == 3 ? 1.5 : 1.0) / 8.0;
         setProp(kVTCompressionPropertyKey_DataRateLimits,
                 (__bridge CFArrayRef)@[ @(peak), @(1.0) ]);
     }
@@ -311,7 +379,7 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
         (NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
     };
 
-    for (int i = 0; i < kFrames; i++)
+    for (int i = 0; i < frameCount; i++)
     {
         CVPixelBufferRef pb = nullptr;
         if (CVPixelBufferCreate(nullptr, kWidth, kHeight, pixelFormat,
@@ -330,7 +398,8 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
 
         CMTime pts = CMTimeMake(i, kFps);
         stream.submitTimes.push_back(std::chrono::steady_clock::now());
-        VTCompressionSessionEncodeFrame(session, pb, pts, kCMTimeInvalid, nullptr, nullptr, nullptr);
+        VTCompressionSessionEncodeFrame(session, pb, pts, kCMTimeInvalid, nullptr,
+                                        (void*)(intptr_t)i, nullptr);
         CVPixelBufferRelease(pb);
         // Pace at the real frame cadence so rate control and pipelining behave
         // like the live 72Hz encoder rather than a burst benchmark.
@@ -340,8 +409,8 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
     VTCompressionSessionInvalidate(session);
     CFRelease(session);
 
-    printf("  encoded: callbacks=%d frames=%zu avgKB/frame=%.0f (%.1f Mbps @%dfps)\n",
-           stream.callbackCount, stream.annexb.size(),
+    printf("  encoded: callbacks=%d dropped=%d errors=%d frames=%zu avgKB/frame=%.0f (%.1f Mbps @%dfps)\n",
+           stream.callbackCount, stream.droppedCount, stream.errorCount, stream.annexb.size(),
            stream.annexb.empty() ? 0.0 : stream.totalBytes / 1024.0 / stream.annexb.size(),
            stream.annexb.empty() ? 0.0
                                  : stream.totalBytes * 8.0 * kFps / stream.annexb.size() / 1e6,
@@ -352,6 +421,43 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
         std::sort(lats.begin(), lats.end());
         printf("  encode latency (submit->callback): p50=%.1fms p95=%.1fms max=%.1fms (n=%zu)\n",
                lats[lats.size() / 2], lats[(size_t)(lats.size() * 0.95)], lats.back(), lats.size());
+    }
+    if (stallMode != 0)
+    {
+        // Chroma decode is irrelevant here; the CBR bug is missing callbacks.
+        // Distinguish frames the encoder REPORTED dropped (callback fires,
+        // pixel buffer released) from frames that got NO callback at all
+        // (buffer retained forever — the true stall symptom).
+        int submitted = (int)stream.submitTimes.size();
+        int accounted = stream.callbackCount + stream.droppedCount + stream.errorCount;
+        int silent = submitted - accounted;
+        if (!stream.droppedPts.empty())
+        {
+            printf("  reported-dropped pts:");
+            for (int64_t p : stream.droppedPts) printf(" %lld", (long long)p);
+            printf("\n");
+        }
+        if (silent > 0)
+        {
+            std::vector<bool> got(submitted, false);
+            for (int64_t p : stream.outputPts) if (p >= 0 && p < submitted) got[(size_t)p] = true;
+            for (int64_t p : stream.droppedPts) if (p >= 0 && p < submitted) got[(size_t)p] = true;
+            printf("  silent (no callback ever) pts:");
+            for (int i2 = 0; i2 < submitted; i2++) if (!got[(size_t)i2]) printf(" %d", i2);
+            printf("\n");
+            printf("  VERDICT: PIPELINE STALL — %d of %d submitted frames never produced any callback\n",
+                   silent, submitted);
+        }
+        else
+        {
+            printf("  VERDICT: no stall — every submitted frame produced a callback (%d output, %d dropped)\n",
+                   stream.callbackCount, stream.droppedCount);
+        }
+        if (stream.formatDesc != nullptr)
+        {
+            CFRelease(stream.formatDesc);
+        }
+        return silent == 0;
     }
     if (stream.formatDesc == nullptr || stream.annexb.empty())
     {
@@ -411,8 +517,25 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label)
     return true;
 }
 
-int main()
+int main(int argc, char** argv)
 {
+    bool cbrMode = false;
+    for (int i = 1; i < argc; i++)
+    {
+        if (strcmp(argv[i], "--cbr") == 0)
+        {
+            cbrMode = true;
+        }
+        else
+        {
+            fprintf(stderr,
+                    "usage: %s [--cbr]\n"
+                    "  (default)  chroma matrix: {LL-RC on/off} x {BGRA/NV12 input}\n"
+                    "  --cbr      ConstantBitRate stall repro (accepted but callbacks cease)\n",
+                    argv[0]);
+            return 2;
+        }
+    }
     @autoreleasepool
     {
 #if defined(__x86_64__)
@@ -420,10 +543,24 @@ int main()
 #else
         printf("arch: arm64 (NATIVE — this does NOT reproduce the wine environment!)\n");
 #endif
-        RunConfig(false, false, "classic RC + BGRA input (control)");
-        RunConfig(true, false, "LOW-LATENCY RC + BGRA input (expect green bug)");
-        RunConfig(false, true, "classic RC + NV12 input");
-        RunConfig(true, true, "LOW-LATENCY RC + NV12 input (the hypothesis)");
+        if (cbrMode)
+        {
+            // NV12 input keeps the LL-RC BGRA chroma bug out of the picture,
+            // so any callback deficit is attributable to ConstantBitRate.
+            // Controls (stallMode 1) use identical accounting without the prop.
+            RunConfig(false, true, "classic RC + NV12 (control, no CBR)", 1);
+            RunConfig(false, true, "classic RC + NV12 + ConstantBitRate", 2);
+            RunConfig(true, true, "LOW-LATENCY RC + NV12 (control, no CBR)", 1);
+            RunConfig(true, true, "LOW-LATENCY RC + NV12 + ConstantBitRate", 2);
+            RunConfig(false, false, "PRODUCTION MIRROR: classic RC + BGRA + CABAC + 1.5x limits + CBR", 3);
+        }
+        else
+        {
+            RunConfig(false, false, "classic RC + BGRA input (control)");
+            RunConfig(true, false, "LOW-LATENCY RC + BGRA input (expect green bug)");
+            RunConfig(false, true, "classic RC + NV12 input");
+            RunConfig(true, true, "LOW-LATENCY RC + NV12 input (the hypothesis)");
+        }
         printf("\ndone\n");
     }
     return 0;
