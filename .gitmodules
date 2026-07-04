@@ -1,0 +1,12 @@
+[submodule "ext/oxrsys"]
+	path = ext/oxrsys
+	url = https://github.com/dingyifei/oxrsys.git
+	branch = main
+[submodule "ext/wineopenxr"]
+	path = ext/wineopenxr
+	url = https://github.com/dingyifei/wineopenxr.git
+	branch = main
+[submodule "ext/ALVR"]
+	path = ext/ALVR
+	url = https://github.com/dingyifei/ALVR.git
+	branch = oxrsys-v20.14.1
