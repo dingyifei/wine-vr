@@ -35,6 +35,32 @@ RUSTC=~/.rustup/toolchains/stable-aarch64-apple-darwin/bin/rustc \
   receive loops retry on `ConnectionError::Other` instead of exiting the
   thread. Upstream exits permanently, so a headset sleep (socket goes quiet /
   errors) killed tracking until a full restart.
+- `alvr/server_core/src/connection.rs` — `is_streaming_nonblocking()` for the
+  CoreAudio capture callback: the blocking session-lock read deadlocked
+  against `connection_pipeline` holding the write lock across cpal device
+  enumeration (which needs the HAL mutex the callback's thread holds) —
+  wedging every reconnect (macOS-only ABBA deadlock).
+- `alvr/sockets/src/stream_socket.rs` + `connection.rs` — closeable stream
+  writer: the shared UDP writer sits behind `Option` with `close_writer()`
+  called on every disconnect flavor (receive-thread exits, teardown tail, an
+  RAII guard for early error returns), so stale `StreamSender` Arc clones
+  (e.g. the CoreAudio callback's) can no longer pin the port and break every
+  re-bind with EADDRINUSE. Plus a lock-free `disconnecting` flag so the old
+  receive thread exits without the session lock, and a bounded (~3 s)
+  EADDRINUSE retry on the stream bind for normal close races.
+- `alvr/server_core/src/connection.rs` — video send errors are logged
+  rate-limited (upstream ignored them silently); manual-IP dial failures are
+  logged (upstream retried in total silence, indistinguishable from a hang).
+- `alvr/sockets/src/lib.rs` — socket buffer sizing: `Maximum` requested
+  `u32::MAX`, which macOS rejects with EINVAL, silently leaving the 9216-byte
+  default; now starts at 8 MiB and halves until accepted.
+- `alvr/audio/src/lib.rs` — capture stops on send error (releases its socket
+  clone), and the stop-state poll is 50 ms (was 500 ms) so teardown can't
+  race the next connection's bind.
+- `alvr/adb/src/lib.rs` + `connection.rs` — `WiredConnectionStatus::NoDevice`
+  falls through to manual-IP/discovery dialing instead of retrying the wired
+  path forever, so a `client.wired` entry no longer starves WiFi connections
+  when no USB device is attached.
 
 Regenerate after changing anything in `ext/ALVR`:
 

@@ -25,6 +25,13 @@ Meta Quest. This repo holds the investigation, reproducers, evidence, and patche
   bridge with **no real Steam** (Goldberg emulator satisfies DRM; 1.29.4 predates the Meta-account
   gate). Menu navigation and gameplay both work in-headset. Getting there needed four runtime fixes
   (see the patch list below).
+- **ALVR backend over WiFi — 78–82 ms motion-to-photon, verified better than Virtual Desktop on
+  some setups (2026-07-04):** the stock ALVR store client streams from the embedded
+  `alvr_server_core` at 72 fps / ~60 Mbps adaptive with **low-latency rate control + correct color**
+  (the Rosetta chroma bug is fixed — see below), 10 ms encode p50, zero steady-state drops, working
+  audio (BlackHole), haptics, and automatic reconnect after boundary exits / client restarts.
+  Remaining polish: stream resolution is 0.75× (viewable, not pixel-perfect), server paces at
+  73.6 fps vs the 72 Hz panel (minor vsync-queue pooling), menu button unmapped.
 
 The architecture (`monofunc/wineopenxr` + a DXMT interop fork + oxrsys, with the fixes in this repo)
 supersedes the original Vulkan+winevulkan plan and targets *real D3D11 PCVR games*, not just Vulkan
@@ -48,23 +55,21 @@ bitrate than the Rosetta-only H.264), removal of Rosetta per-call overhead, and 
 heavier real-game frames. It is *not* primarily a latency/throughput fix on the current flat-frame
 test — H.264 HW already keeps 72 fps there.
 
-### Low-latency rate control — blocked by a Rosetta/VideoToolbox chroma bug (needs native encode)
+### Low-latency rate control — Rosetta chroma bug SOLVED via NV12 input (2026-07-03)
 
 `kVTVideoEncoderSpecification_EnableLowLatencyRateControl` roughly **halves encode latency and its
-jitter** (measured callback ~14.5 ms → ~7.8 ms, p95 ~20 ms → ~9 ms) — a large, real win. It is
-**gated off** (`kEnableLowLatencyRC=false` in `VideoEncoder.mm`) because, **under Rosetta**, the
-low-latency encode path produces frames with **correct luma but all-zero chroma** → the client renders
-green. This was traced conclusively (plane scan of the decoded buffer: `Y[max≈59]` but `Cb/Cr=[0..0]`;
-SPS is High-profile 4:2:0, so chroma *should* exist). It survived every app-level fix — full-range
-decode, multi-slice access-unit assembly, and explicit BT.709 color primaries/transfer/matrix on both
-the input pixel buffers and the compression session — which rules out color *interpretation* and points
-at VideoToolbox's low-latency **encode** dropping chroma under x86_64 translation. Same theme as HEVC HW
-encode being unavailable under Rosetta: **Rosetta's translation of newer VideoToolbox paths is broken.**
+jitter** but historically produced **correct luma with all-zero chroma** (green image) under Rosetta,
+and was gated off. The bug is now root-caused and bypassed: the offline probe
+`tools/vt-llrc-probe` (a {LL-RC on/off} × {BGRA/NV12 input} matrix with decode-back plane scans)
+proved the fault is isolated to the low-latency (`rtvc`) encoder's **internal RGB→YCbCr conversion**
+under x86_64 translation — feed it pre-converted NV12 (`420v` biplanar) and chroma is healthy. No
+production VT consumer (ffmpeg/Chromium/OBS/Sunshine) feeds BGRA to LL sessions, which is why the
+bug was publicly undocumented (`docs/apple-feedback-vt-rosetta.md` is a ready-to-file report; it
+also documents a second bug — `ConstantBitRate` is accepted then stalls the encode pipeline).
 
-The fix is the **native-arm64 out-of-process encoder** above — running VideoToolbox natively avoids the
-translation entirely, and low-latency RC should then work (worth confirming on the Quest / native runtime).
-Default rate control works correctly under Rosetta today (correct color, ~16 ms, steady 72 fps after the
-pacing fix).
+oxrsys now composites to a BGRA texture and runs a BT.709 `rgb_to_nv12` Metal kernel before
+VideoToolbox, with LL-RC enabled: encode 33 ms → **10.3 ms p50** live. The native-arm64
+out-of-process encoder above remains worthwhile for HEVC, but is no longer required for low latency.
 
 ### Smaller items
 - Thread QoS (`QOS_CLASS_USER_INTERACTIVE`) on encode/send threads is applied; a dedicated high-QoS

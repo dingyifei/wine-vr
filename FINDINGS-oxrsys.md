@@ -175,6 +175,37 @@ luma and **all-zero chroma** → green. Traced conclusively (decoded-buffer plan
 and explicit BT.709 tags on input + session — ruling out color interpretation and pinning it on VT's
 low-latency **encode** under x86_64 translation. Same theme as HEVC-HW-unavailable-under-Rosetta.
 
+**Low-latency RC root-caused and FIXED via NV12 input (2026-07-03):** the gate-off above is
+superseded. `tools/vt-llrc-probe` (x86_64, 4-config matrix {LL-RC on/off} × {BGRA/NV12 input}:
+encodes synthetic high-chroma frames, decodes them back in-process, reports per-plane stats) isolated
+the failing stage: **LL+BGRA = dead chroma (`Cb/Cr` flat), LL+NV12 = healthy** — same content, same
+session properties. The zero-chroma bug lives in VT's *internal* RGB→YCbCr conversion of the
+low-latency (`rtvc`) encoder under Rosetta, not in rate control itself; pre-converted 4:2:0 input
+bypasses it. Why it's publicly undocumented: production VT users (ffmpeg, Chromium, OBS, Sunshine)
+all feed 4:2:0, so nobody exercises the LL encoder's BGRA import path. (Ready-to-file Feedback
+Assistant report: `docs/apple-feedback-vt-rosetta.md`.)
+
+**Fix shipped** (oxrsys `47dc2a2`): encoder pool switched to 420v biplanar + `rgb_to_nv12` Metal
+kernel (BT.709 video-range) at the tail of every compose path; `EnableLowLatencyRateControl`
+re-enabled with a retry-without fallback. Encode total p50 **33 → 10.3 ms**, live motion-to-photon
+**311 → 79 ms**.
+
+New Rosetta/VT gotchas found on the way:
+- `kVTCompressionPropertyKey_ConstantBitRate` is **accepted** by the session, then **stalls the VT
+  pipeline** under Rosetta — output callbacks cease after a few frames and encoder slots leak.
+  Never use.
+- VT does **not** reliably enforce `AverageBitRate`/`DataRateLimits` on hard content in *any* mode
+  under Rosetta (probe: 77–122 Mbps at a 42 Mbps target on noise). Mitigated with ALVR's Adaptive
+  bitrate feedback loop rather than VT-side caps.
+- `MaxFrameDelayCount` and `PrioritizeEncodingSpeedOverQuality` are rejected (-12900) by the LL
+  encoder.
+
+**Use-after-free postmortem:** frame-context fields were written *after*
+`VTCompressionSessionEncodeFrame` hands the refcon to VT. LL-RC makes output callbacks
+near-synchronous — the callback (which frees the context) can run before `EncodeFrame` even returns —
+so the late writes corrupted the malloc tiny zone and wedged the encode thread. Rule: **all refcon
+writes must precede submission.**
+
 **Improvement potential (README):** native-arm64 out-of-process media half — runs VideoToolbox natively,
 which removes the Rosetta fragility (unlocks HW HEVC *and* working low-latency RC). Reuses Gate 0's
 cross-arch IOSurface hand-off.
