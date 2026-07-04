@@ -1,4 +1,5 @@
 #!/bin/zsh
+# SUPERSEDED by ../../demo.sh install — kept as the investigation-era reference (hardcoded OpenXRTest bottle).
 # ROLE: SETUP — one-time install of the wineopenxr + DXMT-fork bridge into a CrossOver bottle.
 # Install the wineopenxr + DXMT-fork bridge into the OpenXRTest CrossOver bottle.
 # - Overlays monofunc DXMT fork (interop) over CrossOver's bundled DXMT (stock backed up).

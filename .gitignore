@@ -1,5 +1,6 @@
-# External cloned/built repos + downloaded CI artifacts (huge, not our code)
-ext/
+# Downloaded CI artifacts + demo binary deps (fetched by demo.sh setup)
+ext/dxmt-artifacts/
+third_party/
 
 # Build outputs
 build/
@@ -13,16 +14,21 @@ build/
 # Caches / generated logs
 *.dxvk-cache
 *.log
+logs/
+
+# Local investigation evidence (kept out of git history)
+evidence/
 
 # Stray runtime state markers
 BeatSaberVersion.txt
 
-# Tooling scratch
-tools/
-.remember/
+# Tool binaries (sources are tracked)
+tools/vt-llrc-probe/vt-llrc-probe
+tools/alvr-smoke/alvr-smoke
 
 # macOS
 .DS_Store
 
 # Claude session state
 .claude/
+.remember/

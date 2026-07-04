@@ -1,4 +1,5 @@
 #!/bin/zsh
+# SUPERSEDED by ../../demo.sh run — kept as the investigation-era reference launcher.
 # ROLE: PRIMARY launcher — Beat Saber 1.29.4 end-to-end through the bridge (current working path).
 # End-to-end launch of the downgraded Beat Saber 1.29.4 through the wine-vr / oxrsys bridge,
 # with Goldberg Steam Emulator so NO real Steam is needed (solves the Meta gate + Steam instability).
