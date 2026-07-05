@@ -67,12 +67,15 @@ restore_audio() {
     PREV_AUDIO_OUT=""
   fi
 }
-# zsh runs signal traps only after the foreground pipeline finishes; resignal so a
-# directed INT/TERM actually terminates the script with the right status.
+# INT/TERM: tear the game down (wineserver -k) and restore audio, then resignal so
+# the script exits with the right status. Wine runs as a background job below and
+# the script waits on it, so zsh delivers these traps immediately on a signal.
 trap 'restore_audio' EXIT
-trap 'restore_audio; trap - INT;  kill -INT  $$' INT
-trap 'restore_audio; trap - TERM; kill -TERM $$' TERM
-if [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
+trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; restore_audio; trap - INT;  kill -INT  $$' INT
+trap 'print -r -- "-- terminated: stopping wine"; stop_wine; restore_audio; trap - TERM; kill -TERM $$' TERM
+if [ -n "${WINEVR_NO_AUDIO:-}" ]; then
+  info "audio routing disabled (--no-audio) — sound stays on the Mac"
+elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
   if SwitchAudioSource -a -t output | grep -qx "BlackHole 2ch"; then
     PREV_AUDIO_OUT="$(SwitchAudioSource -c -t output)"
     if SwitchAudioSource -t output -s "BlackHole 2ch" >/dev/null 2>&1; then
@@ -109,7 +112,10 @@ fi
 BS_WIN="$(win_path "$BS_DIR/Beat Saber.exe")"
 export XR_RUNTIME_JSON="$OXR_RUNTIME_JSON"
 export CX_GRAPHICS_BACKEND=dxmt
-export WINEDEBUG="${WINEDEBUG:-fixme-all,+openxr}"
+# Quiet by default: the useful lines (oxrsys/ALVR spdlog, Unity) are not wine
+# channels. --verbose restores the wine/openxr firehose for debugging.
+if [ -n "${WINEVR_VERBOSE:-}" ]; then export WINEDEBUG="${WINEDEBUG:-fixme-all,+openxr}"
+else export WINEDEBUG="${WINEDEBUG:--all}"; fi
 export SteamAppId=$BS_APPID SteamGameId=$BS_APPID
 mkdir -p "$ROOT/logs"
 LOG="$ROOT/logs/beatsaber-$(date +%Y%m%d-%H%M%S).log"
@@ -119,11 +125,17 @@ print -r -- "-- launching Beat Saber through the bridge"
 print -r -- "   put the headset ON and open the ALVR client; first frame can take ~30s."
 print -r -- "   pause in-game = X/A button or the Quest system button"
 print -r -- "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)"
+print -r -- "   stop: Ctrl-C here, or ./demo.sh stop --bottle $WINEVR_BOTTLE from another shell"
 print -r -- "   exe: $BS_WIN"
 print -r -- "   log: $LOG"
 print ""
 
-"$WINE" --bottle "$WINEVR_BOTTLE" --no-update --cx-app "$BS_WIN" 2>&1 | tee "$LOG"
-rc=${pipestatus[1]}
-print "\nwine exited with status $rc (log: $LOG)"
+# Background + wait (instead of a foreground pipeline) so INT/TERM traps run
+# immediately; quitting the game from its own menu ends this too.
+"$WINE" --bottle "$WINEVR_BOTTLE" --no-update --cx-app "$BS_WIN" > >(tee "$LOG") 2>&1 &
+WINE_PID=$!
+wait $WINE_PID
+rc=$?
+print ""
+print -r -- "wine exited with status $rc (log: $LOG)"
 exit $rc

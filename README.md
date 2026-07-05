@@ -102,6 +102,12 @@ servers hang startup), preflights everything with actionable errors, applies
 the Goldberg Steam emulator to the game, routes audio into BlackHole, and
 launches through the bridge. Logs land in `logs/`.
 
+To exit: quit from the game menu, or **Ctrl-C** (tears down wine and restores
+audio), or `./demo.sh stop --bottle Steam` from another shell. Note that audio
+routing sends *all* Mac output to the headset while the game runs — pass
+`--no-audio` to keep sound on the Mac. The console stays quiet by default;
+`--verbose` enables the wine/openxr debug channels.
+
 ## Checking your setup
 
 ```sh
@@ -118,6 +124,8 @@ stale bottle, or a leftover client IP pin in `session.json`.
 |---|---|---|
 | `--bottle` / `WINEVR_BOTTLE` | CLI/env | CrossOver bottle name (required) |
 | `--bs-dir` / `WINEVR_BS_DIR` | CLI/env | Beat Saber 1.29.4 install dir |
+| `--no-audio` / `WINEVR_NO_AUDIO` | CLI/env | keep sound on the Mac (skip BlackHole routing) |
+| `--verbose` / `WINEVR_VERBOSE` | CLI/env | wine/openxr debug channels in console + log |
 | `protocol = "alvr"` | `oxrsys-runtime.toml` | streaming backend (demo path) |
 | `bitrate_mbps` | `oxrsys-runtime.toml` | base video bitrate (42 verified; ALVR's adaptive loop adjusts from there) |
 

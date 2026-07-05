@@ -102,6 +102,15 @@ DXMT_FILES=(x86_64-windows/d3d10core.dll x86_64-windows/d3d11.dll x86_64-windows
 dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
 dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
 
+stop_wine() { # kill the bottle's wineserver (and with it the game) and wait for it to die
+  WINEPREFIX="$PREFIX" "$WINESERVER" -k 2>/dev/null || true
+  ( WINEPREFIX="$PREFIX" "$WINESERVER" -w 2>/dev/null ) &
+  local _wp=$!
+  local _i
+  for _i in {1..40}; do kill -0 $_wp 2>/dev/null || break; sleep 0.1; done
+  kill $_wp 2>/dev/null || true
+}
+
 fetch_pinned() { # url dest expected-sha256 label
   local url="$1" dest="$2" sha="$3" label="$4"
   if sha256_ok "$dest" "$sha"; then info "already present: $label"; return 0; fi
