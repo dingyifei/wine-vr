@@ -25,7 +25,13 @@ cmake -S "$WOXR" -B "$WOXR/build" >/dev/null
 cmake --build "$WOXR/build" -j8
 ok "wineopenxr built"
 
-for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_SO"; do
+# Native arch (talks to the embedded server over localhost, launched by `run`).
+info "building ALVR server dashboard (release)..."
+(cd "$ALVR" && cargo build -p alvr_dashboard --release) || \
+  die "alvr_dashboard build failed — retry with: (cd ext/ALVR && cargo build -p alvr_dashboard --release)"
+ok "ALVR dashboard built"
+
+for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_SO" "$ALVR_DASHBOARD_BIN"; do
   [ -f "$f" ] || die "expected build output missing: $f"
 done
 ok "all build outputs present"

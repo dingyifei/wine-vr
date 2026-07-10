@@ -39,6 +39,9 @@ OXR_ALVR_DYLIB="$OXR_BUILD/runtime/libalvr_server_core.dylib"
 OXR_RUNTIME_JSON="$OXR_BUILD/runtime/oxrsys-runtime.json"
 WOXR_DLL="$WOXR/build/src/pe/wineopenxr.dll"
 WOXR_SO="$WOXR/build/src/unix/wineopenxr.so"
+# Native-arch GUI; talks to the embedded server over 127.0.0.1:8082, so it does
+# not need the x86_64 cross target.
+ALVR_DASHBOARD_BIN="$ALVR/target/release/alvr_dashboard"
 
 ADB="$HOME/Library/Android/sdk/platform-tools/adb"
 command -v "$ADB" >/dev/null 2>&1 || ADB="$(command -v adb 2>/dev/null || true)"

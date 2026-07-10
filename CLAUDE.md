@@ -36,11 +36,11 @@ The demo pipeline (`demo.sh`, zsh) is the entry point; there is no Makefile or C
 ./demo.sh setup                     # submodules + sha256-pinned binaries + runtime config (idempotent, no sudo)
 ./demo.sh build                     # oxrsys (x86_64 + ALVR core) and wineopenxr
 ./demo.sh install --bottle <name>   # bridge into CrossOver + bottle + host loader (the ONLY sudo stage)
-./demo.sh run --bottle <name>       # launch Beat Saber (also: --bs-dir, --no-audio, --verbose)
+./demo.sh run --bottle <name>       # launch Beat Saber (also: --bs-dir, --no-audio, --no-dashboard, --verbose)
 ./demo.sh stop --bottle <name>      # kill game + wineserver, check ports/audio
 ```
 
-Flags mirror env vars: `WINEVR_BOTTLE`, `WINEVR_BS_DIR`, `WINEVR_NO_AUDIO`, `WINEVR_VERBOSE`. Stage scripts in `scripts/demo/` are **sourced** by the dispatcher and depend on `lib.sh` globals — they cannot run standalone. `lib.sh` is the single source of truth for paths, sha256 pins, and helpers.
+Flags mirror env vars: `WINEVR_BOTTLE`, `WINEVR_BS_DIR`, `WINEVR_NO_AUDIO`, `WINEVR_NO_DASHBOARD`, `WINEVR_VERBOSE`. Stage scripts in `scripts/demo/` are **sourced** by the dispatcher and depend on `lib.sh` globals — they cannot run standalone. `lib.sh` is the single source of truth for paths, sha256 pins, and helpers.
 
 What `build` actually runs (useful for iterating on one component):
 

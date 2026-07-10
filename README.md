@@ -125,6 +125,7 @@ stale bottle, or a leftover client IP pin in `session.json`.
 | `--bottle` / `WINEVR_BOTTLE` | CLI/env | CrossOver bottle name (required) |
 | `--bs-dir` / `WINEVR_BS_DIR` | CLI/env | Beat Saber 1.29.4 install dir |
 | `--no-audio` / `WINEVR_NO_AUDIO` | CLI/env | keep sound on the Mac (skip BlackHole routing) |
+| `--no-dashboard` / `WINEVR_NO_DASHBOARD` | CLI/env | don't open the ALVR server dashboard with `run` |
 | `--verbose` / `WINEVR_VERBOSE` | CLI/env | wine/openxr debug channels in console + log |
 | `protocol = "alvr"` | `oxrsys-runtime.toml` | streaming backend (demo path) |
 | `bitrate_mbps` | `oxrsys-runtime.toml` | base video bitrate (42 verified; ALVR's adaptive loop adjusts from there) |

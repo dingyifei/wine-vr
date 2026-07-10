@@ -81,7 +81,7 @@ elif [ -f "$BS_DIR/Beat Saber.exe" ]; then
 else fail "Beat Saber 1.29.4 not found at $BS_DIR" "$DEPOT_CMD  (or set WINEVR_BS_DIR)"; fi
 
 # 9. build outputs
-for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_SO"; do
+for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_SO" "$ALVR_DASHBOARD_BIN"; do
   if [ -f "$f" ]; then ok "built: ${f#$ROOT/}"
   else fail "missing build output: ${f#$ROOT/}" "./demo.sh build"; fi
 done

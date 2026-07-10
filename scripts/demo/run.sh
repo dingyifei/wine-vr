@@ -67,12 +67,19 @@ restore_audio() {
     PREV_AUDIO_OUT=""
   fi
 }
+DASHBOARD_PID=""
+stop_dashboard() {
+  if [ -n "$DASHBOARD_PID" ] && kill -0 "$DASHBOARD_PID" 2>/dev/null; then
+    kill "$DASHBOARD_PID" 2>/dev/null && print "dashboard: closed"
+  fi
+  DASHBOARD_PID=""
+}
 # INT/TERM: tear the game down (wineserver -k) and restore audio, then resignal so
 # the script exits with the right status. Wine runs as a background job below and
 # the script waits on it, so zsh delivers these traps immediately on a signal.
-trap 'restore_audio' EXIT
-trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; restore_audio; trap - INT;  kill -INT  $$' INT
-trap 'print -r -- "-- terminated: stopping wine"; stop_wine; restore_audio; trap - TERM; kill -TERM $$' TERM
+trap 'stop_dashboard; restore_audio' EXIT
+trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; stop_dashboard; restore_audio; trap - INT;  kill -INT  $$' INT
+trap 'print -r -- "-- terminated: stopping wine"; stop_wine; stop_dashboard; restore_audio; trap - TERM; kill -TERM $$' TERM
 if [ -n "${WINEVR_NO_AUDIO:-}" ]; then
   info "audio routing disabled (--no-audio) — sound stays on the Mac"
 elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then
@@ -91,6 +98,22 @@ elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; t
   else
     warn "BlackHole 2ch not present (brew install blackhole-2ch + reboot) — audio stays on the Mac"
   fi
+fi
+
+# ---- ALVR server dashboard ------------------------------------------------------
+# The embedded alvr_server_core hosts the dashboard API on 127.0.0.1:8082 inside
+# the game process; the stock dashboard polls until it appears, so launching it
+# before the game is fine. Closed again by the exit/signal traps above.
+if [ -n "${WINEVR_NO_DASHBOARD:-}" ]; then
+  info "ALVR dashboard disabled (--no-dashboard)"
+elif [ "$PROTOCOL" != "alvr" ]; then
+  :
+elif [ -x "$ALVR_DASHBOARD_BIN" ]; then
+  "$ALVR_DASHBOARD_BIN" >/dev/null 2>&1 &
+  DASHBOARD_PID=$!
+  print -r -- "dashboard: ALVR server dashboard opening (connects once the game is up)"
+else
+  warn "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)"
 fi
 
 # ---- headset client -----------------------------------------------------------

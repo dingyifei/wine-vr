@@ -17,6 +17,7 @@
 #                     default: <bottle>/drive_c/Program Files (x86)/Steam/
 #                              steamapps/common/Beat Saber 1294
 #   --no-audio        don't route Mac audio into the headset (run only)
+#   --no-dashboard    don't open the ALVR server dashboard (run only)
 #   --verbose         full wine debug channels in the console/log (run only)
 set -u
 
@@ -32,6 +33,7 @@ while [ $# -gt 0 ]; do
     --bs-dir) [ $# -ge 2 ] || { echo "error: --bs-dir needs a path" >&2; exit 2; }
               export WINEVR_BS_DIR="$2"; shift 2 ;;
     --no-audio) export WINEVR_NO_AUDIO=1; shift ;;
+    --no-dashboard) export WINEVR_NO_DASHBOARD=1; shift ;;
     --verbose)  export WINEVR_VERBOSE=1; shift ;;
     *) echo "error: unknown argument '$1'" >&2; exit 2 ;;
   esac
