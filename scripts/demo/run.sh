@@ -80,6 +80,10 @@ elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; t
     PREV_AUDIO_OUT="$(SwitchAudioSource -c -t output)"
     if SwitchAudioSource -t output -s "BlackHole 2ch" >/dev/null 2>&1; then
       print -r -- "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
+      # BlackHole applies the macOS device volume to the loopback samples, so
+      # anything under 100% reaches the headset attenuated; volume is per-device,
+      # so this never touches the speakers we restore on exit.
+      osascript -e 'set volume output volume 100' >/dev/null 2>&1 || true
     else
       warn "could not switch output to BlackHole 2ch — audio stays on the Mac"
       PREV_AUDIO_OUT=""

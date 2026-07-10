@@ -33,6 +33,7 @@ start is in the [top-level README](../README.md).
 | Symptom | Cause | Fix |
 |---|---|---|
 | No in-headset audio | BlackHole 2ch not installed, or installed without rebooting afterward | `brew install blackhole-2ch switchaudio-osx`, then reboot. If the output switch fails, `run` warns and leaves audio on the Mac speakers |
+| In-headset audio quieter than expected | macOS applies the BlackHole device volume to the loopback samples before ALVR captures them | `run` now sets the BlackHole volume to 100% after switching; for a session already running, `osascript -e 'set volume output volume 100'` while BlackHole is the default output |
 
 ## Config
 
