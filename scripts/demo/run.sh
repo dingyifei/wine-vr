@@ -22,6 +22,24 @@ grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json' "$PREFIX/system.reg" 2>/dev/n
   die "bottle ActiveRuntime registry key missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
 cmp -s "$DXMT_ART/x86_64-windows/d3d11.dll" "$CX/lib/dxmt/x86_64-windows/d3d11.dll" || \
   die "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle $WINEVR_BOTTLE"
+# The bottle's Graphics Backend setting overrides the CX_GRAPHICS_BACKEND env var; the
+# CrossOver GUI writes "" (= auto) which no longer selects DXMT — the game then spins
+# forever before D3D11 device creation (no DXMT banner, no session, no streamer).
+CXCONF="$PREFIX/cxbottle.conf"
+if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
+  if grep -q '^"CX_GRAPHICS_BACKEND"' "$CXCONF" 2>/dev/null; then
+    sed -i '' 's/^"CX_GRAPHICS_BACKEND" = ".*"$/"CX_GRAPHICS_BACKEND" = "dxmt"/' "$CXCONF" \
+      || die "could not force graphics backend to dxmt in $CXCONF"
+  elif grep -q '^\[EnvironmentVariables\]$' "$CXCONF" 2>/dev/null; then
+    sed -i '' '/^\[EnvironmentVariables\]$/a\
+"CX_GRAPHICS_BACKEND" = "dxmt"
+' "$CXCONF" || die "could not force graphics backend to dxmt in $CXCONF"
+  else
+    printf '\n[EnvironmentVariables]\n"CX_GRAPHICS_BACKEND" = "dxmt"\n' >> "$CXCONF" \
+      || die "could not force graphics backend to dxmt in $CXCONF"
+  fi
+  ok "bottle graphics backend forced to dxmt (was auto/other — the CrossOver GUI can reset this)"
+fi
 sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256" || [ -f "$GBE_DLL" ] || die "Goldberg dll missing — ./demo.sh setup"
 [ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"
 PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"

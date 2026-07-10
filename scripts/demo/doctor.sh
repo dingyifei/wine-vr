@@ -27,6 +27,8 @@ else
     ok "bottle '$WINEVR_BOTTLE' exists"
     if grep -q '^"Template" = "win11_64"' "$PREFIX/cxbottle.conf" 2>/dev/null; then ok "bottle template win11_64"
     else warn "bottle template is not win11_64 ($(grep '^"Template"' "$PREFIX/cxbottle.conf" 2>/dev/null | head -1)) — only win11_64 is verified"; fi
+    if grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$PREFIX/cxbottle.conf" 2>/dev/null; then ok "bottle graphics backend = dxmt"
+    else fail "bottle graphics backend is not dxmt (the CrossOver GUI 'auto' setting no longer selects DXMT — game stalls before D3D11 init, streamer never starts)" "./demo.sh run auto-fixes this, or set Graphics Backend to DXMT in the CrossOver bottle settings"; fi
   else
     fail "bottle '$WINEVR_BOTTLE' not found at $PREFIX" "create it in the CrossOver UI (win11_64)"
   fi
