@@ -1,5 +1,5 @@
 diff --git a/alvr/adb/src/lib.rs b/alvr/adb/src/lib.rs
-index 9d11096..00557de 100644
+index 9d11096e..00557de7 100644
 --- a/alvr/adb/src/lib.rs
 +++ b/alvr/adb/src/lib.rs
 @@ -11,6 +11,9 @@ use std::collections::HashSet;
@@ -24,7 +24,7 @@ index 9d11096..00557de 100644
  
          let ports = HashSet::from([control_port, stream_port]);
 diff --git a/alvr/audio/src/lib.rs b/alvr/audio/src/lib.rs
-index ca76d26..9a51654 100644
+index ca76d26e..9a516541 100644
 --- a/alvr/audio/src/lib.rs
 +++ b/alvr/audio/src/lib.rs
 @@ -358,7 +358,13 @@ pub fn record_audio_blocking(
@@ -55,8 +55,1346 @@ index ca76d26..9a51654 100644
          }
  
          if let AudioRecordState::Err(e) = &mut *state.lock() {
+diff --git a/alvr/client_core/src/c_api.rs b/alvr/client_core/src/c_api.rs
+index b69f7e92..85b9c277 100644
+--- a/alvr/client_core/src/c_api.rs
++++ b/alvr/client_core/src/c_api.rs
+@@ -305,6 +305,7 @@ pub unsafe extern "C" fn alvr_initialize(capabilities: AlvrClientCapabilities) {
+         prefer_full_range: capabilities.prefer_full_range,
+         preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
+         prefer_hdr: capabilities.prefer_hdr,
++        oxrsys_frame_pacing_version: 0,
+     };
+     *CLIENT_CORE_CONTEXT.lock() = Some(ClientCoreContext::new(capabilities));
+ }
+diff --git a/alvr/client_core/src/connection.rs b/alvr/client_core/src/connection.rs
+index 357bd436..db44d378 100644
+--- a/alvr/client_core/src/connection.rs
++++ b/alvr/client_core/src/connection.rs
+@@ -1,6 +1,7 @@
+ #![allow(clippy::if_same_then_else)]
+ 
+ use crate::{
++    frame_pacing::{client_monotonic_now_ns, try_send_bounded, FrameMetadataRing},
+     logging_backend::{LogMirrorData, LOG_CHANNEL_SENDER},
+     sockets::AnnouncerSocket,
+     statistics::StatisticsManager,
+@@ -15,9 +16,13 @@ use alvr_common::{
+     Pose, RelaxedAtomic, ViewParams, ALVR_VERSION,
+ };
+ use alvr_packets::{
+-    ClientConnectionResult, ClientControlPacket, ClientStatistics, Haptics, RealTimeConfig,
++    ClientConnectionResult, ClientControlPacket, ClientStatistics, Haptics,
++    OxrsysFramePacingDisplayTiming, OxrsysFramePacingFrameFeedback, OxrsysFramePacingFrameTarget,
++    OxrsysFramePacingTimesyncQuery, OxrsysFramePacingTimesyncResponse, RealTimeConfig,
+     ServerControlPacket, StreamConfigPacket, Tracking, VideoPacketHeader,
+-    VideoStreamingCapabilities, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
++    VideoStreamingCapabilities, AUDIO, HAPTICS, OXRSYS_FRAME_PACING_DISPLAY_TIMING,
++    OXRSYS_FRAME_PACING_FRAME_FEEDBACK, OXRSYS_FRAME_PACING_FRAME_TARGET,
++    OXRSYS_FRAME_PACING_TIMESYNC, OXRSYS_FRAME_PACING_VERSION_1, STATISTICS, TRACKING, VIDEO,
+ };
+ use alvr_session::{settings_schema::Switch, SocketProtocol};
+ use alvr_sockets::{
+@@ -26,7 +31,11 @@ use alvr_sockets::{
+ };
+ use std::{
+     collections::VecDeque,
+-    sync::{mpsc, Arc},
++    sync::{
++        atomic::{AtomicU16, AtomicU64, Ordering},
++        mpsc::{self, SyncSender},
++        Arc,
++    },
+     thread,
+     time::{Duration, Instant},
+ };
+@@ -62,9 +71,16 @@ const HANDSHAKE_ACTION_TIMEOUT: Duration = Duration::from_secs(2);
+ const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+ 
+ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
++const FRAME_PACING_OUTBOUND_CAPACITY: usize = 64;
+ 
+ pub type DecoderCallback = dyn FnMut(Duration, &[u8]) -> bool + Send;
+ 
++pub(crate) enum ClientPacingPacket {
++    DisplayTiming(OxrsysFramePacingDisplayTiming),
++    TimesyncResponse(OxrsysFramePacingTimesyncResponse),
++    FrameFeedback(OxrsysFramePacingFrameFeedback),
++}
++
+ #[derive(Default)]
+ pub struct ConnectionContext {
+     pub state: RwLock<ConnectionState>,
+@@ -80,6 +96,12 @@ pub struct ConnectionContext {
+     pub uses_multimodal_protocol: RelaxedAtomic,
+     pub velocities_multiplier: RwLock<f32>,
+     pub max_prediction: RwLock<Duration>,
++    pub frame_pacing_version: AtomicU16,
++    pub frame_pacing_epoch: AtomicU64,
++    pub display_sequence: AtomicU64,
++    pub feedback_sequence: AtomicU64,
++    pub pacing_sender: Mutex<Option<SyncSender<ClientPacingPacket>>>,
++    pub frame_metadata: Mutex<FrameMetadataRing>,
+ }
+ 
+ fn set_hud_message(event_queue: &Mutex<VecDeque<ClientCoreEvent>>, message: &str) {
+@@ -99,6 +121,30 @@ fn is_streaming(ctx: &ConnectionContext) -> bool {
+     *ctx.state.read() == ConnectionState::Streaming
+ }
+ 
++fn configure_frame_pacing(ctx: &ConnectionContext, version: u16, epoch: u64) {
++    ctx.frame_pacing_epoch.store(epoch, Ordering::Release);
++    ctx.frame_pacing_version.store(version, Ordering::Release);
++    ctx.display_sequence.store(0, Ordering::Relaxed);
++    ctx.feedback_sequence.store(0, Ordering::Relaxed);
++    ctx.frame_metadata.lock().reset(version, epoch);
++}
++
++fn reset_frame_pacing(ctx: &ConnectionContext) {
++    *ctx.pacing_sender.lock() = None;
++    configure_frame_pacing(ctx, 0, 0);
++}
++
++fn try_queue_pacing(ctx: &ConnectionContext, packet: ClientPacingPacket) -> bool {
++    let Some(sender_lock) = ctx.pacing_sender.try_lock() else {
++        return false;
++    };
++    let Some(sender) = &*sender_lock else {
++        return false;
++    };
++
++    try_send_bounded(sender, packet)
++}
++
+ pub fn connection_lifecycle_loop(
+     capabilities: ClientCapabilities,
+     ctx: Arc<ConnectionContext>,
+@@ -125,6 +171,7 @@ pub fn connection_lifecycle_loop(
+             debug!("Skip try connection because the device is sleeping");
+         }
+ 
++        reset_frame_pacing(&ctx);
+         *ctx.state.write() = ConnectionState::Disconnected;
+         ctx.disconnected_notif.notify_all();
+ 
+@@ -212,6 +259,7 @@ fn connection_pipeline(
+                     prefer_full_range: capabilities.prefer_full_range,
+                     preferred_encoding_gamma: capabilities.preferred_encoding_gamma,
+                     prefer_hdr: capabilities.prefer_hdr,
++                    oxrsys_frame_pacing_version: capabilities.oxrsys_frame_pacing_version,
+                 })
+                 .to_con()?,
+             ),
+@@ -230,6 +278,20 @@ fn connection_pipeline(
+ 
+     let settings = stream_config.settings;
+     let negotiated_config = stream_config.negotiated_config;
++    let frame_pacing_version = if negotiated_config.oxrsys_frame_pacing_version
++        == OXRSYS_FRAME_PACING_VERSION_1
++        && negotiated_config.oxrsys_frame_pacing_session_epoch != 0
++    {
++        OXRSYS_FRAME_PACING_VERSION_1
++    } else {
++        0
++    };
++    let frame_pacing_epoch = if frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1 {
++        negotiated_config.oxrsys_frame_pacing_session_epoch
++    } else {
++        0
++    };
++    configure_frame_pacing(&ctx, frame_pacing_version, frame_pacing_epoch);
+ 
+     *ctx.velocities_multiplier.write() = settings.extra.velocities_multiplier;
+     *ctx.max_prediction.write() = Duration::from_millis(settings.headset.max_prediction_ms);
+@@ -311,6 +373,39 @@ fn connection_pipeline(
+     let mut haptics_receiver =
+         stream_socket.subscribe_to_stream::<Haptics>(HAPTICS, MAX_UNREAD_PACKETS);
+     let statistics_sender = stream_socket.request_stream(STATISTICS);
++    let mut frame_pacing_timesync_receiver =
++        (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1).then(|| {
++            stream_socket.subscribe_to_stream::<OxrsysFramePacingTimesyncQuery>(
++                OXRSYS_FRAME_PACING_TIMESYNC,
++                MAX_UNREAD_PACKETS,
++            )
++        });
++    let mut frame_pacing_target_receiver = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket.subscribe_to_stream::<OxrsysFramePacingFrameTarget>(
++                OXRSYS_FRAME_PACING_FRAME_TARGET,
++                MAX_UNREAD_PACKETS,
++            )
++        });
++    let mut frame_pacing_display_sender = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket.request_stream::<OxrsysFramePacingDisplayTiming>(
++                OXRSYS_FRAME_PACING_DISPLAY_TIMING,
++            )
++        });
++    let mut frame_pacing_timesync_sender = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket
++                .request_stream::<OxrsysFramePacingTimesyncResponse>(OXRSYS_FRAME_PACING_TIMESYNC)
++        });
++    let mut frame_pacing_feedback_sender = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket.request_stream::<OxrsysFramePacingFrameFeedback>(
++                OXRSYS_FRAME_PACING_FRAME_FEEDBACK,
++            )
++        });
++    let (frame_pacing_outbound_sender, frame_pacing_outbound_receiver) =
++        mpsc::sync_channel(FRAME_PACING_OUTBOUND_CAPACITY);
+ 
+     let video_receive_thread = thread::spawn({
+         let ctx = Arc::clone(&ctx);
+@@ -364,6 +459,92 @@ fn connection_pipeline(
+         }
+     });
+ 
++    let frame_pacing_send_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        move || {
++            while is_streaming(&ctx) {
++                let packet =
++                    match frame_pacing_outbound_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
++                        Ok(packet) => packet,
++                        Err(mpsc::RecvTimeoutError::Timeout) => continue,
++                        Err(mpsc::RecvTimeoutError::Disconnected) => return,
++                    };
++
++                let result = match packet {
++                    ClientPacingPacket::DisplayTiming(packet) => frame_pacing_display_sender
++                        .as_mut()
++                        .map(|sender| sender.send_header(&packet)),
++                    ClientPacingPacket::TimesyncResponse(mut packet) => {
++                        packet.client_send_time_ns = client_monotonic_now_ns();
++                        frame_pacing_timesync_sender
++                            .as_mut()
++                            .map(|sender| sender.send_header(&packet))
++                    }
++                    ClientPacingPacket::FrameFeedback(packet) => frame_pacing_feedback_sender
++                        .as_mut()
++                        .map(|sender| sender.send_header(&packet)),
++                };
++                if result.is_some_and(|result| result.is_err()) {
++                    return;
++                }
++            }
++        }
++    });
++
++    let frame_pacing_timesync_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        move || {
++            let Some(receiver) = frame_pacing_timesync_receiver.as_mut() else {
++                return;
++            };
++            while is_streaming(&ctx) {
++                let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
++                    Ok(data) => data,
++                    Err(ConnectionError::TryAgain(_)) => continue,
++                    Err(ConnectionError::Other(_)) => return,
++                };
++                let Ok(query) = data.get_header() else {
++                    continue;
++                };
++                let receive_time_ns = client_monotonic_now_ns();
++                if query.session_epoch != ctx.frame_pacing_epoch.load(Ordering::Acquire) {
++                    continue;
++                }
++
++                try_queue_pacing(
++                    &ctx,
++                    ClientPacingPacket::TimesyncResponse(OxrsysFramePacingTimesyncResponse {
++                        session_epoch: query.session_epoch,
++                        query_sequence: query.query_sequence,
++                        server_send_time_ns: query.server_send_time_ns,
++                        client_receive_time_ns: receive_time_ns,
++                        client_send_time_ns: 0,
++                    }),
++                );
++            }
++        }
++    });
++
++    let frame_pacing_target_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        move || {
++            let Some(receiver) = frame_pacing_target_receiver.as_mut() else {
++                return;
++            };
++            while is_streaming(&ctx) {
++                let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
++                    Ok(data) => data,
++                    Err(ConnectionError::TryAgain(_)) => continue,
++                    Err(ConnectionError::Other(_)) => return,
++                };
++                let Ok(target) = data.get_header() else {
++                    continue;
++                };
++                ctx.frame_metadata.lock().record_target(target);
++            }
++        }
++    });
++
+     let game_audio_thread = if let Switch::Enabled(config) = settings.audio.game_audio {
+         let device = AudioDevice::new_output(None).to_con()?;
+         thread::spawn({
+@@ -570,6 +751,9 @@ fn connection_pipeline(
+     *ctx.control_sender.lock() = Some(control_sender);
+     *ctx.tracking_sender.lock() = Some(tracking_sender);
+     *ctx.statistics_sender.lock() = Some(statistics_sender);
++    if frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1 {
++        *ctx.pacing_sender.lock() = Some(frame_pacing_outbound_sender);
++    }
+     if let Switch::Enabled(filter_level) = settings.extra.logging.client_log_report_level {
+         *LOG_CHANNEL_SENDER.lock() = Some(LogMirrorData {
+             sender: log_channel_sender,
+@@ -591,6 +775,7 @@ fn connection_pipeline(
+     *ctx.control_sender.lock() = None;
+     *ctx.tracking_sender.lock() = None;
+     *ctx.statistics_sender.lock() = None;
++    reset_frame_pacing(&ctx);
+     *LOG_CHANNEL_SENDER.lock() = None;
+ 
+     event_queue
+@@ -603,6 +788,9 @@ fn connection_pipeline(
+     dbg_connection!("connection_pipeline: Destroying streams");
+ 
+     video_receive_thread.join().ok();
++    frame_pacing_send_thread.join().ok();
++    frame_pacing_timesync_thread.join().ok();
++    frame_pacing_target_thread.join().ok();
+     game_audio_thread.join().ok();
+     microphone_thread.join().ok();
+     haptics_receive_thread.join().ok();
+diff --git a/alvr/client_core/src/frame_pacing.rs b/alvr/client_core/src/frame_pacing.rs
+new file mode 100644
+index 00000000..32f51620
+--- /dev/null
++++ b/alvr/client_core/src/frame_pacing.rs
+@@ -0,0 +1,454 @@
++use alvr_common::once_cell::sync::Lazy;
++use alvr_packets::{OxrsysFramePacingFrameTarget, OXRSYS_FRAME_PACING_VERSION_1};
++use std::{
++    collections::VecDeque,
++    sync::mpsc::{SyncSender, TrySendError},
++    time::Instant,
++};
++
++const CLOCK_MAPPING_MAX_AGE_NS: u64 = 1_000_000_000;
++const CLOCK_MAPPING_MAX_DELTA_NS: i128 = 5_000_000_000;
++const ACQUIRE_ALLOWANCE_CUT_GUARD_NS: u64 = 2_000_000;
++const ACQUIRE_ALLOWANCE_GROW_NS: u64 = 10_000;
++const ACQUIRE_ALLOWANCE_MINIMUM_NS: u64 = 1_000_000;
++
++static CLIENT_CLOCK_ORIGIN: Lazy<Instant> = Lazy::new(Instant::now);
++
++/// Monotonic nanoseconds in the clock domain used by the pacing connection threads.
++pub fn client_monotonic_now_ns() -> u64 {
++    CLIENT_CLOCK_ORIGIN
++        .elapsed()
++        .as_nanos()
++        .min(u64::MAX as u128) as u64
++}
++
++pub(crate) fn try_send_bounded<T>(sender: &SyncSender<T>, value: T) -> bool {
++    match sender.try_send(value) {
++        Ok(()) => true,
++        Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
++    }
++}
++
++/// Explicitly maps OpenXR XrTime into the monotonic clock used by the networking threads.
++#[derive(Clone, Copy, Debug, Default)]
++pub struct FramePacingClockMapper {
++    sample: Option<ClockSample>,
++}
++
++#[derive(Clone, Copy, Debug)]
++struct ClockSample {
++    xr_time_ns: i64,
++    client_time_ns: u64,
++}
++
++impl FramePacingClockMapper {
++    pub fn reset(&mut self) {
++        self.sample = None;
++    }
++
++    /// Updates the mapping from a near-simultaneous xrInstance.now()/Instant sample pair.
++    /// Backward samples are rejected rather than moving the display timeline backward.
++    pub fn update(&mut self, xr_time_ns: i64, client_time_ns: u64) -> bool {
++        if xr_time_ns <= 0 {
++            return false;
++        }
++
++        if self.sample.is_some_and(|sample| {
++            xr_time_ns < sample.xr_time_ns || client_time_ns < sample.client_time_ns
++        }) {
++            return false;
++        }
++
++        self.sample = Some(ClockSample {
++            xr_time_ns,
++            client_time_ns,
++        });
++        true
++    }
++
++    /// Maps one XrTime to client monotonic nanoseconds. Old mappings and implausibly distant
++    /// timestamps fail closed so ambiguous clock data cannot influence pacing.
++    pub fn map_xr_time(&self, xr_time_ns: i64, client_now_ns: u64) -> Option<u64> {
++        let sample = self.sample?;
++        if xr_time_ns <= 0
++            || client_now_ns < sample.client_time_ns
++            || client_now_ns - sample.client_time_ns > CLOCK_MAPPING_MAX_AGE_NS
++        {
++            return None;
++        }
++
++        let delta_ns = xr_time_ns as i128 - sample.xr_time_ns as i128;
++        if delta_ns.abs() > CLOCK_MAPPING_MAX_DELTA_NS {
++            return None;
++        }
++
++        u64::try_from(sample.client_time_ns as i128 + delta_ns).ok()
++    }
++}
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct FrameTimingMetadata {
++    pub session_epoch: u64,
++    pub target_sequence: u64,
++    pub frame_timestamp_ns: u64,
++    pub display_target_time_ns: u64,
++    pub decode_complete_time_ns: u64,
++}
++
++/// Bounded frame metadata ring shared by target receipt, decoder completion and the XR latch.
++pub struct FrameMetadataRing {
++    capacity: usize,
++    negotiated_version: u16,
++    session_epoch: u64,
++    last_target_sequence: u64,
++    entries: VecDeque<FrameTimingMetadata>,
++}
++
++impl Default for FrameMetadataRing {
++    fn default() -> Self {
++        Self::new(64)
++    }
++}
++
++impl FrameMetadataRing {
++    pub fn new(capacity: usize) -> Self {
++        Self {
++            capacity: capacity.max(1),
++            negotiated_version: 0,
++            session_epoch: 0,
++            last_target_sequence: 0,
++            entries: VecDeque::with_capacity(capacity.max(1)),
++        }
++    }
++
++    pub fn reset(&mut self, negotiated_version: u16, session_epoch: u64) {
++        self.negotiated_version = negotiated_version;
++        self.session_epoch = session_epoch;
++        self.last_target_sequence = 0;
++        self.entries.clear();
++    }
++
++    pub fn len(&self) -> usize {
++        self.entries.len()
++    }
++
++    pub fn record_target(&mut self, target: OxrsysFramePacingFrameTarget) -> bool {
++        if self.negotiated_version != OXRSYS_FRAME_PACING_VERSION_1
++            || target.session_epoch != self.session_epoch
++            || target.target_sequence <= self.last_target_sequence
++            || target.frame_timestamp_ns == 0
++            || target.display_target_time_ns == 0
++        {
++            return false;
++        }
++        self.last_target_sequence = target.target_sequence;
++
++        if let Some(entry) = self
++            .entries
++            .iter_mut()
++            .find(|entry| entry.frame_timestamp_ns == target.frame_timestamp_ns)
++        {
++            entry.target_sequence = target.target_sequence;
++            entry.display_target_time_ns = target.display_target_time_ns;
++            return true;
++        }
++
++        self.push(FrameTimingMetadata {
++            session_epoch: target.session_epoch,
++            target_sequence: target.target_sequence,
++            frame_timestamp_ns: target.frame_timestamp_ns,
++            display_target_time_ns: target.display_target_time_ns,
++            decode_complete_time_ns: 0,
++        });
++        true
++    }
++
++    pub fn record_decode_complete(
++        &mut self,
++        frame_timestamp_ns: u64,
++        decode_complete_time_ns: u64,
++    ) -> bool {
++        if self.negotiated_version != OXRSYS_FRAME_PACING_VERSION_1
++            || self.session_epoch == 0
++            || frame_timestamp_ns == 0
++            || decode_complete_time_ns == 0
++        {
++            return false;
++        }
++
++        if let Some(entry) = self
++            .entries
++            .iter_mut()
++            .find(|entry| entry.frame_timestamp_ns == frame_timestamp_ns)
++        {
++            entry.decode_complete_time_ns = decode_complete_time_ns;
++            return true;
++        }
++
++        self.push(FrameTimingMetadata {
++            session_epoch: self.session_epoch,
++            target_sequence: 0,
++            frame_timestamp_ns,
++            display_target_time_ns: 0,
++            decode_complete_time_ns,
++        });
++        true
++    }
++
++    pub fn get(&self, frame_timestamp_ns: u64) -> Option<FrameTimingMetadata> {
++        self.entries
++            .iter()
++            .find(|entry| {
++                entry.session_epoch == self.session_epoch
++                    && entry.frame_timestamp_ns == frame_timestamp_ns
++            })
++            .copied()
++    }
++
++    fn push(&mut self, entry: FrameTimingMetadata) {
++        while self.entries.len() >= self.capacity {
++            self.entries.pop_front();
++        }
++        self.entries.push_back(entry);
++    }
++}
++
++/// Selects the newest decoded frame due for this display slot. Untargeted frames are only due at
++/// the queue front, so raced/missing metadata cannot evict a targeted future frame.
++pub fn select_frame_for_display(
++    frame_timestamps_ns: &[u64],
++    display_time_ns: u64,
++    display_period_ns: u64,
++    mut target_for_frame: impl FnMut(u64) -> Option<u64>,
++) -> Option<usize> {
++    let mut due_index = None;
++    for (index, timestamp_ns) in frame_timestamps_ns.iter().copied().enumerate() {
++        let target_ns = target_for_frame(timestamp_ns).unwrap_or(0);
++        let due = if target_ns == 0 || display_period_ns == 0 {
++            index == 0
++        } else {
++            target_ns <= display_time_ns.saturating_add(display_period_ns / 2)
++        };
++        if due {
++            due_index = Some(index);
++        }
++    }
++    due_index
++}
++
++/// Adaptive per-vsync acquire deadline and intended-slot slack attribution.
++#[derive(Clone, Copy, Debug)]
++pub struct AcquireDeadlineController {
++    allowance_ns: u64,
++    pending_missed: Option<(u64, u64)>,
++}
++
++impl AcquireDeadlineController {
++    pub fn new(display_period_ns: u64) -> Self {
++        Self {
++            allowance_ns: (display_period_ns / 2).max(ACQUIRE_ALLOWANCE_MINIMUM_NS),
++            pending_missed: None,
++        }
++    }
++
++    pub fn reset(&mut self, display_period_ns: u64) {
++        *self = Self::new(display_period_ns);
++    }
++
++    pub fn allowance_ns(&self) -> u64 {
++        self.allowance_ns
++    }
++
++    pub fn deadline_ns(&self, frame_loop_start_ns: u64) -> u64 {
++        frame_loop_start_ns.saturating_add(self.allowance_ns)
++    }
++
++    pub fn record_missed_slot(&mut self, deadline_ns: u64, predicted_display_time_ns: u64) {
++        self.pending_missed
++            .get_or_insert((deadline_ns, predicted_display_time_ns));
++    }
++
++    /// Returns slack and whether the intended-slot attribution is unambiguous.
++    pub fn complete_acquire(
++        &mut self,
++        decode_complete_time_ns: u64,
++        display_target_time_ns: u64,
++        current_deadline_ns: u64,
++        current_display_time_ns: u64,
++        display_period_ns: u64,
++    ) -> (i64, bool) {
++        if decode_complete_time_ns == 0 {
++            self.pending_missed = None;
++            return (0, false);
++        }
++
++        let (deadline_ns, deadline_display_ns) = self
++            .pending_missed
++            .filter(|(deadline_ns, _)| decode_complete_time_ns > *deadline_ns)
++            .unwrap_or((current_deadline_ns, current_display_time_ns));
++        self.pending_missed = None;
++
++        let mut slack_ns = deadline_ns as i128 - decode_complete_time_ns as i128;
++        if display_target_time_ns == 0 || deadline_display_ns == 0 || display_period_ns == 0 {
++            return (clamp_i128_to_i64(slack_ns), false);
++        }
++
++        let slot_shift = (display_target_time_ns as i128 - deadline_display_ns as i128) as f64
++            / display_period_ns as f64;
++        let nearest_slot_shift = slot_shift.round();
++        if (slot_shift - nearest_slot_shift).abs() > 0.35 {
++            return (clamp_i128_to_i64(slack_ns), false);
++        }
++
++        slack_ns += nearest_slot_shift as i128 * display_period_ns as i128;
++        (clamp_i128_to_i64(slack_ns), true)
++    }
++
++    pub fn update_after_submit(&mut self, frame_elapsed_ns: u64, display_period_ns: u64) {
++        if display_period_ns == 0 {
++            return;
++        }
++
++        if frame_elapsed_ns > display_period_ns {
++            self.allowance_ns = self.allowance_ns.saturating_sub(
++                frame_elapsed_ns - display_period_ns + ACQUIRE_ALLOWANCE_CUT_GUARD_NS,
++            );
++        } else {
++            self.allowance_ns = self.allowance_ns.saturating_add(ACQUIRE_ALLOWANCE_GROW_NS);
++        }
++        self.allowance_ns = self
++            .allowance_ns
++            .clamp(ACQUIRE_ALLOWANCE_MINIMUM_NS, display_period_ns);
++    }
++}
++
++fn clamp_i128_to_i64(value: i128) -> i64 {
++    value.clamp(i64::MIN as i128, i64::MAX as i128) as i64
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    fn target(
++        epoch: u64,
++        sequence: u64,
++        timestamp: u64,
++        display: u64,
++    ) -> OxrsysFramePacingFrameTarget {
++        OxrsysFramePacingFrameTarget {
++            session_epoch: epoch,
++            target_sequence: sequence,
++            frame_timestamp_ns: timestamp,
++            display_target_time_ns: display,
++        }
++    }
++
++    #[test]
++    fn xr_clock_mapping_rejects_stale_and_backward_samples() {
++        let mut mapper = FramePacingClockMapper::default();
++        assert!(mapper.update(10_000, 1_000));
++        assert_eq!(mapper.map_xr_time(10_500, 1_100), Some(1_500));
++        assert_eq!(
++            mapper.map_xr_time(10_500, 1_000 + CLOCK_MAPPING_MAX_AGE_NS + 1),
++            None
++        );
++        assert!(!mapper.update(9_999, 1_200));
++        assert!(!mapper.update(10_100, 999));
++    }
++
++    #[test]
++    fn metadata_ring_handles_target_decode_races_and_reconnects() {
++        let mut ring = FrameMetadataRing::new(4);
++        ring.reset(1, 7);
++
++        assert!(ring.record_decode_complete(100, 1_000));
++        assert!(ring.record_target(target(7, 1, 100, 20_000)));
++        assert_eq!(ring.get(100).unwrap().decode_complete_time_ns, 1_000);
++        assert_eq!(ring.get(100).unwrap().display_target_time_ns, 20_000);
++
++        assert!(ring.record_target(target(7, 2, 200, 30_000)));
++        assert!(ring.record_decode_complete(200, 2_000));
++        assert_eq!(ring.get(200).unwrap().decode_complete_time_ns, 2_000);
++        assert!(!ring.record_target(target(7, 2, 300, 40_000)));
++
++        ring.reset(1, 8);
++        assert!(ring.get(100).is_none());
++        assert!(!ring.record_target(target(7, 3, 300, 40_000)));
++        assert!(ring.record_target(target(8, 1, 300, 40_000)));
++    }
++
++    #[test]
++    fn metadata_ring_is_bounded() {
++        let mut ring = FrameMetadataRing::new(3);
++        ring.reset(1, 1);
++        for sequence in 1..=8 {
++            assert!(ring.record_target(target(1, sequence, sequence, 1_000 + sequence)));
++        }
++        assert_eq!(ring.len(), 3);
++        assert!(ring.get(5).is_none());
++        assert!(ring.get(8).is_some());
++    }
++
++    #[test]
++    fn target_aware_latch_holds_future_frames_and_selects_latest_due() {
++        let frames = [10, 20, 30];
++        let selected = select_frame_for_display(&frames, 1_000, 100, |timestamp| match timestamp {
++            10 => Some(900),
++            20 => Some(1_040),
++            30 => Some(1_200),
++            _ => None,
++        });
++        assert_eq!(selected, Some(1));
++
++        let selected = select_frame_for_display(&frames, 1_000, 100, |_| Some(1_200));
++        assert_eq!(selected, None);
++        let selected = select_frame_for_display(&frames, 1_000, 100, |_| None);
++        assert_eq!(selected, Some(0));
++    }
++
++    #[test]
++    fn missed_deadline_reports_negative_rebased_slack() {
++        let mut controller = AcquireDeadlineController::new(10_000_000);
++        controller.record_missed_slot(5_000_000, 100_000_000);
++        let (slack, valid) = controller.complete_acquire(
++            6_000_000,
++            100_000_000,
++            15_000_000,
++            110_000_000,
++            10_000_000,
++        );
++        assert!(valid);
++        assert_eq!(slack, -1_000_000);
++    }
++
++    #[test]
++    fn ambiguous_slot_does_not_produce_valid_slack() {
++        let mut controller = AcquireDeadlineController::new(10_000_000);
++        let (_, valid) =
++            controller.complete_acquire(4_000_000, 104_000_000, 5_000_000, 100_000_000, 10_000_000);
++        assert!(!valid);
++    }
++
++    #[test]
++    fn adaptive_deadline_is_bounded_after_overrun() {
++        let mut controller = AcquireDeadlineController::new(10_000_000);
++        controller.update_after_submit(15_000_000, 10_000_000);
++        assert_eq!(controller.allowance_ns(), ACQUIRE_ALLOWANCE_MINIMUM_NS);
++        controller.update_after_submit(9_000_000, 10_000_000);
++        assert_eq!(
++            controller.allowance_ns(),
++            ACQUIRE_ALLOWANCE_MINIMUM_NS + ACQUIRE_ALLOWANCE_GROW_NS
++        );
++    }
++
++    #[test]
++    fn bounded_feedback_queue_never_waits_when_full() {
++        let (sender, receiver) = std::sync::mpsc::sync_channel(1);
++        assert!(try_send_bounded(&sender, 1));
++        assert!(!try_send_bounded(&sender, 2));
++        assert_eq!(receiver.try_recv(), Ok(1));
++        drop(receiver);
++        assert!(!try_send_bounded(&sender, 3));
++    }
++}
+diff --git a/alvr/client_core/src/lib.rs b/alvr/client_core/src/lib.rs
+index 7af1711e..412b1a3e 100644
+--- a/alvr/client_core/src/lib.rs
++++ b/alvr/client_core/src/lib.rs
+@@ -7,6 +7,7 @@
+ 
+ mod c_api;
+ mod connection;
++pub mod frame_pacing;
+ mod logging_backend;
+ mod sockets;
+ mod statistics;
+@@ -25,14 +26,16 @@ use alvr_common::{
+     HAND_RIGHT_ID, HEAD_ID,
+ };
+ use alvr_packets::{
+-    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, RealTimeConfig,
+-    ReservedClientControlPacket, StreamConfig, Tracking, ViewsConfig,
++    BatteryInfo, ButtonEntry, ClientControlPacket, FaceData, OxrsysFramePacingDisplayTiming,
++    OxrsysFramePacingFrameFeedback, RealTimeConfig, ReservedClientControlPacket, StreamConfig,
++    Tracking, ViewsConfig, OXRSYS_FRAME_PACING_VERSION_1,
+ };
+ use alvr_session::CodecType;
+-use connection::{ConnectionContext, DecoderCallback};
++use connection::{ClientPacingPacket, ConnectionContext, DecoderCallback};
++use frame_pacing::{client_monotonic_now_ns, try_send_bounded, FrameTimingMetadata};
+ use std::{
+     collections::{HashSet, VecDeque},
+-    sync::Arc,
++    sync::{atomic::Ordering, Arc},
+     thread::{self, JoinHandle},
+     time::Duration,
+ };
+@@ -71,6 +74,7 @@ pub struct ClientCapabilities {
+     pub prefer_full_range: bool,
+     pub preferred_encoding_gamma: f32,
+     pub prefer_hdr: bool,
++    pub oxrsys_frame_pacing_version: u16,
+ }
+ 
+ pub struct ClientCoreContext {
+@@ -347,9 +351,88 @@ impl ClientCoreContext {
+         }
+     }
+ 
++    pub fn frame_pacing_version(&self) -> u16 {
++        self.connection_context
++            .frame_pacing_version
++            .load(Ordering::Acquire)
++    }
++
++    pub fn report_frame_pacing_display_timing(
++        &self,
++        predicted_display_time_ns: u64,
++        predicted_display_period_ns: u64,
++    ) -> bool {
++        let epoch = self
++            .connection_context
++            .frame_pacing_epoch
++            .load(Ordering::Acquire);
++        if self.frame_pacing_version() != OXRSYS_FRAME_PACING_VERSION_1
++            || epoch == 0
++            || predicted_display_time_ns == 0
++            || predicted_display_period_ns == 0
++        {
++            return false;
++        }
++
++        let packet = OxrsysFramePacingDisplayTiming {
++            session_epoch: epoch,
++            display_sequence: self
++                .connection_context
++                .display_sequence
++                .fetch_add(1, Ordering::Relaxed)
++                + 1,
++            predicted_display_time_ns,
++            predicted_display_period_ns,
++        };
++        self.try_send_frame_pacing(ClientPacingPacket::DisplayTiming(packet))
++    }
++
++    pub fn report_frame_pacing_feedback(
++        &self,
++        mut feedback: OxrsysFramePacingFrameFeedback,
++    ) -> bool {
++        let epoch = self
++            .connection_context
++            .frame_pacing_epoch
++            .load(Ordering::Acquire);
++        if self.frame_pacing_version() != OXRSYS_FRAME_PACING_VERSION_1 || epoch == 0 {
++            return false;
++        }
++
++        feedback.session_epoch = epoch;
++        feedback.feedback_sequence = self
++            .connection_context
++            .feedback_sequence
++            .fetch_add(1, Ordering::Relaxed)
++            + 1;
++        self.try_send_frame_pacing(ClientPacingPacket::FrameFeedback(feedback))
++    }
++
++    pub fn frame_pacing_metadata(&self, timestamp: Duration) -> Option<FrameTimingMetadata> {
++        self.connection_context
++            .frame_metadata
++            .try_lock()
++            .and_then(|ring| ring.get(timestamp.as_nanos() as u64))
++    }
++
++    fn try_send_frame_pacing(&self, packet: ClientPacingPacket) -> bool {
++        let Some(sender_lock) = self.connection_context.pacing_sender.try_lock() else {
++            return false;
++        };
++        let Some(sender) = &*sender_lock else {
++            return false;
++        };
++
++        try_send_bounded(sender, packet)
++    }
++
+     pub fn report_frame_decoded(&self, timestamp: Duration) {
+         dbg_client_core!("report_frame_decoded");
+ 
++        if let Some(mut ring) = self.connection_context.frame_metadata.try_lock() {
++            ring.record_decode_complete(timestamp.as_nanos() as u64, client_monotonic_now_ns());
++        }
++
+         if let Some(stats) = &mut *self.connection_context.statistics_manager.lock() {
+             stats.report_frame_decoded(timestamp);
+         }
+diff --git a/alvr/client_core/src/video_decoder/android.rs b/alvr/client_core/src/video_decoder/android.rs
+index a8e70c2e..eaa63455 100644
+--- a/alvr/client_core/src/video_decoder/android.rs
++++ b/alvr/client_core/src/video_decoder/android.rs
+@@ -133,6 +133,52 @@ impl VideoDecoderSource {
+             None
+         }
+     }
++
++    pub fn dequeue_frame_for_display(
++        &mut self,
++        display_time_ns: u64,
++        display_period_ns: u64,
++        mut target_for_frame: impl FnMut(Duration) -> Option<u64>,
++    ) -> Option<(Duration, *mut c_void)> {
++        const MAX_LATCH_QUEUE_DEPTH: usize = 3;
++
++        let mut image_queue_lock = self.image_queue.lock();
++        if image_queue_lock
++            .front()
++            .is_some_and(|queued_image| queued_image.in_use)
++        {
++            image_queue_lock.pop_front();
++        }
++        while image_queue_lock.len() > MAX_LATCH_QUEUE_DEPTH {
++            image_queue_lock.pop_front();
++        }
++
++        let timestamps = image_queue_lock
++            .iter()
++            .map(|image| image.timestamp.as_nanos() as u64)
++            .collect::<Vec<_>>();
++        let due_index = crate::frame_pacing::select_frame_for_display(
++            &timestamps,
++            display_time_ns,
++            display_period_ns,
++            |timestamp_ns| target_for_frame(Duration::from_nanos(timestamp_ns)),
++        )?;
++        for _ in 0..due_index {
++            image_queue_lock.pop_front();
++        }
++
++        let queued_image = image_queue_lock.front_mut()?;
++        queued_image.in_use = true;
++        Some((
++            queued_image.timestamp,
++            queued_image
++                .image
++                .hardware_buffer()
++                .unwrap()
++                .as_ptr()
++                .cast(),
++        ))
++    }
+ }
+ 
+ impl Drop for VideoDecoderSource {
+diff --git a/alvr/client_core/src/video_decoder/mod.rs b/alvr/client_core/src/video_decoder/mod.rs
+index 3a1555ce..06d7aa0e 100644
+--- a/alvr/client_core/src/video_decoder/mod.rs
++++ b/alvr/client_core/src/video_decoder/mod.rs
+@@ -48,6 +48,27 @@ impl VideoDecoderSource {
+         #[cfg(not(target_os = "android"))]
+         None
+     }
++
++    /// Returns the newest decoded frame due for this intended display slot. Frames carrying a
++    /// future target stay queued; missing/raced metadata fails closed to queue-front behavior.
++    #[allow(unused_variables)]
++    pub fn get_frame_for_display(
++        &mut self,
++        display_time_ns: u64,
++        display_period_ns: u64,
++        target_for_frame: impl FnMut(Duration) -> Option<u64>,
++    ) -> Option<(Duration, *mut std::ffi::c_void)> {
++        #[cfg(target_os = "android")]
++        {
++            self.inner.dequeue_frame_for_display(
++                display_time_ns,
++                display_period_ns,
++                target_for_frame,
++            )
++        }
++        #[cfg(not(target_os = "android"))]
++        None
++    }
+ }
+ 
+ // report_frame_decoded: (target_timestamp: Duration) -> ()
+diff --git a/alvr/client_mock/src/main.rs b/alvr/client_mock/src/main.rs
+index 2c2be779..39589dba 100644
+--- a/alvr/client_mock/src/main.rs
++++ b/alvr/client_mock/src/main.rs
+@@ -214,6 +214,7 @@ fn client_thread(
+         prefer_full_range: true,
+         preferred_encoding_gamma: 1.0,
+         prefer_hdr: false,
++        oxrsys_frame_pacing_version: 0,
+     };
+     let client_core_context = Arc::new(ClientCoreContext::new(capabilities));
+ 
+diff --git a/alvr/client_openxr/src/lib.rs b/alvr/client_openxr/src/lib.rs
+index 3e35add1..af51f75d 100644
+--- a/alvr/client_openxr/src/lib.rs
++++ b/alvr/client_openxr/src/lib.rs
+@@ -7,7 +7,10 @@ mod passthrough;
+ mod stream;
+ 
+ use crate::stream::ParsedStreamConfig;
+-use alvr_client_core::{ClientCapabilities, ClientCoreContext, ClientCoreEvent};
++use alvr_client_core::{
++    frame_pacing::{client_monotonic_now_ns, FramePacingClockMapper},
++    ClientCapabilities, ClientCoreContext, ClientCoreEvent,
++};
+ use alvr_common::settings_schema::Switch;
+ use alvr_common::{
+     error,
+@@ -275,6 +278,7 @@ pub fn entry_point() {
+             prefer_full_range: true,
+             preferred_encoding_gamma: 1.0,
+             prefer_hdr: false,
++            oxrsys_frame_pacing_version: alvr_packets::OXRSYS_FRAME_PACING_VERSION_1,
+         };
+         let core_context = Arc::new(ClientCoreContext::new(capabilities));
+ 
+@@ -311,6 +315,7 @@ pub fn entry_point() {
+ 
+         let mut session_running = false;
+         let mut stream_context = None::<StreamContext>;
++        let mut frame_pacing_clock_mapper = FramePacingClockMapper::default();
+         let mut passthrough_layer = None;
+ 
+         let mut event_storage = xr::EventDataBuffer::new();
+@@ -388,6 +393,7 @@ pub fn entry_point() {
+                         lobby.update_hud_message(&message);
+                     }
+                     ClientCoreEvent::StreamingStarted(config) => {
++                        frame_pacing_clock_mapper.reset();
+                         let config = ParsedStreamConfig::new(&config);
+ 
+                         let context = StreamContext::new(
+@@ -406,6 +412,7 @@ pub fn entry_point() {
+                         stream_context = Some(context);
+                     }
+                     ClientCoreEvent::StreamingStopped => {
++                        frame_pacing_clock_mapper.reset();
+                         if passthrough_layer.is_none() {
+                             passthrough_layer = PassthroughLayer::new(&xr_session, platform).ok();
+                         }
+@@ -467,6 +474,25 @@ pub fn entry_point() {
+                 Duration::from_nanos(frame_state.predicted_display_period.as_nanos() as _);
+             let vsync_time =
+                 Duration::from_nanos(frame_state.predicted_display_time.as_nanos() as _);
++            // XrTime is runtime-defined and std::time::Instant has an opaque epoch. Sample both
++            // clocks explicitly and map the predicted display time into the connection clock.
++            let client_before_ns = client_monotonic_now_ns();
++            let pacing_display_time_ns = xr_runtime_now(&xr_instance).and_then(|xr_now| {
++                let client_after_ns = client_monotonic_now_ns();
++                let client_sample_ns = client_before_ns
++                    .saturating_add(client_after_ns.saturating_sub(client_before_ns) / 2);
++                frame_pacing_clock_mapper.update(xr_now.as_nanos(), client_sample_ns);
++                frame_pacing_clock_mapper.map_xr_time(
++                    frame_state.predicted_display_time.as_nanos(),
++                    client_after_ns,
++                )
++            });
++            if let Some(predicted_display_time_ns) = pacing_display_time_ns {
++                core_context.report_frame_pacing_display_timing(
++                    predicted_display_time_ns,
++                    frame_interval.as_nanos() as u64,
++                );
++            }
+ 
+             xr_frame_stream.begin().unwrap();
+ 
+@@ -484,7 +510,7 @@ pub fn entry_point() {
+ 
+             // todo: allow rendering lobby and stream layers at the same time and add cross fade
+             let (layer, display_time) = if let Some(stream) = &mut stream_context {
+-                stream.render(frame_interval, vsync_time)
++                stream.render(frame_interval, vsync_time, pacing_display_time_ns)
+             } else {
+                 (lobby.render(vsync_time), vsync_time)
+             };
+@@ -503,6 +529,15 @@ pub fn entry_point() {
+                 layers,
+             );
+ 
++            if res.is_ok() {
++                if let Some(stream) = &mut stream_context {
++                    stream.report_frame_presented(
++                        pacing_display_time_ns,
++                        frame_interval.as_nanos() as u64,
++                    );
++                }
++            }
++
+             if let Err(e) = res {
+                 let time = to_xr_time(display_time);
+                 error!("End frame failed! {e}, timestamp: {display_time:?}, time: {time:?}");
+diff --git a/alvr/client_openxr/src/stream.rs b/alvr/client_openxr/src/stream.rs
+index ca329456..6c3c3192 100644
+--- a/alvr/client_openxr/src/stream.rs
++++ b/alvr/client_openxr/src/stream.rs
+@@ -3,6 +3,7 @@ use crate::{
+     interaction::{self, InteractionContext, InteractionSourcesConfig},
+ };
+ use alvr_client_core::{
++    frame_pacing::{client_monotonic_now_ns, AcquireDeadlineController},
+     video_decoder::{self, VideoDecoderConfig, VideoDecoderSource},
+     ClientCoreContext,
+ };
+@@ -16,7 +17,11 @@ use alvr_common::{
+ use alvr_graphics::{
+     compute_target_view_resolution, GraphicsContext, StreamRenderer, StreamViewParams,
+ };
+-use alvr_packets::{FaceData, RealTimeConfig, StreamConfig};
++use alvr_packets::{
++    FaceData, OxrsysFramePacingFrameFeedback, RealTimeConfig, StreamConfig,
++    OXRSYS_FRAME_FEEDBACK_FLAG_FRESH, OXRSYS_FRAME_FEEDBACK_FLAG_SLACK_VALID,
++    OXRSYS_FRAME_PACING_MODE_ACTIVE, OXRSYS_FRAME_PACING_VERSION_1,
++};
+ use alvr_session::{
+     ClientsideFoveationConfig, ClientsideFoveationMode, ClientsidePostProcessingConfig, CodecType,
+     FoveatedEncodingConfig, MediacodecProperty, PassthroughMode, UpscalingConfig,
+@@ -49,6 +54,8 @@ pub struct ParsedStreamConfig {
+     pub buffering_history_weight: f32,
+     pub decoder_options: Vec<(String, MediacodecProperty)>,
+     pub interaction_sources: InteractionSourcesConfig,
++    pub oxrsys_frame_pacing_version: u16,
++    pub oxrsys_frame_pacing_mode: u8,
+ }
+ 
+ impl ParsedStreamConfig {
+@@ -83,10 +90,24 @@ impl ParsedStreamConfig {
+             buffering_history_weight: config.settings.video.buffering_history_weight,
+             decoder_options: config.settings.video.mediacodec_extra_options.clone(),
+             interaction_sources: InteractionSourcesConfig::new(config),
++            oxrsys_frame_pacing_version: config.negotiated_config.oxrsys_frame_pacing_version,
++            oxrsys_frame_pacing_mode: config.negotiated_config.oxrsys_frame_pacing_mode,
+         }
+     }
+ }
+ 
++#[derive(Clone, Copy, Default)]
++struct PresentedPacingFrame {
++    valid: bool,
++    frame_timestamp_ns: u64,
++    decode_complete_time_ns: u64,
++    acquire_time_ns: u64,
++    display_target_time_ns: u64,
++    acquire_slack_ns: i64,
++    acquire_slack_valid: bool,
++    times_displayed: u32,
++}
++
+ pub struct StreamContext {
+     core_context: Arc<ClientCoreContext>,
+     xr_session: xr::Session<xr::OpenGlEs>,
+@@ -102,6 +123,9 @@ pub struct StreamContext {
+     renderer: StreamRenderer,
+     decoder: Option<(VideoDecoderConfig, VideoDecoderSource)>,
+     use_custom_reprojection: bool,
++    acquire_deadline: AcquireDeadlineController,
++    frame_loop_start_ns: u64,
++    presented_pacing_frame: PresentedPacingFrame,
+ }
+ 
+ impl StreamContext {
+@@ -224,6 +248,8 @@ impl StreamContext {
+             xr::ReferenceSpaceType::VIEW,
+         ));
+ 
++        let display_period_ns =
++            Duration::from_secs_f32(1.0 / config.refresh_rate_hint).as_nanos() as u64;
+         let mut this = StreamContext {
+             core_context: core_ctx,
+             xr_session,
+@@ -239,6 +265,9 @@ impl StreamContext {
+             renderer,
+             decoder: None,
+             use_custom_reprojection: platform.is_yvr(),
++            acquire_deadline: AcquireDeadlineController::new(display_period_ns),
++            frame_loop_start_ns: 0,
++            presented_pacing_frame: PresentedPacingFrame::default(),
+         };
+ 
+         this.update_reference_space();
+@@ -338,17 +367,96 @@ impl StreamContext {
+         &mut self,
+         frame_interval: Duration,
+         vsync_time: Duration,
++        pacing_display_time_ns: Option<u64>,
+     ) -> (ProjectionLayerBuilder, Duration) {
+         let xr_vsync_time = xr::Time::from_nanos(vsync_time.as_nanos() as _);
++        let display_period_ns = frame_interval.as_nanos() as u64;
++        // pacing_enabled: version 1 negotiated — report telemetry (shadow and active).
++        // active_latch: mode is active — additionally drive target-aware frame selection
++        // and the adaptive acquire deadline. Shadow keeps the legacy dequeue path.
++        let pacing_enabled = self.config.oxrsys_frame_pacing_version
++            == OXRSYS_FRAME_PACING_VERSION_1
++            && pacing_display_time_ns.is_some();
++        let active_latch = pacing_enabled
++            && self.config.oxrsys_frame_pacing_mode == OXRSYS_FRAME_PACING_MODE_ACTIVE;
++        self.frame_loop_start_ns = pacing_enabled
++            .then(client_monotonic_now_ns)
++            .unwrap_or_default();
++        let acquire_deadline_ns = self.acquire_deadline.deadline_ns(self.frame_loop_start_ns);
++
+         let frame_poll_deadline = Instant::now()
+             + Duration::from_secs_f32(
+                 frame_interval.as_secs_f32() * DECODER_MAX_TIMEOUT_MULTIPLIER,
+             );
+         let mut frame_result = None;
+         if let Some((_, source)) = &mut self.decoder {
+-            while frame_result.is_none() && Instant::now() < frame_poll_deadline {
+-                frame_result = source.get_frame();
+-                thread::sleep(Duration::from_micros(500));
++            if let Some(display_time_ns) = active_latch.then_some(pacing_display_time_ns.unwrap()) {
++                let core_context = Arc::clone(&self.core_context);
++                frame_result =
++                    source.get_frame_for_display(display_time_ns, display_period_ns, |timestamp| {
++                        core_context
++                            .frame_pacing_metadata(timestamp)
++                            .map(|metadata| metadata.display_target_time_ns)
++                            .filter(|target| *target != 0)
++                    });
++                while frame_result.is_none()
++                    && self.presented_pacing_frame.valid
++                    && client_monotonic_now_ns() < acquire_deadline_ns
++                {
++                    thread::sleep(Duration::from_micros(500));
++                    let core_context = Arc::clone(&self.core_context);
++                    frame_result = source.get_frame_for_display(
++                        display_time_ns,
++                        display_period_ns,
++                        |timestamp| {
++                            core_context
++                                .frame_pacing_metadata(timestamp)
++                                .map(|metadata| metadata.display_target_time_ns)
++                                .filter(|target| *target != 0)
++                        },
++                    );
++                }
++            } else {
++                while frame_result.is_none() && Instant::now() < frame_poll_deadline {
++                    frame_result = source.get_frame();
++                    thread::sleep(Duration::from_micros(500));
++                }
++            }
++        }
++
++        if pacing_enabled {
++            let display_time_ns = pacing_display_time_ns.unwrap();
++            if let Some((timestamp, _)) = frame_result {
++                let metadata = self
++                    .core_context
++                    .frame_pacing_metadata(timestamp)
++                    .unwrap_or_default();
++                let acquire_time_ns = client_monotonic_now_ns();
++                let (acquire_slack_ns, acquire_slack_valid) =
++                    self.acquire_deadline.complete_acquire(
++                        metadata.decode_complete_time_ns,
++                        metadata.display_target_time_ns,
++                        acquire_deadline_ns,
++                        display_time_ns,
++                        display_period_ns,
++                    );
++                self.presented_pacing_frame = PresentedPacingFrame {
++                    valid: true,
++                    frame_timestamp_ns: timestamp.as_nanos() as u64,
++                    decode_complete_time_ns: metadata.decode_complete_time_ns,
++                    acquire_time_ns,
++                    display_target_time_ns: metadata.display_target_time_ns,
++                    acquire_slack_ns,
++                    acquire_slack_valid,
++                    times_displayed: 1,
++                };
++            } else if self.presented_pacing_frame.valid {
++                self.acquire_deadline
++                    .record_missed_slot(acquire_deadline_ns, display_time_ns);
++                self.presented_pacing_frame.times_displayed = self
++                    .presented_pacing_frame
++                    .times_displayed
++                    .saturating_add(1);
+             }
+         }
+ 
+@@ -503,6 +611,47 @@ impl StreamContext {
+ 
+         (layer, openxr_display_time)
+     }
++
++    pub fn report_frame_presented(
++        &mut self,
++        predicted_display_time_ns: Option<u64>,
++        display_period_ns: u64,
++    ) {
++        let Some(predicted_display_time_ns) = predicted_display_time_ns else {
++            return;
++        };
++        if self.config.oxrsys_frame_pacing_version != OXRSYS_FRAME_PACING_VERSION_1
++            || !self.presented_pacing_frame.valid
++        {
++            return;
++        }
++
++        let frame_elapsed_ns = client_monotonic_now_ns().saturating_sub(self.frame_loop_start_ns);
++        self.acquire_deadline
++            .update_after_submit(frame_elapsed_ns, display_period_ns);
++
++        let frame = self.presented_pacing_frame;
++        let mut flags = 0;
++        if frame.times_displayed == 1 {
++            flags |= OXRSYS_FRAME_FEEDBACK_FLAG_FRESH;
++        }
++        if frame.acquire_slack_valid {
++            flags |= OXRSYS_FRAME_FEEDBACK_FLAG_SLACK_VALID;
++        }
++        self.core_context
++            .report_frame_pacing_feedback(OxrsysFramePacingFrameFeedback {
++                session_epoch: 0,
++                feedback_sequence: 0,
++                frame_timestamp_ns: frame.frame_timestamp_ns,
++                decode_complete_time_ns: frame.decode_complete_time_ns,
++                acquire_time_ns: frame.acquire_time_ns,
++                display_target_time_ns: frame.display_target_time_ns,
++                predicted_display_time_ns,
++                acquire_slack_ns: frame.acquire_slack_ns,
++                times_displayed: frame.times_displayed,
++                flags,
++            });
++    }
+ }
+ 
+ impl Drop for StreamContext {
 diff --git a/alvr/events/src/lib.rs b/alvr/events/src/lib.rs
-index acc8659..8779a28 100644
+index acc86598..8779a281 100644
 --- a/alvr/events/src/lib.rs
 +++ b/alvr/events/src/lib.rs
 @@ -132,7 +132,8 @@ impl Event {
@@ -69,11 +1407,881 @@ index acc8659..8779a28 100644
              EventType::Tracking(tracking) => serde_json::to_string(tracking).unwrap(),
              EventType::Buttons(buttons) => serde_json::to_string(buttons).unwrap(),
              EventType::Haptics(haptics) => serde_json::to_string(haptics).unwrap(),
+diff --git a/alvr/packets/src/lib.rs b/alvr/packets/src/lib.rs
+index 995888ea..f105e541 100644
+--- a/alvr/packets/src/lib.rs
++++ b/alvr/packets/src/lib.rs
+@@ -23,6 +23,79 @@ pub const AUDIO: u16 = 2;
+ pub const VIDEO: u16 = 3;
+ pub const STATISTICS: u16 = 4;
+ 
++// OXRSys frame-pacing extension streams. These are negotiated independently from the base ALVR
++// protocol so v20 clients and servers never subscribe to them.
++pub const OXRSYS_FRAME_PACING_TIMESYNC: u16 = 0x8000;
++pub const OXRSYS_FRAME_PACING_DISPLAY_TIMING: u16 = 0x8001;
++pub const OXRSYS_FRAME_PACING_FRAME_TARGET: u16 = 0x8002;
++pub const OXRSYS_FRAME_PACING_FRAME_FEEDBACK: u16 = 0x8003;
++
++pub const OXRSYS_FRAME_PACING_VERSION_1: u16 = 1;
++pub const OXRSYS_FRAME_PACING_MODE_OFF: u8 = 0;
++pub const OXRSYS_FRAME_PACING_MODE_SHADOW: u8 = 1;
++pub const OXRSYS_FRAME_PACING_MODE_ACTIVE: u8 = 2;
++pub const OXRSYS_FRAME_FEEDBACK_FLAG_FRESH: u32 = 0x0001;
++pub const OXRSYS_FRAME_FEEDBACK_FLAG_SLACK_VALID: u32 = 0x0002;
++
++// All pacing packet timestamps are nanoseconds. Client timestamps use the explicit monotonic clock
++// mapping maintained by client_core; server timestamps use the embedding runtime's steady clock.
++// Keeping these as dedicated fixed-field packets avoids changing any existing positional v20 packet.
++#[repr(C)]
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OxrsysFramePacingTimesyncQuery {
++    pub session_epoch: u64,
++    pub query_sequence: u64,
++    pub server_send_time_ns: u64,
++}
++
++#[repr(C)]
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OxrsysFramePacingTimesyncResponse {
++    pub session_epoch: u64,
++    pub query_sequence: u64,
++    pub server_send_time_ns: u64,
++    pub client_receive_time_ns: u64,
++    pub client_send_time_ns: u64,
++}
++
++#[repr(C)]
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OxrsysFramePacingDisplayTiming {
++    pub session_epoch: u64,
++    pub display_sequence: u64,
++    // Predicted OpenXR display time mapped into the client's monotonic connection clock.
++    pub predicted_display_time_ns: u64,
++    pub predicted_display_period_ns: u64,
++}
++
++#[repr(C)]
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OxrsysFramePacingFrameTarget {
++    pub session_epoch: u64,
++    pub target_sequence: u64,
++    // Existing ALVR video/tracking timestamp. This remains the frame identity.
++    pub frame_timestamp_ns: u64,
++    // Intended display slot in the client's monotonic connection clock. Zero means unknown.
++    pub display_target_time_ns: u64,
++}
++
++#[repr(C)]
++#[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
++pub struct OxrsysFramePacingFrameFeedback {
++    pub session_epoch: u64,
++    pub feedback_sequence: u64,
++    pub frame_timestamp_ns: u64,
++    pub decode_complete_time_ns: u64,
++    pub acquire_time_ns: u64,
++    pub display_target_time_ns: u64,
++    pub predicted_display_time_ns: u64,
++    // Slack against the intended slot's acquire deadline. Negative means late.
++    pub acquire_slack_ns: i64,
++    // One for a fresh frame, then increments for every consecutive reuse.
++    pub times_displayed: u32,
++    pub flags: u32,
++}
++
+ // todo: use simple string
+ #[derive(Serialize, Deserialize, Clone)]
+ pub struct VideoStreamingCapabilitiesLegacy {
+@@ -46,6 +119,7 @@ pub struct VideoStreamingCapabilities {
+     pub prefer_full_range: bool,
+     pub preferred_encoding_gamma: f32,
+     pub prefer_hdr: bool,
++    pub oxrsys_frame_pacing_version: u16,
+ }
+ 
+ // Nasty workaround to make the packet extensible, pushing the limits of protocol compatibility
+@@ -107,6 +181,10 @@ pub fn decode_video_streaming_capabilities(
+             .as_f64()
+             .unwrap_or(1.0) as f32,
+         prefer_hdr: caps_json["prefer_hdr"].as_bool().unwrap_or(false),
++        oxrsys_frame_pacing_version: caps_json["oxrsys_frame_pacing_version"]
++            .as_u64()
++            .unwrap_or(0)
++            .min(u16::MAX as u64) as u16,
+     })
+ }
+ 
+@@ -135,6 +213,9 @@ pub struct NegotiatedStreamingConfig {
+     pub encoding_gamma: f32,
+     pub enable_hdr: bool,
+     pub wired: bool,
++    pub oxrsys_frame_pacing_version: u16,
++    pub oxrsys_frame_pacing_mode: u8,
++    pub oxrsys_frame_pacing_session_epoch: u64,
+ }
+ 
+ #[derive(Serialize, Deserialize)]
+@@ -181,6 +262,13 @@ pub fn decode_stream_config(packet: &StreamConfigPacket) -> Result<StreamConfig>
+     let encoding_gamma = json::from_value(negotiated_json["encoding_gamma"].clone()).unwrap_or(1.0);
+     let enable_hdr = json::from_value(negotiated_json["enable_hdr"].clone()).unwrap_or(false);
+     let wired = json::from_value(negotiated_json["wired"].clone()).unwrap_or(false);
++    let oxrsys_frame_pacing_version =
++        json::from_value(negotiated_json["oxrsys_frame_pacing_version"].clone()).unwrap_or(0);
++    let oxrsys_frame_pacing_mode =
++        json::from_value(negotiated_json["oxrsys_frame_pacing_mode"].clone())
++            .unwrap_or(OXRSYS_FRAME_PACING_MODE_OFF);
++    let oxrsys_frame_pacing_session_epoch =
++        json::from_value(negotiated_json["oxrsys_frame_pacing_session_epoch"].clone()).unwrap_or(0);
+ 
+     Ok(StreamConfig {
+         server_version: session_config.server_version,
+@@ -195,6 +283,9 @@ pub fn decode_stream_config(packet: &StreamConfigPacket) -> Result<StreamConfig>
+             encoding_gamma,
+             enable_hdr,
+             wired,
++            oxrsys_frame_pacing_version,
++            oxrsys_frame_pacing_mode,
++            oxrsys_frame_pacing_session_epoch,
+         },
+     })
+ }
+@@ -431,3 +522,115 @@ impl RealTimeConfig {
+         }
+     }
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::mem::size_of;
++
++    fn round_trip<T>(packet: T)
++    where
++        T: Serialize + serde::de::DeserializeOwned + PartialEq + Debug,
++    {
++        let encoded = bincode::serialize(&packet).unwrap();
++        let decoded = bincode::deserialize::<T>(&encoded).unwrap();
++
++        assert_eq!(decoded, packet);
++        assert_eq!(encoded.len(), size_of::<T>());
++    }
++
++    #[test]
++    fn protocol_20_and_legacy_capabilities_remain_compatible() {
++        assert_eq!(alvr_common::protocol_id(), "20");
++        assert_eq!(OXRSYS_FRAME_PACING_TIMESYNC, 0x8000);
++        assert_eq!(OXRSYS_FRAME_PACING_DISPLAY_TIMING, 0x8001);
++        assert_eq!(OXRSYS_FRAME_PACING_FRAME_TARGET, 0x8002);
++        assert_eq!(OXRSYS_FRAME_PACING_FRAME_FEEDBACK, 0x8003);
++
++        let legacy = VideoStreamingCapabilitiesLegacy {
++            default_view_resolution: UVec2::new(1832, 1920),
++            supported_refresh_rates_plus_extra_data: vec![72.0, 90.0],
++            microphone_sample_rate: 48_000,
++        };
++        let decoded = decode_video_streaming_capabilities(&legacy).unwrap();
++
++        assert_eq!(decoded.oxrsys_frame_pacing_version, 0);
++        assert_eq!(decoded.supported_refresh_rates, vec![72.0, 90.0]);
++    }
++
++    #[test]
++    fn missing_negotiated_pacing_fields_default_to_zero() {
++        let packet = StreamConfigPacket {
++            session: json::to_string(&SessionConfig::default()).unwrap(),
++            negotiated: json::json!({
++                "view_resolution": [1832, 1920],
++                "refresh_rate_hint": 72.0,
++                "game_audio_sample_rate": 48000,
++                "enable_foveated_encoding": false,
++                "use_multimodal_protocol": false,
++                "use_full_range": true,
++                "encoding_gamma": 1.0,
++                "enable_hdr": false,
++                "wired": false
++            })
++            .to_string(),
++        };
++        let decoded = decode_stream_config(&packet).unwrap();
++
++        assert_eq!(decoded.negotiated_config.oxrsys_frame_pacing_version, 0);
++        assert_eq!(
++            decoded.negotiated_config.oxrsys_frame_pacing_mode,
++            OXRSYS_FRAME_PACING_MODE_OFF
++        );
++        assert_eq!(
++            decoded.negotiated_config.oxrsys_frame_pacing_session_epoch,
++            0
++        );
++    }
++
++    #[test]
++    fn frame_pacing_packets_have_fixed_round_trip_layouts() {
++        round_trip(OxrsysFramePacingTimesyncQuery {
++            session_epoch: 1,
++            query_sequence: 2,
++            server_send_time_ns: 3,
++        });
++        round_trip(OxrsysFramePacingTimesyncResponse {
++            session_epoch: 1,
++            query_sequence: 2,
++            server_send_time_ns: 3,
++            client_receive_time_ns: 4,
++            client_send_time_ns: 5,
++        });
++        round_trip(OxrsysFramePacingDisplayTiming {
++            session_epoch: 1,
++            display_sequence: 2,
++            predicted_display_time_ns: 3,
++            predicted_display_period_ns: 4,
++        });
++        round_trip(OxrsysFramePacingFrameTarget {
++            session_epoch: 1,
++            target_sequence: 2,
++            frame_timestamp_ns: 3,
++            display_target_time_ns: 4,
++        });
++        round_trip(OxrsysFramePacingFrameFeedback {
++            session_epoch: 1,
++            feedback_sequence: 2,
++            frame_timestamp_ns: 3,
++            decode_complete_time_ns: 4,
++            acquire_time_ns: 5,
++            display_target_time_ns: 6,
++            predicted_display_time_ns: 7,
++            acquire_slack_ns: -8,
++            times_displayed: 2,
++            flags: OXRSYS_FRAME_FEEDBACK_FLAG_SLACK_VALID,
++        });
++
++        assert_eq!(size_of::<OxrsysFramePacingTimesyncQuery>(), 24);
++        assert_eq!(size_of::<OxrsysFramePacingTimesyncResponse>(), 40);
++        assert_eq!(size_of::<OxrsysFramePacingDisplayTiming>(), 32);
++        assert_eq!(size_of::<OxrsysFramePacingFrameTarget>(), 32);
++        assert_eq!(size_of::<OxrsysFramePacingFrameFeedback>(), 72);
++    }
++}
+diff --git a/alvr/server_core/src/c_api.rs b/alvr/server_core/src/c_api.rs
+index e8cb9ab1..11edb688 100644
+--- a/alvr/server_core/src/c_api.rs
++++ b/alvr/server_core/src/c_api.rs
+@@ -2,7 +2,8 @@
+ #![allow(clippy::missing_safety_doc)]
+ 
+ use crate::{
+-    logging_backend, tracking::HandType, ServerCoreContext, ServerCoreEvent, SESSION_MANAGER,
++    logging_backend, tracking::HandType, FramePacingEvent, ServerCoreContext, ServerCoreEvent,
++    SESSION_MANAGER,
+ };
+ use alvr_common::{
+     log,
+@@ -10,7 +11,10 @@ use alvr_common::{
+     parking_lot::{Mutex, RwLock},
+     Fov, Pose,
+ };
+-use alvr_packets::{ButtonEntry, ButtonValue, Haptics};
++use alvr_packets::{
++    ButtonEntry, ButtonValue, Haptics, OxrsysFramePacingDisplayTiming,
++    OxrsysFramePacingFrameFeedback, OxrsysFramePacingTimesyncResponse,
++};
+ use alvr_session::CodecType;
+ use std::{
+     collections::{HashMap, VecDeque},
+@@ -26,6 +30,8 @@ static SERVER_CORE_CONTEXT: Lazy<RwLock<Option<ServerCoreContext>>> =
+     Lazy::new(|| RwLock::new(None));
+ static EVENTS_RECEIVER: Lazy<Mutex<Option<mpsc::Receiver<ServerCoreEvent>>>> =
+     Lazy::new(|| Mutex::new(None));
++static FRAME_PACING_EVENTS_RECEIVER: Lazy<Mutex<Option<mpsc::Receiver<FramePacingEvent>>>> =
++    Lazy::new(|| Mutex::new(None));
+ static BUTTONS_QUEUE: Lazy<Mutex<VecDeque<Vec<ButtonEntry>>>> =
+     Lazy::new(|| Mutex::new(VecDeque::new()));
+ 
+@@ -107,6 +113,47 @@ pub struct AlvrBatteryInfo {
+     pub is_plugged: bool,
+ }
+ 
++pub const ALVR_SERVER_CORE_API_VERSION: u32 = 1;
++
++#[repr(C)]
++pub struct AlvrFramePacingCapabilities {
++    pub supported_version: u16,
++    pub negotiated_version: u16,
++    pub reserved: u32,
++    pub session_epoch: u64,
++}
++
++#[repr(C)]
++pub struct AlvrFramePacingDisplayTiming {
++    pub session_epoch: u64,
++    pub display_sequence: u64,
++    pub predicted_display_time_ns: u64,
++    pub predicted_display_period_ns: u64,
++}
++
++#[repr(C)]
++pub struct AlvrFramePacingTimesyncResponse {
++    pub session_epoch: u64,
++    pub query_sequence: u64,
++    pub server_send_time_ns: u64,
++    pub client_receive_time_ns: u64,
++    pub client_send_time_ns: u64,
++}
++
++#[repr(C)]
++pub struct AlvrFramePacingFrameFeedback {
++    pub session_epoch: u64,
++    pub feedback_sequence: u64,
++    pub frame_timestamp_ns: u64,
++    pub decode_complete_time_ns: u64,
++    pub acquire_time_ns: u64,
++    pub display_target_time_ns: u64,
++    pub predicted_display_time_ns: u64,
++    pub acquire_slack_ns: i64,
++    pub times_displayed: u32,
++    pub flags: u32,
++}
++
+ #[repr(u8)]
+ pub enum AlvrEvent {
+     ClientConnected,
+@@ -125,6 +172,9 @@ pub enum AlvrEvent {
+     CaptureFrame,
+     RestartPending,
+     ShutdownPending,
++    FramePacingDisplayTiming(AlvrFramePacingDisplayTiming),
++    FramePacingTimesyncResponse(AlvrFramePacingTimesyncResponse),
++    FramePacingFrameFeedback(AlvrFramePacingFrameFeedback),
+ }
+ 
+ #[repr(C)]
+@@ -168,6 +218,42 @@ fn fov_to_capi(fov: &Fov) -> AlvrFov {
+     }
+ }
+ 
++fn display_timing_to_capi(packet: OxrsysFramePacingDisplayTiming) -> AlvrFramePacingDisplayTiming {
++    AlvrFramePacingDisplayTiming {
++        session_epoch: packet.session_epoch,
++        display_sequence: packet.display_sequence,
++        predicted_display_time_ns: packet.predicted_display_time_ns,
++        predicted_display_period_ns: packet.predicted_display_period_ns,
++    }
++}
++
++fn timesync_response_to_capi(
++    packet: OxrsysFramePacingTimesyncResponse,
++) -> AlvrFramePacingTimesyncResponse {
++    AlvrFramePacingTimesyncResponse {
++        session_epoch: packet.session_epoch,
++        query_sequence: packet.query_sequence,
++        server_send_time_ns: packet.server_send_time_ns,
++        client_receive_time_ns: packet.client_receive_time_ns,
++        client_send_time_ns: packet.client_send_time_ns,
++    }
++}
++
++fn frame_feedback_to_capi(packet: OxrsysFramePacingFrameFeedback) -> AlvrFramePacingFrameFeedback {
++    AlvrFramePacingFrameFeedback {
++        session_epoch: packet.session_epoch,
++        feedback_sequence: packet.feedback_sequence,
++        frame_timestamp_ns: packet.frame_timestamp_ns,
++        decode_complete_time_ns: packet.decode_complete_time_ns,
++        acquire_time_ns: packet.acquire_time_ns,
++        display_target_time_ns: packet.display_target_time_ns,
++        predicted_display_time_ns: packet.predicted_display_time_ns,
++        acquire_slack_ns: packet.acquire_slack_ns,
++        times_displayed: packet.times_displayed,
++        flags: packet.flags,
++    }
++}
++
+ fn string_to_c_str(buffer: *mut c_char, value: &str) -> u64 {
+     let cstring = CString::new(value).unwrap();
+     if !buffer.is_null() {
+@@ -186,6 +272,38 @@ pub unsafe extern "C" fn alvr_get_time_ns() -> u64 {
+     Instant::now().elapsed().as_nanos() as u64
+ }
+ 
++#[no_mangle]
++pub extern "C" fn alvr_get_server_core_api_version() -> u32 {
++    ALVR_SERVER_CORE_API_VERSION
++}
++
++// Must be called before alvr_initialize(). 0 = off, 1 = shadow, 2 = active.
++// Off advertises pacing version 0, keeping every client on the legacy path.
++#[no_mangle]
++pub extern "C" fn alvr_set_frame_pacing_mode(mode: u8) {
++    crate::set_frame_pacing_mode(mode);
++}
++
++#[no_mangle]
++pub unsafe extern "C" fn alvr_get_frame_pacing_capabilities(
++    out_capabilities: *mut AlvrFramePacingCapabilities,
++) -> bool {
++    if out_capabilities.is_null() {
++        return false;
++    }
++    let Some(context) = &*SERVER_CORE_CONTEXT.read() else {
++        return false;
++    };
++    let snapshot = context.frame_pacing_snapshot();
++    *out_capabilities = AlvrFramePacingCapabilities {
++        supported_version: snapshot.supported_version,
++        negotiated_version: snapshot.negotiated_version,
++        reserved: 0,
++        session_epoch: snapshot.session_epoch,
++    };
++    true
++}
++
+ // The libalvr user is responsible of interpreting values and calling functions using
+ // device/input/output identifiers obtained using this function
+ #[no_mangle]
+@@ -281,9 +399,10 @@ pub unsafe extern "C" fn alvr_initialize_logging(
+ 
+ #[no_mangle]
+ pub unsafe extern "C" fn alvr_initialize() -> AlvrTargetConfig {
+-    let (context, receiver) = ServerCoreContext::new();
++    let (context, receiver, frame_pacing_receiver) = ServerCoreContext::new_with_frame_pacing();
+     *SERVER_CORE_CONTEXT.write() = Some(context);
+     *EVENTS_RECEIVER.lock() = Some(receiver);
++    *FRAME_PACING_EVENTS_RECEIVER.lock() = Some(frame_pacing_receiver);
+ 
+     let session_manager_lock = SESSION_MANAGER.read();
+     let restart_settings = &session_manager_lock.session().openvr_config;
+@@ -303,63 +422,102 @@ pub unsafe extern "C" fn alvr_start_connection() {
+     }
+ }
+ 
++unsafe fn write_server_event(out_event: *mut AlvrEvent, event: ServerCoreEvent) -> bool {
++    match event {
++        ServerCoreEvent::ClientConnected => *out_event = AlvrEvent::ClientConnected,
++        ServerCoreEvent::ClientDisconnected => *out_event = AlvrEvent::ClientDisconnected,
++        ServerCoreEvent::Battery(battery) => {
++            *out_event = AlvrEvent::Battery(AlvrBatteryInfo {
++                device_id: battery.device_id,
++                gauge_value: battery.gauge_value,
++                is_plugged: battery.is_plugged,
++            });
++        }
++        ServerCoreEvent::PlayspaceSync(bounds) => {
++            *out_event = AlvrEvent::PlayspaceSync(bounds.to_array())
++        }
++        ServerCoreEvent::ViewsConfig(config) => {
++            *out_event = AlvrEvent::ViewsConfig {
++                local_view_transform: [
++                    pose_to_capi(&config.local_view_transforms[0]),
++                    pose_to_capi(&config.local_view_transforms[1]),
++                ],
++                fov: [fov_to_capi(&config.fov[0]), fov_to_capi(&config.fov[1])],
++            }
++        }
++        ServerCoreEvent::Tracking { sample_timestamp } => {
++            *out_event = AlvrEvent::TrackingUpdated {
++                sample_timestamp_ns: sample_timestamp.as_nanos() as u64,
++            };
++        }
++        ServerCoreEvent::Buttons(entries) => {
++            BUTTONS_QUEUE.lock().push_back(entries);
++            *out_event = AlvrEvent::ButtonsUpdated;
++        }
++        ServerCoreEvent::RequestIDR => *out_event = AlvrEvent::RequestIDR,
++        ServerCoreEvent::CaptureFrame => *out_event = AlvrEvent::CaptureFrame,
++        ServerCoreEvent::RestartPending => *out_event = AlvrEvent::RestartPending,
++        ServerCoreEvent::ShutdownPending => *out_event = AlvrEvent::ShutdownPending,
++        ServerCoreEvent::GameRenderLatencyFeedback(_)
++        | ServerCoreEvent::SetOpenvrProperty { .. } => return false,
++    }
++    true
++}
++
++unsafe fn write_frame_pacing_event(out_event: *mut AlvrEvent, event: FramePacingEvent) {
++    *out_event = match event {
++        FramePacingEvent::DisplayTiming(packet) => {
++            AlvrEvent::FramePacingDisplayTiming(display_timing_to_capi(packet))
++        }
++        FramePacingEvent::TimesyncResponse(packet) => {
++            AlvrEvent::FramePacingTimesyncResponse(timesync_response_to_capi(packet))
++        }
++        FramePacingEvent::FrameFeedback(packet) => {
++            AlvrEvent::FramePacingFrameFeedback(frame_feedback_to_capi(packet))
++        }
++    };
++}
++
+ #[no_mangle]
+ pub unsafe extern "C" fn alvr_poll_event(out_event: *mut AlvrEvent, timeout_ns: u64) -> bool {
+-    if let Some(receiver) = &*EVENTS_RECEIVER.lock() {
+-        if let Ok(event) = receiver.recv_timeout(Duration::from_nanos(timeout_ns)) {
+-            match event {
+-                ServerCoreEvent::ClientConnected => {
+-                    *out_event = AlvrEvent::ClientConnected;
+-                }
+-                ServerCoreEvent::ClientDisconnected => {
+-                    *out_event = AlvrEvent::ClientDisconnected;
+-                }
+-                ServerCoreEvent::Battery(battery) => {
+-                    *out_event = AlvrEvent::Battery(AlvrBatteryInfo {
+-                        device_id: battery.device_id,
+-                        gauge_value: battery.gauge_value,
+-                        is_plugged: battery.is_plugged,
+-                    });
+-                }
+-                ServerCoreEvent::PlayspaceSync(bounds) => {
+-                    *out_event = AlvrEvent::PlayspaceSync(bounds.to_array())
+-                }
+-                ServerCoreEvent::ViewsConfig(config) => {
+-                    *out_event = AlvrEvent::ViewsConfig {
+-                        local_view_transform: [
+-                            pose_to_capi(&config.local_view_transforms[0]),
+-                            pose_to_capi(&config.local_view_transforms[1]),
+-                        ],
+-                        fov: [fov_to_capi(&config.fov[0]), fov_to_capi(&config.fov[1])],
+-                    }
+-                }
+-                ServerCoreEvent::Tracking { sample_timestamp } => {
+-                    *out_event = AlvrEvent::TrackingUpdated {
+-                        sample_timestamp_ns: sample_timestamp.as_nanos() as u64,
+-                    };
+-                }
+-                ServerCoreEvent::Buttons(entries) => {
+-                    BUTTONS_QUEUE.lock().push_back(entries);
+-                    *out_event = AlvrEvent::ButtonsUpdated;
+-                }
+-                ServerCoreEvent::RequestIDR => *out_event = AlvrEvent::RequestIDR,
+-                ServerCoreEvent::CaptureFrame => *out_event = AlvrEvent::CaptureFrame,
+-                ServerCoreEvent::RestartPending => {
+-                    *out_event = AlvrEvent::RestartPending;
+-                }
+-                ServerCoreEvent::ShutdownPending => {
+-                    *out_event = AlvrEvent::ShutdownPending;
+-                }
+-                ServerCoreEvent::GameRenderLatencyFeedback(_)
+-                | ServerCoreEvent::SetOpenvrProperty { .. } => {} // implementation not needed
++    if out_event.is_null() {
++        return false;
++    }
++    let events_lock = EVENTS_RECEIVER.lock();
++    let pacing_events_lock = FRAME_PACING_EVENTS_RECEIVER.lock();
++    let Some(receiver) = &*events_lock else {
++        return false;
++    };
++    let timeout = Duration::from_nanos(timeout_ns);
++    let start = Instant::now();
++
++    loop {
++        if let Some(pacing_receiver) = &*pacing_events_lock {
++            if let Ok(event) = pacing_receiver.try_recv() {
++                write_frame_pacing_event(out_event, event);
++                return true;
++            }
++        }
++        if let Ok(event) = receiver.try_recv() {
++            if write_server_event(out_event, event) {
++                return true;
+             }
++            continue;
++        }
++        if timeout.is_zero() || start.elapsed() >= timeout {
++            return false;
++        }
+ 
+-            true
+-        } else {
+-            false
++        // The general and pacing channels are independent. Slice the blocking wait so a pacing
++        // event is observed promptly without ever making its producer block.
++        let wait = timeout
++            .saturating_sub(start.elapsed())
++            .min(Duration::from_millis(1));
++        if let Ok(event) = receiver.recv_timeout(wait) {
++            if write_server_event(out_event, event) {
++                return true;
++            }
+         }
+-    } else {
+-        false
+     }
+ }
+ 
+@@ -484,6 +642,37 @@ pub unsafe extern "C" fn alvr_set_video_config_nals(
+     }
+ }
+ 
++#[no_mangle]
++pub extern "C" fn alvr_send_frame_pacing_timesync(server_send_time_ns: u64) -> bool {
++    SERVER_CORE_CONTEXT
++        .read()
++        .as_ref()
++        .is_some_and(|context| context.send_frame_pacing_timesync(server_send_time_ns))
++}
++
++#[no_mangle]
++pub unsafe extern "C" fn alvr_send_video_nal_paced(
++    timestamp_ns: u64,
++    display_target_time_ns: u64,
++    buffer_ptr: *const u8,
++    len: i32,
++    is_idr: bool,
++) -> bool {
++    if len < 0 || (buffer_ptr.is_null() && len != 0) {
++        return false;
++    }
++    let Some(context) = &*SERVER_CORE_CONTEXT.read() else {
++        return false;
++    };
++    let buffer = std::slice::from_raw_parts(buffer_ptr, len as usize);
++    context.send_video_nal_paced(
++        Duration::from_nanos(timestamp_ns),
++        display_target_time_ns,
++        buffer.to_vec(),
++        is_idr,
++    )
++}
++
+ #[no_mangle]
+ pub unsafe extern "C" fn alvr_send_video_nal(
+     timestamp_ns: u64,
+@@ -491,6 +680,9 @@ pub unsafe extern "C" fn alvr_send_video_nal(
+     len: i32,
+     is_idr: bool,
+ ) {
++    if len < 0 || (buffer_ptr.is_null() && len != 0) {
++        return;
++    }
+     if let Some(context) = &*SERVER_CORE_CONTEXT.read() {
+         let buffer = std::slice::from_raw_parts(buffer_ptr, len as usize);
+         context.send_video_nal(Duration::from_nanos(timestamp_ns), buffer.to_vec(), is_idr);
+@@ -562,3 +754,201 @@ pub unsafe extern "C" fn alvr_restart() {
+ pub unsafe extern "C" fn alvr_shutdown() {
+     SERVER_CORE_CONTEXT.write().take();
+ }
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::mem::{align_of, offset_of, size_of};
++
++    fn event_tag(event: &AlvrEvent) -> u8 {
++        unsafe { *(event as *const AlvrEvent).cast::<u8>() }
++    }
++
++    fn event_payload_epoch(event: &AlvrEvent) -> u64 {
++        unsafe {
++            (event as *const AlvrEvent)
++                .cast::<u8>()
++                .add(8)
++                .cast::<u64>()
++                .read()
++        }
++    }
++
++    #[test]
++    fn appended_event_tags_preserve_the_v20_abi() {
++        assert_eq!(event_tag(&AlvrEvent::ClientConnected), 0);
++        assert_eq!(event_tag(&AlvrEvent::ShutdownPending), 10);
++        assert_eq!(
++            event_tag(&AlvrEvent::FramePacingDisplayTiming(
++                AlvrFramePacingDisplayTiming {
++                    session_epoch: 0,
++                    display_sequence: 0,
++                    predicted_display_time_ns: 0,
++                    predicted_display_period_ns: 0,
++                }
++            )),
++            11
++        );
++        assert_eq!(
++            event_tag(&AlvrEvent::FramePacingTimesyncResponse(
++                AlvrFramePacingTimesyncResponse {
++                    session_epoch: 0,
++                    query_sequence: 0,
++                    server_send_time_ns: 0,
++                    client_receive_time_ns: 0,
++                    client_send_time_ns: 0,
++                }
++            )),
++            12
++        );
++        assert_eq!(
++            event_tag(&AlvrEvent::FramePacingFrameFeedback(
++                AlvrFramePacingFrameFeedback {
++                    session_epoch: 0,
++                    feedback_sequence: 0,
++                    frame_timestamp_ns: 0,
++                    decode_complete_time_ns: 0,
++                    acquire_time_ns: 0,
++                    display_target_time_ns: 0,
++                    predicted_display_time_ns: 0,
++                    acquire_slack_ns: 0,
++                    times_displayed: 0,
++                    flags: 0,
++                }
++            )),
++            13
++        );
++
++        const EPOCH: u64 = 0x1122_3344_5566_7788;
++        assert_eq!(size_of::<AlvrEvent>(), 96);
++        assert_eq!(align_of::<AlvrEvent>(), 8);
++        assert_eq!(
++            event_payload_epoch(&AlvrEvent::FramePacingDisplayTiming(
++                AlvrFramePacingDisplayTiming {
++                    session_epoch: EPOCH,
++                    display_sequence: 0,
++                    predicted_display_time_ns: 0,
++                    predicted_display_period_ns: 0,
++                }
++            )),
++            EPOCH
++        );
++        assert_eq!(
++            event_payload_epoch(&AlvrEvent::FramePacingTimesyncResponse(
++                AlvrFramePacingTimesyncResponse {
++                    session_epoch: EPOCH,
++                    query_sequence: 0,
++                    server_send_time_ns: 0,
++                    client_receive_time_ns: 0,
++                    client_send_time_ns: 0,
++                }
++            )),
++            EPOCH
++        );
++        assert_eq!(
++            event_payload_epoch(&AlvrEvent::FramePacingFrameFeedback(
++                AlvrFramePacingFrameFeedback {
++                    session_epoch: EPOCH,
++                    feedback_sequence: 0,
++                    frame_timestamp_ns: 0,
++                    decode_complete_time_ns: 0,
++                    acquire_time_ns: 0,
++                    display_target_time_ns: 0,
++                    predicted_display_time_ns: 0,
++                    acquire_slack_ns: 0,
++                    times_displayed: 0,
++                    flags: 0,
++                }
++            )),
++            EPOCH
++        );
++    }
++
++    #[test]
++    fn frame_pacing_c_payload_layouts_are_fixed() {
++        assert_eq!(size_of::<AlvrFramePacingCapabilities>(), 16);
++        assert_eq!(
++            offset_of!(AlvrFramePacingCapabilities, supported_version),
++            0
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingCapabilities, negotiated_version),
++            2
++        );
++        assert_eq!(offset_of!(AlvrFramePacingCapabilities, reserved), 4);
++        assert_eq!(offset_of!(AlvrFramePacingCapabilities, session_epoch), 8);
++
++        assert_eq!(size_of::<AlvrFramePacingDisplayTiming>(), 32);
++        assert_eq!(offset_of!(AlvrFramePacingDisplayTiming, session_epoch), 0);
++        assert_eq!(
++            offset_of!(AlvrFramePacingDisplayTiming, display_sequence),
++            8
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingDisplayTiming, predicted_display_time_ns),
++            16
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingDisplayTiming, predicted_display_period_ns),
++            24
++        );
++
++        assert_eq!(size_of::<AlvrFramePacingTimesyncResponse>(), 40);
++        assert_eq!(
++            offset_of!(AlvrFramePacingTimesyncResponse, session_epoch),
++            0
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingTimesyncResponse, query_sequence),
++            8
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingTimesyncResponse, server_send_time_ns),
++            16
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingTimesyncResponse, client_receive_time_ns),
++            24
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingTimesyncResponse, client_send_time_ns),
++            32
++        );
++
++        assert_eq!(size_of::<AlvrFramePacingFrameFeedback>(), 72);
++        assert_eq!(offset_of!(AlvrFramePacingFrameFeedback, session_epoch), 0);
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, feedback_sequence),
++            8
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, frame_timestamp_ns),
++            16
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, decode_complete_time_ns),
++            24
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, acquire_time_ns),
++            32
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, display_target_time_ns),
++            40
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, predicted_display_time_ns),
++            48
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, acquire_slack_ns),
++            56
++        );
++        assert_eq!(
++            offset_of!(AlvrFramePacingFrameFeedback, times_displayed),
++            64
++        );
++        assert_eq!(offset_of!(AlvrFramePacingFrameFeedback, flags), 68);
++    }
++}
 diff --git a/alvr/server_core/src/connection.rs b/alvr/server_core/src/connection.rs
-index 3144dfe..59c0e14 100644
+index 3144dfef..a566fda5 100644
 --- a/alvr/server_core/src/connection.rs
 +++ b/alvr/server_core/src/connection.rs
-@@ -28,14 +28,18 @@ use alvr_session::{
+@@ -5,7 +5,8 @@ use crate::{
+     sockets::WelcomeSocket,
+     statistics::StatisticsManager,
+     tracking::{self, TrackingManager},
+-    ConnectionContext, ServerCoreEvent, ViewsConfig, FILESYSTEM_LAYOUT, SESSION_MANAGER,
++    ConnectionContext, FramePacingEvent, ServerCoreEvent, ViewsConfig, FILESYSTEM_LAYOUT,
++    SESSION_MANAGER,
+ };
+ use alvr_adb::{WiredConnection, WiredConnectionStatus};
+ use alvr_common::{
+@@ -20,22 +21,31 @@ use alvr_common::{
+ use alvr_events::{AdbEvent, ButtonEvent, EventType};
+ use alvr_packets::{
+     ClientConnectionResult, ClientControlPacket, ClientListAction, ClientStatistics,
+-    NegotiatedStreamingConfig, RealTimeConfig, ReservedClientControlPacket, ServerControlPacket,
+-    Tracking, VideoPacketHeader, AUDIO, HAPTICS, STATISTICS, TRACKING, VIDEO,
++    NegotiatedStreamingConfig, OxrsysFramePacingDisplayTiming, OxrsysFramePacingFrameFeedback,
++    OxrsysFramePacingFrameTarget, OxrsysFramePacingTimesyncQuery,
++    OxrsysFramePacingTimesyncResponse, RealTimeConfig, ReservedClientControlPacket,
++    ServerControlPacket, Tracking, VideoPacketHeader, AUDIO, HAPTICS,
++    OXRSYS_FRAME_PACING_DISPLAY_TIMING, OXRSYS_FRAME_PACING_FRAME_FEEDBACK,
++    OXRSYS_FRAME_PACING_FRAME_TARGET, OXRSYS_FRAME_PACING_TIMESYNC, OXRSYS_FRAME_PACING_VERSION_1,
++    STATISTICS, TRACKING, VIDEO,
+ };
+ use alvr_session::{
+     BodyTrackingBDConfig, BodyTrackingSinkConfig, CodecType, ControllersEmulationMode, FrameSize,
      H264Profile, OpenvrConfig, SessionConfig, SocketProtocol,
  };
  use alvr_sockets::{
@@ -88,14 +2296,27 @@ index 3144dfe..59c0e14 100644
      process::Command,
 -    sync::{mpsc::RecvTimeoutError, Arc},
 +    sync::{
-+        atomic::{AtomicBool, Ordering},
++        atomic::{AtomicBool, AtomicU64, Ordering},
 +        mpsc::RecvTimeoutError,
 +        Arc,
 +    },
      thread,
      time::{Duration, Instant},
  };
-@@ -64,6 +68,23 @@ fn is_streaming(client_hostname: &str) -> bool {
+@@ -46,9 +56,12 @@ pub const STREAMING_RECV_TIMEOUT: Duration = Duration::from_millis(500);
+ const REAL_TIME_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+ 
+ const MAX_UNREAD_PACKETS: usize = 10; // Applies per stream
++const FRAME_PACING_OUTBOUND_CAPACITY: usize = 32;
++static NEXT_FRAME_PACING_EPOCH: AtomicU64 = AtomicU64::new(1);
+ 
+ pub struct VideoPacket {
+     pub header: VideoPacketHeader,
++    pub display_target_time_ns: u64,
+     pub payload: Vec<u8>,
+ }
+ 
+@@ -64,6 +77,23 @@ fn is_streaming(client_hostname: &str) -> bool {
          .is_some_and(|c| c.connection_state == ConnectionState::Streaming)
  }
  
@@ -119,7 +2340,7 @@ index 3144dfe..59c0e14 100644
  pub fn contruct_openvr_config(session: &SessionConfig) -> OpenvrConfig {
      let old_config = session.openvr_config.clone();
      let settings = session.to_settings();
-@@ -321,15 +342,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+@@ -321,15 +351,23 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
                  }
              };
  
@@ -151,7 +2372,7 @@ index 3144dfe..59c0e14 100644
          }
  
          if !wired_client_ips.is_empty()
-@@ -365,16 +394,28 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
+@@ -365,16 +403,28 @@ pub fn handshake_loop(ctx: Arc<ConnectionContext>, lifecycle_state: Arc<RwLock<L
              manual_client_ips
          };
  
@@ -187,10 +2408,25 @@ index 3144dfe..59c0e14 100644
          }
  
          let discovery_config = SESSION_MANAGER
-@@ -507,6 +548,37 @@ fn try_connect(
+@@ -507,6 +557,53 @@ fn try_connect(
      Ok(())
  }
  
++struct FramePacingSessionGuard {
++    ctx: Arc<ConnectionContext>,
++    session_epoch: u64,
++}
++
++impl Drop for FramePacingSessionGuard {
++    fn drop(&mut self) {
++        *self.ctx.frame_pacing_timesync_sender.lock() = None;
++        self.ctx
++            .frame_pacing_state
++            .lock()
++            .end_session(self.session_epoch);
++    }
++}
++
 +// RAII cleanup for every exit path of connection_pipeline after the stream socket exists:
 +// closes the stream writer fd and clears the global sender slots, so early `?` returns (e.g.
 +// virtual microphone creation failing on macOS) can't leave a StreamSender in ConnectionContext
@@ -218,6 +2454,7 @@ index 3144dfe..59c0e14 100644
 +            self.close_handle.close();
 +            *self.ctx.video_channel_sender.lock() = None;
 +            *self.ctx.haptics_sender.lock() = None;
++            *self.ctx.frame_pacing_timesync_sender.lock() = None;
 +        }
 +    }
 +}
@@ -225,10 +2462,90 @@ index 3144dfe..59c0e14 100644
  fn connection_pipeline(
      ctx: Arc<ConnectionContext>,
      lifecycle_state: Arc<RwLock<LifecycleState>>,
-@@ -864,6 +936,24 @@ fn connection_pipeline(
+@@ -768,6 +865,35 @@ fn connection_pipeline(
+     };
+ 
+     let wired = client_ip.is_loopback();
++    let frame_pacing_supported_version = ctx.frame_pacing_state.lock().snapshot().supported_version;
++    let frame_pacing_version = if frame_pacing_supported_version >= OXRSYS_FRAME_PACING_VERSION_1
++        && streaming_caps.oxrsys_frame_pacing_version >= OXRSYS_FRAME_PACING_VERSION_1
++    {
++        OXRSYS_FRAME_PACING_VERSION_1
++    } else {
++        0
++    };
++    let frame_pacing_session_epoch = if frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1 {
++        NEXT_FRAME_PACING_EPOCH
++            .fetch_add(1, Ordering::Relaxed)
++            .max(1)
++    } else {
++        0
++    };
++    // Echo the configured mode so the client can distinguish telemetry-only shadow
++    // from closed-loop active. Version 0 carries mode OFF.
++    let frame_pacing_mode = if frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1 {
++        crate::frame_pacing_mode()
++    } else {
++        alvr_packets::OXRSYS_FRAME_PACING_MODE_OFF
++    };
++    ctx.frame_pacing_state
++        .lock()
++        .begin_session(frame_pacing_version, frame_pacing_session_epoch);
++    let _frame_pacing_session_guard = FramePacingSessionGuard {
++        ctx: Arc::clone(&ctx),
++        session_epoch: frame_pacing_session_epoch,
++    };
+ 
+     dbg_connection!("connection_pipeline: send streaming config");
+     let stream_config_packet = alvr_packets::encode_stream_config(
+@@ -782,6 +908,9 @@ fn connection_pipeline(
+             encoding_gamma,
+             enable_hdr,
+             wired,
++            oxrsys_frame_pacing_version: frame_pacing_version,
++            oxrsys_frame_pacing_mode: frame_pacing_mode,
++            oxrsys_frame_pacing_session_epoch: frame_pacing_session_epoch,
+         },
+     )
+     .to_con()?;
+@@ -863,29 +992,214 @@ fn connection_pipeline(
+     let haptics_sender = stream_socket.request_stream(HAPTICS);
      let mut statics_receiver =
          stream_socket.subscribe_to_stream::<ClientStatistics>(STATISTICS, MAX_UNREAD_PACKETS);
- 
++    let mut frame_pacing_target_sender = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket
++                .request_stream::<OxrsysFramePacingFrameTarget>(OXRSYS_FRAME_PACING_FRAME_TARGET)
++        });
++    let mut frame_pacing_timesync_stream_sender =
++        (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1).then(|| {
++            stream_socket
++                .request_stream::<OxrsysFramePacingTimesyncQuery>(OXRSYS_FRAME_PACING_TIMESYNC)
++        });
++    let mut frame_pacing_display_receiver = (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1)
++        .then(|| {
++            stream_socket.subscribe_to_stream::<OxrsysFramePacingDisplayTiming>(
++                OXRSYS_FRAME_PACING_DISPLAY_TIMING,
++                MAX_UNREAD_PACKETS,
++            )
++        });
++    let mut frame_pacing_timesync_receiver =
++        (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1).then(|| {
++            stream_socket.subscribe_to_stream::<OxrsysFramePacingTimesyncResponse>(
++                OXRSYS_FRAME_PACING_TIMESYNC,
++                MAX_UNREAD_PACKETS,
++            )
++        });
++    let mut frame_pacing_feedback_receiver =
++        (frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1).then(|| {
++            stream_socket.subscribe_to_stream::<OxrsysFramePacingFrameFeedback>(
++                OXRSYS_FRAME_PACING_FRAME_FEEDBACK,
++                MAX_UNREAD_PACKETS,
++            )
++        });
++    let (frame_pacing_timesync_sender, frame_pacing_timesync_channel_receiver) =
++        std::sync::mpsc::sync_channel(FRAME_PACING_OUTBOUND_CAPACITY);
++
 +    // The socket itself is moved into stream_receive_thread; keep a handle so the teardown tail
 +    // can drop the writer fd on every disconnect flavor, not only stream-recv errors.
 +    let stream_writer_close_handle = stream_socket.writer_close_handle();
@@ -246,19 +2563,53 @@ index 3144dfe..59c0e14 100644
 +    // thread to drop the old receive fd, so gating the exit on is_streaming() alone would
 +    // deadlock the retry window (fd held until read lock acquired, read lock blocked by retry).
 +    let stream_disconnecting = Arc::new(AtomicBool::new(false));
-+
+ 
      let (video_channel_sender, video_channel_receiver) =
          std::sync::mpsc::sync_channel(initial_settings.connection.max_queued_server_video_frames);
      *ctx.video_channel_sender.lock() = Some(video_channel_sender);
-@@ -872,6 +962,7 @@ fn connection_pipeline(
+     *ctx.haptics_sender.lock() = Some(haptics_sender);
++    if frame_pacing_version == OXRSYS_FRAME_PACING_VERSION_1 {
++        *ctx.frame_pacing_timesync_sender.lock() = Some(frame_pacing_timesync_sender);
++    }
+ 
      let video_send_thread = thread::spawn({
          let client_hostname = client_hostname.clone();
          move || {
 +            let mut send_error_count = 0_usize;
++            let mut target_sequence = 0_u64;
              while is_streaming(&client_hostname) {
-                 let VideoPacket { header, payload } =
-                     match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
-@@ -885,7 +976,19 @@ fn connection_pipeline(
+-                let VideoPacket { header, payload } =
+-                    match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
+-                        Ok(packet) => packet,
+-                        Err(RecvTimeoutError::Timeout) => continue,
+-                        Err(RecvTimeoutError::Disconnected) => return,
+-                    };
++                let VideoPacket {
++                    header,
++                    display_target_time_ns,
++                    payload,
++                } = match video_channel_receiver.recv_timeout(STREAMING_RECV_TIMEOUT) {
++                    Ok(packet) => packet,
++                    Err(RecvTimeoutError::Timeout) => continue,
++                    Err(RecvTimeoutError::Disconnected) => return,
++                };
++
++                if display_target_time_ns != 0 {
++                    if let Some(sender) = frame_pacing_target_sender.as_mut() {
++                        target_sequence = target_sequence.wrapping_add(1).max(1);
++                        let target = OxrsysFramePacingFrameTarget {
++                            session_epoch: frame_pacing_session_epoch,
++                            target_sequence,
++                            frame_timestamp_ns: header.timestamp.as_nanos() as u64,
++                            display_target_time_ns,
++                        };
++                        // Target loss is safe: the client treats the frame as untargeted.
++                        sender.send_header(&target).ok();
++                    }
++                }
+ 
+                 let mut buffer = video_sender.get_buffer(&header).unwrap();
+                 // todo: make encoder write to socket buffers directly to avoid copy
                  buffer
                      .get_range_mut(0, payload.len())
                      .copy_from_slice(&payload);
@@ -276,10 +2627,110 @@ index 3144dfe..59c0e14 100644
 +                        send_error_count += 1;
 +                    }
 +                }
++            }
++        }
++    });
++
++    let frame_pacing_timesync_send_thread = thread::spawn({
++        let client_hostname = client_hostname.clone();
++        move || {
++            while is_streaming(&client_hostname) {
++                let query = match frame_pacing_timesync_channel_receiver
++                    .recv_timeout(STREAMING_RECV_TIMEOUT)
++                {
++                    Ok(query) => query,
++                    Err(RecvTimeoutError::Timeout) => continue,
++                    Err(RecvTimeoutError::Disconnected) => return,
++                };
++                let Some(sender) = frame_pacing_timesync_stream_sender.as_mut() else {
++                    return;
++                };
++                if sender.send_header(&query).is_err() {
++                    return;
++                }
++            }
++        }
++    });
++
++    let frame_pacing_display_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        let client_hostname = client_hostname.clone();
++        move || {
++            let Some(receiver) = frame_pacing_display_receiver.as_mut() else {
++                return;
++            };
++            while is_streaming(&client_hostname) {
++                let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
++                    Ok(data) => data,
++                    Err(ConnectionError::TryAgain(_)) => continue,
++                    Err(ConnectionError::Other(_)) => return,
++                };
++                let Ok(packet) = data.get_header() else {
++                    continue;
++                };
++                if ctx.frame_pacing_state.lock().accept_display_timing(&packet) {
++                    ctx.frame_pacing_events_sender
++                        .try_send(FramePacingEvent::DisplayTiming(packet))
++                        .ok();
++                }
++            }
++        }
++    });
++
++    let frame_pacing_timesync_receive_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        let client_hostname = client_hostname.clone();
++        move || {
++            let Some(receiver) = frame_pacing_timesync_receiver.as_mut() else {
++                return;
++            };
++            while is_streaming(&client_hostname) {
++                let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
++                    Ok(data) => data,
++                    Err(ConnectionError::TryAgain(_)) => continue,
++                    Err(ConnectionError::Other(_)) => return,
++                };
++                let Ok(packet) = data.get_header() else {
++                    continue;
++                };
++                if ctx
++                    .frame_pacing_state
++                    .lock()
++                    .accept_timesync_response(&packet)
++                {
++                    ctx.frame_pacing_events_sender
++                        .try_send(FramePacingEvent::TimesyncResponse(packet))
++                        .ok();
++                }
++            }
++        }
++    });
++
++    let frame_pacing_feedback_thread = thread::spawn({
++        let ctx = Arc::clone(&ctx);
++        let client_hostname = client_hostname.clone();
++        move || {
++            let Some(receiver) = frame_pacing_feedback_receiver.as_mut() else {
++                return;
++            };
++            while is_streaming(&client_hostname) {
++                let data = match receiver.recv(STREAMING_RECV_TIMEOUT) {
++                    Ok(data) => data,
++                    Err(ConnectionError::TryAgain(_)) => continue,
++                    Err(ConnectionError::Other(_)) => return,
++                };
++                let Ok(packet) = data.get_header() else {
++                    continue;
++                };
++                if ctx.frame_pacing_state.lock().accept_frame_feedback(&packet) {
++                    ctx.frame_pacing_events_sender
++                        .try_send(FramePacingEvent::FrameFeedback(packet))
++                        .ok();
++                }
              }
          }
      });
-@@ -943,7 +1046,8 @@ fn connection_pipeline(
+@@ -943,7 +1257,8 @@ fn connection_pipeline(
                      if let Err(e) = alvr_audio::record_audio_blocking(
                          Arc::new({
                              let client_hostname = client_hostname.clone();
@@ -289,7 +2740,7 @@ index 3144dfe..59c0e14 100644
                          }),
                          game_audio_sender.clone(),
                          &device,
-@@ -1054,10 +1158,16 @@ fn connection_pipeline(
+@@ -1054,10 +1369,16 @@ fn connection_pipeline(
                  let data = match statics_receiver.recv(STREAMING_RECV_TIMEOUT) {
                      Ok(stats) => stats,
                      Err(ConnectionError::TryAgain(_)) => continue,
@@ -308,7 +2759,7 @@ index 3144dfe..59c0e14 100644
                  };
  
                  if let Some(stats) = &mut *ctx.statistics_manager.write() {
-@@ -1352,21 +1462,30 @@ fn connection_pipeline(
+@@ -1352,21 +1673,30 @@ fn connection_pipeline(
  
      let stream_receive_thread = thread::spawn({
          let disconnect_notif = Arc::clone(&disconnect_notif);
@@ -343,10 +2794,12 @@ index 3144dfe..59c0e14 100644
          }
      });
  
-@@ -1426,6 +1545,19 @@ fn connection_pipeline(
+@@ -1425,6 +1755,20 @@ fn connection_pipeline(
+     // This requests shutdown from threads
      *ctx.video_channel_sender.lock() = None;
      *ctx.haptics_sender.lock() = None;
- 
++    *ctx.frame_pacing_timesync_sender.lock() = None;
++
 +    // Release stream_receive_thread without it needing SESSION_MANAGER (see flag declaration),
 +    // so its receive fd drops within one recv timeout even while the next connection's
 +    // bind-retry loop holds the session write lock.
@@ -359,11 +2812,10 @@ index 3144dfe..59c0e14 100644
 +    // This tail performs the guard's cleanup explicitly (and at the right time, under the
 +    // session lock); disarm it so its drop at function end can't race a new connection.
 +    stream_cleanup_guard.disarm();
-+
+ 
      *ctx.video_recording_file.lock() = None;
  
-     session_manager_lock.update_client_list(
-@@ -1459,15 +1591,26 @@ fn connection_pipeline(
+@@ -1459,17 +1803,35 @@ fn connection_pipeline(
  
      // Ensure shutdown of threads
      dbg_connection!("connection_pipeline: Shutdown threads");
@@ -383,6 +2835,10 @@ index 3144dfe..59c0e14 100644
      video_send_thread.join().ok();
 -    game_audio_thread.join().ok();
 -    microphone_thread.join().ok();
++    frame_pacing_timesync_send_thread.join().ok();
++    frame_pacing_display_thread.join().ok();
++    frame_pacing_timesync_receive_thread.join().ok();
++    frame_pacing_feedback_thread.join().ok();
      tracking_receive_thread.join().ok();
      statistics_thread.join().ok();
      real_time_update_thread.join().ok();
@@ -393,9 +2849,522 @@ index 3144dfe..59c0e14 100644
 +    microphone_thread.join().ok();
      lifecycle_check_thread.join().ok();
  
++    ctx.frame_pacing_state
++        .lock()
++        .end_session(frame_pacing_session_epoch);
      ctx.events_sender
+         .send(ServerCoreEvent::ClientDisconnected)
+         .ok();
+diff --git a/alvr/server_core/src/frame_pacing.rs b/alvr/server_core/src/frame_pacing.rs
+new file mode 100644
+index 00000000..98f8cd09
+--- /dev/null
++++ b/alvr/server_core/src/frame_pacing.rs
+@@ -0,0 +1,234 @@
++use alvr_packets::{
++    OxrsysFramePacingDisplayTiming, OxrsysFramePacingFrameFeedback, OxrsysFramePacingTimesyncQuery,
++    OxrsysFramePacingTimesyncResponse, OXRSYS_FRAME_PACING_VERSION_1,
++};
++
++#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
++pub struct FramePacingSnapshot {
++    pub supported_version: u16,
++    pub negotiated_version: u16,
++    pub session_epoch: u64,
++}
++
++pub struct ServerFramePacingState {
++    supported_version: u16,
++    negotiated_version: u16,
++    session_epoch: u64,
++    next_query_sequence: u64,
++    last_display_sequence: u64,
++    last_response_sequence: u64,
++    last_feedback_sequence: u64,
++    outstanding_queries: [Option<(u64, u64)>; 32],
++}
++
++impl ServerFramePacingState {
++    pub fn new(supported_version: u16) -> Self {
++        Self {
++            supported_version,
++            negotiated_version: 0,
++            session_epoch: 0,
++            next_query_sequence: 0,
++            last_display_sequence: 0,
++            last_response_sequence: 0,
++            last_feedback_sequence: 0,
++            outstanding_queries: [None; 32],
++        }
++    }
++
++    pub fn begin_session(
++        &mut self,
++        client_version: u16,
++        session_epoch: u64,
++    ) -> FramePacingSnapshot {
++        self.negotiated_version = if self.supported_version >= OXRSYS_FRAME_PACING_VERSION_1
++            && client_version >= OXRSYS_FRAME_PACING_VERSION_1
++            && session_epoch != 0
++        {
++            OXRSYS_FRAME_PACING_VERSION_1
++        } else {
++            0
++        };
++        self.session_epoch = if self.negotiated_version == OXRSYS_FRAME_PACING_VERSION_1 {
++            session_epoch
++        } else {
++            0
++        };
++        self.next_query_sequence = 0;
++        self.last_display_sequence = 0;
++        self.last_response_sequence = 0;
++        self.last_feedback_sequence = 0;
++        self.outstanding_queries = [None; 32];
++        self.snapshot()
++    }
++
++    pub fn end_session(&mut self, session_epoch: u64) {
++        if self.session_epoch == session_epoch {
++            self.negotiated_version = 0;
++            self.session_epoch = 0;
++            self.next_query_sequence = 0;
++            self.last_display_sequence = 0;
++            self.last_response_sequence = 0;
++            self.last_feedback_sequence = 0;
++            self.outstanding_queries = [None; 32];
++        }
++    }
++
++    pub fn snapshot(&self) -> FramePacingSnapshot {
++        FramePacingSnapshot {
++            supported_version: self.supported_version,
++            negotiated_version: self.negotiated_version,
++            session_epoch: self.session_epoch,
++        }
++    }
++
++    pub fn next_timesync_query(
++        &mut self,
++        server_send_time_ns: u64,
++    ) -> Option<OxrsysFramePacingTimesyncQuery> {
++        if self.negotiated_version != OXRSYS_FRAME_PACING_VERSION_1 {
++            return None;
++        }
++        self.next_query_sequence = self.next_query_sequence.wrapping_add(1).max(1);
++        let sequence = self.next_query_sequence;
++        self.outstanding_queries[sequence as usize % self.outstanding_queries.len()] =
++            Some((sequence, server_send_time_ns));
++        Some(OxrsysFramePacingTimesyncQuery {
++            session_epoch: self.session_epoch,
++            query_sequence: sequence,
++            server_send_time_ns,
++        })
++    }
++
++    pub fn accept_display_timing(&mut self, packet: &OxrsysFramePacingDisplayTiming) -> bool {
++        if !self.accept_sequence(
++            packet.session_epoch,
++            packet.display_sequence,
++            self.last_display_sequence,
++        ) || packet.predicted_display_time_ns == 0
++            || packet.predicted_display_period_ns == 0
++        {
++            return false;
++        }
++        self.last_display_sequence = packet.display_sequence;
++        true
++    }
++
++    pub fn accept_timesync_response(&mut self, packet: &OxrsysFramePacingTimesyncResponse) -> bool {
++        if !self.accept_sequence(
++            packet.session_epoch,
++            packet.query_sequence,
++            self.last_response_sequence,
++        ) || packet.server_send_time_ns == 0
++            || packet.client_receive_time_ns == 0
++            || packet.client_send_time_ns < packet.client_receive_time_ns
++        {
++            return false;
++        }
++
++        let slot = packet.query_sequence as usize % self.outstanding_queries.len();
++        if self.outstanding_queries[slot]
++            != Some((packet.query_sequence, packet.server_send_time_ns))
++        {
++            return false;
++        }
++        self.outstanding_queries[slot] = None;
++        self.last_response_sequence = packet.query_sequence;
++        true
++    }
++
++    pub fn accept_frame_feedback(&mut self, packet: &OxrsysFramePacingFrameFeedback) -> bool {
++        if !self.accept_sequence(
++            packet.session_epoch,
++            packet.feedback_sequence,
++            self.last_feedback_sequence,
++        ) || packet.frame_timestamp_ns == 0
++            || packet.predicted_display_time_ns == 0
++            || packet.times_displayed == 0
++        {
++            return false;
++        }
++        self.last_feedback_sequence = packet.feedback_sequence;
++        true
++    }
++
++    fn accept_sequence(&self, epoch: u64, sequence: u64, last_sequence: u64) -> bool {
++        self.negotiated_version == OXRSYS_FRAME_PACING_VERSION_1
++            && epoch == self.session_epoch
++            && sequence > last_sequence
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++
++    #[test]
++    fn version_zero_and_reconnect_reset_fail_closed() {
++        let mut state = ServerFramePacingState::new(1);
++        assert_eq!(state.begin_session(0, 1).negotiated_version, 0);
++        assert!(state.next_timesync_query(10).is_none());
++
++        assert_eq!(state.begin_session(1, 7).negotiated_version, 1);
++        let query = state.next_timesync_query(10).unwrap();
++        assert_eq!(query.query_sequence, 1);
++        state.end_session(6);
++        assert_eq!(state.snapshot().session_epoch, 7);
++        state.end_session(7);
++        assert_eq!(state.snapshot().negotiated_version, 0);
++
++        assert_eq!(state.begin_session(1, 8).session_epoch, 8);
++        assert_eq!(state.next_timesync_query(20).unwrap().query_sequence, 1);
++    }
++
++    #[test]
++    fn timesync_response_must_match_an_outstanding_query() {
++        let mut state = ServerFramePacingState::new(1);
++        state.begin_session(1, 9);
++        let query = state.next_timesync_query(123).unwrap();
++        let response = OxrsysFramePacingTimesyncResponse {
++            session_epoch: 9,
++            query_sequence: query.query_sequence,
++            server_send_time_ns: query.server_send_time_ns,
++            client_receive_time_ns: 200,
++            client_send_time_ns: 201,
++        };
++        assert!(state.accept_timesync_response(&response));
++        assert!(!state.accept_timesync_response(&response));
++
++        let query = state.next_timesync_query(456).unwrap();
++        assert!(
++            !state.accept_timesync_response(&OxrsysFramePacingTimesyncResponse {
++                server_send_time_ns: query.server_send_time_ns + 1,
++                query_sequence: query.query_sequence,
++                ..response
++            })
++        );
++    }
++
++    #[test]
++    fn reordered_or_wrong_epoch_feedback_is_rejected() {
++        let mut state = ServerFramePacingState::new(1);
++        state.begin_session(1, 9);
++        let packet = OxrsysFramePacingFrameFeedback {
++            session_epoch: 9,
++            feedback_sequence: 2,
++            frame_timestamp_ns: 3,
++            decode_complete_time_ns: 4,
++            acquire_time_ns: 5,
++            display_target_time_ns: 6,
++            predicted_display_time_ns: 7,
++            acquire_slack_ns: -8,
++            times_displayed: 1,
++            flags: 1,
++        };
++        assert!(state.accept_frame_feedback(&packet));
++        assert!(!state.accept_frame_feedback(&packet));
++        assert!(
++            !state.accept_frame_feedback(&OxrsysFramePacingFrameFeedback {
++                session_epoch: 8,
++                feedback_sequence: 3,
++                ..packet
++            })
++        );
++    }
++}
+diff --git a/alvr/server_core/src/lib.rs b/alvr/server_core/src/lib.rs
+index a1023203..5c6437a1 100644
+--- a/alvr/server_core/src/lib.rs
++++ b/alvr/server_core/src/lib.rs
+@@ -1,6 +1,7 @@
+ mod bitrate;
+ mod c_api;
+ mod connection;
++mod frame_pacing;
+ mod hand_gestures;
+ mod haptics;
+ mod input_mapping;
+@@ -14,7 +15,10 @@ pub use c_api::*;
+ pub use logging_backend::init_logging;
+ pub use tracking::HandType;
+ 
+-use crate::connection::VideoPacket;
++use crate::{
++    connection::VideoPacket,
++    frame_pacing::{FramePacingSnapshot, ServerFramePacingState},
++};
+ use alvr_common::{
+     dbg_server_core, error,
+     glam::Vec2,
+@@ -28,7 +32,8 @@ use alvr_events::{EventType, HapticsEvent};
+ use alvr_filesystem as afs;
+ use alvr_packets::{
+     BatteryInfo, ButtonEntry, ClientListAction, DecoderInitializationConfig, Haptics,
+-    VideoPacketHeader,
++    OxrsysFramePacingDisplayTiming, OxrsysFramePacingFrameFeedback, OxrsysFramePacingTimesyncQuery,
++    OxrsysFramePacingTimesyncResponse, VideoPacketHeader,
+ };
+ use alvr_server_io::ServerSessionManager;
+ use alvr_session::{CodecType, OpenvrProperty, Settings};
+@@ -42,7 +47,7 @@ use std::{
+     fs::File,
+     io::Write,
+     sync::{
+-        atomic::{AtomicBool, Ordering},
++        atomic::{AtomicBool, AtomicU8, Ordering},
+         mpsc::{self, SyncSender, TrySendError},
+         Arc, OnceLock,
+     },
+@@ -54,6 +59,20 @@ use tracking::TrackingManager;
+ 
+ static FILESYSTEM_LAYOUT: OnceLock<afs::Layout> = OnceLock::new();
+ 
++// OXRSys frame-pacing mode configured by the embedding runtime before alvr_initialize().
++// OFF keeps stock behavior (version 0 is advertised, so no client ever leaves the legacy path);
++// SHADOW/ACTIVE advertise version 1. The negotiated mode byte is echoed to the client so it can
++// distinguish telemetry-only (shadow) from closed-loop frame selection (active).
++static FRAME_PACING_MODE: AtomicU8 = AtomicU8::new(alvr_packets::OXRSYS_FRAME_PACING_MODE_OFF);
++
++pub fn set_frame_pacing_mode(mode: u8) {
++    FRAME_PACING_MODE.store(mode, Ordering::Relaxed);
++}
++
++pub fn frame_pacing_mode() -> u8 {
++    FRAME_PACING_MODE.load(Ordering::Relaxed)
++}
++
+ // This is lazily initialized when initializing logging or ServerCoreContext. So FILESYSTEM_LAYOUT
+ // needs to be initialized first using initialize_environment().
+ // NB: this must remain a global because only one instance should exist for the whole application
+@@ -99,6 +118,12 @@ pub enum ServerCoreEvent {
+     RestartPending,
+ }
+ 
++pub enum FramePacingEvent {
++    DisplayTiming(OxrsysFramePacingDisplayTiming),
++    TimesyncResponse(OxrsysFramePacingTimesyncResponse),
++    FrameFeedback(OxrsysFramePacingFrameFeedback),
++}
++
+ pub struct ConnectionContext {
+     events_sender: mpsc::Sender<ServerCoreEvent>,
+     statistics_manager: RwLock<Option<StatisticsManager>>,
+@@ -111,6 +136,9 @@ pub struct ConnectionContext {
+     clients_to_be_removed: Mutex<HashSet<String>>,
+     video_channel_sender: Mutex<Option<SyncSender<VideoPacket>>>,
+     haptics_sender: Mutex<Option<StreamSender<Haptics>>>,
++    frame_pacing_state: Mutex<ServerFramePacingState>,
++    frame_pacing_events_sender: SyncSender<FramePacingEvent>,
++    frame_pacing_timesync_sender: Mutex<Option<SyncSender<OxrsysFramePacingTimesyncQuery>>>,
+ }
+ 
+ pub fn create_recording_file(connection_context: &ConnectionContext, settings: &Settings) {
+@@ -180,6 +208,33 @@ pub struct ServerCoreContext {
+ 
+ impl ServerCoreContext {
+     pub fn new() -> (Self, mpsc::Receiver<ServerCoreEvent>) {
++        let (context, events_receiver, frame_pacing_receiver) = Self::new_internal(0);
++        drop(frame_pacing_receiver);
++        (context, events_receiver)
++    }
++
++    pub(crate) fn new_with_frame_pacing() -> (
++        Self,
++        mpsc::Receiver<ServerCoreEvent>,
++        mpsc::Receiver<FramePacingEvent>,
++    ) {
++        // OFF advertises version 0 so no client ever leaves the legacy path.
++        let supported_version = if frame_pacing_mode() == alvr_packets::OXRSYS_FRAME_PACING_MODE_OFF
++        {
++            0
++        } else {
++            alvr_packets::OXRSYS_FRAME_PACING_VERSION_1
++        };
++        Self::new_internal(supported_version)
++    }
++
++    fn new_internal(
++        frame_pacing_supported_version: u16,
++    ) -> (
++        Self,
++        mpsc::Receiver<ServerCoreEvent>,
++        mpsc::Receiver<FramePacingEvent>,
++    ) {
+         dbg_server_core!("Creating");
+ 
+         if SESSION_MANAGER
+@@ -195,6 +250,7 @@ impl ServerCoreContext {
+         SESSION_MANAGER.write().clean_client_list();
+ 
+         let (events_sender, events_receiver) = mpsc::channel();
++        let (frame_pacing_events_sender, frame_pacing_events_receiver) = mpsc::sync_channel(256);
+ 
+         // Create a temporary StatisticsManager until a headset connects
+         let initial_settings = SESSION_MANAGER.read().settings().clone();
+@@ -222,6 +278,11 @@ impl ServerCoreContext {
+             clients_to_be_removed: Mutex::new(HashSet::new()),
+             video_channel_sender: Mutex::new(None),
+             haptics_sender: Mutex::new(None),
++            frame_pacing_state: Mutex::new(ServerFramePacingState::new(
++                frame_pacing_supported_version,
++            )),
++            frame_pacing_events_sender,
++            frame_pacing_timesync_sender: Mutex::new(None),
+         });
+ 
+         let webserver_runtime = Runtime::new().unwrap();
+@@ -240,6 +301,7 @@ impl ServerCoreContext {
+                 webserver_runtime: Some(webserver_runtime),
+             },
+             events_receiver,
++            frame_pacing_events_receiver,
+         )
+     }
+ 
+@@ -256,6 +318,32 @@ impl ServerCoreContext {
+         }));
+     }
+ 
++    pub fn frame_pacing_snapshot(&self) -> FramePacingSnapshot {
++        self.connection_context.frame_pacing_state.lock().snapshot()
++    }
++
++    pub fn send_frame_pacing_timesync(&self, server_send_time_ns: u64) -> bool {
++        let Some(mut state) = self.connection_context.frame_pacing_state.try_lock() else {
++            return false;
++        };
++        let Some(packet) = state.next_timesync_query(server_send_time_ns) else {
++            return false;
++        };
++        drop(state);
++        let Some(sender_lock) = self
++            .connection_context
++            .frame_pacing_timesync_sender
++            .try_lock()
++        else {
++            return false;
++        };
++        let Some(sender) = &*sender_lock else {
++            return false;
++        };
++
++        sender.try_send(packet).is_ok()
++    }
++
+     pub fn get_device_motion(
+         &self,
+         device_id: u64,
+@@ -360,14 +448,33 @@ impl ServerCoreContext {
+         });
+     }
+ 
+-    pub fn send_video_nal(&self, target_timestamp: Duration, nal_buffer: Vec<u8>, is_idr: bool) {
+-        dbg_server_core!("send_video_nal");
++    pub fn send_video_nal(
++        &self,
++        target_timestamp: Duration,
++        nal_buffer: Vec<u8>,
++        is_idr: bool,
++    ) -> bool {
++        self.send_video_nal_paced(target_timestamp, 0, nal_buffer, is_idr)
++    }
++
++    pub fn send_video_nal_paced(
++        &self,
++        target_timestamp: Duration,
++        display_target_time_ns: u64,
++        nal_buffer: Vec<u8>,
++        is_idr: bool,
++    ) -> bool {
++        dbg_server_core!("send_video_nal_paced");
+ 
+         // start in the corrupts state, the client didn't receive the initial IDR yet.
+         static STREAM_CORRUPTED: AtomicBool = AtomicBool::new(true);
+         static LAST_IDR_INSTANT: Lazy<Mutex<Instant>> = Lazy::new(|| Mutex::new(Instant::now()));
+ 
+-        if let Some(sender) = &*self.connection_context.video_channel_sender.lock() {
++        let Some(sender_slot) = self.connection_context.video_channel_sender.try_lock() else {
++            return false;
++        };
++        let mut enqueued = false;
++        if let Some(sender) = &*sender_slot {
+             let buffer_size = nal_buffer.len();
+ 
+             if is_idr {
+@@ -414,22 +521,23 @@ impl ServerCoreContext {
+                     file.write_all(&nal_buffer).ok();
+                 }
+ 
+-                if matches!(
+-                    sender.try_send(VideoPacket {
+-                        header: VideoPacketHeader {
+-                            timestamp: target_timestamp,
+-                            is_idr
+-                        },
+-                        payload: nal_buffer,
+-                    }),
+-                    Err(TrySendError::Full(_))
+-                ) {
+-                    STREAM_CORRUPTED.store(true, Ordering::SeqCst);
+-                    self.connection_context
+-                        .events_sender
+-                        .send(ServerCoreEvent::RequestIDR)
+-                        .ok();
+-                    warn!("Dropping video packet. Reason: Can't push to network");
++                match sender.try_send(VideoPacket {
++                    header: VideoPacketHeader {
++                        timestamp: target_timestamp,
++                        is_idr,
++                    },
++                    display_target_time_ns,
++                    payload: nal_buffer,
++                }) {
++                    Ok(()) => enqueued = true,
++                    Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
++                        STREAM_CORRUPTED.store(true, Ordering::SeqCst);
++                        self.connection_context
++                            .events_sender
++                            .send(ServerCoreEvent::RequestIDR)
++                            .ok();
++                        warn!("Dropping video packet. Reason: Can't push to network");
++                    }
+                 }
+             } else {
+                 warn!("Dropping video packet. Reason: Waiting for IDR frame");
+@@ -444,6 +552,8 @@ impl ServerCoreContext {
+                     .report_frame_encoded(target_timestamp, encoder_latency, buffer_size);
+             }
+         }
++
++        enqueued
+     }
+ 
+     pub fn get_dynamic_encoder_params(&self) -> Option<DynamicEncoderParams> {
 diff --git a/alvr/server_core/src/tracking/mod.rs b/alvr/server_core/src/tracking/mod.rs
-index c6e7d02..ce47ee1 100644
+index c6e7d02b..ce47ee11 100644
 --- a/alvr/server_core/src/tracking/mod.rs
 +++ b/alvr/server_core/src/tracking/mod.rs
 @@ -354,10 +354,17 @@ pub fn tracking_loop(
@@ -419,7 +3388,7 @@ index c6e7d02..ce47ee1 100644
  
          let timestamp = tracking.target_timestamp;
 diff --git a/alvr/sockets/src/lib.rs b/alvr/sockets/src/lib.rs
-index ed9ffb2..90e12ce 100644
+index ed9ffb2b..90e12ce6 100644
 --- a/alvr/sockets/src/lib.rs
 +++ b/alvr/sockets/src/lib.rs
 @@ -2,10 +2,11 @@ mod backend;
@@ -548,7 +3517,7 @@ index ed9ffb2..90e12ce 100644
      Ok(())
  }
 diff --git a/alvr/sockets/src/stream_socket.rs b/alvr/sockets/src/stream_socket.rs
-index ce882fc..003c213 100644
+index ce882fc4..003c2137 100644
 --- a/alvr/sockets/src/stream_socket.rs
 +++ b/alvr/sockets/src/stream_socket.rs
 @@ -18,18 +18,23 @@
