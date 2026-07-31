@@ -117,7 +117,9 @@ in the git history; the ALVR backend below replaced it.)
 
 Hardware H.264 encode **works** under Rosetta
 (`UsingHardwareAcceleratedVideoEncoder=true`); only HEVC hardware encode is
-unavailable translated. The rest is subtler.
+unavailable translated (still true on macOS 27.0 beta — see the
+[2026-08-01 re-verification](#re-verified-on-macos-270-beta-26a5388g-2026-08-01)
+below). The rest is subtler.
 
 **Low-latency rate control: zero-chroma bug, root-caused and fixed.**
 `EnableLowLatencyRateControl` halves encode latency (~14.8 → 7.8 ms p50) but
@@ -132,7 +134,9 @@ Rosetta — undocumented: production VT users all feed 4:2:0. Report:
 Fix (oxrsys `47dc2a2`): 420v biplanar encoder pool + `rgb_to_nv12` Metal
 kernel (BT.709 video-range) on every compose path; LL-RC re-enabled with a
 retry-without fallback. Encode p50 **33 → 10.3 ms**, live motion-to-photon
-**311 → 79 ms**.
+**311 → 79 ms**. (Apple appears to have fixed the underlying VT bug on macOS
+27.0 beta — LL+BGRA now decodes healthy chroma — but the NV12 conversion stays;
+see the [re-verification](#re-verified-on-macos-270-beta-26a5388g-2026-08-01).)
 
 **ConstantBitRate — banned, but the stall claim was retracted (2026-07-04).**
 `kVTCompressionPropertyKey_ConstantBitRate` is still never used, but the
@@ -157,6 +161,42 @@ Adaptive bitrate feedback loop, not VT-side caps.
 `VTCompressionSessionEncodeFrame` hands the refcon to VT; LL-RC makes
 callbacks near-synchronous, so the callback (which frees the context) can run
 before `EncodeFrame` returns. Rule: all refcon writes precede submission.
+
+### Re-verified on macOS 27.0 beta (26A5388g), 2026-08-01
+
+Re-ran `tools/vt-llrc-probe` (rebuilt fresh, x86_64/Rosetta) plus one-off HEVC
+and per-frame-latency probes on the newer macOS beta. Three findings:
+
+- **The LL-RC zero-chroma "green" bug no longer reproduces.** LL+BGRA now
+  decodes healthy chroma (`Cb[42..236] Cr[60..245]`, deterministic across 4
+  runs) where it was previously `CHROMA DEAD`. Apple appears to have fixed VT's
+  internal RGB→YCbCr path under Rosetta. **We are not removing the NV12
+  conversion** — it's beta-only, could regress, is still needed on stable
+  macOS, and also fixes color-matrix correctness, not just the bug.
+
+- **Hardware HEVC is still unavailable under Rosetta — unchanged.** Creating a
+  session with `RequireHardwareAcceleratedVideoEncoder=YES` fails (H.264 succeeds;
+  HEVC returns -12908 classic / -12902 LL-RC). `VTCopyVideoEncoderList` under
+  x86_64 shows only `HEVC … hardware=no` (software); native arm64 on the same
+  machine shows `Apple HEVC (HW) … hardware=YES`, proving the silicon has the
+  encoder — VT just won't hand it to a translated process. The software HEVC
+  fallback is **~600 ms/frame p50** (40× over the 14 ms 72fps budget) and can't
+  use LL-RC at all, so it's not viable. This is *why* the native-arm64
+  out-of-process encoder (noted under the ALVR WiFi backend section) is the
+  real path to HEVC.
+
+- **"LL-RC has a worse latency tail" is an artifact, not a regression.**
+  Steady-state per-frame latency is identical to classic RC (~10 ms p50; both
+  flat ~9–11 ms from frame 6 on). The apparent gap is three separable things:
+  (1) a 5–6-frame warmup ramp (large IDR + HW spin-up) that dominates p95/max
+  in a 48-frame sample — LL-RC's ramp peaks lower but stays elevated longer,
+  inflating its p95; (2) the probe's classic-only `DataRateLimits` cap made the
+  original bitrate comparison unfair (fixed: same cap → same conclusion); and
+  (3) LL-RC **drops frames by design** to hold its latency ceiling — on the
+  probe's incompressible per-pixel-noise content it sheds every other frame from
+  ~frame 20 (14/48), while classic RC absorbs the load and drops none. Real
+  temporally-coherent game frames (~21 KB inter-frames here) don't trigger this,
+  which is why LL-RC+NV12 is the live production path.
 
 ## Gate 5 — decision — go with the D3D11 path
 
