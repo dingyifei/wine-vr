@@ -134,9 +134,11 @@ Rosetta — undocumented: production VT users all feed 4:2:0. Report:
 Fix (oxrsys `47dc2a2`): 420v biplanar encoder pool + `rgb_to_nv12` Metal
 kernel (BT.709 video-range) on every compose path; LL-RC re-enabled with a
 retry-without fallback. Encode p50 **33 → 10.3 ms**, live motion-to-photon
-**311 → 79 ms**. (Apple appears to have fixed the underlying VT bug on macOS
-27.0 beta — LL+BGRA now decodes healthy chroma — but the NV12 conversion stays;
-see the [re-verification](#re-verified-on-macos-270-beta-26a5388g-2026-08-01).)
+**311 → 79 ms**. (Apple fixed the underlying VT bug on macOS 27.0 beta — LL+BGRA now decodes
+healthy chroma — and the NV12 conversion was subsequently **removed** on the
+oxrsys `bgra-direct` branch; see the
+[re-verification](#re-verified-on-macos-270-beta-26a5388g-2026-08-01) and the
+decision note that follows it.)
 
 **ConstantBitRate — banned, but the stall claim was retracted (2026-07-04).**
 `kVTCompressionPropertyKey_ConstantBitRate` is still never used, but the
@@ -197,6 +199,22 @@ and per-frame-latency probes on the newer macOS beta. Three findings:
   ~frame 20 (14/48), while classic RC absorbs the load and drops none. Real
   temporally-coherent game frames (~21 KB inter-frames here) don't trigger this,
   which is why LL-RC+NV12 is the live production path.
+
+#### Decision update, 2026-08-01: NV12 conversion removed (supersedes the note above)
+
+The "we are not removing the NV12 conversion" position above was reversed the
+same day, with the color-matrix concern resolved by measurement rather than
+assumption. A new `tools/vt-llrc-probe --matrix` mode encodes flat color bands
+and compares decoded Y/Cb/Cr against the same BT.709 limited-range reference
+the `rgb_to_nv12` kernel implemented: on 26A5388g, VT's internal conversion of
+BGRA matches within ±1 across all bands (NV12 controls exact at 0.0;
+deterministic across runs, both classic and LL-RC). With correctness proven,
+the oxrsys `bgra-direct` branch deletes the kernel, the NV12 pool/plane views,
+and the convert pass; the BGRA composite target is now the encoder's
+CVPixelBuffer itself. Consequences: the pipeline **requires macOS 27+** under
+Rosetta (`doctor` checks this; older hosts must pin oxrsys ≤ `cf5f926`), and
+the fork carries the risk that the beta fix regresses before GA — re-run
+`--matrix` on each macOS beta bump.
 
 ## Gate 5 — decision — go with the D3D11 path
 

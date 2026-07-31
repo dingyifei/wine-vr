@@ -12,7 +12,7 @@ Beat Saber.exe (x64, CrossOver/Wine, Rosetta)
       └─ wineopenxr.dll (PE) ⇄ wineopenxr.so (unix side, same process)
             │  D3D11 → Metal via DXMT; swapchain images imported as MTLTextures (zero-copy)
             └─ oxrsys runtime (in-process dylib, x86_64 under Rosetta)
-                  └─ rgb_to_nv12 Metal kernel → VideoToolbox H.264 low-latency encode
+                  └─ BGRA composite → VideoToolbox H.264 low-latency encode (direct)
                         └─ embedded alvr_server_core ── WiFi ──► stock ALVR client (Quest 3)
 ```
 
@@ -36,11 +36,15 @@ root-owned system manifest `/usr/local/share/openxr/1/active_runtime.x86_64.json
 Rosetta, so the manifest points at an x86_64 build of the runtime, loaded
 in-process.
 
-On `xrEndFrame`, the runtime composites layers into a BGRA target, converts it
-to BT.709 video-range NV12 with the `rgb_to_nv12` Metal compute kernel (see
-[why NV12 input matters](apple-feedback-1-lowlatency-bgra-zero-chroma.md)),
-and encodes with a VideoToolbox H.264 session using
-`EnableLowLatencyRateControl`. `ConstantBitRate` is not used: Apple documents
+On `xrEndFrame`, the runtime composites layers into a BGRA target that is
+itself the encoder's CVPixelBuffer, and encodes with a VideoToolbox H.264
+session using `EnableLowLatencyRateControl`; VT performs the BT.709
+video-range RGB→YCbCr conversion internally (declared via session/buffer color
+attachments, verified numerically by `tools/vt-llrc-probe --matrix`). This
+requires macOS 27+: on earlier macOS under Rosetta, VT's internal conversion
+produced all-zero chroma, which is why a `rgb_to_nv12` Metal pre-convert
+kernel existed historically (see
+[the original bug report](apple-feedback-1-lowlatency-bgra-zero-chroma.md)). `ConstantBitRate` is not used: Apple documents
 it as incompatible with low-latency rate control (an earlier claim that it was
 accepted and then stalled was
 [retracted](apple-feedback-2-constantbitrate-pipeline-stall.md)). Encoded NALs

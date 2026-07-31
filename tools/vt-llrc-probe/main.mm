@@ -93,6 +93,31 @@ static void EncodeOutput(void* refCon, void* frameRefCon, OSStatus status, VTEnc
     }
 }
 
+// --matrix mode: flat vertical bands of known colors (no noise, no motion) so
+// the decoded planes can be compared numerically against the BT.709
+// limited-range reference below. Verifies WHICH matrix VT's internal RGB->YCbCr
+// applies to BGRA input — "chroma healthy" alone doesn't prove the values match
+// the BT.709 contract the streaming client decodes against.
+static bool gMatrixMode = false;
+static const int kBands = 8;
+static const uint8_t kBandRgb[kBands][3] = {
+    // r, g, b
+    { 255, 255, 255 }, // white
+    { 0, 0, 0 },       // black
+    { 128, 128, 128 }, // gray
+    { 255, 0, 0 },     // red
+    { 0, 255, 0 },     // green
+    { 0, 0, 255 },     // blue
+    { 255, 0, 255 },   // magenta
+    { 255, 128, 0 },   // orange
+};
+struct BandAccum
+{
+    double y = 0, cb = 0, cr = 0;
+    int64_t yn = 0, cn = 0;
+};
+static BandAccum gBands[kBands];
+
 // Per-pixel hash noise mixed over a strong-chroma base pattern. High entropy
 // forces the encoder against its bitrate budget (like real game content) so
 // rate-control latency behavior is exercised, not just pipeline latency.
@@ -108,6 +133,14 @@ static inline uint32_t Hash32(uint32_t v)
 
 static inline void PatternRgb(int x, int y, int frameIndex, uint8_t& r, uint8_t& g, uint8_t& b)
 {
+    if (gMatrixMode)
+    {
+        int band = std::min(x / (kWidth / kBands), kBands - 1);
+        r = kBandRgb[band][0];
+        g = kBandRgb[band][1];
+        b = kBandRgb[band][2];
+        return;
+    }
     int barX = (frameIndex * 37) % kWidth;
     if (x >= barX && x < barX + 120) { b = 255; g = 0; r = 255; }       // magenta bar
     else if (x < kWidth / 2)         { b = 0;   g = 128; r = 255; }     // orange
@@ -254,6 +287,40 @@ static void DecodeOutput(void* refCon, void*, OSStatus status, VTDecodeInfoFlags
             cbSum += cb; crSum += cr; cbCount++; crCount++;
         }
     }
+    if (gMatrixMode)
+    {
+        // Per-band means over the band interior (margin skips 4:2:0 filtering
+        // and codec ringing at band edges).
+        const int bandW = w / kBands;
+        const int lumaMargin = 24;
+        for (int band = 0; band < kBands; band++)
+        {
+            for (int yy = 0; yy < h; yy += 3)
+            {
+                const uint8_t* row = yBase + yy * yStride;
+                for (int xx = band * bandW + lumaMargin; xx < (band + 1) * bandW - lumaMargin; xx += 3)
+                {
+                    gBands[band].y += row[xx];
+                    gBands[band].yn++;
+                }
+            }
+        }
+        const int cBandW = cw / kBands;
+        const int chromaMargin = 12;
+        for (int band = 0; band < kBands; band++)
+        {
+            for (int yy = 0; yy < ch; yy += 3)
+            {
+                const uint8_t* row = cBase + yy * cStride;
+                for (int xx = band * cBandW + chromaMargin; xx < (band + 1) * cBandW - chromaMargin; xx += 3)
+                {
+                    gBands[band].cb += row[xx * 2 + 0];
+                    gBands[band].cr += row[xx * 2 + 1];
+                    gBands[band].cn++;
+                }
+            }
+        }
+    }
     stats->framesDecoded++;
     stats->y.mean = yCount ? ySum / yCount : 0;
     stats->cb.mean = cbCount ? cbSum / cbCount : 0;
@@ -271,6 +338,10 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
 {
     printf("\n=== %s ===\n", label);
     const int frameCount = (stallMode != 0) ? kFrames * 5 : kFrames;
+    for (auto& band : gBands)
+    {
+        band = BandAccum{};
+    }
 
     EncodedStream stream;
     NSMutableDictionary* encoderSpec = [@{
@@ -516,6 +587,31 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
     printf("  VERDICT: %s\n", chromaDead      ? "CHROMA DEAD (green bug)"
                               : chromaHealthy ? "chroma healthy"
                                               : "chroma SUSPICIOUS (low variance)");
+    if (gMatrixMode)
+    {
+        // Compare decoded per-band means against the BT.709 limited-range
+        // reference. A wrong matrix (601, full-range, or gamma-corrected
+        // conversion) shows up as double-digit deltas on the saturated bands.
+        const double kTolerance = 8.0;
+        double worst = 0.0;
+        printf("  band      expected Y/Cb/Cr    decoded Y/Cb/Cr       delta\n");
+        for (int band = 0; band < kBands; band++)
+        {
+            uint8_t eY, eCb, eCr;
+            Rgb709(kBandRgb[band][0], kBandRgb[band][1], kBandRgb[band][2], eY, eCb, eCr);
+            double dY = gBands[band].yn ? gBands[band].y / gBands[band].yn : -1;
+            double dCb = gBands[band].cn ? gBands[band].cb / gBands[band].cn : -1;
+            double dCr = gBands[band].cn ? gBands[band].cr / gBands[band].cn : -1;
+            double delta = std::max({ std::abs(dY - eY), std::abs(dCb - eCb), std::abs(dCr - eCr) });
+            worst = std::max(worst, delta);
+            printf("  #%d %3d/%3d/%3d -> %6.1f/%6.1f/%6.1f  max|d|=%5.1f\n",
+                   band, eY, eCb, eCr, dY, dCb, dCr, delta);
+        }
+        printf("  MATRIX VERDICT: %s (worst delta %.1f, tolerance %.0f)\n",
+               worst <= kTolerance ? "BT.709 limited-range MATCH" : "MISMATCH — do not trust VT's internal conversion",
+               worst, kTolerance);
+        return worst <= kTolerance;
+    }
     return true;
 }
 
@@ -528,12 +624,17 @@ int main(int argc, char** argv)
         {
             cbrMode = true;
         }
+        else if (strcmp(argv[i], "--matrix") == 0)
+        {
+            gMatrixMode = true;
+        }
         else
         {
             fprintf(stderr,
-                    "usage: %s [--cbr]\n"
+                    "usage: %s [--cbr | --matrix]\n"
                     "  (default)  chroma matrix: {LL-RC on/off} x {BGRA/NV12 input}\n"
-                    "  --cbr      ConstantBitRate callback accounting (stall claim retracted)\n",
+                    "  --cbr      ConstantBitRate callback accounting (stall claim retracted)\n"
+                    "  --matrix   flat color bands; verify decoded YCbCr matches BT.709 limited-range\n",
                     argv[0]);
             return 2;
         }
@@ -555,6 +656,17 @@ int main(int argc, char** argv)
             RunConfig(true, true, "LOW-LATENCY RC + NV12 (control, no CBR)", 1);
             RunConfig(true, true, "LOW-LATENCY RC + NV12 + ConstantBitRate", 2);
             RunConfig(false, false, "PRODUCTION MIRROR: classic RC + BGRA + CABAC + 1.5x limits + CBR", 3);
+        }
+        else if (gMatrixMode)
+        {
+            // NV12 configs are self-consistency controls (we feed exact BT.709
+            // values); the BGRA configs measure VT's internal conversion.
+            int failures = 0;
+            failures += !RunConfig(false, true, "MATRIX: classic RC + NV12 (control)");
+            failures += !RunConfig(true, true, "MATRIX: LOW-LATENCY RC + NV12 (control)");
+            failures += !RunConfig(false, false, "MATRIX: classic RC + BGRA (VT internal conversion)");
+            failures += !RunConfig(true, false, "MATRIX: LOW-LATENCY RC + BGRA (VT internal conversion)");
+            printf("\nmatrix summary: %d of 4 configs failed\n", failures);
         }
         else
         {

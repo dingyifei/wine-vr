@@ -11,7 +11,7 @@ Beat Saber.exe (x64, Wine, Rosetta)
   └─ openxr_loader.dll → wineopenxr.dll (PE) ⇄ wineopenxr.so (unix, same process)
         │  D3D11 → Metal via DXMT fork; swapchain images imported as MTLTextures (zero-copy)
         └─ oxrsys runtime (in-process x86_64 dylib)
-              └─ rgb_to_nv12 Metal kernel → VideoToolbox H.264 LL encode
+              └─ BGRA composite → VideoToolbox H.264 LL encode (direct, no NV12 pre-convert)
                     └─ embedded alvr_server_core (Rust, C API) ── WiFi ──► ALVR client v20.14.1 (Quest 3)
 ```
 
@@ -95,7 +95,7 @@ When adding a new requirement to the pipeline, add a `doctor` section with a one
 ## Constraints that look wrong but aren't
 
 - **x86_64 is load-bearing everywhere.** The whole Wine process runs under Rosetta; oxrsys, the ALVR core, and the VideoToolbox probes are all deliberately x86_64. The VT chroma bug does not reproduce on arm64. Debug is the live-verified build type.
-- **VideoToolbox under Rosetta:** H.264 only (no hardware HEVC); the LL-RC encoder must be fed NV12 (BGRA input → all-zero chroma, green video); LL-RC rejects `ConstantBitRate` with -12900. All frame-context writes must happen **before** `VTCompressionSessionEncodeFrame` — LL-RC callbacks are near-synchronous (use-after-free postmortem, oxrsys 47dc2a2). Since the oxrsys 1.3.0 merge, codec choice is negotiated with the client (`CodecSelect.h`), but the Rosetta constraint filters every rung — H.264 is always what the demo path encodes, regardless of the `video_codec` config.
+- **VideoToolbox under Rosetta:** H.264 only (no hardware HEVC); LL-RC rejects `ConstantBitRate` with -12900. **Requires macOS 27+**: the encoder feeds BGRA directly (oxrsys branch `bgra-direct` removed the historical `rgb_to_nv12` pre-convert) and VT's internal RGB→YCbCr under Rosetta produced all-zero chroma (green video) before macOS 27 — `doctor` checks the OS version; `tools/vt-llrc-probe --matrix` verifies the BT.709 limited-range conversion. All frame-context writes must happen **before** `VTCompressionSessionEncodeFrame` — LL-RC callbacks are near-synchronous (use-after-free postmortem, oxrsys 47dc2a2). Since the oxrsys 1.3.0 merge, codec choice is negotiated with the client (`CodecSelect.h`), but the Rosetta constraint filters every rung — H.264 is always what the demo path encodes, regardless of the `video_codec` config.
 - **Beat Saber must be exactly 1.29.4** — first native-OpenXR build, and newer builds hard-crash on the Meta account gate. DRM is satisfied offline by Goldberg (`run` swaps `steam_api64.dll`); no real Steam ever runs.
 - Interop traps in the bridge: non-sRGB swapchain format only (sRGB trips `ImportMTLTexture2D`), app OpenXR apiVersion 1.1.0, swapchain textures need `MTLTextureUsagePixelFormatView`.
 - The zsh scripts use `print -r` deliberately (echo mangles backslashes in Windows paths) and zsh array semantics — keep both when editing.

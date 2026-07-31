@@ -55,3 +55,7 @@ the stall was misattributed to CBR.
 
 *The companion report `apple-feedback-1-lowlatency-bgra-zero-chroma.md` is unaffected: its bug
 (LL-RC + BGRA → all-zero chroma) reproduces on every run of the probe's default mode.*
+
+*(2026-08-01 update: that last statement was true when written but is now macOS-version-dependent —
+Apple fixed the zero-chroma bug on macOS 27.0 beta 26A5388g. See the re-verification and decision
+note in `bridge-findings.md`; the probe's default mode reports "chroma healthy" for LL+BGRA there.)*

@@ -19,7 +19,7 @@ start is in the [top-level README](../README.md).
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Green or corrupted stream | Historical VideoToolbox low-latency + BGRA zero-chroma bug, fixed by feeding the encoder NV12 input. Only reappears if that fix is reverted | Keep the pinned `oxrsys-v20.14.1` ALVR branch (`./demo.sh setup` restores it). Background: [low-latency BGRA zero-chroma report](apple-feedback-1-lowlatency-bgra-zero-chroma.md) |
+| Green or corrupted stream | Host macOS older than 27: the encoder feeds BGRA directly (the `rgb_to_nv12` pre-convert was removed after Apple fixed VT's internal conversion in macOS 27) and older VT under Rosetta produces all-zero chroma | Upgrade the host to macOS 27+, or pin oxrsys back to the NV12-era revision (`cf5f926` or earlier). `doctor` FAILs on macOS < 27; verify with `tools/vt-llrc-probe --matrix`. Background: [low-latency BGRA zero-chroma report](apple-feedback-1-lowlatency-bgra-zero-chroma.md) |
 
 ## Network / streaming
 

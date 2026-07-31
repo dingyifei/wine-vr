@@ -6,6 +6,12 @@ print "== wine-vr demo doctor =="
 # 1. hardware / OS
 if [ "$(uname -m)" = "arm64" ]; then ok "Apple Silicon ($(sysctl -n machdep.cpu.brand_string 2>/dev/null))"
 else fail "not an Apple Silicon Mac ($(uname -m))" "this demo requires an arm64 Mac"; fi
+# BGRA-direct encoding (oxrsys bgra-direct, no NV12 pre-convert) needs VT's fixed
+# internal RGB->YCbCr under Rosetta — macOS 27+ only; older VT emits all-zero chroma.
+OSVER="$(sw_vers -productVersion 2>/dev/null || echo 0)"
+if printf '%s\n27\n' "${OSVER%%.*}" | sort -n | tail -1 | grep -qx "${OSVER%%.*}"; then
+  ok "macOS $OSVER (>= 27: VT encodes BGRA directly under Rosetta)"
+else fail "macOS $OSVER < 27 — BGRA-direct encode produces green video (VT zero-chroma bug)" "upgrade to macOS 27+, or pin ext/oxrsys back to the NV12-era revision cf5f926"; fi
 
 # 2. CrossOver
 if [ -n "${CX_APP:-}" ]; then
