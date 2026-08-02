@@ -11,7 +11,7 @@ else fail "not an Apple Silicon Mac ($(uname -m))" "this demo requires an arm64 
 OSVER="$(sw_vers -productVersion 2>/dev/null || echo 0)"
 if printf '%s\n27\n' "${OSVER%%.*}" | sort -n | tail -1 | grep -qx "${OSVER%%.*}"; then
   ok "macOS $OSVER (>= 27: VT encodes BGRA directly under Rosetta)"
-else fail "macOS $OSVER < 27 — BGRA-direct encode produces green video (VT zero-chroma bug)" "upgrade to macOS 27+, or pin ext/oxrsys back to the NV12-era revision cf5f926"; fi
+else fail "macOS $OSVER < 27 — in-process BGRA-direct encode produces green video (VT zero-chroma bug); the in-process fallback needs macOS 27+ even with the native helper (native helper path unaffected)" "upgrade to macOS 27+, or pin ext/oxrsys back to the NV12-era revision cf5f926"; fi
 
 # 2. CrossOver
 if [ -n "${CX_APP:-}" ]; then
@@ -93,6 +93,13 @@ for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_S
   if [ -f "$f" ]; then ok "built: ${f#$ROOT/}"
   else fail "missing build output: ${f#$ROOT/}" "./demo.sh build"; fi
 done
+# 9b. native-arm64 encoder helper (staged next to the runtime dylib — the runtime
+# locates it beside its own dylib; helper has no probe flag, so checks stop at arch)
+if [ -f "$OXR_HELPER_BIN" ]; then
+  ok "built: ${OXR_HELPER_BIN#$ROOT/} (staged next to the runtime dylib)"
+  if lipo -archs "$OXR_HELPER_BIN" 2>/dev/null | grep -qw arm64; then ok "encoder helper is arm64"
+  else fail "encoder helper is not arm64 ($(lipo -archs "$OXR_HELPER_BIN" 2>/dev/null)) — a manual build-x64 build emits an x86_64 helper here and clobbers the staged one" "./demo.sh build (restages the arm64 helper)"; fi
+else fail "encoder helper not staged: ${OXR_HELPER_BIN#$ROOT/}" "./demo.sh build"; fi
 
 # 10. global bridge overlay (a CrossOver update silently reverts these)
 if [ -n "${CX_APP:-}" ]; then

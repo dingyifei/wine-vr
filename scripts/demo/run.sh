@@ -49,6 +49,20 @@ case "$PROTOCOL" in
   *) die "oxrsys-runtime.toml protocol='$PROTOCOL' is not valid for the demo
        set protocol = \"alvr\" in $TOML (or delete the file and re-run ./demo.sh setup)" ;;
 esac
+# encoder_process: the runtime spawns/owns the native-arm64 helper itself; we only
+# verify the staged binary is launchable. Missing key = code default "auto".
+ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
+ENCODER_PROC="${ENCODER_PROC:-auto}"
+case "$ENCODER_PROC" in
+  native)
+    { [ -x "$OXR_HELPER_BIN" ] && lipo -archs "$OXR_HELPER_BIN" 2>/dev/null | grep -qw arm64; } || \
+      die "encoder_process=native but the arm64 helper is missing/not executable at $OXR_HELPER_BIN — ./demo.sh build" ;;
+  auto)
+    [ -x "$OXR_HELPER_BIN" ] || \
+      warn "encoder helper not staged at $OXR_HELPER_BIN — encoder_process=auto falls back to in-process encode (./demo.sh build stages it)" ;;
+  inproc) info "encoder_process=inproc — in-process x86_64 encode (native helper disabled)" ;;
+  *) warn "oxrsys-runtime.toml encoder_process='$ENCODER_PROC' unrecognized — the runtime treats unknown values as auto" ;;
+esac
 
 # ---- reset the bottle's wineserver (stale servers + steam locks hang startup) ---
 print -r -- "-- resetting wineserver for bottle '$WINEVR_BOTTLE'"
@@ -92,12 +106,19 @@ stop_dashboard() {
   fi
   DASHBOARD_PID=""
 }
+# Safety net only: the runtime spawns and owns the encoder helper (it dies with the
+# game); reap one left over if the game process died uncleanly.
+stop_helper() {
+  if pgrep -f "$OXR_HELPER_BIN" >/dev/null 2>&1; then
+    pkill -f "$OXR_HELPER_BIN" 2>/dev/null && print "encoder helper: reaped (left over from the runtime)"
+  fi
+}
 # INT/TERM: tear the game down (wineserver -k) and restore audio, then resignal so
 # the script exits with the right status. Wine runs as a background job below and
 # the script waits on it, so zsh delivers these traps immediately on a signal.
-trap 'stop_dashboard; restore_audio' EXIT
-trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; stop_dashboard; restore_audio; trap - INT;  kill -INT  $$' INT
-trap 'print -r -- "-- terminated: stopping wine"; stop_wine; stop_dashboard; restore_audio; trap - TERM; kill -TERM $$' TERM
+trap 'stop_dashboard; stop_helper; restore_audio' EXIT
+trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - INT;  kill -INT  $$' INT
+trap 'print -r -- "-- terminated: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - TERM; kill -TERM $$' TERM
 if [ -n "${WINEVR_NO_AUDIO:-}" ]; then
   info "audio routing disabled (--no-audio) — sound stays on the Mac"
 elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then

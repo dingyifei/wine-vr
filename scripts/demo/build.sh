@@ -20,6 +20,21 @@ cmake -S "$OXRSYS" -B "$OXR_BUILD" -G Ninja \
 cmake --build "$OXR_BUILD" -j8
 ok "oxrsys built"
 
+# Encoder helper: must be native arm64 (HW HEVC is Rosetta-blocked), so the x86_64
+# tree above cannot build it — a dedicated minimal arm64 tree does (no ALVR core;
+# keeps configure/build fast). The runtime finds the helper NEXT TO its own dylib,
+# so stage it into build-x64/runtime/.
+info "building oxrsys encoder helper (build-helper-arm64: Ninja, Debug, arm64)..."
+cmake -S "$OXRSYS" -B "$OXR_HELPER_BUILD" -G Ninja \
+  -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=arm64 -DOXRSYS_BUILD_ENCODER_HELPER=ON \
+  >/dev/null
+cmake --build "$OXR_HELPER_BUILD" --target oxrsys_encoder_helper -j8
+[ -f "$OXR_HELPER_BIN_BUILT" ] || die "encoder helper build produced no binary at $OXR_HELPER_BIN_BUILT"
+lipo -archs "$OXR_HELPER_BIN_BUILT" 2>/dev/null | grep -qw arm64 || \
+  die "encoder helper is not arm64 ($(lipo -archs "$OXR_HELPER_BIN_BUILT" 2>/dev/null)) — delete $OXR_HELPER_BUILD and re-run ./demo.sh build"
+install_if_changed "$OXR_HELPER_BIN_BUILT" "$OXR_HELPER_BIN"
+ok "encoder helper built (arm64) and staged next to the runtime dylib"
+
 info "building wineopenxr (PE dll via mingw + unix .so)..."
 cmake -S "$WOXR" -B "$WOXR/build" >/dev/null
 cmake --build "$WOXR/build" -j8
@@ -31,7 +46,7 @@ info "building ALVR server dashboard (release)..."
   die "alvr_dashboard build failed — retry with: (cd ext/ALVR && cargo build -p alvr_dashboard --release)"
 ok "ALVR dashboard built"
 
-for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$WOXR_DLL" "$WOXR_SO" "$ALVR_DASHBOARD_BIN"; do
+for f in "$OXR_DYLIB" "$OXR_ALVR_DYLIB" "$OXR_RUNTIME_JSON" "$OXR_HELPER_BIN" "$WOXR_DLL" "$WOXR_SO" "$ALVR_DASHBOARD_BIN"; do
   [ -f "$f" ] || die "expected build output missing: $f"
 done
 ok "all build outputs present"

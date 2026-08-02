@@ -37,6 +37,12 @@ OXR_BUILD="$OXRSYS/build-x64"
 OXR_DYLIB="$OXR_BUILD/runtime/liboxrsys-runtime.dylib"
 OXR_ALVR_DYLIB="$OXR_BUILD/runtime/libalvr_server_core.dylib"
 OXR_RUNTIME_JSON="$OXR_BUILD/runtime/oxrsys-runtime.json"
+# Native-arm64 encoder helper: built in its own minimal arm64 tree (NOT ext/oxrsys/build,
+# that's the dev/test tree), then staged next to the runtime dylib in build-x64 — the
+# x86_64 runtime locates it beside its own dylib at runtime (dladdr/ModuleDirectory).
+OXR_HELPER_BUILD="$OXRSYS/build-helper-arm64"
+OXR_HELPER_BIN_BUILT="$OXR_HELPER_BUILD/runtime/oxrsys-encoder-helper"
+OXR_HELPER_BIN="$OXR_BUILD/runtime/oxrsys-encoder-helper"
 WOXR_DLL="$WOXR/build/src/pe/wineopenxr.dll"
 WOXR_SO="$WOXR/build/src/unix/wineopenxr.so"
 # Native-arch GUI; talks to the embedded server over 127.0.0.1:8082, so it does

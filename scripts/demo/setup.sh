@@ -51,8 +51,11 @@ else
 [streaming]
 protocol = "alvr"     # embedded ALVR core; stock ALVR Quest client connects over WiFi
 bitrate_mbps = 42
+encoder_process = "auto"   # "auto" | "native" (arm64 helper, HW HEVC) | "inproc" (x86_64, H.264)
 EOF
-  ok "wrote $TOML (protocol=alvr, 42 Mbps)"
+  # Deployed configs that predate encoder_process are left untouched (write-once);
+  # the runtime's code default is the same "auto".
+  ok "wrote $TOML (protocol=alvr, 42 Mbps, encoder_process=auto)"
 fi
 info "note: the embedded ALVR core keeps its session.json under '$OXR_APPSUP/alvr/' — auto-created on first run, LAN clients auto-trusted"
 
