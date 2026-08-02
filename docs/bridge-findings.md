@@ -428,3 +428,39 @@ helper design moves to bootstrap-based rendezvous.
 Gate B2 verdict: **PASS** — the foreign-surface wrap-once seam is
 production-viable; hardware HEVC LL-RC encodes parent-written surfaces
 cross-arch with correct color.
+
+## Gates D/E/F — native helper LIVE (2026-08-03)
+
+USB-wired session (adb forward tcp:9943/9944 + `client.wired` pinned to
+127.0.0.1 — the ALVR wired shape; the "searching for streamer" WiFi symptom
+earlier that night was these same leftover adb forwards squatting the Mac's
+ports). Helper spawned by the runtime from INSIDE the Wine process via
+posix_spawn (`arm64 native, capsH264=0x3 capsH265=0x3`).
+
+- **Gate D (helper H.264, isolates IPC) PASS**: enc totalMs p50 24-35ms /
+  p95 28-40ms — same band as the in-process baseline (~35-40ms), 0-2 drops/s.
+  Live IPC cost is invisible, as Gates B/C predicted. Corollary: the "~25ms
+  Rosetta conversion penalty" is mostly VT's conversion contending with the
+  game's GPU load — native VT pays it too under load; the remaining encoder
+  lever is the NV12 Metal kernel in the parent (untested trade), not the arch.
+- **Gate E (helper HEVC) PASS — the codec thesis confirmed**: 30s dashboard
+  sample (n=1997): total M2P **93.5ms p50** (vs ~114ms H.264/WiFi baseline);
+  Quest decoder **16.6ms p50** (was ~28-32); decoder_queue **1.1ms p50** (was
+  ~30 — collapsed exactly as predicted: HEVC decodes faster than realtime so
+  the queue can't build). decode+queue: ~55-60ms → ~18ms. Note vsync_queue
+  22.9ms p50 — frames now arrive EARLY and wait for display; frame-pacer
+  tuning could reclaim another ~10-15ms. Encoder unchanged (37.6ms p50);
+  native encoder sheds ~6 frames/s pushing against the 80Mbps cap (its quality
+  floor is higher than Rosetta's — bitrate/preset tuning open).
+- **Gate F (SIGKILL helper mid-HEVC-stream) PASS**: EOF detected → in-flight
+  frames reclaimed → new helper up and HEVC re-ready **383ms** after the kill
+  → codec config re-sent → stream continued; EndFrame never blocked, tracking
+  uninterrupted, "failure 1 this session" budget accounting correct. Same-codec
+  respawn, no codec flip needed. (Cosmetic: "VideoEncoder: Shut down" logs
+  twice during the swap.) Parent-kill and generation-chaos legs deferred to
+  the soak gate.
+
+Deployed config now ships `encoder_process = "auto"` + `video_codec = "auto"`.
+Player verdict: "feels rly good" — and Gate D over USB already felt better
+tracking-wise (wired network 2.7ms p50 vs WiFi ~6ms spiky, independent of
+codec).
