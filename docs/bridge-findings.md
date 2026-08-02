@@ -216,6 +216,18 @@ Rosetta (`doctor` checks this; older hosts must pin oxrsys ≤ `cf5f926`), and
 the fork carries the risk that the beta fix regresses before GA — re-run
 `--matrix` on each macOS beta bump.
 
+Live-verified 2026-08-02 (Quest 3, stock client, 3008x1664@72): colors
+correct, 72 fps, zero packet loss. A same-day live A/B against the NV12-era
+build (only the encoder reverted) measured a real latency cost that the
+CPU-written offline probe cannot see: VT's internal RGB→YCbCr of
+**GPU-written** IOSurfaces under Rosetta takes ~25 ms inside VT (vs ~2 ms for
+the old Metal kernel), so encode is ~35-40 ms vs ~13-22 ms and client-measured
+motion-to-photon ~114 ms vs ~82-96 ms. **Accepted** (decision 2026-08-02) in
+favor of the simpler path — the NV12 kernel was retroactively also a Rosetta
+performance optimization, and the planned native-arm64 out-of-process encoder
+is the roadmap item that recovers the latency (plus HW HEVC). Merged to fork
+main as `ab070b8`.
+
 ## Gate 5 — decision — go with the D3D11 path
 
 The original Vulkan+winevulkan plan is unnecessary: the D3D11 path works
