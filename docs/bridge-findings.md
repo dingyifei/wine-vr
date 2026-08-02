@@ -358,3 +358,73 @@ build). Results:
 Gate A verdict: **PASS** — existence proof complete (native HW HEVC LL-RC +
 IDR contract + color), with the latency criterion explicitly deferred to the
 live gates per the both-ways probe/live divergence above.
+
+## Gate B/B2 — cross-arch IPC + the foreign-surface VT seam (2026-08-03)
+
+`tools/xarch-ipc-probe` (one source, two builds): an x86_64 parent
+(simulating the Rosetta/Wine runtime) spawns the arm64 build as the future
+encoder helper, hands it 3 IOSurface-backed 32BGRA 3008x1664 CVPixelBuffers
+by Mach send right, and drives the production frame loop across the arch
+boundary — parent GPU-writes, socketpair notify after the command buffer's
+completed handler, child verifies/encodes. Logs:
+`evidence/xarch-ipc-probe-gateB-100k.log`, `-gateB2-noise.log`,
+`-gateB2-matrix.log`.
+
+- **The preferred rendezvous route is dead — by XPC poisoning, not by
+  rendezvous.** Installing the parent's receive right as the child's
+  bootstrap port (`posix_spawnattr_setspecialport_np(TASK_BOOTSTRAP_PORT)`)
+  delivers the check-in message fine, but libxpc latches the bootstrap port
+  during libSystem init, before `main()`; restoring the real port afterwards
+  (sent by the parent in the first Mach message, then
+  `task_set_special_port` + `bootstrap_port`) does not heal it. The child's
+  first XPC-touching call hangs forever — concretely
+  `IOSurfaceLookupFromMachPort → os_log_create → _os_trace_get_logd_port →
+  bootstrap_look_up2` against a port nobody launchd-serves (sampled stack in
+  the probe header). Metal's shader compiler and VideoToolbox sit behind the
+  same door, so this route cannot host an encoder helper unless the parent
+  proxies the launchd protocol. The probe detects the hang with a 10 s
+  watchdog (`_exit(3)`) and falls back automatically.
+- **The fallback is the design: bootstrap namespace left intact.** Child
+  `bootstrap_register`s a per-spawn name (`xarch-ipc-probe.<pid>.<seq>`),
+  parent `bootstrap_look_up`s it — worked first try, every spawn (11
+  spawns/run). `bootstrap_register` is deprecated; the production helper
+  should invert it (parent `bootstrap_check_in` a well-known per-pid name
+  before spawning, child looks it up), same namespace-intact principle.
+- **IOSurface transfer + rotation: 100,000/100,000 rotations, zero stale.**
+  Each surface validated in the child (3008x1664 'BGRA', rowBytes 12032,
+  alloc 20 021 312) and re-verified per rotation by a child-side Metal
+  compute pass over all 5M pixels (frame index encoded in a pixel block and
+  hashed into every pixel). Notify+verify round-trip p50 0.76 ms / p95
+  4.2 ms / p99 5.4 ms / max 7.9 ms — the IPC hop itself is noise against a
+  13.9 ms frame budget (early Gate C signal).
+- **Kill/respawn leaks nothing.** 5 cycles of SIGKILL mid-stream (frames in
+  flight) → respawn → re-register the same surfaces → 200/200 clean
+  rotations. Parent Mach port count flat at 69 across all 5 cycles;
+  parent-held IOSurfaces unaffected by child death.
+- **Clock-domain trap for the helper protocol:** `mach_absolute_time` ticks
+  are not comparable across the Rosetta boundary — the x86_64 side sees a
+  1/1 ns timebase, native arm64 125/3. First B2 run produced 7.7e14 ms
+  "latencies". Wire timestamps must be normalized (we use nanoseconds);
+  same underlying counter, so deltas are then valid cross-process.
+- **Gate B2 — hardware HEVC accepts foreign surfaces.** The child wraps each
+  received IOSurface once with `CVPixelBufferCreateWithIOSurface` (+ BT.709
+  ShouldPropagate attachments) and feeds the wrapped buffers to a
+  hardware-required HEVC Main LL-RC session
+  (`com.apple.videotoolbox.videoencoder.hevc.rtvc`, Gate A property set):
+  300/300 frames accounted, decode-back chroma healthy, and the flat-band
+  pass decodes to BT.709 limited-range with worst band delta 1.0/255
+  (tolerance 8), 0 drops at 0.2 Mbps (static content). GPU-done →
+  child-VT-callback p50 15.7 ms / p95 19.7 ms / p99 67 ms on band content;
+  noise content reproduces Gate A's native-HEVC floor exactly (ran ~80 Mbps
+  against the 42 Mbps target, shed 143/300) — Gate E bitrate tuning, not a
+  seam problem. Two arm64 LL-RC quirks: `PrioritizeEncodingSpeedOverQuality`
+  is rejected (-12900), and the `UsingHardwareAcceleratedVideoEncoder`
+  query itself fails (-12900) — hardware is proven by the
+  RequireHardware create succeeding plus the rtvc encoder ID.
+
+Gate B verdict: **PASS** — via the bootstrap-namespace route; the
+special-port route is a documented FAIL (rendezvous works, XPC dies) and the
+helper design moves to bootstrap-based rendezvous.
+Gate B2 verdict: **PASS** — the foreign-surface wrap-once seam is
+production-viable; hardware HEVC LL-RC encodes parent-written surfaces
+cross-arch with correct color.

@@ -24,7 +24,10 @@ BeatSaberVersion.txt
 
 # Tool binaries (sources are tracked)
 tools/vt-llrc-probe/vt-llrc-probe
+tools/vt-llrc-probe/vt-llrc-probe-arm64
 tools/alvr-smoke/alvr-smoke
+tools/xarch-ipc-probe/xarch-ipc-probe
+tools/xarch-ipc-probe/xarch-ipc-probe-arm64
 
 # macOS
 .DS_Store
