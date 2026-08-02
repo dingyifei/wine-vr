@@ -12,12 +12,28 @@
 // 2026-07-04 — no config stalls (classic RC accepts-and-ignores CBR, LL-RC
 // rejects it -12900). See docs/apple-feedback-2-constantbitrate-pipeline-stall.md.
 //
-// Built x86_64 so it reproduces the Rosetta translation environment of the
-// wine-hosted encoder.
+// --gpu mode (Gate A of the native-arm64 encoder plan): frames are GPU-WRITTEN
+// by a Metal compute kernel into 3 rotating IOSurface-backed BGRA pixel buffers,
+// and VTCompressionSessionEncodeFrame is called from the command buffer's
+// completed handler — mirroring the production oxrsys encoder. CPU-written
+// buffers CANNOT reproduce VT's GPU-surface conversion cost under Rosetta
+// (live A/B 2026-08-02: ~25ms in VT vs 13.5ms CPU-probe at the same config),
+// so only --gpu numbers are latency-representative. --gpu also encodes HEVC
+// with the hardware encoder REQUIRED, forces a mid-run IDR, and verifies
+// sync-frame + parameter-set (VPS/SPS/PPS) re-emission — the LL-RC keyframe
+// contract the out-of-process helper depends on.
+//
+// Build (x86_64 reproduces the Rosetta/wine environment; arm64 is the native
+// helper environment the Gate A probe certifies):
+//   clang++ -arch x86_64 -std=c++17 -fobjc-arc -O2 main.mm -o vt-llrc-probe \
+//     -framework VideoToolbox -framework CoreMedia -framework CoreVideo \
+//     -framework Foundation -framework Metal
+//   clang++ -arch arm64 ... -o vt-llrc-probe-arm64   (same flags otherwise)
 
 #import <CoreMedia/CoreMedia.h>
 #import <CoreVideo/CoreVideo.h>
 #import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
 #import <VideoToolbox/VideoToolbox.h>
 
 #include <algorithm>
@@ -27,8 +43,8 @@
 #include <thread>
 #include <vector>
 
-static const int kWidth = 2496;
-static const int kHeight = 1312;
+static int gWidth = 2496;
+static int gHeight = 1312;
 static const int kFps = 72;
 static const int kFrames = 48;
 static const int kBitrate = 42 * 1000 * 1000;
@@ -46,14 +62,22 @@ struct EncodedStream
     int64_t totalBytes = 0;
     // Encode latency: submit time per frame index (pts.value), delta measured
     // in the output callback. This is the stage where low-latency RC differs.
+    // In --gpu mode the "submit" time is the Metal command buffer's completion,
+    // so the reported latency is GPU-done -> VT callback (the production span).
     std::vector<std::chrono::steady_clock::time_point> submitTimes;
     std::vector<double> latenciesMs;
+    std::vector<int64_t> idrPts; // pts of sync samples (IDR verification)
+    dispatch_semaphore_t slotSem = nullptr; // --gpu: released once per callback
 };
 
 static void EncodeOutput(void* refCon, void* frameRefCon, OSStatus status, VTEncodeInfoFlags infoFlags,
                          CMSampleBufferRef sampleBuffer)
 {
     auto* stream = (EncodedStream*)refCon;
+    if (stream->slotSem != nullptr)
+    {
+        dispatch_semaphore_signal(stream->slotSem);
+    }
     if (status != noErr)
     {
         stream->errorCount++;
@@ -69,6 +93,22 @@ static void EncodeOutput(void* refCon, void* frameRefCon, OSStatus status, VTEnc
         return;
     }
     stream->callbackCount++;
+    // Sync-sample (IDR) detection: absent NotSync attachment means keyframe.
+    {
+        CFArrayRef atts = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, false);
+        bool notSync = false;
+        if (atts != nullptr && CFArrayGetCount(atts) > 0)
+        {
+            CFDictionaryRef d = (CFDictionaryRef)CFArrayGetValueAtIndex(atts, 0);
+            CFTypeRef v = d ? CFDictionaryGetValue(d, kCMSampleAttachmentKey_NotSync) : nullptr;
+            notSync = v != nullptr && CFBooleanGetValue((CFBooleanRef)v);
+        }
+        if (!notSync)
+        {
+            CMTime p = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+            stream->idrPts.push_back(p.value);
+        }
+    }
     CMTime cbPts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
     if (cbPts.value >= 0 && (size_t)cbPts.value < stream->submitTimes.size())
     {
@@ -135,17 +175,17 @@ static inline void PatternRgb(int x, int y, int frameIndex, uint8_t& r, uint8_t&
 {
     if (gMatrixMode)
     {
-        int band = std::min(x / (kWidth / kBands), kBands - 1);
+        int band = std::min(x / (gWidth / kBands), kBands - 1);
         r = kBandRgb[band][0];
         g = kBandRgb[band][1];
         b = kBandRgb[band][2];
         return;
     }
-    int barX = (frameIndex * 37) % kWidth;
+    int barX = (frameIndex * 37) % gWidth;
     if (x >= barX && x < barX + 120) { b = 255; g = 0; r = 255; }       // magenta bar
-    else if (x < kWidth / 2)         { b = 0;   g = 128; r = 255; }     // orange
+    else if (x < gWidth / 2)         { b = 0;   g = 128; r = 255; }     // orange
     else                             { b = 255; g = 64;  r = 0; }       // blue
-    uint32_t h = Hash32((uint32_t)(y * kWidth + x) * 2654435761u + (uint32_t)frameIndex * 97);
+    uint32_t h = Hash32((uint32_t)(y * gWidth + x) * 2654435761u + (uint32_t)frameIndex * 97);
     r = (uint8_t)std::clamp((int)r + (int)(h & 0x7F) - 64, 0, 255);
     g = (uint8_t)std::clamp((int)g + (int)((h >> 8) & 0x7F) - 64, 0, 255);
     b = (uint8_t)std::clamp((int)b + (int)((h >> 16) & 0x7F) - 64, 0, 255);
@@ -156,10 +196,10 @@ static void FillBGRA(CVPixelBufferRef pb, int frameIndex)
     CVPixelBufferLockBaseAddress(pb, 0);
     uint8_t* base = (uint8_t*)CVPixelBufferGetBaseAddress(pb);
     size_t stride = CVPixelBufferGetBytesPerRow(pb);
-    for (int y = 0; y < kHeight; y++)
+    for (int y = 0; y < gHeight; y++)
     {
         uint8_t* row = base + y * stride;
-        for (int x = 0; x < kWidth; x++)
+        for (int x = 0; x < gWidth; x++)
         {
             uint8_t r, g, b;
             PatternRgb(x, y, frameIndex, r, g, b);
@@ -191,10 +231,10 @@ static void FillNV12(CVPixelBufferRef pb, int frameIndex)
     uint8_t* cBase = (uint8_t*)CVPixelBufferGetBaseAddressOfPlane(pb, 1);
     size_t yStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 0);
     size_t cStride = CVPixelBufferGetBytesPerRowOfPlane(pb, 1);
-    for (int y = 0; y < kHeight; y++)
+    for (int y = 0; y < gHeight; y++)
     {
         uint8_t* row = yBase + y * yStride;
-        for (int x = 0; x < kWidth; x++)
+        for (int x = 0; x < gWidth; x++)
         {
             uint8_t r, g, b, Y, Cb, Cr;
             PatternRgb(x, y, frameIndex, r, g, b);
@@ -202,10 +242,10 @@ static void FillNV12(CVPixelBufferRef pb, int frameIndex)
             row[x] = Y;
         }
     }
-    for (int y = 0; y < kHeight / 2; y++)
+    for (int y = 0; y < gHeight / 2; y++)
     {
         uint8_t* row = cBase + y * cStride;
-        for (int x = 0; x < kWidth / 2; x++)
+        for (int x = 0; x < gWidth / 2; x++)
         {
             uint8_t r, g, b, Y, Cb, Cr;
             PatternRgb(x * 2, y * 2, frameIndex, r, g, b);
@@ -328,6 +368,94 @@ static void DecodeOutput(void* refCon, void*, OSStatus status, VTDecodeInfoFlags
     CVPixelBufferUnlockBaseAddress(pb, kCVPixelBufferLock_ReadOnly);
 }
 
+// Decode the captured stream back and report plane stats / chroma verdict /
+// (in --matrix mode) the BT.709 band comparison. Shared by the CPU-written
+// RunConfig path and the GPU-written RunGpuConfig path. Consumes formatDesc.
+static bool DecodeAndVerify(EncodedStream& stream)
+{
+    if (stream.formatDesc == nullptr || stream.annexb.empty())
+    {
+        printf("  NO OUTPUT — encoder stalled or produced nothing\n");
+        return false;
+    }
+    DecodeStats dstats;
+    VTDecompressionOutputCallbackRecord cb = { DecodeOutput, &dstats };
+    NSDictionary* outAttrs = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    };
+    VTDecompressionSessionRef dec = nullptr;
+    OSStatus status = VTDecompressionSessionCreate(nullptr, stream.formatDesc, nullptr,
+                                                   (__bridge CFDictionaryRef)outAttrs, &cb, &dec);
+    if (status != noErr)
+    {
+        printf("  DECODER CREATE FAILED: %d\n", (int)status);
+        CFRelease(stream.formatDesc);
+        stream.formatDesc = nullptr;
+        return false;
+    }
+    for (size_t i = 0; i < stream.annexb.size(); i++)
+    {
+        auto& frame = stream.annexb[i];
+        CMBlockBufferRef block = nullptr;
+        CMBlockBufferCreateWithMemoryBlock(nullptr, frame.data(), frame.size(), kCFAllocatorNull,
+                                           nullptr, 0, frame.size(), 0, &block);
+        CMSampleBufferRef sample = nullptr;
+        size_t sizes[1] = { frame.size() };
+        CMSampleBufferCreateReady(nullptr, block, stream.formatDesc, 1, 0, nullptr, 1, sizes, &sample);
+        if (sample != nullptr)
+        {
+            VTDecompressionSessionDecodeFrame(dec, sample, 0, nullptr, nullptr);
+            CFRelease(sample);
+        }
+        if (block != nullptr)
+        {
+            CFRelease(block);
+        }
+    }
+    VTDecompressionSessionWaitForAsynchronousFrames(dec);
+    VTDecompressionSessionInvalidate(dec);
+    CFRelease(dec);
+    CFRelease(stream.formatDesc);
+    stream.formatDesc = nullptr;
+
+    printf("  decoded %d frames\n", dstats.framesDecoded);
+    printf("  Y : min=%3d max=%3d mean=%6.1f\n", dstats.y.minv, dstats.y.maxv, dstats.y.mean);
+    printf("  Cb: min=%3d max=%3d mean=%6.1f\n", dstats.cb.minv, dstats.cb.maxv, dstats.cb.mean);
+    printf("  Cr: min=%3d max=%3d mean=%6.1f\n", dstats.cr.minv, dstats.cr.maxv, dstats.cr.mean);
+    const bool chromaDead = dstats.cb.maxv <= 20 && dstats.cr.maxv <= 20;
+    const bool chromaHealthy = (dstats.cb.maxv - dstats.cb.minv) > 60 &&
+                               (dstats.cr.maxv - dstats.cr.minv) > 60;
+    printf("  VERDICT: %s\n", chromaDead      ? "CHROMA DEAD (green bug)"
+                              : chromaHealthy ? "chroma healthy"
+                                              : "chroma SUSPICIOUS (low variance)");
+    if (gMatrixMode)
+    {
+        // Compare decoded per-band means against the BT.709 limited-range
+        // reference. A wrong matrix (601, full-range, or gamma-corrected
+        // conversion) shows up as double-digit deltas on the saturated bands.
+        const double kTolerance = 8.0;
+        double worst = 0.0;
+        printf("  band      expected Y/Cb/Cr    decoded Y/Cb/Cr       delta\n");
+        for (int band = 0; band < kBands; band++)
+        {
+            uint8_t eY, eCb, eCr;
+            Rgb709(kBandRgb[band][0], kBandRgb[band][1], kBandRgb[band][2], eY, eCb, eCr);
+            double dY = gBands[band].yn ? gBands[band].y / gBands[band].yn : -1;
+            double dCb = gBands[band].cn ? gBands[band].cb / gBands[band].cn : -1;
+            double dCr = gBands[band].cn ? gBands[band].cr / gBands[band].cn : -1;
+            double delta = std::max({ std::abs(dY - eY), std::abs(dCb - eCb), std::abs(dCr - eCr) });
+            worst = std::max(worst, delta);
+            printf("  #%d %3d/%3d/%3d -> %6.1f/%6.1f/%6.1f  max|d|=%5.1f\n",
+                   band, eY, eCb, eCr, dY, dCb, dCr, delta);
+        }
+        printf("  MATRIX VERDICT: %s (worst delta %.1f, tolerance %.0f)\n",
+               worst <= kTolerance ? "BT.709 limited-range MATCH" : "MISMATCH — do not trust VT's internal conversion",
+               worst, kTolerance);
+        return worst <= kTolerance;
+    }
+    return true;
+}
+
 // stallMode: 0 = chroma matrix (decode + plane stats),
 //            1 = callback accounting only (control for --cbr),
 //            2 = callback accounting + set kVTCompressionPropertyKey_ConstantBitRate,
@@ -354,7 +482,7 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
 
     VTCompressionSessionRef session = nullptr;
     OSStatus status = VTCompressionSessionCreate(
-        kCFAllocatorDefault, kWidth, kHeight, kCMVideoCodecType_H264,
+        kCFAllocatorDefault, gWidth, gHeight, kCMVideoCodecType_H264,
         (__bridge CFDictionaryRef)encoderSpec, nullptr, kCFAllocatorDefault,
         EncodeOutput, &stream, &session);
     if (status != noErr)
@@ -455,7 +583,7 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
     for (int i = 0; i < frameCount; i++)
     {
         CVPixelBufferRef pb = nullptr;
-        if (CVPixelBufferCreate(nullptr, kWidth, kHeight, pixelFormat,
+        if (CVPixelBufferCreate(nullptr, gWidth, gHeight, pixelFormat,
                                 (__bridge CFDictionaryRef)pbAttrs, &pb) != kCVReturnSuccess)
         {
             printf("  pixel buffer create failed at frame %d\n", i);
@@ -492,8 +620,9 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
     {
         auto lats = stream.latenciesMs;
         std::sort(lats.begin(), lats.end());
-        printf("  encode latency (submit->callback): p50=%.1fms p95=%.1fms max=%.1fms (n=%zu)\n",
-               lats[lats.size() / 2], lats[(size_t)(lats.size() * 0.95)], lats.back(), lats.size());
+        printf("  encode latency (submit->callback): p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms (n=%zu)\n",
+               lats[lats.size() / 2], lats[(size_t)(lats.size() * 0.95)],
+               lats[(size_t)(lats.size() * 0.99)], lats.back(), lats.size());
     }
     if (stallMode != 0)
     {
@@ -532,92 +661,356 @@ static bool RunConfig(bool lowLatency, bool nv12Input, const char* label, int st
         }
         return silent == 0;
     }
-    if (stream.formatDesc == nullptr || stream.annexb.empty())
+    return DecodeAndVerify(stream);
+}
+
+// ---------------------------------------------------------------------------
+// --gpu mode (Gate A): GPU-written frames + production-shaped submission.
+// ---------------------------------------------------------------------------
+
+// MSL twin of PatternRgb: matrix bands (matrixMode=1) or moving bars + hash
+// noise. Must stay in sync with the CPU pattern so --matrix band expectations
+// hold for GPU frames too.
+static const char* kPatternMetalSource = R"MSL(
+#include <metal_stdlib>
+using namespace metal;
+
+struct Params { uint width; uint height; uint frameIndex; uint matrixMode; };
+
+static uint hash32(uint v)
+{
+    v ^= v >> 16; v *= 0x7feb352du; v ^= v >> 15; v *= 0x846ca68bu; v ^= v >> 16;
+    return v;
+}
+
+constant float3 kBandRgb[8] = {
+    float3(255,255,255), float3(0,0,0), float3(128,128,128), float3(255,0,0),
+    float3(0,255,0), float3(0,0,255), float3(255,0,255), float3(255,128,0),
+};
+
+kernel void pattern_kernel(texture2d<float, access::write> dst [[texture(0)]],
+                           constant Params& p [[buffer(0)]],
+                           uint2 gid [[thread_position_in_grid]])
+{
+    if (gid.x >= p.width || gid.y >= p.height) { return; }
+    float3 c;
+    if (p.matrixMode != 0u)
     {
-        printf("  NO OUTPUT — encoder stalled or produced nothing\n");
+        uint band = min(gid.x / (p.width / 8u), 7u);
+        c = kBandRgb[band];
+    }
+    else
+    {
+        uint barX = (p.frameIndex * 37u) % p.width;
+        if (gid.x >= barX && gid.x < barX + 120u) { c = float3(255, 0, 255); }
+        else if (gid.x < p.width / 2u)            { c = float3(255, 128, 0); }
+        else                                      { c = float3(0, 64, 255); }
+        uint h = hash32((gid.y * p.width + gid.x) * 2654435761u + p.frameIndex * 97u);
+        c.r = clamp(c.r + float(h & 0x7Fu) - 64.0, 0.0, 255.0);
+        c.g = clamp(c.g + float((h >> 8) & 0x7Fu) - 64.0, 0.0, 255.0);
+        c.b = clamp(c.b + float((h >> 16) & 0x7Fu) - 64.0, 0.0, 255.0);
+    }
+    dst.write(float4(c / 255.0, 1.0), gid);
+}
+)MSL";
+
+// Encode GPU-written frames the way production does: Metal compute writes the
+// pattern into a rotating IOSurface-backed BGRA slot, and EncodeFrame is called
+// from the command buffer's completed handler. Reported latency = GPU-done ->
+// VT callback. forceIdrAt >= 0 forces a keyframe at that frame index and the
+// run fails if no sync sample appears there (LL-RC keyframe contract).
+static bool RunGpuConfig(bool hevc, bool lowLatency, const char* label, int frameCount, int forceIdrAt)
+{
+    printf("\n=== %s ===\n", label);
+    for (auto& band : gBands)
+    {
+        band = BandAccum{};
+    }
+
+    id<MTLDevice> device = MTLCreateSystemDefaultDevice();
+    if (device == nil)
+    {
+        printf("  NO METAL DEVICE\n");
+        return false;
+    }
+    NSError* err = nil;
+    id<MTLLibrary> lib = [device newLibraryWithSource:[NSString stringWithUTF8String:kPatternMetalSource]
+                                              options:nil
+                                                error:&err];
+    if (lib == nil)
+    {
+        printf("  metal compile failed: %s\n", err.localizedDescription.UTF8String);
+        return false;
+    }
+    id<MTLComputePipelineState> pso =
+        [device newComputePipelineStateWithFunction:[lib newFunctionWithName:@"pattern_kernel"] error:&err];
+    if (pso == nil)
+    {
+        printf("  pipeline create failed: %s\n", err.localizedDescription.UTF8String);
+        return false;
+    }
+    id<MTLCommandQueue> queue = [device newCommandQueue];
+
+    CVMetalTextureCacheRef texCache = nullptr;
+    if (CVMetalTextureCacheCreate(kCFAllocatorDefault, nullptr, device, nullptr, &texCache) != kCVReturnSuccess)
+    {
+        printf("  CVMetalTextureCache create failed\n");
         return false;
     }
 
-    // Decode back and measure planes.
-    DecodeStats dstats;
-    VTDecompressionOutputCallbackRecord cb = { DecodeOutput, &dstats };
-    NSDictionary* outAttrs = @{
-        (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange)
+    const int kSlots = 3; // production slot count
+    CVPixelBufferRef pbs[3] = {};
+    CVMetalTextureRef cvTex[3] = {};
+    id<MTLTexture> tex[3] = {};
+    NSDictionary* pbAttrs = @{
+        (NSString*)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (NSString*)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        (NSString*)kCVPixelBufferMetalCompatibilityKey: @YES,
     };
-    VTDecompressionSessionRef dec = nullptr;
-    status = VTDecompressionSessionCreate(nullptr, stream.formatDesc, nullptr,
-                                          (__bridge CFDictionaryRef)outAttrs, &cb, &dec);
+    NSDictionary* texAttrs = @{
+        (NSString*)kCVMetalTextureUsage: @(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite),
+    };
+    auto cleanupSlots = [&]()
+    {
+        for (int s = 0; s < kSlots; s++)
+        {
+            if (cvTex[s] != nullptr) { CFRelease(cvTex[s]); cvTex[s] = nullptr; }
+            if (pbs[s] != nullptr) { CVPixelBufferRelease(pbs[s]); pbs[s] = nullptr; }
+            tex[s] = nil;
+        }
+        if (texCache != nullptr) { CFRelease(texCache); texCache = nullptr; }
+    };
+    for (int s = 0; s < kSlots; s++)
+    {
+        if (CVPixelBufferCreate(nullptr, gWidth, gHeight, kCVPixelFormatType_32BGRA,
+                                (__bridge CFDictionaryRef)pbAttrs, &pbs[s]) != kCVReturnSuccess)
+        {
+            printf("  pixel buffer create failed (slot %d)\n", s);
+            cleanupSlots();
+            return false;
+        }
+        CVBufferSetAttachment(pbs[s], kCVImageBufferColorPrimariesKey,
+                              kCVImageBufferColorPrimaries_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pbs[s], kCVImageBufferTransferFunctionKey,
+                              kCVImageBufferTransferFunction_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        CVBufferSetAttachment(pbs[s], kCVImageBufferYCbCrMatrixKey,
+                              kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVAttachmentMode_ShouldPropagate);
+        if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, texCache, pbs[s],
+                                                      (__bridge CFDictionaryRef)texAttrs,
+                                                      MTLPixelFormatBGRA8Unorm, gWidth, gHeight, 0,
+                                                      &cvTex[s]) != kCVReturnSuccess)
+        {
+            printf("  CVMetalTexture create failed (slot %d)\n", s);
+            cleanupSlots();
+            return false;
+        }
+        tex[s] = CVMetalTextureGetTexture(cvTex[s]);
+    }
+
+    EncodedStream stream;
+    // Created at 0 and pre-signaled: disposing a semaphore below its creation
+    // value traps in libdispatch, and the drain loop ends at 0.
+    stream.slotSem = dispatch_semaphore_create(0);
+    for (int s = 0; s < kSlots; s++)
+    {
+        dispatch_semaphore_signal(stream.slotSem);
+    }
+    stream.submitTimes.assign((size_t)frameCount, std::chrono::steady_clock::now());
+
+    NSMutableDictionary* encoderSpec = [@{
+        (NSString*)kVTVideoEncoderSpecification_EnableHardwareAcceleratedVideoEncoder: @YES,
+        // Hardware REQUIRED: a silent software fallback would fake a pass.
+        (NSString*)kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder: @YES,
+    } mutableCopy];
+    if (lowLatency)
+    {
+        encoderSpec[(NSString*)kVTVideoEncoderSpecification_EnableLowLatencyRateControl] = @YES;
+    }
+
+    VTCompressionSessionRef session = nullptr;
+    OSStatus status = VTCompressionSessionCreate(
+        kCFAllocatorDefault, gWidth, gHeight, hevc ? kCMVideoCodecType_HEVC : kCMVideoCodecType_H264,
+        (__bridge CFDictionaryRef)encoderSpec, nullptr, kCFAllocatorDefault, EncodeOutput, &stream, &session);
     if (status != noErr)
     {
-        printf("  DECODER CREATE FAILED: %d\n", (int)status);
-        CFRelease(stream.formatDesc);
+        printf("  SESSION CREATE FAILED: %d (hardware %s LL-RC %s)\n", (int)status,
+               hevc ? "HEVC" : "H264", lowLatency ? "on" : "off");
+        cleanupSlots();
         return false;
     }
-    for (size_t i = 0; i < stream.annexb.size(); i++)
-    {
-        auto& frame = stream.annexb[i];
-        CMBlockBufferRef block = nullptr;
-        CMBlockBufferCreateWithMemoryBlock(nullptr, frame.data(), frame.size(), kCFAllocatorNull,
-                                           nullptr, 0, frame.size(), 0, &block);
-        CMSampleBufferRef sample = nullptr;
-        size_t sizes[1] = { frame.size() };
-        CMSampleBufferCreateReady(nullptr, block, stream.formatDesc, 1, 0, nullptr, 1, sizes, &sample);
-        if (sample != nullptr)
-        {
-            VTDecompressionSessionDecodeFrame(dec, sample, 0, nullptr, nullptr);
-            CFRelease(sample);
-        }
-        if (block != nullptr)
-        {
-            CFRelease(block);
-        }
-    }
-    VTDecompressionSessionWaitForAsynchronousFrames(dec);
-    VTDecompressionSessionInvalidate(dec);
-    CFRelease(dec);
-    CFRelease(stream.formatDesc);
 
-    printf("  decoded %d frames\n", dstats.framesDecoded);
-    printf("  Y : min=%3d max=%3d mean=%6.1f\n", dstats.y.minv, dstats.y.maxv, dstats.y.mean);
-    printf("  Cb: min=%3d max=%3d mean=%6.1f\n", dstats.cb.minv, dstats.cb.maxv, dstats.cb.mean);
-    printf("  Cr: min=%3d max=%3d mean=%6.1f\n", dstats.cr.minv, dstats.cr.maxv, dstats.cr.mean);
-    const bool chromaDead = dstats.cb.maxv <= 20 && dstats.cr.maxv <= 20;
-    const bool chromaHealthy = (dstats.cb.maxv - dstats.cb.minv) > 60 &&
-                               (dstats.cr.maxv - dstats.cr.minv) > 60;
-    printf("  VERDICT: %s\n", chromaDead      ? "CHROMA DEAD (green bug)"
-                              : chromaHealthy ? "chroma healthy"
-                                              : "chroma SUSPICIOUS (low variance)");
-    if (gMatrixMode)
+    auto setProp = [&](CFStringRef key, CFTypeRef value)
     {
-        // Compare decoded per-band means against the BT.709 limited-range
-        // reference. A wrong matrix (601, full-range, or gamma-corrected
-        // conversion) shows up as double-digit deltas on the saturated bands.
-        const double kTolerance = 8.0;
-        double worst = 0.0;
-        printf("  band      expected Y/Cb/Cr    decoded Y/Cb/Cr       delta\n");
-        for (int band = 0; band < kBands; band++)
+        OSStatus s = VTSessionSetProperty(session, key, value);
+        if (s != noErr)
         {
-            uint8_t eY, eCb, eCr;
-            Rgb709(kBandRgb[band][0], kBandRgb[band][1], kBandRgb[band][2], eY, eCb, eCr);
-            double dY = gBands[band].yn ? gBands[band].y / gBands[band].yn : -1;
-            double dCb = gBands[band].cn ? gBands[band].cb / gBands[band].cn : -1;
-            double dCr = gBands[band].cn ? gBands[band].cr / gBands[band].cn : -1;
-            double delta = std::max({ std::abs(dY - eY), std::abs(dCb - eCb), std::abs(dCr - eCr) });
-            worst = std::max(worst, delta);
-            printf("  #%d %3d/%3d/%3d -> %6.1f/%6.1f/%6.1f  max|d|=%5.1f\n",
-                   band, eY, eCb, eCr, dY, dCb, dCr, delta);
+            printf("  prop %s REJECTED (%d)\n", [(__bridge NSString*)key UTF8String], (int)s);
         }
-        printf("  MATRIX VERDICT: %s (worst delta %.1f, tolerance %.0f)\n",
-               worst <= kTolerance ? "BT.709 limited-range MATCH" : "MISMATCH — do not trust VT's internal conversion",
-               worst, kTolerance);
-        return worst <= kTolerance;
+    };
+    setProp(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
+    setProp(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
+    setProp(kVTCompressionPropertyKey_ProfileLevel,
+            hevc ? kVTProfileLevel_HEVC_Main_AutoLevel : kVTProfileLevel_H264_High_AutoLevel);
+    int br = kBitrate;
+    CFNumberRef brRef = CFNumberCreate(nullptr, kCFNumberIntType, &br);
+    setProp(kVTCompressionPropertyKey_AverageBitRate, brRef);
+    CFRelease(brRef);
+    setProp(kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, kCFBooleanTrue);
+    int fps = kFps;
+    CFNumberRef fpsRef = CFNumberCreate(nullptr, kCFNumberIntType, &fps);
+    setProp(kVTCompressionPropertyKey_ExpectedFrameRate, fpsRef);
+    CFRelease(fpsRef);
+    setProp(kVTCompressionPropertyKey_ColorPrimaries, kCVImageBufferColorPrimaries_ITU_R_709_2);
+    setProp(kVTCompressionPropertyKey_TransferFunction, kCVImageBufferTransferFunction_ITU_R_709_2);
+    setProp(kVTCompressionPropertyKey_YCbCrMatrix, kCVImageBufferYCbCrMatrix_ITU_R_709_2);
+    VTCompressionSessionPrepareToEncodeFrames(session);
+
+    CFBooleanRef usingHw = nullptr;
+    if (VTSessionCopyProperty(session, kVTCompressionPropertyKey_UsingHardwareAcceleratedVideoEncoder,
+                              kCFAllocatorDefault, &usingHw) == noErr && usingHw)
+    {
+        printf("  hardware=%s\n", CFBooleanGetValue(usingHw) ? "yes" : "NO (software!)");
+        CFRelease(usingHw);
     }
-    return true;
+    CFStringRef encoderId = nullptr;
+    if (VTSessionCopyProperty(session, kVTCompressionPropertyKey_EncoderID, kCFAllocatorDefault,
+                              &encoderId) == noErr && encoderId != nullptr)
+    {
+        printf("  encoder=%s\n", [(__bridge NSString*)encoderId UTF8String]);
+        CFRelease(encoderId);
+    }
+
+    EncodedStream* streamPtr = &stream;
+    int timeouts = 0;
+    for (int i = 0; i < frameCount; i++)
+    {
+        if (dispatch_semaphore_wait(stream.slotSem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) != 0)
+        {
+            printf("  TIMEOUT waiting for a free slot at frame %d — aborting\n", i);
+            timeouts++;
+            break;
+        }
+        int s = i % kSlots;
+        id<MTLCommandBuffer> cmd = [queue commandBuffer];
+        id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
+        [enc setComputePipelineState:pso];
+        [enc setTexture:tex[s] atIndex:0];
+        struct { uint32_t w, h, fi, mm; } params = {
+            (uint32_t)gWidth, (uint32_t)gHeight, (uint32_t)i, gMatrixMode ? 1u : 0u
+        };
+        [enc setBytes:&params length:sizeof(params) atIndex:0];
+        [enc dispatchThreadgroups:MTLSizeMake((gWidth + 15) / 16, (gHeight + 15) / 16, 1)
+            threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+        [enc endEncoding];
+        const int frameIndex = i;
+        const bool forceIdr = (i == forceIdrAt);
+        CVPixelBufferRef pb = pbs[s];
+        VTCompressionSessionRef sess = session;
+        [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            // Production shape: encode only after the GPU finished writing the
+            // IOSurface. All bookkeeping writes happen BEFORE EncodeFrame —
+            // the LL-RC output callback can fire before EncodeFrame returns.
+            streamPtr->submitTimes[(size_t)frameIndex] = std::chrono::steady_clock::now();
+            NSDictionary* props =
+                forceIdr ? @{ (NSString*)kVTEncodeFrameOptionKey_ForceKeyFrame: @YES } : nil;
+            VTCompressionSessionEncodeFrame(sess, pb, CMTimeMake(frameIndex, kFps), kCMTimeInvalid,
+                                            (__bridge CFDictionaryRef)props,
+                                            (void*)(intptr_t)frameIndex, nullptr);
+        }];
+        [cmd commit];
+        // Pace at the live cadence so rate control behaves like production.
+        std::this_thread::sleep_for(std::chrono::microseconds(1000000 / kFps));
+    }
+    // Drain: reacquire every slot (i.e. every in-flight frame called back).
+    for (int s = 0; s < kSlots; s++)
+    {
+        if (dispatch_semaphore_wait(stream.slotSem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) != 0)
+        {
+            timeouts++;
+        }
+    }
+    VTCompressionSessionCompleteFrames(session, kCMTimeInvalid);
+    VTCompressionSessionInvalidate(session);
+    CFRelease(session);
+
+    printf("  encoded: callbacks=%d dropped=%d errors=%d frames=%zu avgKB/frame=%.0f (%.1f Mbps @%dfps)%s\n",
+           stream.callbackCount, stream.droppedCount, stream.errorCount, stream.annexb.size(),
+           stream.annexb.empty() ? 0.0 : stream.totalBytes / 1024.0 / stream.annexb.size(),
+           stream.annexb.empty() ? 0.0
+                                 : stream.totalBytes * 8.0 * kFps / stream.annexb.size() / 1e6,
+           kFps, timeouts > 0 ? "  [SLOT TIMEOUTS]" : "");
+    if (!stream.latenciesMs.empty())
+    {
+        auto lats = stream.latenciesMs;
+        std::sort(lats.begin(), lats.end());
+        printf("  encode latency (GPU-done->callback): p50=%.1fms p95=%.1fms p99=%.1fms max=%.1fms (n=%zu)\n",
+               lats[lats.size() / 2], lats[(size_t)(lats.size() * 0.95)],
+               lats[(size_t)(lats.size() * 0.99)], lats.back(), lats.size());
+    }
+
+    // LL-RC keyframe contract: initial IDR + the forced mid-run IDR.
+    bool forcedIdrSeen = forceIdrAt < 0;
+    printf("  sync samples (pts):");
+    for (int64_t p : stream.idrPts)
+    {
+        printf(" %lld", (long long)p);
+        if (forceIdrAt >= 0 && p == forceIdrAt)
+        {
+            forcedIdrSeen = true;
+        }
+    }
+    printf("\n");
+    if (forceIdrAt >= 0)
+    {
+        printf("  forced IDR at pts %d: %s\n", forceIdrAt, forcedIdrSeen ? "PRESENT" : "MISSING");
+    }
+
+    // Parameter sets (helper contract: VPS/SPS/PPS + real NAL header length).
+    if (stream.formatDesc != nullptr)
+    {
+        size_t psCount = 0;
+        int nalHdrLen = 0;
+        OSStatus psStatus = hevc
+            ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(stream.formatDesc, 0, nullptr, nullptr,
+                                                                 &psCount, &nalHdrLen)
+            : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(stream.formatDesc, 0, nullptr, nullptr,
+                                                                 &psCount, &nalHdrLen);
+        if (psStatus == noErr)
+        {
+            printf("  parameter sets: count=%zu nalUnitHeaderLength=%d types=[", psCount, nalHdrLen);
+            for (size_t p = 0; p < psCount; p++)
+            {
+                const uint8_t* ps = nullptr;
+                size_t psSize = 0;
+                OSStatus s = hevc
+                    ? CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(stream.formatDesc, p, &ps, &psSize,
+                                                                         nullptr, nullptr)
+                    : CMVideoFormatDescriptionGetH264ParameterSetAtIndex(stream.formatDesc, p, &ps, &psSize,
+                                                                         nullptr, nullptr);
+                if (s == noErr && ps != nullptr && psSize > 0)
+                {
+                    printf("%s%d(%zuB)", p ? " " : "", hevc ? (ps[0] >> 1) & 0x3F : ps[0] & 0x1F, psSize);
+                }
+            }
+            printf("]  (HEVC: 32=VPS 33=SPS 34=PPS; H264: 7=SPS 8=PPS)\n");
+        }
+        else
+        {
+            printf("  parameter set query FAILED: %d\n", (int)psStatus);
+        }
+    }
+
+    bool ok = DecodeAndVerify(stream);
+    stream.slotSem = nullptr;
+    cleanupSlots();
+    return ok && forcedIdrSeen && timeouts == 0;
 }
 
 int main(int argc, char** argv)
 {
     bool cbrMode = false;
+    bool gpuMode = false;
+    int gpuFrames = 0; // 0 = default per mode
     for (int i = 1; i < argc; i++)
     {
         if (strcmp(argv[i], "--cbr") == 0)
@@ -628,14 +1021,35 @@ int main(int argc, char** argv)
         {
             gMatrixMode = true;
         }
+        else if (strcmp(argv[i], "--gpu") == 0)
+        {
+            gpuMode = true;
+        }
+        else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc)
+        {
+            int w = 0, h = 0;
+            if (sscanf(argv[++i], "%dx%d", &w, &h) == 2 && w > 0 && h > 0)
+            {
+                gWidth = w & ~1;
+                gHeight = h & ~1;
+            }
+        }
+        else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc)
+        {
+            gpuFrames = atoi(argv[++i]);
+        }
         else
         {
             fprintf(stderr,
-                    "usage: %s [--cbr | --matrix]\n"
-                    "  (default)  chroma matrix: {LL-RC on/off} x {BGRA/NV12 input}\n"
+                    "usage: %s [--cbr | --matrix | --gpu] [--size WxH] [--frames N]\n"
+                    "  (default)  chroma matrix: {LL-RC on/off} x {BGRA/NV12 input} (CPU-written)\n"
                     "  --cbr      ConstantBitRate callback accounting (stall claim retracted)\n"
-                    "  --matrix   flat color bands; verify decoded YCbCr matches BT.709 limited-range\n",
-                    argv[0]);
+                    "  --matrix   flat color bands; verify decoded YCbCr matches BT.709 limited-range\n"
+                    "  --gpu      Gate A: GPU-written IOSurface slots, LL-RC H.264 + HEVC (HW required),\n"
+                    "             forced mid-run IDR + parameter-set verification; combine with --matrix\n"
+                    "  --size     override %dx%d (e.g. 3008x1664 = live stream dims)\n"
+                    "  --frames   override frame count (--gpu only)\n",
+                    argv[0], gWidth, gHeight);
             return 2;
         }
     }
@@ -646,7 +1060,23 @@ int main(int argc, char** argv)
 #else
         printf("arch: arm64 (NATIVE — this does NOT reproduce the wine environment!)\n");
 #endif
-        if (cbrMode)
+        if (gpuMode)
+        {
+            printf("dims: %dx%d @%dfps %dMbps\n", gWidth, gHeight, kFps, kBitrate / 1000000);
+            int frames = gpuFrames > 0 ? gpuFrames : (gMatrixMode ? kFrames : 300);
+            int forceIdrAt = gMatrixMode ? -1 : frames / 2;
+            int failures = 0;
+            failures += !RunGpuConfig(false, true, gMatrixMode
+                                          ? "GPU MATRIX: LL-RC + BGRA H.264 (VT internal conversion)"
+                                          : "GPU: LL-RC + BGRA H.264 (HW required)",
+                                      frames, forceIdrAt);
+            failures += !RunGpuConfig(true, true, gMatrixMode
+                                          ? "GPU MATRIX: LL-RC + BGRA HEVC (VT internal conversion)"
+                                          : "GPU: LL-RC + BGRA HEVC Main (HW required)",
+                                      frames, forceIdrAt);
+            printf("\ngpu summary: %d of 2 configs failed\n", failures);
+        }
+        else if (cbrMode)
         {
             // NV12 input keeps the LL-RC BGRA chroma bug out of the picture,
             // so any callback deficit is attributable to ConstantBitRate.

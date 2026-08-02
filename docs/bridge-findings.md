@@ -311,3 +311,50 @@ client-native), then a native-arm64 out-of-process encoder: running
 VideoToolbox natively removes the Rosetta fragility (hardware HEVC, LL-RC
 without the NV12 workaround) and reuses Gate 0's cross-arch IOSurface
 hand-off.
+
+## Gate A — native-arm64 encoder plan (2026-08-02)
+
+First gate of the out-of-process encoder effort (plan: gpt-5.6-sol design +
+Codex adversarial review). `vt-llrc-probe` gained a `--gpu` mode: a Metal
+compute kernel writes each frame into one of 3 rotating IOSurface-backed BGRA
+pixel buffers and `VTCompressionSessionEncodeFrame` runs from the command
+buffer's completed handler — the production oxrsys shape, on both arches
+(`--size 3008x1664` = live stream dims; `vt-llrc-probe-arm64` is the native
+build). Results:
+
+- **HW HEVC Main LL-RC works natively with GPU-written surfaces**: session
+  creates with hardware *required* (`com.apple.videotoolbox.videoencoder.hevc.rtvc`),
+  sustains 72 Hz at 3008x1664, and under deliberately incompressible noise
+  content degrades *better* than H.264 (p95 20.5 ms vs 49.6 ms; the heavy
+  frame-shedding on this content is LL-RC's documented load behavior, same as
+  the 2026-08-01 CPU-probe note). Under Rosetta the same config still fails
+  -12902 (re-verified with this exact code path).
+- **LL-RC keyframe contract holds**: a mid-run `ForceKeyFrame` produces a sync
+  sample at exactly the requested PTS on both codecs, and parameter sets
+  extract cleanly — HEVC VPS/SPS/PPS (NAL types 32/33/34, 26/53/7 bytes),
+  `NALUnitHeaderLengthOut` = 4 on both codecs.
+- **BT.709 color contract holds natively**: `--gpu --matrix` worst band delta
+  1.1/255 (H.264) and 1.0/255 (HEVC) vs the probe's own limited-range
+  reference.
+- **The probe still cannot reproduce the live Rosetta conversion penalty.**
+  GPU-written x86_64 H.264 shows p50 13.6 ms — nowhere near the live
+  ~35-40 ms. GPU-written buffers alone are not sufficient; the live cost
+  evidently needs the game's concurrent GPU load contending with VT's
+  conversion. Consequence: offline probe latency numbers bound the pipeline
+  optimistically in BOTH environments; the BGRA-vs-NV12 helper input decision
+  and all latency acceptance move to the live A/B gates (D/E).
+- Curiosity, same code/content/config: the Rosetta H.264 encoder held the
+  42 Mbps target with 0 drops; the native one ran at ~79 Mbps and shed 136/300
+  frames. The two rtvc builds have different quality/rate floors — expect
+  live HEVC bitrate behavior to need Gate E tuning, not config parity alone.
+- **Client HEVC capability resolved** (was a plan unknown): ALVR v20.14.1
+  never capability-checks H.264/HEVC — `VideoStreamingCapabilities` has flags
+  only for AV1/10-bit/high-profile (`connection.rs:787-800`; 10-bit gate at
+  `:751`). H.264 and HEVC are assumed universal in the protocol, so HEVC is
+  safe to select for the stock Quest client, and the *negotiated* codec is
+  echoed into `session.json` `openvr_config/codec` — the same file
+  `RefreshNegotiatedConfig` already reads for dims.
+
+Gate A verdict: **PASS** — existence proof complete (native HW HEVC LL-RC +
+IDR contract + color), with the latency criterion explicitly deferred to the
+live gates per the both-ways probe/live divergence above.
