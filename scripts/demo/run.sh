@@ -109,9 +109,7 @@ stop_dashboard() {
 # Safety net only: the runtime spawns and owns the encoder helper (it dies with the
 # game); reap one left over if the game process died uncleanly.
 stop_helper() {
-  if pgrep -f "$OXR_HELPER_BIN" >/dev/null 2>&1; then
-    pkill -f "$OXR_HELPER_BIN" 2>/dev/null && print "encoder helper: reaped (left over from the runtime)"
-  fi
+  reap_stray "$OXR_HELPER_BIN" && print "encoder helper: reaped (left over from the runtime)"
 }
 # INT/TERM: tear the game down (wineserver -k) and restore audio, then resignal so
 # the script exits with the right status. Wine runs as a background job below and

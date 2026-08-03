@@ -120,6 +120,20 @@ stop_wine() { # kill the bottle's wineserver (and with it the game) and wait for
   kill $_wp 2>/dev/null || true
 }
 
+reap_stray() { # bin_path [found_msg] [not_found_msg] -> if a stray process matching bin_path
+  # (pgrep -f) is running, pkill -f it (errors swallowed — pgrep already confirmed something was
+  # there) and report found_msg via ok() when given; otherwise report not_found_msg via ok() when
+  # given. Returns 0 if a stray was found (kill attempted), 1 if none was running. Shared by every
+  # "reap a leftover helper/dashboard process" site in stop.sh/run.sh.
+  if pgrep -f "$1" >/dev/null 2>&1; then
+    pkill -f "$1" 2>/dev/null || true
+    [ -n "${2:-}" ] && ok "$2"
+    return 0
+  fi
+  [ -n "${3:-}" ] && ok "$3"
+  return 1
+}
+
 fetch_pinned() { # url dest expected-sha256 label
   local url="$1" dest="$2" sha="$3" label="$4"
   if sha256_ok "$dest" "$sha"; then info "already present: $label"; return 0; fi

@@ -16,17 +16,11 @@ STALE="$(lsof -nP -iUDP:9944 -iTCP:9943 2>/dev/null | awk 'NR>1{print $1"("$2")"
 if [ -n "$STALE" ]; then warn "streaming ports still held by: $STALE"
 else ok "streaming ports free"; fi
 
-if pgrep -f "$OXR_HELPER_BIN" >/dev/null 2>&1; then
-  pkill -f "$OXR_HELPER_BIN" 2>/dev/null || true
-  ok "encoder helper killed (the runtime owns it — this one outlived its game)"
-else
-  ok "no leftover encoder helper"
-fi
+reap_stray "$OXR_HELPER_BIN" \
+  "encoder helper killed (the runtime owns it — this one outlived its game)" \
+  "no leftover encoder helper"
 
-if pgrep -f "$ALVR_DASHBOARD_BIN" >/dev/null 2>&1; then
-  pkill -f "$ALVR_DASHBOARD_BIN" 2>/dev/null || true
-  ok "ALVR dashboard closed (left over from a run that died uncleanly)"
-fi
+reap_stray "$ALVR_DASHBOARD_BIN" "ALVR dashboard closed (left over from a run that died uncleanly)"
 
 if command -v SwitchAudioSource >/dev/null 2>&1; then
   CUR="$(SwitchAudioSource -c -t output 2>/dev/null)"
