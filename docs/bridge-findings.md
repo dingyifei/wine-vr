@@ -2,7 +2,9 @@
 
 Engineering record of the risk-retirement gates behind the demo in the
 [README](../README.md): Beat Saber 1.29.4 → CrossOver/DXMT → wineopenxr →
-oxrsys → embedded ALVR → Quest 3 at 72 fps and ~79 ms motion-to-photon —
+oxrsys → embedded ALVR → Quest 3 at 72 fps and ~79 ms motion-to-photon (the
+pre-1.3.0 baseline; see [README](../README.md) for the current 93.5 ms p50
+figure with the native arm64 HEVC helper) —
 what each gate proved and which fixes were load-bearing. Condensed; the full
 transcript is in the git history of `FINDINGS-oxrsys.md` (repo root). The
 dead SteamVR-under-Wine path:

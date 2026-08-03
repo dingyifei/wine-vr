@@ -2,12 +2,16 @@
 
 Run the Windows build of **Beat Saber 1.29.4** on an Apple Silicon Mac under
 CrossOver and stream it to a Meta Quest 3 over WiFi with the **stock ALVR
-client** — full 6DoF tracking, 72 fps, ~79 ms motion-to-photon (measured
-better than Virtual Desktop on the same network).
+client** — full 6DoF tracking, 72 fps, 93.5 ms p50 motion-to-photon
+(USB-wired, native arm64 HEVC helper; measured better than Virtual Desktop on
+the same network).
 
 ```
 Beat Saber (Windows, x64) ─ CrossOver/Wine ─ DXMT (D3D11→Metal, zero-copy)
-        └─ wineopenxr ─→ oxrsys OpenXR runtime ─→ embedded ALVR core ─ WiFi ─→ Quest 3
+        └─ wineopenxr ─→ oxrsys OpenXR runtime (x86_64, compose in-process)
+              └─ IOSurfaces via Mach send rights (once per generation)
+                    └─ arm64 helper: VideoToolbox HW HEVC encode
+                          └─ Annex-B over socketpair ─→ embedded ALVR core (x86_64) ─ WiFi/USB ─→ Quest 3
 ```
 
 Everything runs in-process on the Mac; no SteamVR, no real Steam at runtime.
@@ -127,14 +131,19 @@ stale bottle, or a leftover client IP pin in `session.json`.
 | `--no-audio` / `WINEVR_NO_AUDIO` | CLI/env | keep sound on the Mac (skip BlackHole routing) |
 | `--no-dashboard` / `WINEVR_NO_DASHBOARD` | CLI/env | don't open the ALVR server dashboard with `run` |
 | `--verbose` / `WINEVR_VERBOSE` | CLI/env | wine/openxr debug channels in console + log |
+| `--wired` / `WINEVR_WIRED` | CLI/env | create the `adb forward tcp:9943/9944` pair for USB-wired streaming (a normal run clears them) |
 | `protocol = "alvr"` | `oxrsys-runtime.toml` | streaming backend (demo path) |
 | `bitrate_mbps` | `oxrsys-runtime.toml` | base video bitrate (42 verified; ALVR's adaptive loop adjusts from there) |
+| `encoder_process = "auto"` | `oxrsys-runtime.toml` | `auto`/`native` = out-of-process arm64 helper (HW HEVC); `inproc` = in-process Rosetta H.264 fallback |
 
 ## Known limitations
 
-- **H.264 only** — the runtime encodes under Rosetta, where VideoToolbox HEVC
-  paths misbehave (one bug is documented and filed: see
-  `docs/apple-feedback-1-lowlatency-bgra-zero-chroma.md`)
+- **H.264 only under the in-process fallback (`encoder_process = "inproc"`)**
+  — the runtime encodes under Rosetta, where VideoToolbox HEVC paths misbehave
+  (one bug is documented and filed: see
+  `docs/apple-feedback-1-lowlatency-bgra-zero-chroma.md`). The default
+  out-of-process arm64 helper (`auto`/`native`) encodes native HW HEVC and
+  negotiates codec choice with the client for real.
 - Left menu button cannot pause (game limitation, all OpenXR runtimes)
 - Verified config is a Debug x86_64 build; other configs are untested
 

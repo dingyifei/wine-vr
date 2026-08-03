@@ -19,7 +19,7 @@ start is in the [top-level README](../README.md).
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Green or corrupted stream | Host macOS older than 27: the encoder feeds BGRA directly (the `rgb_to_nv12` pre-convert was removed after Apple fixed VT's internal conversion in macOS 27) and older VT under Rosetta produces all-zero chroma | Upgrade the host to macOS 27+, or pin oxrsys back to the NV12-era revision (`cf5f926` or earlier). `doctor` FAILs on macOS < 27; verify with `tools/vt-llrc-probe --matrix`. Background: [low-latency BGRA zero-chroma report](apple-feedback-1-lowlatency-bgra-zero-chroma.md) |
+| Green or corrupted stream | Only the in-process x86_64 Rosetta fallback (`encoder_process = "inproc"`, or `auto` when the native-arm64 helper isn't staged) is affected: it feeds BGRA directly to VT (the `rgb_to_nv12` pre-convert was removed after Apple fixed VT's internal conversion in macOS 27) and older VT under Rosetta produces all-zero chroma. The native helper (`encoder_process = "native"`, HW HEVC) doesn't go through this path and is unaffected | Upgrade the host to macOS 27+, or pin oxrsys back to the NV12-era revision (`cf5f926` or earlier) — only needed if you must run the in-process fallback. `doctor` still hard-FAILs on macOS < 27 regardless of encoder path, so the fallback stays viable; verify with `tools/vt-llrc-probe --matrix`. Background: [low-latency BGRA zero-chroma report](apple-feedback-1-lowlatency-bgra-zero-chroma.md) |
 
 ## Network / streaming
 
@@ -28,6 +28,7 @@ start is in the [top-level README](../README.md).
 | Client connects, then loops with EADDRINUSE on the headset | Stale adb reverse tunnels from the legacy USB path squatting port 9944 on the Quest | `./demo.sh run` clears all reverse tunnels at launch. Manual: `adb reverse --remove-all` |
 | Same connect/EADDRINUSE loop, tunnels already clear | A previous server instance still alive on the Mac | `doctor` warns when ports 9943/9944 are busy and names the process; kill it and relaunch |
 | Quest never connects | Mac and Quest on different WiFi networks or bands; discovery blocked by a host firewall/traffic filter (e.g. TripMode); or a stale manual-IP pin in `session.json` after a DHCP change | Put both on the same network/band; allow the traffic in the filter; delete `~/Library/Application Support/OXRSys/alvr/session.json` (recreated with discovery + auto-trust). `doctor` warns when `session.json` pins an IP |
+| Quest stuck on "searching for streamer" after a wired/USB session | Stale `adb forward tcp:9943`/`tcp:9944` from a previous `--wired` launch squatting the streaming ports — forwards persist across sessions until explicitly removed | A normal (non-wired) `./demo.sh run` clears exactly these two forwards in preflight; `doctor` warns when they're present. Manual: `adb forward --remove tcp:9943` + `adb forward --remove tcp:9944` (avoid `--remove-all`, which also deletes unrelated forwards). (Unrelated to `adb reverse`, which `run` already clears every launch.) |
 
 ## Audio
 

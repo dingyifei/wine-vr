@@ -181,6 +181,15 @@ STALE="$(lsof -nP -iUDP:9944 -iTCP:9943 2>/dev/null | awk 'NR>1{print $1"("$2")"
 if [ -n "$STALE" ]; then warn "ports 9943/9944 busy: $STALE— a previous session may still be running"
 else ok "streaming ports free"; fi
 
+# 16b. stale adb forwards (legit only for a --wired launch; left behind they squat
+# the streaming ports and break Quest WiFi discovery)
+if [ -n "$ADB" ]; then
+  FWD="$("$ADB" forward --list 2>/dev/null | awk '{print $2}')"
+  if print -r -- "$FWD" | grep -qx 'tcp:9943' || print -r -- "$FWD" | grep -qx 'tcp:9944'; then
+    warn "adb forward tcp:9943/tcp:9944 present — expected only for a wired launch (--wired); stale forwards break WiFi discovery — remedy: adb forward --remove tcp:9943 (and tcp:9944), or just a normal ./demo.sh run"
+  fi
+fi
+
 print ""
 if [ "$FAILCOUNT" -eq 0 ]; then print -r -- "doctor: ${_G}all checks passed${_N} — ./demo.sh run --bottle $WINEVR_BOTTLE"
 else print -r -- "doctor: ${_R}$FAILCOUNT check(s) failed${_N} — remedies above"; fi

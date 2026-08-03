@@ -64,6 +64,37 @@ case "$ENCODER_PROC" in
   *) warn "oxrsys-runtime.toml encoder_process='$ENCODER_PROC' unrecognized — the runtime treats unknown values as auto" ;;
 esac
 
+# ---- wired (USB) streaming: adb owns the tcp:9943/tcp:9944 forwards -------------
+# USB-wired ALVR streaming needs the client's stream ports forwarded from the Quest
+# over adb; left behind after the session ends, the same forwards silently break
+# WiFi discovery on a later non-wired run (the client just shows "searching for
+# streamer"). --wired creates them here; a normal run clears exactly these two.
+WIRED_PORTS=(9943 9944)
+WIRED_SER=""
+[ -n "$ADB" ] && WIRED_SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
+if [ -n "${WINEVR_WIRED:-}" ]; then
+  [ -n "$ADB" ] || die "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
+  [ -n "$WIRED_SER" ] || die "--wired: no Quest over adb — connect USB and check 'adb devices'"
+  for p in $WIRED_PORTS; do
+    if ! "$ADB" -s "$WIRED_SER" forward tcp:$p tcp:$p >/dev/null; then
+      for q in $WIRED_PORTS; do "$ADB" -s "$WIRED_SER" forward --remove tcp:$q 2>/dev/null || true; done
+      die "adb forward tcp:$p tcp:$p failed on $WIRED_SER — check the USB connection (adb devices)"
+    fi
+  done
+  info "wired mode: adb forward tcp:9943/tcp:9944 up on $WIRED_SER (a later non-wired run clears these two)"
+elif [ -n "$ADB" ]; then
+  # --list rows are "<serial> <local> <remote>"; remove our two ports per-serial
+  # so this works even with several devices attached, and touches nothing else.
+  "$ADB" forward --list 2>/dev/null | while read -r fwd_ser fwd_local fwd_remote; do
+    case "$fwd_local" in
+      tcp:9943|tcp:9944)
+        "$ADB" -s "$fwd_ser" forward --remove "$fwd_local" 2>/dev/null && \
+          info "cleared stale adb forward $fwd_local on $fwd_ser (left over from a --wired launch — would otherwise break WiFi discovery)"
+        ;;
+    esac
+  done
+fi
+
 # ---- reset the bottle's wineserver (stale servers + steam locks hang startup) ---
 print -r -- "-- resetting wineserver for bottle '$WINEVR_BOTTLE'"
 WINEPREFIX="$PREFIX" "$WINESERVER" -k 2>/dev/null || true

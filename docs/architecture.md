@@ -7,13 +7,24 @@ usage, see the [README](../README.md).
 ## Frame path
 
 ```
+[x86_64 Wine process, under Rosetta]
 Beat Saber.exe (x64, CrossOver/Wine, Rosetta)
   └─ openxr_loader.dll (Unity's stock loader)
       └─ wineopenxr.dll (PE) ⇄ wineopenxr.so (unix side, same process)
             │  D3D11 → Metal via DXMT; swapchain images imported as MTLTextures (zero-copy)
             └─ oxrsys runtime (in-process dylib, x86_64 under Rosetta)
-                  └─ BGRA composite → VideoToolbox H.264 low-latency encode (direct)
-                        └─ embedded alvr_server_core ── WiFi ──► stock ALVR client (Quest 3)
+                  └─ BGRA composite (3 IOSurface-backed slots)
+                        └─ IOSurfaces handed off as Mach send rights (once per generation)
+                              │
+[oxrsys-encoder-helper, native arm64 process] ◄──────────┘
+                  └─ VideoToolbox HW HEVC Main, low-latency encode
+                        └─ Annex-B NALs back over an inherited socketpair
+                              │
+[back in the x86_64 Wine process]
+                  └─ embedded alvr_server_core ── WiFi/USB ──► stock ALVR client (Quest 3)
+
+(encoder_process = "inproc" fallback: BGRA composite → VideoToolbox H.264
+ encode directly in the x86_64 process, no helper hop, macOS 27+ only)
 ```
 
 The game renders D3D11; the DXMT fork translates that to Metal. Unity's own
@@ -36,7 +47,25 @@ root-owned system manifest `/usr/local/share/openxr/1/active_runtime.x86_64.json
 Rosetta, so the manifest points at an x86_64 build of the runtime, loaded
 in-process.
 
-On `xrEndFrame`, the runtime composites layers into a BGRA target that is
+By default (`encoder_process = "auto"`, effectively `"native"`), encoding
+happens out of process on a native arm64 helper (`oxrsys-encoder-helper`),
+which the x86_64 Wine parent launches once via `posix_spawn`. The parent keeps
+compose (3 IOSurface-backed BGRA slots) and every `alvr_*` call; only the
+IOSurfaces cross, and only once per generation, as Mach send rights — the
+parent does a `bootstrap_check_in` and the child a matching
+`bootstrap_look_up` (not the special-port route: `libxpc` latches the
+bootstrap port at `libSystem` init, so that route is dead for a
+`posix_spawn`ed child). The helper runs VideoToolbox HW HEVC Main with
+low-latency rate control natively on arm64 — no Rosetta, no chroma bug — and
+returns Annex-B NALs to the parent over an inherited socketpair; the helper
+exits cleanly on socket EOF (SIGKILL recovery is ~383 ms). This cut
+motion-to-photon to 93.5 ms p50 (USB-wired, 3008x1664@72) from the prior
+~114 ms WiFi H.264 in-process baseline — not a matched A/B, since transport
+differs too — and collapsed the Quest's `decoder_queue` from ~30 ms to
+~1.1 ms.
+
+The in-process Rosetta fallback (`encoder_process = "inproc"`) is retained:
+on `xrEndFrame`, the runtime composites layers into a BGRA target that is
 itself the encoder's CVPixelBuffer, and encodes with a VideoToolbox H.264
 session using `EnableLowLatencyRateControl`; VT performs the BT.709
 video-range RGB→YCbCr conversion internally (declared via session/buffer color
@@ -47,10 +76,12 @@ kernel existed historically (see
 [the original bug report](apple-feedback-1-lowlatency-bgra-zero-chroma.md)). `ConstantBitRate` is not used: Apple documents
 it as incompatible with low-latency rate control (an earlier claim that it was
 accepted and then stalled was
-[retracted](apple-feedback-2-constantbitrate-pipeline-stall.md)). Encoded NALs
-go to the embedded `alvr_server_core` (Rust, C API), which streams over WiFi
-to the stock ALVR Quest client v20.14.1; tracking and controller input return
-over the same connection and surface as OpenXR actions.
+[retracted](apple-feedback-2-constantbitrate-pipeline-stall.md)). The
+macOS 27+ requirement applies only to this in-process fallback; the arm64
+helper path has no such constraint. Either way, encoded NALs
+go to the embedded `alvr_server_core` (Rust, C API), which streams over
+WiFi or USB to the stock ALVR Quest client v20.14.1; tracking and controller
+input return over the same connection and surface as OpenXR actions.
 
 ## Repositories
 
@@ -68,15 +99,16 @@ regenerated with
 ## Configuration
 
 - `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` — runtime config
-  (`protocol = "alvr"`, `bitrate_mbps`). Written once by `./demo.sh setup`,
-  never overwritten.
+  (`protocol = "alvr"`, `bitrate_mbps`, `encoder_process`). Written once by
+  `./demo.sh setup`, never overwritten.
+- `encoder_process` (`[streaming]`, default `"auto"`) — `"auto"`/`"native"`
+  select the out-of-process arm64 helper (HW HEVC); `"inproc"` selects the
+  in-process Rosetta H.264 fallback.
 - `~/Library/Application Support/OXRSys/alvr/session.json` — the embedded ALVR
   core's session file (not stock ALVR's config directory). Auto-created on
   first run; LAN clients are auto-trusted, so no pairing step.
 
 ## Future work
 
-- Native arm64 out-of-process encoder: moves encoding out of the Rosetta
-  process, unlocking HEVC and lower latency.
 - 1:1 resolution.
 - 72 fps pacing refinements.

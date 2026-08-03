@@ -11,9 +11,15 @@ Beat Saber.exe (x64, Wine, Rosetta)
   └─ openxr_loader.dll → wineopenxr.dll (PE) ⇄ wineopenxr.so (unix, same process)
         │  D3D11 → Metal via DXMT fork; swapchain images imported as MTLTextures (zero-copy)
         └─ oxrsys runtime (in-process x86_64 dylib)
-              └─ BGRA composite → VideoToolbox H.264 LL encode (direct, no NV12 pre-convert)
-                    └─ embedded alvr_server_core (Rust, C API) ── WiFi ──► ALVR client v20.14.1 (Quest 3)
+              │  BGRA composite (3 IOSurface-backed slots) + embedded alvr_server_core (Rust, C API, all alvr_* calls)
+              │  ── IOSurface as Mach send right (bootstrap_check_in/look_up) ──►
+              │        oxrsys-encoder-helper (native arm64, posix_spawn'd)
+              │              └─ VideoToolbox HW HEVC Main LL-RC
+              │  ◄── Annex-B over inherited socketpair ──
+              └─ ── WiFi/USB ──► ALVR client v20.14.1 (Quest 3)
 ```
+
+`encoder_process` config selects the path: `auto`/`native` (default) uses the arm64 helper above for HW HEVC; `inproc` falls back to in-process Rosetta BGRA-direct H.264 (see Constraints).
 
 This repo itself is small (~41 tracked files): the demo pipeline (`demo.sh` + `scripts/demo/`), docs, investigation-era probes (`src/`, `tools/`, `scripts/dev/`), and one patch mirror. **All runtime code lives in three submodule forks under `ext/`:**
 
@@ -36,11 +42,11 @@ The demo pipeline (`demo.sh`, zsh) is the entry point; there is no Makefile or C
 ./demo.sh setup                     # submodules + sha256-pinned binaries + runtime config (idempotent, no sudo)
 ./demo.sh build                     # oxrsys (x86_64 + ALVR core) and wineopenxr
 ./demo.sh install --bottle <name>   # bridge into CrossOver + bottle + host loader (the ONLY sudo stage)
-./demo.sh run --bottle <name>       # launch Beat Saber (also: --bs-dir, --no-audio, --no-dashboard, --verbose)
+./demo.sh run --bottle <name>       # launch Beat Saber (also: --bs-dir, --no-audio, --no-dashboard, --verbose, --wired)
 ./demo.sh stop --bottle <name>      # kill game + wineserver, check ports/audio
 ```
 
-Flags mirror env vars: `WINEVR_BOTTLE`, `WINEVR_BS_DIR`, `WINEVR_NO_AUDIO`, `WINEVR_NO_DASHBOARD`, `WINEVR_VERBOSE`. Stage scripts in `scripts/demo/` are **sourced** by the dispatcher and depend on `lib.sh` globals — they cannot run standalone. `lib.sh` is the single source of truth for paths, sha256 pins, and helpers.
+Flags mirror env vars: `WINEVR_BOTTLE`, `WINEVR_BS_DIR`, `WINEVR_NO_AUDIO`, `WINEVR_NO_DASHBOARD`, `WINEVR_VERBOSE`, `WINEVR_WIRED`. Stage scripts in `scripts/demo/` are **sourced** by the dispatcher and depend on `lib.sh` globals — they cannot run standalone. `lib.sh` is the single source of truth for paths, sha256 pins, and helpers.
 
 What `build` actually runs (useful for iterating on one component):
 
@@ -80,11 +86,12 @@ scripts/dev/run_quest_gate1.sh     # streaming path without Wine (needs arm64 ex
 
 - **Runtime discovery is the one non-obvious hop.** Wine's secure-exec ignores `XR_RUNTIME_JSON`; the host OpenXR loader finds oxrsys only via the root-owned `/usr/local/share/openxr/1/active_runtime.x86_64.json` (written by `install`), which embeds the **absolute path** to `ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib` — moving the repo breaks routing.
 - **`install` touches 4 layers:** global DXMT overlay in `$CX/lib/dxmt`, global wineopenxr in `$CX/lib/wine`, per-bottle (system32 dll + `drive_c/openxr/` manifest + `HKLM\Software\Khronos\OpenXR\1` registry key), and the host manifest above. A CrossOver update silently reverts the global overlays — `doctor` and `run`'s preflight both catch this; the fix is always re-running `install`.
-- **Two oxrsys build trees coexist:** `ext/oxrsys/build` (arm64, native dev/tests, used by Gate 1 tooling) and `ext/oxrsys/build-x64` (x86_64 + ALVR, what the pipeline installs from). Don't conflate them; both read the same user config.
+- **Three oxrsys build trees coexist:** `ext/oxrsys/build` (arm64, native dev/tests, used by Gate 1 tooling), `ext/oxrsys/build-x64` (x86_64 + ALVR, what the pipeline installs from), and `ext/oxrsys/build-helper-arm64` (the native-arm64 `oxrsys-encoder-helper`, staged next to the build-x64 runtime dylib). `doctor` section 9b checks the staged helper + arch. Don't conflate them; all read the same user config.
 - **ALVR embedding:** oxrsys's CMake (`cmake/AlvrServerCore.cmake`) cargo-builds `libalvr_server_core.dylib` from `ext/ALVR` and stages it next to the runtime dylib. It needs the **rustup** stable toolchain with the `x86_64-apple-darwin` target — Homebrew cargo lacks the cross-target std (override: `-DOXRSYS_CARGO_BIN_DIR`). If rustup or the ALVR checkout is missing, a bare cmake configure silently disables the backend with only a WARNING (`demo.sh build` fails earlier, loudly).
 - **The ALVR C API header** (`ext/oxrsys/runtime/src/alvr/alvr_server_core.h`) is hand-written and pinned to ALVR v20.14.1 commit a9f6542; the upstream C API changed after that tag, so bumping the ALVR pin without re-verifying against `c_api.rs` produces silent ABI breakage. `oxrsys-runtime.toml` is the single source of truth: it's synced into ALVR's `session.json` **before** `alvr_initialize` (server_core reads it once at init).
 - **Streaming backends:** two implementations behind `IStreamingBackend` in oxrsys, selected by `protocol = "alvr" | "oxrsys"` in the runtime config. `alvr` is the demo path (stock Quest client); `oxrsys` is the legacy USB/adb-reverse protocol. Preserve `StopForProcessExit()` — `alvr_shutdown()` hangs at process exit by design.
-- **Config/state:** `~/Library/Application Support/OXRSys/` holds `oxrsys-runtime.toml` (written once by `setup`, never overwritten; `doctor` FAILs if protocol ≠ alvr), `alvr/session.json` (auto-created, LAN auto-trust; delete it to clear a stale IP pin after a DHCP change), and runtime logs. The oxrsys 1.3.0 merge added `[streaming]` keys (`render_device`, `video_codec`, `encoder_10bit`, `client_sharpening`, `app_alpha_blend_passthrough`); deployed write-once configs that predate them fall back to code defaults identical to the template, so no migration is needed — and `render_device` only affects the legacy oxrsys protocol, not the ALVR session template.
+- **`--wired`** creates `adb forward tcp:9943`/`tcp:9944`; these forwards persist across sessions and silently break WiFi discovery ("searching for streamer") if left behind — a normal (non-wired) run removes exactly those two forwards in preflight, and `doctor` WARNs when they're present. Manual recovery: `adb forward --remove tcp:9943` (and `tcp:9944`) — avoid `--remove-all`, which also deletes unrelated forwards (distinct from `adb reverse --remove-all`, which `run.sh` already does).
+- **Config/state:** `~/Library/Application Support/OXRSys/` holds `oxrsys-runtime.toml` (written once by `setup`, never overwritten; `doctor` FAILs if protocol ≠ alvr), `alvr/session.json` (auto-created, LAN auto-trust; delete it to clear a stale IP pin after a DHCP change), and runtime logs. The oxrsys 1.3.0 merge added `[streaming]` keys (`render_device`, `video_codec`, `encoder_10bit`, `client_sharpening`, `app_alpha_blend_passthrough`, `encoder_process`); deployed write-once configs that predate them fall back to code defaults identical to the template, so no migration is needed — and `render_device` only affects the legacy oxrsys protocol, not the ALVR session template.
 
 ## Cross-repo workflow
 
@@ -95,7 +102,7 @@ When adding a new requirement to the pipeline, add a `doctor` section with a one
 ## Constraints that look wrong but aren't
 
 - **x86_64 is load-bearing everywhere.** The whole Wine process runs under Rosetta; oxrsys, the ALVR core, and the VideoToolbox probes are all deliberately x86_64. The VT chroma bug does not reproduce on arm64. Debug is the live-verified build type.
-- **VideoToolbox under Rosetta:** H.264 only (no hardware HEVC); LL-RC rejects `ConstantBitRate` with -12900. **Requires macOS 27+**: the encoder feeds BGRA directly (oxrsys branch `bgra-direct` removed the historical `rgb_to_nv12` pre-convert) and VT's internal RGB→YCbCr under Rosetta produced all-zero chroma (green video) before macOS 27 — `doctor` checks the OS version; `tools/vt-llrc-probe --matrix` verifies the BT.709 limited-range conversion. All frame-context writes must happen **before** `VTCompressionSessionEncodeFrame` — LL-RC callbacks are near-synchronous (use-after-free postmortem, oxrsys 47dc2a2). Since the oxrsys 1.3.0 merge, codec choice is negotiated with the client (`CodecSelect.h`), but the Rosetta constraint filters every rung — H.264 is always what the demo path encodes, regardless of the `video_codec` config.
+- **VideoToolbox under Rosetta:** H.264 only (no hardware HEVC); LL-RC rejects `ConstantBitRate` with -12900. This constraint applies only to the `encoder_process = "inproc"` fallback — the default `auto`/`native` path runs VT in a native-arm64 helper process and hardware-encodes real HEVC (see architecture diagram); `video_codec` negotiation with the client (`CodecSelect.h`) is only meaningfully gated to H.264 when `inproc` is forced. **The inproc fallback requires macOS 27+**: it feeds BGRA directly (oxrsys branch `bgra-direct` removed the historical `rgb_to_nv12` pre-convert) and VT's internal RGB→YCbCr under Rosetta produced all-zero chroma (green video) before macOS 27 — `doctor` checks the OS version (hard FAIL below macOS 27 regardless of `encoder_process`, on purpose, so the fallback stays viable); `tools/vt-llrc-probe --matrix` verifies the BT.709 limited-range conversion. All frame-context writes must happen **before** `VTCompressionSessionEncodeFrame` — LL-RC callbacks are near-synchronous (use-after-free postmortem, oxrsys 47dc2a2).
 - **Beat Saber must be exactly 1.29.4** — first native-OpenXR build, and newer builds hard-crash on the Meta account gate. DRM is satisfied offline by Goldberg (`run` swaps `steam_api64.dll`); no real Steam ever runs.
 - Interop traps in the bridge: non-sRGB swapchain format only (sRGB trips `ImportMTLTexture2D`), app OpenXR apiVersion 1.1.0, swapchain textures need `MTLTextureUsagePixelFormatView`.
 - The zsh scripts use `print -r` deliberately (echo mangles backslashes in Windows paths) and zsh array semantics — keep both when editing.
