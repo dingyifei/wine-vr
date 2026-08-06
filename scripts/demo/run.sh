@@ -49,19 +49,33 @@ case "$PROTOCOL" in
   *) die "oxrsys-runtime.toml protocol='$PROTOCOL' is not valid for the demo
        set protocol = \"alvr\" in $TOML (or delete the file and re-run ./demo.sh setup)" ;;
 esac
-# encoder_process: the runtime spawns/owns the native-arm64 helper itself; we only
-# verify the staged binary is launchable. Missing key = code default "auto".
+# encoder_process: the runtime spawns/owns the native-arm64 helper itself; we verify
+# the staged binary is an arm64 executable and restage it from the pristine helper
+# build output when it is missing or wrong-arch. Missing key = code default "auto".
+# Both auto and native hard-require the helper: without it, auto silently downgrades
+# to in-process H.264 (that downgrade reached a live session once — never again).
 ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
 ENCODER_PROC="${ENCODER_PROC:-auto}"
+helper_is_arm64() { [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64; }
+ensure_helper_staged() {
+  helper_is_arm64 "$OXR_HELPER_BIN" && return 0
+  if helper_is_arm64 "$OXR_HELPER_BIN_BUILT"; then
+    warn "encoder helper missing/not arm64 at $OXR_HELPER_BIN — restaging from the helper build tree"
+    install_if_changed "$OXR_HELPER_BIN_BUILT" "$OXR_HELPER_BIN"
+    helper_is_arm64 "$OXR_HELPER_BIN" || \
+      die "encoder helper restage failed validation at $OXR_HELPER_BIN — ./demo.sh build"
+    ok "encoder helper restaged (arm64)"
+  else
+    die "encoder_process=$ENCODER_PROC needs the arm64 helper, but neither the staged copy
+       ($OXR_HELPER_BIN) nor the build output ($OXR_HELPER_BIN_BUILT) is an arm64 executable — ./demo.sh build"
+  fi
+}
 case "$ENCODER_PROC" in
-  native)
-    { [ -x "$OXR_HELPER_BIN" ] && lipo -archs "$OXR_HELPER_BIN" 2>/dev/null | grep -qw arm64; } || \
-      die "encoder_process=native but the arm64 helper is missing/not executable at $OXR_HELPER_BIN — ./demo.sh build" ;;
-  auto)
-    [ -x "$OXR_HELPER_BIN" ] || \
-      warn "encoder helper not staged at $OXR_HELPER_BIN — encoder_process=auto falls back to in-process encode (./demo.sh build stages it)" ;;
+  native|auto) ensure_helper_staged ;;
   inproc) info "encoder_process=inproc — in-process x86_64 encode (native helper disabled)" ;;
-  *) warn "oxrsys-runtime.toml encoder_process='$ENCODER_PROC' unrecognized — the runtime treats unknown values as auto" ;;
+  *)
+    warn "oxrsys-runtime.toml encoder_process='$ENCODER_PROC' unrecognized — the runtime treats unknown values as auto"
+    ensure_helper_staged ;;
 esac
 
 # ---- wired (USB) streaming: adb owns the tcp:9943/tcp:9944 forwards -------------

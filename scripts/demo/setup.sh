@@ -49,9 +49,11 @@ else
   cat > "$TOML" <<'EOF'
 # oxrsys runtime configuration (created by wine-vr demo.sh setup)
 [streaming]
-protocol = "alvr"     # embedded ALVR core; stock ALVR Quest client connects over WiFi
+# embedded ALVR core; stock ALVR Quest client connects over WiFi
+protocol = "alvr"
 bitrate_mbps = 42
-encoder_process = "auto"   # "auto" | "native" (arm64 helper, HW HEVC) | "inproc" (x86_64, H.264)
+# "auto" | "native" (arm64 helper, HW HEVC) | "inproc" (x86_64, H.264)
+encoder_process = "auto"
 EOF
   # Deployed configs that predate encoder_process are left untouched (write-once);
   # the runtime's code default is the same "auto".
