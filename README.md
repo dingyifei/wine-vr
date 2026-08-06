@@ -133,8 +133,14 @@ stale bottle, or a leftover client IP pin in `session.json`.
 | `--verbose` / `WINEVR_VERBOSE` | CLI/env | wine/openxr debug channels in console + log |
 | `--wired` / `WINEVR_WIRED` | CLI/env | create the `adb forward tcp:9943/9944` pair for USB-wired streaming (a normal run clears them) |
 | `protocol = "alvr"` | `oxrsys-runtime.toml` | streaming backend (demo path) |
-| `bitrate_mbps` | `oxrsys-runtime.toml` | base video bitrate (42 verified; ALVR's adaptive loop adjusts from there) |
-| `encoder_process = "auto"` | `oxrsys-runtime.toml` | `auto`/`native` = out-of-process arm64 helper (HW HEVC); `inproc` = in-process Rosetta H.264 fallback |
+| `bitrate_mbps` | `oxrsys-runtime.toml` | base video bitrate (template writes 42; sessions to date ran at 80, which sheds ~5-6 frames/s at the cap — tuning open; ALVR's adaptive loop adjusts from the base) |
+| `encoder_process = "auto"` | `oxrsys-runtime.toml` | `auto`/`native` = out-of-process arm64 helper (HW HEVC), hard-required at launch — `run`'s preflight restages a missing/wrong-arch helper from the build tree, or fails with a remedy; `inproc` = in-process Rosetta H.264 fallback |
+| `video_codec = "auto"` | `oxrsys-runtime.toml` | `h265`/`h264`/`auto` — honored for real on the helper path; the `inproc` fallback under Rosetta is H.264-only |
+| `resolution_scale`, `refresh_rate_hz` | `oxrsys-runtime.toml` | encode-side downscale (1.0 = native) and refresh rate (72 verified) |
+
+The runtime's toml parser strips same-line `#` comments (outside quotes).
+Runtime builds before the 2026-08 fix silently mis-parsed keys carrying a
+trailing comment — if you run an older dylib, keep comments on their own lines.
 
 ## Known limitations
 

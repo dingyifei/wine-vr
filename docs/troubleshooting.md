@@ -21,6 +21,12 @@ start is in the [top-level README](../README.md).
 |---|---|---|
 | Green or corrupted stream | Only the in-process x86_64 Rosetta fallback (`encoder_process = "inproc"`, or `auto` when the native-arm64 helper isn't staged) is affected: it feeds BGRA directly to VT (the `rgb_to_nv12` pre-convert was removed after Apple fixed VT's internal conversion in macOS 27) and older VT under Rosetta produces all-zero chroma. The native helper (`encoder_process = "native"`, HW HEVC) doesn't go through this path and is unaffected | Upgrade the host to macOS 27+, or pin oxrsys back to the NV12-era revision (`cf5f926` or earlier) — only needed if you must run the in-process fallback. `doctor` still hard-FAILs on macOS < 27 regardless of encoder path, so the fallback stays viable; verify with `tools/vt-llrc-probe --matrix`. Background: [low-latency BGRA zero-chroma report](apple-feedback-1-lowlatency-bgra-zero-chroma.md) |
 
+## Encoder
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Stream works but the log says `encoder ready … (H.264, in-process)` instead of `(HEVC, native helper)` | The staged arm64 helper is missing or wrong-arch at `ext/oxrsys/build-x64/runtime/oxrsys-encoder-helper` — under `encoder_process = "auto"` the runtime falls back to in-process H.264 (higher latency, softer image) and warns once per connection. Historically an out-of-band CMake re-configure of `build-x64` deleted the staged helper; that sweep now spares arm64 binaries | `./demo.sh run`'s preflight now restages the helper automatically from `build-helper-arm64` (or dies with a remedy); `doctor` 9b checks presence + arch. Manual: `./demo.sh build` |
+
 ## Network / streaming
 
 | Symptom | Cause | Fix |
@@ -42,3 +48,5 @@ start is in the [top-level README](../README.md).
 | Symptom | Cause | Fix |
 |---|---|---|
 | `doctor` FAILs on `oxrsys-runtime.toml` | `protocol` is not `"alvr"` — hand-edited, or clobbered by an old tool | `./demo.sh setup` rewrites the file only when it is absent: delete `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` and re-run setup, or set `protocol = "alvr"` yourself |
+| A toml key is set but the runtime behaves as if it weren't (e.g. `video_codec = "h264" # note` still streams HEVC); the shell checks (`doctor`) pass | Runtime builds before the 2026-08 parser fix ignored same-line `#` comments: string keys silently kept code defaults and bool keys were forced to `false`, while the demo scripts' quote-splitting `awk` checks read the file correctly — so `doctor` saw the intended value and the runtime didn't | Update oxrsys (the parser now strips unquoted `#` comments), or keep comments on their own lines. The startup config-dump log line now includes `codec=` so the parsed value is visible |
+| Running oxrsys test binaries directly clobbered your real config | Direct test-binary runs bypass ctest's isolated `HOME` and overwrite `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` | Always run tests through `ctest`; restore values from the startup config-dump line in an old `oxrsys-runtime.log` (see `ext/oxrsys/docs/testing-and-conformance.md`) |
