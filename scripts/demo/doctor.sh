@@ -97,8 +97,8 @@ done
 # locates it beside its own dylib; helper has no probe flag, so checks stop at arch)
 if [ -f "$OXR_HELPER_BIN" ]; then
   ok "built: ${OXR_HELPER_BIN#$ROOT/} (staged next to the runtime dylib)"
-  if lipo -archs "$OXR_HELPER_BIN" 2>/dev/null | grep -qw arm64; then ok "encoder helper is arm64"
-  else fail "encoder helper is not arm64 ($(lipo -archs "$OXR_HELPER_BIN" 2>/dev/null)) — a manual build-x64 build emits an x86_64 helper here and clobbers the staged one" "./demo.sh build (restages the arm64 helper)"; fi
+  if helper_is_arm64 "$OXR_HELPER_BIN"; then ok "encoder helper is arm64"
+  else fail "encoder helper is not an arm64 executable ($(lipo -archs "$OXR_HELPER_BIN" 2>/dev/null)) — a stale/wrong-arch binary here shadows the staged one" "./demo.sh build (restages the arm64 helper)"; fi
 else fail "encoder helper not staged: ${OXR_HELPER_BIN#$ROOT/}" "./demo.sh build"; fi
 
 # 10. global bridge overlay (a CrossOver update silently reverts these)

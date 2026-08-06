@@ -56,7 +56,6 @@ esac
 # to in-process H.264 (that downgrade reached a live session once — never again).
 ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
 ENCODER_PROC="${ENCODER_PROC:-auto}"
-helper_is_arm64() { [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64; }
 ensure_helper_staged() {
   helper_is_arm64 "$OXR_HELPER_BIN" && return 0
   if helper_is_arm64 "$OXR_HELPER_BIN_BUILT"; then

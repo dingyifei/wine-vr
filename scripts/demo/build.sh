@@ -30,8 +30,8 @@ cmake -S "$OXRSYS" -B "$OXR_HELPER_BUILD" -G Ninja \
   >/dev/null
 cmake --build "$OXR_HELPER_BUILD" --target oxrsys_encoder_helper -j8
 [ -f "$OXR_HELPER_BIN_BUILT" ] || die "encoder helper build produced no binary at $OXR_HELPER_BIN_BUILT"
-lipo -archs "$OXR_HELPER_BIN_BUILT" 2>/dev/null | grep -qw arm64 || \
-  die "encoder helper is not arm64 ($(lipo -archs "$OXR_HELPER_BIN_BUILT" 2>/dev/null)) — delete $OXR_HELPER_BUILD and re-run ./demo.sh build"
+helper_is_arm64 "$OXR_HELPER_BIN_BUILT" || \
+  die "encoder helper is not an arm64 executable ($(lipo -archs "$OXR_HELPER_BIN_BUILT" 2>/dev/null)) — delete $OXR_HELPER_BUILD and re-run ./demo.sh build"
 install_if_changed "$OXR_HELPER_BIN_BUILT" "$OXR_HELPER_BIN"
 ok "encoder helper built (arm64) and staged next to the runtime dylib"
 

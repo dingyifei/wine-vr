@@ -96,6 +96,10 @@ install_if_changed() { # src dst  -> copies only when content differs; prints ac
   fi
 }
 
+helper_is_arm64() { # path -> true iff an executable whose lipo archs include arm64
+  [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64
+}
+
 win_path() { # unix absolute path -> windows path: C:\ inside the bottle's drive_c, else Z:\ (z: -> /)
   if [ -n "${PREFIX:-}" ] && [[ "$1" == "$PREFIX/drive_c/"* ]]; then
     local rel="${1#$PREFIX/drive_c/}"
