@@ -36,6 +36,13 @@ start is in the [top-level README](../README.md).
 | Quest never connects | Mac and Quest on different WiFi networks or bands; discovery blocked by a host firewall/traffic filter (e.g. TripMode); or a stale manual-IP pin in `session.json` after a DHCP change | Put both on the same network/band; allow the traffic in the filter; delete `~/Library/Application Support/OXRSys/alvr/session.json` (recreated with discovery + auto-trust). `doctor` warns when `session.json` pins an IP |
 | Quest stuck on "searching for streamer" after a wired/USB session | Stale `adb forward tcp:9943`/`tcp:9944` from a previous `--wired` launch squatting the streaming ports — forwards persist across sessions until explicitly removed | A normal (non-wired) `./demo.sh run` clears exactly these two forwards in preflight; `doctor` warns when they're present. Manual: `adb forward --remove tcp:9943` + `adb forward --remove tcp:9944` (avoid `--remove-all`, which also deletes unrelated forwards). (Unrelated to `adb reverse`, which `run` already clears every launch.) |
 
+## Session
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Headset shows a frozen frame after the display went to standby; tracking/battery still update, no disconnect | Quest display standby without an ALVR disconnect starves the frame loop: the session stays FOCUSED, encode stops, and no reconnect path fires because the client never disconnects (observed 2026-08-04, ~3 min frozen) | Fully wake the headset (press the power button / put it on) — the stream resumes by itself. No server-side fix yet; client-side behavior is under investigation |
+| ALVR dashboard window is frozen (busy-spins ~34% CPU), but streaming keeps working | Upstream `alvr_dashboard` egui wedge; the server API on `127.0.0.1:8082` stays healthy | Quit and relaunch the dashboard (or ignore it — the stream doesn't depend on it; `--no-dashboard` skips it entirely) |
+
 ## Audio
 
 | Symptom | Cause | Fix |

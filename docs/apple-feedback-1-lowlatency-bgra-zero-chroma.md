@@ -1,5 +1,8 @@
 # Feedback Assistant report — VideoToolbox low-latency H.264 encoder emits all-zero chroma for BGRA input under Rosetta 2
 
+**Status (2026-08): fixed by Apple in the macOS 27.0 beta** — the NV12 pre-convert
+workaround was removed (oxrsys `bgra-direct`); this report is kept verbatim as filed.
+
 **Title:** VideoToolbox low-latency H.264 encoder (EnableLowLatencyRateControl) emits all-zero
 chroma planes for BGRA input in x86_64 (Rosetta 2) processes on Apple Silicon
 

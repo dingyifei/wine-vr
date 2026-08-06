@@ -2,9 +2,16 @@
 
 Run the Windows build of **Beat Saber 1.29.4** on an Apple Silicon Mac under
 CrossOver and stream it to a Meta Quest 3 over WiFi with the **stock ALVR
-client** — full 6DoF tracking, 72 fps, 93.5 ms p50 motion-to-photon
-(USB-wired, native arm64 HEVC helper; measured better than Virtual Desktop on
-the same network).
+client** — full 6DoF tracking, 72 fps, **102.9 ms p50 / 130.5 ms p95
+motion-to-photon on-head over WiFi** (native arm64 HEVC helper).
+
+Measured status (2026-08-04, 3008x1664@72, 80 Mbps,
+`evidence/batchA-soak-20260804-results.md`): WiFi desk-idle
+106.9 ms p50 / 130.7 p95 over 231k frames; 60-minute soak with zero
+uninduced encoder-helper deaths; ~5-6 dropped frames/s at the 80 Mbps cap
+(bitrate tuning open). USB-wired measured 93.5 ms p50 — a
+transport-isolation figure from the helper validation gate, not the WiFi
+product number.
 
 ```
 Beat Saber (Windows, x64) ─ CrossOver/Wine ─ DXMT (D3D11→Metal, zero-copy)

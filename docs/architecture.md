@@ -58,11 +58,27 @@ bootstrap port at `libSystem` init, so that route is dead for a
 `posix_spawn`ed child). The helper runs VideoToolbox HW HEVC Main with
 low-latency rate control natively on arm64 — no Rosetta, no chroma bug — and
 returns Annex-B NALs to the parent over an inherited socketpair; the helper
-exits cleanly on socket EOF (SIGKILL recovery is ~383 ms). This cut
-motion-to-photon to 93.5 ms p50 (USB-wired, 3008x1664@72) from the prior
-~114 ms WiFi H.264 in-process baseline — not a matched A/B, since transport
-differs too — and collapsed the Quest's `decoder_queue` from ~30 ms to
-~1.1 ms.
+exits cleanly on socket EOF. Crash handling is budgeted: at most one automatic
+respawn per 30 s, and after two failures in one connected session `auto` pins
+to in-process H.264 until the next reconnect (`native` fails loudly instead).
+Live recovery numbers (2026-08-04): SIGKILL→HEVC-ready 398 ms (515 ms
+mid-soak), second-failure pin engaged in 13 ms, parent kill-9 → helper
+EOF-exit in 0.32 s.
+
+Latency, by transport (3008x1664@72, 80 Mbps, all p50 unless noted):
+
+| | USB-wired (Gate E, 2026-08-03) | WiFi desk-idle (2026-08-04) | WiFi on-head (2026-08-04) |
+|---|---|---|---|
+| total motion-to-photon | 93.5 ms | 106.9 ms (130.7 p95) | 102.9 ms (130.5 p95) |
+| encoder | 37.6 ms | 38.2 ms | 38.6 ms |
+| network | — | 7.4 ms | 7.0 ms |
+| Quest decoder | 16.6 ms | 16.7 ms | 16.9 ms |
+| decoder_queue | 1.1 ms | 1.9 ms (17.2 p95) | 2.1 ms |
+| vsync_queue | 22.9 ms | 24.4 ms (46.0 p95) | 25.0 ms |
+
+(The pre-helper in-process WiFi H.264 baseline was ~114 ms; the helper's HEVC
+collapsed the Quest `decoder_queue` from ~30 ms. `vsync_queue` — frames
+arriving early and waiting for display — is the frame-pacing headroom.)
 
 The in-process Rosetta fallback (`encoder_process = "inproc"`) is retained:
 on `xrEndFrame`, the runtime composites layers into a BGRA target that is
@@ -99,16 +115,23 @@ regenerated with
 ## Configuration
 
 - `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` — runtime config
-  (`protocol = "alvr"`, `bitrate_mbps`, `encoder_process`). Written once by
-  `./demo.sh setup`, never overwritten.
+  (`protocol = "alvr"`, `bitrate_mbps`, `encoder_process`, `video_codec`).
+  Written once by `./demo.sh setup`, never overwritten. The parser strips
+  same-line `#` comments (runtime builds before the 2026-08 fix mis-parsed
+  keys with trailing comments — see troubleshooting).
 - `encoder_process` (`[streaming]`, default `"auto"`) — `"auto"`/`"native"`
-  select the out-of-process arm64 helper (HW HEVC); `"inproc"` selects the
-  in-process Rosetta H.264 fallback.
+  select the out-of-process arm64 helper (HW HEVC) and are hard-required by
+  `run`'s preflight (self-heals by restaging, or fails with a remedy);
+  `"inproc"` selects the in-process Rosetta H.264 fallback.
+- `video_codec` (`[streaming]`, default `"h265"`; deployed `"auto"`) —
+  honored for real on the helper path; `inproc` under Rosetta stays H.264.
 - `~/Library/Application Support/OXRSys/alvr/session.json` — the embedded ALVR
   core's session file (not stock ALVR's config directory). Auto-created on
   first run; LAN clients are auto-trusted, so no pairing step.
 
 ## Future work
 
-- 1:1 resolution.
-- 72 fps pacing refinements.
+- Bitrate tuning: ~5-6 dropped frames/s at the 80 Mbps cap (first lever: 80→60).
+- NV12-in-parent probe (`vt-llrc-probe --gpu --nv12`, adopt only on a ≥5 ms win).
+- Frame pacing: ~24 ms p50 `vsync_queue` headroom (owned by the PR#22 pacer thread).
+- Quest display-standby freeze: client-side experiments (see troubleshooting).

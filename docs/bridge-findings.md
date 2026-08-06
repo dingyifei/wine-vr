@@ -3,8 +3,9 @@
 Engineering record of the risk-retirement gates behind the demo in the
 [README](../README.md): Beat Saber 1.29.4 → CrossOver/DXMT → wineopenxr →
 oxrsys → embedded ALVR → Quest 3 at 72 fps and ~79 ms motion-to-photon (the
-pre-1.3.0 baseline; see [README](../README.md) for the current 93.5 ms p50
-figure with the native arm64 HEVC helper) —
+pre-1.3.0 baseline; see [README](../README.md) for the current WiFi baseline
+with the native arm64 HEVC helper — 102.9 ms p50 on-head, USB 93.5 as the
+gate-era transport-isolation figure) —
 what each gate proved and which fixes were load-bearing. Condensed; the full
 transcript is in the git history of `FINDINGS-oxrsys.md` (repo root). The
 dead SteamVR-under-Wine path:
@@ -460,9 +461,39 @@ posix_spawn (`arm64 native, capsH264=0x3 capsH265=0x3`).
   uninterrupted, "failure 1 this session" budget accounting correct. Same-codec
   respawn, no codec flip needed. (Cosmetic: "VideoEncoder: Shut down" logs
   twice during the swap.) Parent-kill and generation-chaos legs deferred to
-  the soak gate.
+  the soak gate at the time — both completed 2026-08-04, see the batch A /
+  soak section below.
 
 Deployed config now ships `encoder_process = "auto"` + `video_codec = "auto"`.
 Player verdict: "feels rly good" — and Gate D over USB already felt better
 tracking-wise (wired network 2.7ms p50 vs WiFi ~6ms spiky, independent of
 codec).
+
+## 2026-08-04 — live batch A + 60-min soak (WiFi): validation closed
+
+Full record: `evidence/batchA-soak-20260804-results.md` +
+`evidence/soak-20260804-samples.csv` (local artifacts). Stock ALVR Quest
+client v20.14.1, WiFi discovery, 3008x1664@72, 80 Mbps, oxrsys `1ca5ef6`.
+
+- **WiFi baseline** (desk-idle, 231,484 frames): total **106.9 ms p50 /
+  130.7 p95** — encoder 38.2, network 7.4, decoder 16.7, decoder_queue 1.9,
+  vsync_queue 24.4 (pacing headroom). On-head (1 min head-motion):
+  **102.9 / 130.5** — motion state doesn't move the number. Never compared
+  against the USB 93.5 (different transport).
+- **V4 codec/fallback matrix 5/5**: `h264`-forced on the helper; silent auto
+  fallback with the helper absent; spawn-fail ×2 → pin (13 ms failover) with
+  the hands-free 30 s budget retry landing to the second; reconnect
+  no-inherit; codec-churn identity rebuilds.
+- **V5 kill legs**: SIGKILL→HEVC-ready **398 ms** (matches the 383 ms USB
+  gate figure; 515 ms on a mid-soak repeat); parent kill-9 → helper EOF-exit
+  **0.32 s**, no orphan, no `alvr_shutdown`; EndFrame enqueue ≤0.03 ms p95
+  throughout.
+- **V7 soak (60 min)**: **0 uninduced helper deaths**; RSS/fd flat (helper
+  ~48 MB / 20-21 fds per generation); 6 IDR storms limiter-capped at ~1/s;
+  one labeled generation rebuild (515 ms).
+- **Found and since fixed** (oxrsys `a0d37b8` + the wine-vr preflight
+  commits): the configure-time sweep deleting the staged helper, the
+  warn-only `auto` preflight, the toml trailing-comment parser bug, and the
+  silent auto→in-process downgrade log gap. Still open: the Quest
+  display-standby freeze (client-side experiments next) and the upstream
+  dashboard egui wedge (restart recovers).
