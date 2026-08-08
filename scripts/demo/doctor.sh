@@ -139,7 +139,7 @@ else fail "$HOST_XR_JSON missing" "./demo.sh install --bottle $WINEVR_BOTTLE (su
 
 # 13. runtime config
 if [ -f "$TOML" ]; then
-  PROTO="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
+  PROTO="$(toml_string_value "$TOML" protocol)"
   if [ "$PROTO" = "alvr" ]; then ok "oxrsys-runtime.toml: protocol=alvr"
   else fail "oxrsys-runtime.toml protocol='"$PROTO"' — the demo streams via ALVR" "set protocol = \"alvr\" in $TOML"; fi
 else fail "$TOML missing" "./demo.sh setup"; fi

@@ -42,7 +42,7 @@ if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
 fi
 sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256" || [ -f "$GBE_DLL" ] || die "Goldberg dll missing — ./demo.sh setup"
 [ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"
-PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
+PROTOCOL="$(toml_string_value "$TOML" protocol)"
 case "$PROTOCOL" in
   alvr) : ;;
   oxrsys) warn "protocol=oxrsys (legacy USB path) — the demo path is alvr" ;;
@@ -54,7 +54,7 @@ esac
 # build output when it is missing or wrong-arch. Missing key = code default "auto".
 # Both auto and native hard-require the helper: without it, auto silently downgrades
 # to in-process H.264 (that downgrade reached a live session once — never again).
-ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
+ENCODER_PROC="$(toml_string_value "$TOML" encoder_process)"
 ENCODER_PROC="${ENCODER_PROC:-auto}"
 ensure_helper_staged() {
   helper_is_arm64 "$OXR_HELPER_BIN" && return 0

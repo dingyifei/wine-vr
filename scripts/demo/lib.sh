@@ -100,6 +100,12 @@ helper_is_arm64() { # path -> true iff an executable whose lipo archs include ar
   [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64
 }
 
+toml_string_value() { # file key -> first quoted value of `key = "..."`, else empty.
+  # The shell-side reading of the runtime toml (run/setup/doctor all preflight
+  # against it) — one definition so the quote-splitting can't drift per stage.
+  awk -F'"' -v key="$2" '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" {print $2; exit}' "$1"
+}
+
 win_path() { # unix absolute path -> windows path: C:\ inside the bottle's drive_c, else Z:\ (z: -> /)
   if [ -n "${PREFIX:-}" ] && [[ "$1" == "$PREFIX/drive_c/"* ]]; then
     local rel="${1#$PREFIX/drive_c/}"
