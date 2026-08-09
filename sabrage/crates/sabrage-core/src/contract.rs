@@ -1,0 +1,339 @@
+//! The shared parity contract, compiled in.
+//!
+//! `contract/pipeline.toml` is the single source for pins, the depot triple, the
+//! host-manifest path, the DXMT artifact set, the port lists, and — most
+//! importantly for this crate — the **ordered check registry** and the
+//! launch-action registry. The zsh side consumes the same data through the
+//! GENERATED `scripts/demo/contract.gen.sh`; sabrage-core parses the TOML
+//! directly.
+//!
+//! ## Why `include_str!` and not a runtime read
+//!
+//! `Sabrage.app` is installed somewhere unrelated to the repo, and `repo_root` is
+//! user-configurable at runtime. The *check registry* must not depend on which
+//! repo the user pointed at — it is part of the binary's identity, not of the
+//! machine state. So the three contract files are baked in at compile time.
+//! Editing any of them retriggers a rebuild (`include_str!` registers a build
+//! dependency), which is exactly the tripwire the parity design wants.
+//!
+//! [`crate::util::contract_hash`] deliberately does the opposite (reads the three
+//! files from `repo_root` at runtime) because the `meta.contract-sync` check has
+//! to compare the *on-disk* contract against the *on-disk* generated shell file.
+//!
+//! ## Include-path depth
+//!
+//! This file lives at `sabrage/crates/sabrage-core/src/contract.rs`, and
+//! `include_str!` resolves relative to the including file's directory, so the
+//! repo root is four levels up (`src/` → `sabrage-core/` → `crates/` →
+//! `sabrage/` → repo root). All three includes live in this one module so the
+//! depth is stated exactly once.
+
+use std::collections::BTreeMap;
+use std::path::Path;
+use std::sync::LazyLock;
+
+use serde::{Deserialize, Serialize};
+
+/// Raw bytes of `contract/pipeline.toml` (compile-time).
+pub const PIPELINE_TOML: &str = include_str!("../../../../contract/pipeline.toml");
+
+/// Raw bytes of `contract/oxrsys-runtime.toml.template` (compile-time).
+///
+/// setup.sh does `cat template > "$TOML"`, so the file it writes is these bytes
+/// verbatim — no trailing-newline munging. See [`crate::util::toml_template`].
+pub const RUNTIME_TOML_TEMPLATE: &str =
+    include_str!("../../../../contract/oxrsys-runtime.toml.template");
+
+/// Raw bytes of `contract/active_runtime.x86_64.json.template` (compile-time).
+///
+/// install.sh reads it with `$(<…)`, which strips trailing newlines — see
+/// [`crate::util::render_host_manifest`] for the exact rendering rule.
+pub const HOST_MANIFEST_TEMPLATE: &str =
+    include_str!("../../../../contract/active_runtime.x86_64.json.template");
+
+/// Placeholder substituted by [`crate::util::render_host_manifest`].
+pub const HOST_MANIFEST_PLACEHOLDER: &str = "@OXR_DYLIB@";
+
+/// Repo-relative path of the generated shell mirror of this contract.
+pub const CONTRACT_GEN_REL_PATH: &str = "scripts/demo/contract.gen.sh";
+
+/// Repo-relative paths of the three contract files, in the order the
+/// `meta.contract-sync` hash recipe concatenates them (doctor.sh section 0).
+pub const CONTRACT_FILES: [&str; 3] = [
+    "contract/pipeline.toml",
+    "contract/oxrsys-runtime.toml.template",
+    "contract/active_runtime.x86_64.json.template",
+];
+
+/// How a check's failure is treated by the launch preflight, per side.
+///
+/// Mirrors the contract's gate vocabulary verbatim:
+/// * `block` — launch aborts on failure (`die` on the zsh side, [`crate::error::SabrageError::Fatal`] here)
+/// * `warn` — failure prints a warning, launch continues
+/// * `autofix` — failure triggers an automatic permanent fix, then a re-check
+/// * `none` — doctor-only; not part of the launch preflight on that side
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Gate {
+    Block,
+    Warn,
+    Autofix,
+    None,
+}
+
+impl Gate {
+    /// True when this gate participates in the launch preflight at all.
+    pub fn is_gating(self) -> bool {
+        !matches!(self, Gate::None)
+    }
+
+    /// The contract spelling (`"block"` / `"warn"` / `"autofix"` / `"none"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Gate::Block => "block",
+            Gate::Warn => "warn",
+            Gate::Autofix => "autofix",
+            Gate::None => "none",
+        }
+    }
+}
+
+/// `[deps]` — pinned dependency sources fetched by `demo.sh setup`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Deps {
+    /// Release base URL (`DEPS_URL`).
+    pub url: String,
+    /// Goldberg dll asset filename.
+    pub gbe_dll_asset: String,
+    /// Pinned sha256 of the Goldberg dll (`GBE_DLL_SHA256`).
+    pub gbe_dll_sha256: String,
+    /// DXMT artifact tarball asset filename.
+    pub dxmt_tgz_asset: String,
+    /// Pinned sha256 of the DXMT tarball (`DXMT_TGZ_SHA256`), also the content of
+    /// the `.sha256` provenance marker `setup` writes into `ext/dxmt-artifacts/`.
+    pub dxmt_tgz_sha256: String,
+}
+
+/// `[game]` — the Beat Saber 1.29.4 depot pin and default install leaf.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Game {
+    /// `BS_APPID` (620980).
+    pub appid: u64,
+    /// `BS_DEPOT` (620981).
+    pub depot: u64,
+    /// `BS_MANIFEST` — a 19-digit id, kept a string so it never round-trips
+    /// through a float or overflows on a 32-bit target.
+    pub manifest: String,
+    /// Default install directory leaf under the bottle's Steam library
+    /// (`"Beat Saber 1294"`).
+    pub bs_dir_leaf: String,
+}
+
+/// `[paths]` — path literals both front-ends must agree on.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ContractPaths {
+    /// `HOST_XR_JSON` — the root-owned host OpenXR registration.
+    pub host_xr_json: String,
+}
+
+/// `[ports]` — streaming / dashboard endpoints.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Ports {
+    /// `WIRED_PORTS` — the two ports `--wired` forwards, and the pair doctor's
+    /// `net.ports` / `net.adb-forwards` checks look at.
+    pub stream: Vec<u16>,
+    /// `LEGACY_REVERSE_PORTS` — explicit list (9947 is deliberately absent;
+    /// never treat this as a range).
+    pub legacy_reverse: Vec<u16>,
+    /// Embedded ALVR dashboard address, `"127.0.0.1:8082"`.
+    pub dashboard_addr: String,
+}
+
+/// `[dxmt]` — the complete artifact set `install` deploys.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Dxmt {
+    /// Paths relative to `ext/dxmt-artifacts/`; presence gates key on ALL of them.
+    pub files: Vec<String>,
+}
+
+/// One `[[check]]` entry: the stable slug plus its per-side launch gates.
+///
+/// Check *logic* and message/remedy prose are impl-owned and deliberately absent
+/// from the contract — the parity harness joins on `slug` + status only.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct CheckSpec {
+    /// Stable dotted slug, the join key for everything (`"build.helper-arm64"`).
+    pub slug: String,
+    /// Grouping label (`"system"`, `"bottle-bridge"`, `"run-only"`, …). Maps to a
+    /// module under `checks/` — see [`crate::checks`] for the exact mapping.
+    pub group: String,
+    /// How `run.sh`'s preflight treats a failure of this check.
+    pub shell_gate: Gate,
+    /// How the native run preflight treats a failure. May deliberately differ
+    /// from `shell_gate`; the divergence is recorded in the contract, not in code.
+    pub native_gate: Gate,
+    /// True when the tier-2 live differ may only compare presence, not status
+    /// (adb / lsof / session state legitimately change between two doctor runs).
+    #[serde(default)]
+    pub volatile: bool,
+    /// Optional `FixId` this check's remedy maps to (`"fix.run-install"`, …).
+    #[serde(default)]
+    pub fix: Option<String>,
+}
+
+/// One `[[launch_action]]`: an unconditional ordered preparation step in `run.sh`
+/// (NOT check-shaped — no pass/fail, no remedy). Order here == execution order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct LaunchAction {
+    /// Stable id, matching run.sh's `# launch-action:` tag.
+    pub id: String,
+    /// One-line description of what the step does.
+    pub what: String,
+}
+
+/// The parsed `contract/pipeline.toml`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Contract {
+    pub deps: Deps,
+    pub game: Game,
+    pub paths: ContractPaths,
+    pub ports: Ports,
+    pub dxmt: Dxmt,
+    /// Ordered check registry. **Order is load-bearing** — it is doctor.sh's
+    /// order, in which section 3 resolves the bottle context that later checks
+    /// consume, and run-only preflights come last.
+    #[serde(default, rename = "check")]
+    pub checks: Vec<CheckSpec>,
+    /// Ordered launch-action registry.
+    #[serde(default, rename = "launch_action")]
+    pub launch_actions: Vec<LaunchAction>,
+}
+
+impl Contract {
+    /// Parse a contract from TOML text. Used by the compile-time [`CONTRACT`] and
+    /// by anything that wants to diff an on-disk contract against the baked one.
+    pub fn parse(text: &str) -> Result<Contract, toml::de::Error> {
+        toml::from_str(text)
+    }
+
+    /// The check spec for `slug`, if the contract declares it.
+    pub fn check(&self, slug: &str) -> Option<&CheckSpec> {
+        self.checks.iter().find(|c| c.slug == slug)
+    }
+
+    /// All check slugs, in contract (= doctor) order.
+    pub fn check_slugs(&self) -> Vec<&str> {
+        self.checks.iter().map(|c| c.slug.as_str()).collect()
+    }
+
+    /// Slug → spec, for O(log n) lookups when binding a whole registry.
+    pub fn checks_by_slug(&self) -> BTreeMap<&str, &CheckSpec> {
+        self.checks.iter().map(|c| (c.slug.as_str(), c)).collect()
+    }
+
+    /// Checks whose `native_gate` participates in the launch preflight.
+    pub fn native_preflight(&self) -> Vec<&CheckSpec> {
+        self.checks
+            .iter()
+            .filter(|c| c.native_gate.is_gating())
+            .collect()
+    }
+
+    /// The `DepotDownloader …` remedy string doctor's `game.present` row prints.
+    ///
+    /// Byte-identical to lib.sh's `DEPOT_CMD` / doctor.sh's `$DEPOT_CMD`,
+    /// including the quoting of `-dir`.
+    pub fn depot_command(&self, bs_dir: &Path) -> String {
+        format!(
+            "DepotDownloader -app {} -depot {} -manifest {} -username <steam-user> -dir \"{}\"",
+            self.game.appid,
+            self.game.depot,
+            self.game.manifest,
+            bs_dir.display()
+        )
+    }
+}
+
+/// The compiled-in contract. Panics on first use if `contract/pipeline.toml` is
+/// malformed — which can only happen at build time, so the panic is a build-time
+/// error in practice.
+pub static CONTRACT: LazyLock<Contract> = LazyLock::new(|| {
+    Contract::parse(PIPELINE_TOML).expect("contract/pipeline.toml is not valid contract TOML")
+});
+
+/// `&'static` accessor for the compiled-in contract.
+pub fn contract() -> &'static Contract {
+    &CONTRACT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn contract_parses_and_include_path_resolves() {
+        // If the include path were wrong this would not compile at all; the
+        // assertions below pin the values the rest of the crate hard-codes.
+        let c = contract();
+        assert_eq!(c.game.appid, 620980);
+        assert_eq!(c.game.depot, 620981);
+        assert_eq!(c.game.manifest, "6291266771922375922");
+        assert_eq!(c.game.bs_dir_leaf, "Beat Saber 1294");
+        assert_eq!(
+            c.paths.host_xr_json,
+            "/usr/local/share/openxr/1/active_runtime.x86_64.json"
+        );
+        assert_eq!(c.ports.stream, vec![9943, 9944]);
+        assert_eq!(c.ports.legacy_reverse, vec![9944, 9945, 9946, 9948]);
+        assert_eq!(c.ports.dashboard_addr, "127.0.0.1:8082");
+        assert_eq!(c.dxmt.files.len(), 5);
+        assert!(!c.checks.is_empty());
+        assert_eq!(c.launch_actions.len(), 7);
+    }
+
+    #[test]
+    fn check_slugs_are_unique_and_ordered_meta_first() {
+        let c = contract();
+        let mut seen = std::collections::BTreeSet::new();
+        for slug in c.check_slugs() {
+            assert!(seen.insert(slug), "duplicate slug in contract: {slug}");
+        }
+        assert_eq!(c.checks[0].slug, "meta.contract-sync");
+    }
+
+    #[test]
+    fn gates_round_trip() {
+        let c = contract();
+        let helper = c.check("build.helper-arm64").expect("slug present");
+        assert_eq!(helper.shell_gate, Gate::Autofix);
+        assert_eq!(helper.native_gate, Gate::Autofix);
+        assert_eq!(helper.fix.as_deref(), Some("fix.restage-helper"));
+        assert!(!helper.volatile);
+
+        let legacy = c.check("cfg.protocol.legacy-oxrsys").expect("slug present");
+        assert_eq!(legacy.shell_gate, Gate::Warn);
+        assert_eq!(legacy.native_gate, Gate::Block);
+
+        let ports = c.check("net.ports").expect("slug present");
+        assert!(ports.volatile);
+        assert_eq!(ports.native_gate, Gate::None);
+        assert!(!ports.native_gate.is_gating());
+    }
+
+    #[test]
+    fn depot_command_matches_lib_sh() {
+        let c = contract();
+        assert_eq!(
+            c.depot_command(Path::new("/tmp/Beat Saber 1294")),
+            "DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 \
+             -username <steam-user> -dir \"/tmp/Beat Saber 1294\""
+        );
+    }
+
+    #[test]
+    fn templates_are_the_bytes_the_shell_writes() {
+        assert!(RUNTIME_TOML_TEMPLATE.contains("protocol = \"alvr\""));
+        assert!(HOST_MANIFEST_TEMPLATE.contains(HOST_MANIFEST_PLACEHOLDER));
+        assert!(HOST_MANIFEST_TEMPLATE.ends_with('\n'));
+    }
+}

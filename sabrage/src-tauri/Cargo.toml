@@ -13,3 +13,5 @@ tauri-build = { version = "2", features = [] }
 [dependencies]
 tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
+sabrage-core = { path = "../crates/sabrage-core" }
+serde = { version = "1", features = ["derive"] }

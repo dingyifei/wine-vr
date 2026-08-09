@@ -6,6 +6,7 @@
   import Doctor from "./screens/Doctor.svelte";
   import Logs from "./screens/Logs.svelte";
   import Settings from "./screens/Settings.svelte";
+  import { doctorStore } from "./stores/doctor.svelte";
   import type { Screen } from "./types";
 
   let screen = $state<Screen>("about");
@@ -16,7 +17,7 @@
 </script>
 
 <div class="app-shell">
-  <Sidebar {screen} onNavigate={navigate} />
+  <Sidebar {screen} onNavigate={navigate} doctorBadge={doctorStore.failCount > 0} />
 
   <main class="main-area">
     {#if screen === "about"}

@@ -4,3 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: cfg.session-pins must render pinned clients in session.json
+# file order to match doctor.sh's python (dict insertion order) verbatim.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"

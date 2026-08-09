@@ -3,6 +3,8 @@ use tauri::{
     Manager,
 };
 
+mod commands;
+
 /// Builds the native menu bar: App / Edit / Pipeline / Window.
 ///
 /// The Edit submenu's predefined clipboard items are required — without them
@@ -14,7 +16,13 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
     let about = PredefinedMenuItem::about(handle, Some("About Sabrage"), None)?;
     let app_sep1 = PredefinedMenuItem::separator(handle)?;
     // Disabled until the Settings screen gains a deep-link (Phase 4).
-    let settings = MenuItem::with_id(handle, "app_settings", "Settings…", false, Some("CmdOrCtrl+,"))?;
+    let settings = MenuItem::with_id(
+        handle,
+        "app_settings",
+        "Settings…",
+        false,
+        Some("CmdOrCtrl+,"),
+    )?;
     let app_sep2 = PredefinedMenuItem::separator(handle)?;
     let hide = PredefinedMenuItem::hide(handle, None)?;
     let hide_others = PredefinedMenuItem::hide_others(handle, None)?;
@@ -24,7 +32,16 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
         handle,
         "Sabrage",
         true,
-        &[&about, &app_sep1, &settings, &app_sep2, &hide, &hide_others, &app_sep3, &quit],
+        &[
+            &about,
+            &app_sep1,
+            &settings,
+            &app_sep2,
+            &hide,
+            &hide_others,
+            &app_sep3,
+            &quit,
+        ],
     )?;
 
     // Edit submenu: predefined clipboard items only.
@@ -65,14 +82,9 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
         false,
         Some("CmdOrCtrl+R"),
     )?;
-    let stop = MenuItem::with_id(
-        handle,
-        "pipeline_stop",
-        "Stop",
-        false,
-        Some("CmdOrCtrl+."),
-    )?;
-    let pipeline_menu = Submenu::with_items(handle, "Pipeline", true, &[&run_doctor, &launch, &stop])?;
+    let stop = MenuItem::with_id(handle, "pipeline_stop", "Stop", false, Some("CmdOrCtrl+."))?;
+    let pipeline_menu =
+        Submenu::with_items(handle, "Pipeline", true, &[&run_doctor, &launch, &stop])?;
 
     // Window submenu: close, minimize, zoom.
     let close = PredefinedMenuItem::close_window(handle, None)?;
@@ -80,7 +92,10 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
     let zoom = PredefinedMenuItem::maximize(handle, Some("Zoom"))?;
     let window_menu = Submenu::with_items(handle, "Window", true, &[&close, &minimize, &zoom])?;
 
-    Menu::with_items(handle, &[&app_menu, &edit_menu, &pipeline_menu, &window_menu])
+    Menu::with_items(
+        handle,
+        &[&app_menu, &edit_menu, &pipeline_menu, &window_menu],
+    )
 }
 
 pub fn run() {
@@ -91,6 +106,10 @@ pub fn run() {
                 let _ = window.set_focus();
             }
         }))
+        .invoke_handler(tauri::generate_handler![
+            commands::run_doctor,
+            commands::get_app_state
+        ])
         .setup(|app| {
             let handle = app.handle();
             let menu = build_menu(handle)?;

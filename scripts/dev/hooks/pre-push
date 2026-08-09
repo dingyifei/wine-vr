@@ -1,0 +1,42 @@
+#!/bin/zsh
+# Pre-push hook: tier-1 parity only (no live differ — that needs a real bottle and
+# a real machine). Installed via: scripts/dev/parity.sh --install-hook, which sets
+# core.hooksPath for every worktree sharing this git directory (see that flag's own
+# warning; this hook does not re-explain it since --install-hook already prints it).
+#
+# Escape hatch: PARITY_SKIP=1 git push   (by repo convention, say why in the push
+# or the next commit message — this bypass exists for emergencies, not habit).
+set -u
+
+[ -n "${PARITY_SKIP:-}" ] && exit 0
+
+ROOT="$(git rev-parse --show-toplevel 2>/dev/null)"
+[ -n "$ROOT" ] || exit 0   # not resolvable as a git checkout — don't block the push
+
+PARITY="$ROOT/scripts/dev/parity.sh"
+
+# Skip silently if scripts/dev/parity.sh does not exist on any ref actually being
+# pushed (an old branch that predates the harness must not be blocked by it).
+# git pre-push receives "<local-ref> <local-sha> <remote-ref> <remote-sha>" lines
+# on stdin, one per ref being pushed.
+HAVE_PARITY=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_sha:-}" ] || continue
+  [ "$local_sha" = "0000000000000000000000000000000000000000" ] && continue  # ref deletion
+  if git -C "$ROOT" cat-file -e "${local_sha}:scripts/dev/parity.sh" 2>/dev/null; then
+    HAVE_PARITY=1
+  fi
+done
+[ -n "$HAVE_PARITY" ] || exit 0
+
+if ! command -v cargo >/dev/null 2>&1 && [ ! -x "$HOME/.cargo/bin/cargo" ]; then
+  print -r -- "############################################################"
+  print -r -- "# WARNING: cargo not found on PATH or at \$HOME/.cargo/bin/cargo"
+  print -r -- "# skipping scripts/dev/parity.sh (tier-1 parity) — push is NOT gated"
+  print -r -- "############################################################"
+  exit 0
+fi
+
+export PATH="$HOME/.cargo/bin:$PATH"
+"$PARITY" --live=off
+exit $?

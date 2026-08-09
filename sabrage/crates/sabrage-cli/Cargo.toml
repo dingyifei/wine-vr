@@ -7,4 +7,9 @@ edition = "2021"
 name = "sabrage"
 path = "src/main.rs"
 
+# NOTE (Frame agent): sabrage-core is the ONLY dependency on purpose.
+# demo.sh's flag surface (--bottle/--bs-dir/--no-audio/--no-dashboard/--verbose/
+# --wired, `exit 2` on unknown arg or missing value) is hand-parsed so the CLI can
+# match it byte-for-byte; clap would impose its own error text and exit codes.
 [dependencies]
+sabrage-core = { path = "../sabrage-core" }

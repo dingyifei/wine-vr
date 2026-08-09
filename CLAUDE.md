@@ -101,6 +101,44 @@ Pre-push arch gate for oxrsys changes (all four must hold): (1) any `oxrsys-enco
 
 When adding a new requirement to the pipeline, add a `doctor` section with a one-line remedy string, and a matching hard preflight in `run.sh` if it's launch-critical (fresh bottles / CrossOver updates pass machine-global checks yet launch with no VR).
 
+## Sabrage ⇄ demo.sh parity (both front-ends stay alive)
+
+The native pipeline (`sabrage/`, Rust — the Sabrage GUI + `sabrage` CLI) and the zsh
+pipeline are two independent implementations of ONE pipeline. They meet at on-disk
+artifacts and at `contract/`. Rules:
+
+- **Never edit `scripts/demo/contract.gen.sh`.** Pins, URLs, ports, artifact lists, and
+  the check registry live in `contract/pipeline.toml`; regenerate with
+  `scripts/dev/parity.sh --regen`. The two templates in `contract/` are read at runtime
+  by BOTH sides — a byte changed there changes what both implementations write.
+  Doctor's `meta.contract-sync` check catches a stale regen with zero Rust.
+- **A pipeline behavior change lands in both implementations in the same commit**: a
+  new/changed doctor check needs its slug in the contract, a literal `chk`/`tap` call in
+  doctor.sh, and an evaluator in `sabrage-core/src/checks/`; a run-preflight change needs
+  the `# preflight:` tag in run.sh + the contract's per-side gates + the native preflight;
+  a change to bytes either side writes (host XR JSON, toml template, cxbottle line,
+  steam_appid.txt, `.sha256` marker) needs its golden test updated.
+- **Run `scripts/dev/parity.sh` after touching `scripts/demo/`, `demo.sh`, `contract/`,
+  or `sabrage/` core, and before any push.** Tier-1 is hermetic (`cargo test -p
+  sabrage-parity`, also run by `.github/workflows/parity.yml`); tier-2 live-diffs the two
+  doctors' tap channels (needs `--bottle`/`WINEVR_BOTTLE`). A red `shell_fingerprint`
+  test means shell was edited without re-running parity — fix the divergence, then
+  `scripts/dev/parity.sh --bless`; don't bless around a real break. One-time hook setup:
+  `scripts/dev/parity.sh --install-hook` (note: `core.hooksPath` is shared git config —
+  it applies to ALL worktrees of this repo, including agent worktrees; the hook
+  fast-paths tier-1 only, passes loudly when cargo is absent, and honors `PARITY_SKIP=1`).
+- **Intentional divergences go in `sabrage/PARITY.md`** (human rationale); the
+  machine-checkable side (per-side launch gates, volatile flags) lives in the contract.
+  Bug-for-bug parity is NOT required; artifact-byte parity IS.
+- **demo.sh scope**: frozen vocabulary (7 stages incl. `all`, 6 flags, `WINEVR_*` env,
+  exit-code conventions). It gains changes only for shared pipeline requirements, never
+  for GUI features. GUI-only state lives under `~/Library/Application Support/Sabrage/`,
+  and every Sabrage pipeline action must stay expressible as a `./demo.sh …` command.
+- demo.sh never invokes `sabrage`, and `sabrage` never shells out to demo.sh for core
+  operations. The parity harness is the only place both run together.
+- Telemetry format strings (Phase 5 parsers over oxrsys/ALVR logs) join the
+  both-sides-same-commit rule on `ext/` submodule pin bumps.
+
 ## Constraints that look wrong but aren't
 
 - **x86_64 is load-bearing everywhere.** The whole Wine process runs under Rosetta; oxrsys, the ALVR core, and the VideoToolbox probes are all deliberately x86_64. The VT chroma bug does not reproduce on arm64. Debug is the live-verified build type.
