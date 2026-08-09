@@ -56,7 +56,7 @@ fi
 WINEVR_BOTTLE="${WINEVR_BOTTLE:-<name>}"   # placeholder keeps remedy strings valid under set -u
 PREFIX="${PREFIX:-}"; SYS32="${SYS32:-}"
 BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294}"
-DEPOT_CMD="DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 -username <steam-user> -dir \"$BS_DIR\""
+DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
 if [ "$BOTTLE_OK" = 1 ] && [[ "$BS_DIR" != "$PREFIX/drive_c/"* ]]; then
   if [ -e "$PREFIX/dosdevices/z:" ]; then chk ok bottle.zdrive "bottle z: drive maps / (Beat Saber lives outside drive_c)"
   else chk fail bottle.zdrive "Beat Saber is outside drive_c but the bottle has no z: drive" "add dosdevices/z: -> / or move the install under drive_c"; fi

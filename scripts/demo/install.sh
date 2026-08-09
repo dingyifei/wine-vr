@@ -46,13 +46,9 @@ fi
 #    ignores XR_RUNTIME_JSON; this root-owned file is what actually routes the
 #    game to the oxrsys runtime.
 print -r -- "-- host OpenXR registration ($HOST_XR_JSON)"
-WANT="{
-    \"file_format_version\": \"1.0.0\",
-    \"runtime\": {
-        \"name\": \"OXRSys Runtime\",
-        \"library_path\": \"$OXR_DYLIB\"
-    }
-}"
+# Byte-shared with sabrage-core: both sides render contract/active_runtime.x86_64.json.template
+# ($(<…) strips the template's trailing newline, matching the historical inline string).
+WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB}"
 if [ -f "$HOST_XR_JSON" ] && [ "$(cat "$HOST_XR_JSON")" = "$WANT" ]; then
   info "host registration already current"
 else

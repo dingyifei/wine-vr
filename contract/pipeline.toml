@@ -1,0 +1,426 @@
+# wine-vr shared parity contract — the single source for pins, paths, ports, and the
+# check / launch-action registries shared by demo.sh (via the GENERATED
+# scripts/demo/contract.gen.sh, sourced by lib.sh) and the native Sabrage pipeline
+# (sabrage-core parses this file at compile time and binds evaluators by slug).
+#
+# Edit THIS file, never contract.gen.sh; regenerate with: scripts/dev/parity.sh --regen
+# (until the generator lands in Phase 1: hand-edit contract.gen.sh to match and update
+# its # contract-sha256: header — doctor's meta.contract-sync check verifies it).
+#
+# Gate vocabulary (how run-preflight treats a check, per side):
+#   block   — launch aborts on failure (die / Fatal)
+#   warn    — failure prints a warning, launch continues
+#   autofix — failure triggers an automatic permanent fix, then a re-check
+#   none    — doctor-only; not part of the launch preflight on that side
+# volatile = true — the tier-2 live differ compares presence only (adb/lsof/session
+# state can legitimately change between the two doctor runs).
+
+[deps]
+url = "https://github.com/dingyifei/wine-vr/releases/download/deps-v1"
+gbe_dll_asset = "gbe-steam_api64-regular-x64.dll"
+gbe_dll_sha256 = "cc5a2c9cb93fdbde7dadb825138ab7f694e3f8c310cdd675f733eaa784cbcc3e"
+dxmt_tgz_asset = "dxmt-artifacts-monofunc.tar.gz"
+dxmt_tgz_sha256 = "487e57e86e9866c922f8d8e42a50cb0818697b927739b6741fae8f4447e2df96"
+
+[game]
+appid = 620980
+depot = 620981
+manifest = "6291266771922375922"
+bs_dir_leaf = "Beat Saber 1294"
+
+[paths]
+host_xr_json = "/usr/local/share/openxr/1/active_runtime.x86_64.json"
+
+[ports]
+stream = [9943, 9944]
+# 9947 is deliberately absent — the legacy client never used it (explicit list, never a range)
+legacy_reverse = [9944, 9945, 9946, 9948]
+dashboard_addr = "127.0.0.1:8082"
+
+[dxmt]
+# The complete artifact set install.sh deploys; presence gates key on ALL of these.
+files = [
+  "x86_64-windows/d3d10core.dll",
+  "x86_64-windows/d3d11.dll",
+  "x86_64-windows/dxgi.dll",
+  "x86_64-windows/winemetal.dll",
+  "x86_64-unix/winemetal.so",
+]
+
+# ── check registry ─────────────────────────────────────────────────────────────
+# Order = doctor.sh order (load-bearing: section 3 resolves the bottle context that
+# later checks consume), run-only preflights last.
+
+[[check]]
+slug = "meta.contract-sync"
+group = "meta"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "sys.arch"
+group = "system"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "sys.macos27"
+group = "system"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "cx.present"
+group = "crossover"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "cx.version"
+group = "crossover"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "bottle.named"
+group = "bottle"
+shell_gate = "block"    # require_bottle dies before the run preflight proper
+native_gate = "block"
+
+[[check]]
+slug = "bottle.exists"
+group = "bottle"
+shell_gate = "block"    # require_bottle
+native_gate = "block"
+
+[[check]]
+slug = "bottle.template"
+group = "bottle"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "bottle.gfx-dxmt"
+group = "bottle"
+shell_gate = "autofix"  # run.sh forces CX_GRAPHICS_BACKEND=dxmt in cxbottle.conf
+native_gate = "autofix"
+fix = "fix.set-graphics-backend"
+
+[[check]]
+slug = "bottle.zdrive"
+group = "bottle"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.create-z-drive"
+
+[[check]]
+slug = "tool.cmake"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "tool.ninja"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "tool.git"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "tool.curl"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "tool.mingw"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "rust.x64-target"
+group = "toolchain"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "src.oxrsys"
+group = "sources"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "src.wineopenxr"
+group = "sources"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "src.alvr"
+group = "sources"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "src.alvr-patchset"
+group = "sources"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "dep.dxmt"
+group = "pinned"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "dep.goldberg"
+group = "pinned"
+shell_gate = "block"    # run dies only when the dll is entirely missing (hash mismatch tolerated)
+native_gate = "block"
+fix = "fix.run-setup"
+
+[[check]]
+slug = "game.present"
+group = "game"
+shell_gate = "block"
+native_gate = "block"
+
+[[check]]
+slug = "game.version"
+group = "game"
+shell_gate = "warn"
+native_gate = "warn"
+
+[[check]]
+slug = "build.oxr-dylib"
+group = "build"
+shell_gate = "none"     # run covers the pair via run.bridge-built
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.alvr-core"
+group = "build"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.runtime-json"
+group = "build"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.woxr-dll"
+group = "build"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.woxr-so"
+group = "build"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.dashboard"
+group = "build"
+shell_gate = "none"
+native_gate = "none"
+fix = "fix.run-build"
+
+[[check]]
+slug = "build.helper-staged"
+group = "build"
+shell_gate = "autofix"  # ensure_helper_staged restages from the arm64 build tree
+native_gate = "autofix"
+fix = "fix.restage-helper"
+
+[[check]]
+slug = "build.helper-arm64"
+group = "build"
+shell_gate = "autofix"
+native_gate = "autofix"
+fix = "fix.restage-helper"
+
+[[check]]
+slug = "overlay.dxmt-d3d11"
+group = "overlay"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "overlay.dxmt-winemetal"
+group = "overlay"
+shell_gate = "none"     # PARITY divergence: native preflights all overlay files, shell only d3d11
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "overlay.woxr-dll"
+group = "overlay"
+shell_gate = "none"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "overlay.woxr-so"
+group = "overlay"
+shell_gate = "none"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "bottle.woxr-dll"
+group = "bottle-bridge"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "bottle.manifest"
+group = "bottle-bridge"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "bottle.registry"
+group = "bottle-bridge"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "host.manifest"
+group = "host"
+shell_gate = "block"    # PARITY divergence: shell checks presence only; native validates library_path
+native_gate = "block"
+fix = "fix.run-install"
+
+[[check]]
+slug = "cfg.protocol.supported"
+group = "config"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.edit-protocol"
+
+[[check]]
+slug = "cfg.protocol.legacy-oxrsys"
+group = "config"
+shell_gate = "warn"     # PARITY divergence (v1 trim): native blocks Launch on the legacy protocol
+native_gate = "block"
+fix = "fix.edit-protocol"
+
+[[check]]
+slug = "cfg.session-pins"
+group = "config"
+shell_gate = "none"
+native_gate = "none"
+volatile = true
+fix = "fix.delete-session-json"
+
+[[check]]
+slug = "hs.adb"
+group = "headset"
+shell_gate = "none"
+native_gate = "none"
+volatile = true
+
+[[check]]
+slug = "hs.client"
+group = "headset"
+shell_gate = "none"
+native_gate = "none"
+volatile = true
+
+[[check]]
+slug = "audio.loopback"
+group = "audio"
+shell_gate = "none"
+native_gate = "none"
+
+[[check]]
+slug = "net.ports"
+group = "network"
+shell_gate = "none"
+native_gate = "none"
+volatile = true
+
+[[check]]
+slug = "net.adb-forwards"
+group = "network"
+shell_gate = "none"
+native_gate = "none"
+volatile = true
+fix = "fix.remove-adb-forwards"
+
+# run-only preflights (no doctor row)
+
+[[check]]
+slug = "run.wine-exec"
+group = "run-only"
+shell_gate = "block"
+native_gate = "block"
+
+[[check]]
+slug = "run.bridge-built"
+group = "run-only"
+shell_gate = "block"
+native_gate = "block"
+fix = "fix.run-build"
+
+[[check]]
+slug = "run.wired-adb"
+group = "run-only"
+shell_gate = "block"    # only evaluated when --wired (skip predicate)
+native_gate = "block"
+
+# ── launch-action registry ────────────────────────────────────────────────────
+# Unconditional ordered preparation steps in run.sh (NOT check-shaped; tagged
+# # launch-action: in run.sh). Order here == execution order == tag order.
+
+[[launch_action]]
+id = "adb-forward-hygiene"
+what = "wired: create adb forward tcp:9943/9944 per-serial; normal: remove exactly those two per-serial (never --remove-all)"
+
+[[launch_action]]
+id = "wineserver-reset"
+what = "wineserver -k + bounded -w wait (5 s, fatal on timeout)"
+
+[[launch_action]]
+id = "goldberg-stage"
+what = "swap steam_api64.dll (backup .orig-steam once), write steam_appid.txt (no trailing newline), truncate-create steam_settings/ flags"
+
+[[launch_action]]
+id = "audio-route"
+what = "route default output to BlackHole 2ch (remember previous), volume 100; guarded — restored on exit"
+
+[[launch_action]]
+id = "dashboard"
+what = "launch alvr_dashboard in the background (polls 127.0.0.1:8082); guarded — closed on exit"
+
+[[launch_action]]
+id = "adb-reverse-cleanup"
+what = "alvr: adb reverse --remove-all; legacy oxrsys: reverse tunnels for legacy_reverse ports + am start of the Android client"
+
+[[launch_action]]
+id = "launch-wine"
+what = "spawn wine --bottle --no-update --cx-app with XR_RUNTIME_JSON/CX_GRAPHICS_BACKEND/WINEDEBUG/SteamAppId env, log to logs/beatsaber-<ts>.log, wait; exit = wine rc"

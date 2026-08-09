@@ -97,7 +97,7 @@ esac
 # streamer"). --wired creates them here; a normal run clears exactly these two.
 # preflight: run.wired-adb
 # launch-action: adb-forward-hygiene
-WIRED_PORTS=(9943 9944)
+# WIRED_PORTS comes from the contract (contract.gen.sh, sourced via lib.sh)
 WIRED_SER=""
 [ -n "$ADB" ] && WIRED_SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
 if [ -n "${WINEVR_WIRED:-}" ]; then
@@ -230,7 +230,7 @@ else
   [ -n "$SER" ] || warn "no Quest over adb — the legacy oxrsys protocol needs USB"
   if [ -n "$SER" ]; then
     "$ADB" -s "$SER" reverse --remove-all 2>/dev/null || true
-    for p in 9944 9945 9946 9948; do "$ADB" -s "$SER" reverse tcp:$p tcp:$p >/dev/null; done
+    for p in $LEGACY_REVERSE_PORTS; do "$ADB" -s "$SER" reverse tcp:$p tcp:$p >/dev/null; done
     "$ADB" -s "$SER" shell am start -n net.demonixis.oxrsys.android/com.oculus.NativeActivity >/dev/null 2>&1
     info "Quest $SER: reverse tunnels up, oxrsys client starting"
   fi

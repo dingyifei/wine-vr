@@ -46,15 +46,8 @@ if [ -f "$TOML" ]; then
   if [ "$PROTO" = "alvr" ]; then info "config present: $TOML (protocol=alvr)"
   else warn "config present with protocol='"$PROTO"' — the demo needs protocol = \"alvr\"; edit $TOML yourself (not overwriting)"; fi
 else
-  cat > "$TOML" <<'EOF'
-# oxrsys runtime configuration (created by wine-vr demo.sh setup)
-[streaming]
-# embedded ALVR core; stock ALVR Quest client connects over WiFi
-protocol = "alvr"
-bitrate_mbps = 42
-# "auto" | "native" (arm64 helper, HW HEVC) | "inproc" (x86_64, H.264)
-encoder_process = "auto"
-EOF
+  # Byte-shared with sabrage-core: both sides create this file from the same template.
+  cat "$ROOT/contract/oxrsys-runtime.toml.template" > "$TOML"
   # Deployed configs that predate encoder_process are left untouched (write-once);
   # the runtime's code default is the same "auto".
   ok "wrote $TOML (protocol=alvr, 42 Mbps, encoder_process=auto)"

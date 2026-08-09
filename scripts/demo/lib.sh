@@ -3,10 +3,10 @@
 
 ROOT="$WINEVR_ROOT"
 
-# ---- pinned dependency sources -----------------------------------------------
-DEPS_URL="https://github.com/dingyifei/wine-vr/releases/download/deps-v1"
-DXMT_TGZ_SHA256="487e57e86e9866c922f8d8e42a50cb0818697b927739b6741fae8f4447e2df96"
-GBE_DLL_SHA256="cc5a2c9cb93fdbde7dadb825138ab7f694e3f8c310cdd675f733eaa784cbcc3e"
+# ---- shared contract (pins, depot triple, ports, artifact lists) ----------------
+# Generated from contract/pipeline.toml — edit the contract, then regenerate
+# (scripts/dev/parity.sh --regen). Never edit contract.gen.sh by hand.
+source "$ROOT/scripts/demo/contract.gen.sh"
 
 # ---- user-tunable environment ------------------------------------------------
 # WINEVR_BOTTLE   (required by doctor/install/run) CrossOver bottle name, e.g. Steam
@@ -25,7 +25,6 @@ WINESERVER="$CX/bin/wineserver"
 
 OXR_APPSUP="$HOME/Library/Application Support/OXRSys"
 TOML="$OXR_APPSUP/oxrsys-runtime.toml"
-HOST_XR_JSON="/usr/local/share/openxr/1/active_runtime.x86_64.json"
 
 OXRSYS="$ROOT/ext/oxrsys"
 WOXR="$ROOT/ext/wineopenxr"
@@ -51,8 +50,6 @@ ALVR_DASHBOARD_BIN="$ALVR/target/release/alvr_dashboard"
 
 ADB="$HOME/Library/Android/sdk/platform-tools/adb"
 command -v "$ADB" >/dev/null 2>&1 || ADB="$(command -v adb 2>/dev/null || true)"
-
-BS_APPID=620980
 
 # ---- output helpers (print -r: never mangle backslashes in windows paths) -------
 _G=$'\e[32m'; _Y=$'\e[33m'; _R=$'\e[31m'; _N=$'\e[0m'
@@ -100,7 +97,7 @@ require_bottle() {
   # Beat Saber location: --bs-dir/WINEVR_BS_DIR override, else the bottle's
   # standard Steam library path.
   BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294}"
-  DEPOT_CMD="DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 -username <steam-user> -dir \"$BS_DIR\""
+  DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
 }
 
 sha256_ok() { # file expected-hash
@@ -130,9 +127,8 @@ win_path() { # unix absolute path -> windows path: C:\ inside the bottle's drive
   fi
 }
 
-# The complete DXMT artifact set install.sh deploys; presence gates key on ALL of
-# these plus the .sha256 provenance marker written by setup after extraction.
-DXMT_FILES=(x86_64-windows/d3d10core.dll x86_64-windows/d3d11.dll x86_64-windows/dxgi.dll x86_64-windows/winemetal.dll x86_64-unix/winemetal.so)
+# DXMT_FILES comes from the contract; presence gates key on ALL of them plus the
+# .sha256 provenance marker written by setup after extraction.
 dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
 dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
 
