@@ -10,6 +10,14 @@
 
 print "== wine-vr demo doctor =="
 
+# 0. contract sync — the generated pins file must match contract/ (recipe pinned:
+# cat pipeline.toml + both templates, in that order, bytes as-is | shasum -a 256).
+# This catches "edited contract/, forgot to regen" with zero Rust available.
+_want="$(cat "$ROOT/contract/pipeline.toml" "$ROOT/contract/oxrsys-runtime.toml.template" "$ROOT/contract/active_runtime.x86_64.json.template" 2>/dev/null | shasum -a 256 | awk '{print $1}')"
+_have="$(sed -n 's/^# contract-sha256: //p' "$ROOT/scripts/demo/contract.gen.sh" 2>/dev/null | head -1)"
+if [ -n "$_have" ] && [ "$_want" = "$_have" ]; then chk ok meta.contract-sync "contract/ in sync with scripts/demo/contract.gen.sh"
+else chk fail meta.contract-sync "contract/ and scripts/demo/contract.gen.sh out of sync (contract edited without regen, or the generated file was hand-edited)" "scripts/dev/parity.sh --regen"; fi
+
 # 1. hardware / OS
 if [ "$(uname -m)" = "arm64" ]; then chk ok sys.arch "Apple Silicon ($(sysctl -n machdep.cpu.brand_string 2>/dev/null))"
 else chk fail sys.arch "not an Apple Silicon Mac ($(uname -m))" "this demo requires an arm64 Mac"; fi
