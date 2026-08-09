@@ -63,6 +63,27 @@ warn() { print -r -- "  ${_Y}WARN${_N} $*"; }
 fail() { print -r -- "  ${_R}FAIL${_N} $1"; [ $# -gt 1 ] && print -r -- "       remedy: $2"; FAILCOUNT=$((FAILCOUNT+1)); }
 die()  { print -r -- "${_R}FATAL${_N} $*" >&2; exit 1; }
 
+# ---- check slugs (parity with the native Sabrage pipeline) ----------------------
+# Every doctor row has a stable slug shared with sabrage-core's check registry.
+# tap: emit "<slug> <status>" to $WINEVR_DOCTOR_TAP when set (parity differ channel,
+# opt-in like WINEVR_DOCTOR_SOFT). chk: print exactly like ok/warn/fail/info AND tap.
+# Both must always return 0: lib.sh is sourced by set -e stages (setup/build/install),
+# and a bare `[ -n ... ] && ...` tail would return 1 whenever the tap is off.
+tap() { # slug status
+  [ -n "${WINEVR_DOCTOR_TAP:-}" ] && print -r -- "$1 $2" >> "$WINEVR_DOCTOR_TAP"
+  :
+}
+chk() { # chk <ok|warn|fail|info> <slug> <msg> [remedy]
+  local _st="$1" _slug="$2"; shift 2
+  case "$_st" in
+    ok)   ok "$@" ;;
+    warn) warn "$@" ;;
+    fail) fail "$@" ;;
+    info) info "$@" ;;
+  esac
+  tap "$_slug" "$_st"
+}
+
 bs_version() { # best-effort Beat Saber version: marker file, else the Unity build stamp
   cat "$BS_DIR/BeatSaberVersion.txt" 2>/dev/null && return
   grep -a -o -E -m1 '[0-9]{1,2}\.[0-9]{1,3}\.[0-9]{1,3}_[0-9]{6,}' \

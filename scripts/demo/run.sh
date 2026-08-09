@@ -6,25 +6,35 @@ print "== wine-vr demo run =="
 require_bottle
 
 # ---- preflight (fail fast with remedies instead of a black window) -------------
+# preflight: game.present
 [ -f "$BS_DIR/Beat Saber.exe" ] || die "Beat Saber not found at $BS_DIR
        download 1.29.4: $DEPOT_CMD
        (or pass --bs-dir / set WINEVR_BS_DIR)"
+# preflight: game.version
 BSVER="$(bs_version)"
 case "$BSVER" in 1.29.4*) : ;; *) warn "Beat Saber version '$BSVER' != 1.29.4 — the Meta gate may block startup" ;; esac
+# preflight: run.wine-exec
 [ -x "$WINE" ] || die "CrossOver wine not found at $WINE — is CrossOver installed?"
+# preflight: run.bridge-built
 [ -f "$OXR_DYLIB" ] && [ -f "$WOXR_DLL" ] || die "bridge not built — ./demo.sh build"
+# preflight: host.manifest
 [ -f "$HOST_XR_JSON" ] || die "host OpenXR registration missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
 # bottle + global overlay currency (a fresh bottle or a CrossOver update passes every
 # machine-global check yet launches with no VR — catch it here, not as a black window)
+# preflight: bottle.woxr-dll
 cmp -s "$WOXR_DLL" "$SYS32/wineopenxr.dll" || die "bottle wineopenxr.dll stale/missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+# preflight: bottle.manifest
 [ -f "$PREFIX/drive_c/openxr/wineopenxr64.json" ] || die "bottle OpenXR manifest missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+# preflight: bottle.registry
 grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json' "$PREFIX/system.reg" 2>/dev/null || \
   die "bottle ActiveRuntime registry key missing — ./demo.sh install --bottle $WINEVR_BOTTLE"
+# preflight: overlay.dxmt-d3d11
 cmp -s "$DXMT_ART/x86_64-windows/d3d11.dll" "$CX/lib/dxmt/x86_64-windows/d3d11.dll" || \
   die "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle $WINEVR_BOTTLE"
 # The bottle's Graphics Backend setting overrides the CX_GRAPHICS_BACKEND env var; the
 # CrossOver GUI writes "" (= auto) which no longer selects DXMT — the game then spins
 # forever before D3D11 device creation (no DXMT banner, no session, no streamer).
+# preflight-autofix: bottle.gfx-dxmt
 CXCONF="$PREFIX/cxbottle.conf"
 if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
   if grep -q '^"CX_GRAPHICS_BACKEND"' "$CXCONF" 2>/dev/null; then
@@ -40,7 +50,9 @@ if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
   fi
   ok "bottle graphics backend forced to dxmt (was auto/other — the CrossOver GUI can reset this)"
 fi
+# preflight: dep.goldberg
 sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256" || [ -f "$GBE_DLL" ] || die "Goldberg dll missing — ./demo.sh setup"
+# preflight: cfg.protocol.supported cfg.protocol.legacy-oxrsys
 [ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"
 PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
 case "$PROTOCOL" in
@@ -54,6 +66,7 @@ esac
 # build output when it is missing or wrong-arch. Missing key = code default "auto".
 # Both auto and native hard-require the helper: without it, auto silently downgrades
 # to in-process H.264 (that downgrade reached a live session once — never again).
+# preflight-autofix: build.helper-staged build.helper-arm64
 ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
 ENCODER_PROC="${ENCODER_PROC:-auto}"
 ensure_helper_staged() {
@@ -82,6 +95,8 @@ esac
 # over adb; left behind after the session ends, the same forwards silently break
 # WiFi discovery on a later non-wired run (the client just shows "searching for
 # streamer"). --wired creates them here; a normal run clears exactly these two.
+# preflight: run.wired-adb
+# launch-action: adb-forward-hygiene
 WIRED_PORTS=(9943 9944)
 WIRED_SER=""
 [ -n "$ADB" ] && WIRED_SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
@@ -109,6 +124,7 @@ elif [ -n "$ADB" ]; then
 fi
 
 # ---- reset the bottle's wineserver (stale servers + steam locks hang startup) ---
+# launch-action: wineserver-reset
 print -r -- "-- resetting wineserver for bottle '$WINEVR_BOTTLE'"
 WINEPREFIX="$PREFIX" "$WINESERVER" -k 2>/dev/null || true
 ( WINEPREFIX="$PREFIX" "$WINESERVER" -w 2>/dev/null ) &
@@ -122,6 +138,7 @@ fi
 ok "wineserver down"
 
 # ---- Goldberg steam emulator (no real Steam at runtime; avoids the Meta gate) ---
+# launch-action: goldberg-stage
 print -r -- "-- Goldberg"
 API="$BS_DIR/Beat Saber_Data/Plugins/x86_64/steam_api64.dll"
 [ -f "$API" ] || API="$BS_DIR/steam_api64.dll"
@@ -135,6 +152,7 @@ GSET="$APIDIR/steam_settings"; mkdir -p "$GSET"
 : > "$GSET/offline.txt"; : > "$GSET/disable_networking.txt"; : > "$GSET/disable_overlay.txt"
 
 # ---- audio: route the Mac output into BlackHole so ALVR streams it ---------------
+# launch-action: audio-route
 PREV_AUDIO_OUT=""
 restore_audio() {
   if [ -n "$PREV_AUDIO_OUT" ]; then
@@ -185,6 +203,7 @@ fi
 # The embedded alvr_server_core hosts the dashboard API on 127.0.0.1:8082 inside
 # the game process; the stock dashboard polls until it appears, so launching it
 # before the game is fine. Closed again by the exit/signal traps above.
+# launch-action: dashboard
 if [ -n "${WINEVR_NO_DASHBOARD:-}" ]; then
   info "ALVR dashboard disabled (--no-dashboard)"
 elif [ "$PROTOCOL" != "alvr" ]; then
@@ -198,6 +217,7 @@ else
 fi
 
 # ---- headset client -----------------------------------------------------------
+# launch-action: adb-reverse-cleanup
 SER=""
 [ -n "$ADB" ] && SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
 if [ "$PROTOCOL" = "alvr" ]; then
@@ -217,6 +237,7 @@ else
 fi
 
 # ---- launch ---------------------------------------------------------------------
+# launch-action: launch-wine
 BS_WIN="$(win_path "$BS_DIR/Beat Saber.exe")"
 export XR_RUNTIME_JSON="$OXR_RUNTIME_JSON"
 export CX_GRAPHICS_BACKEND=dxmt
