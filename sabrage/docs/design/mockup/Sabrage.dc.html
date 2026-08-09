@@ -1,0 +1,944 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="stylesheet" href="_ds/industry-4bcd7014-0b6f-4b0b-9bb2-e02f55f3040f/styles.css">
+<script src="_ds/industry-4bcd7014-0b6f-4b0b-9bb2-e02f55f3040f/_ds_bundle.js"></script>
+<style>
+body{margin:0;background:#d7d9dc;display:grid;place-items:center;min-height:100vh;padding:24px}
+a{color:var(--color-accent)}a:hover{color:var(--color-accent-700)}
+@keyframes spin{to{transform:rotate(360deg)}}
+input[type="range"]{accent-color:#5980a6}
+::-webkit-scrollbar{width:9px;height:9px}::-webkit-scrollbar-thumb{background:#b7b7ba;border:2px solid transparent;background-clip:content-box;border-radius:6px}
+</style>
+</helmet>
+<x-import component-from-global-scope="MacWindow" from="./macos-window.jsx" dc-props="{{ winProps }}" hint-size="1280px,840px">
+<div style="display:flex;height:100%;min-height:0;font-family:var(--font-body);color:var(--color-text);background:var(--color-bg);position:relative;font-size:14px;line-height:1.5">
+
+  <!-- ── sidebar ── -->
+  <div style="width:204px;flex:none;display:flex;flex-direction:column;border-right:1px solid var(--color-divider)">
+    <div style="padding:18px 16px 14px">
+      <div style="font-family:var(--font-heading);font-weight:600;font-size:22px;letter-spacing:0.06em">SABRAGE</div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:2px;padding:4px 8px">
+      <div onClick="{{ goAbout }}" style="{{ nav.about }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="12" cy="12" r="9"></circle><line x1="12" y1="16" x2="12" y2="12"></line><line x1="12" y1="8" x2="12.01" y2="8"></line></svg>About</div>
+      <div onClick="{{ goLibrary }}" style="{{ nav.library }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" y1="18" x2="3.01" y2="18"></line></svg>Library</div>
+      <div onClick="{{ goSession }}" style="{{ nav.session }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg>Session</div>
+      <div onClick="{{ goDoctor }}" style="{{ nav.doctor }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"></path><polyline points="22 4 12 14.01 9 11.01"></polyline></svg>Doctor<sc-if value="{{ doctorBadge }}" hint-placeholder-val="{{ false }}"><span style="margin-left:auto;width:7px;height:7px;background:var(--color-accent-800)"></span></sc-if></div>
+      <div onClick="{{ goLogs }}" style="{{ nav.logs }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>Logs</div>
+      <div onClick="{{ goSettings }}" style="{{ nav.settings }}"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="21" y1="4" x2="14" y2="4"></line><line x1="10" y1="4" x2="3" y2="4"></line><line x1="21" y1="12" x2="12" y2="12"></line><line x1="8" y1="12" x2="3" y2="12"></line><line x1="21" y1="20" x2="16" y2="20"></line><line x1="12" y1="20" x2="3" y2="20"></line><line x1="14" y1="2" x2="14" y2="6"></line><line x1="8" y1="10" x2="8" y2="14"></line><line x1="16" y1="18" x2="16" y2="22"></line></svg>Settings</div>
+    </div>
+    <div style="margin-top:auto;padding:12px 16px;display:flex;flex-direction:column;gap:8px;border-top:1px solid var(--color-divider)">
+      <div style="display:flex;align-items:center;gap:7px;font-size:12px"><span style="width:8px;height:8px;flex:none;background:{{ statusDotBg }}"></span>{{ statusLine }}</div>
+      <div class="text-muted" style="font-size:11px">Bottle · Steam (win11_64)</div>
+      <button class="btn btn-ghost" onClick="{{ openSetup }}" style="justify-content:flex-start;font-size:12.5px;padding:2px 4px">Setup</button>
+      <div class="text-muted" style="font-size:10px;letter-spacing:0.06em">BRIDGE 2026-08-04 · ALVR v20.14.1</div>
+    </div>
+  </div>
+
+  <!-- ── main column ── -->
+  <div style="flex:1;min-width:0;display:flex;flex-direction:column;min-height:0">
+
+    <!-- ABOUT / COVER (default screen) -->
+    <sc-if value="{{ isAbout }}" hint-placeholder-val="{{ false }}">
+      <div style="flex:1;min-height:0;overflow:auto;padding:44px 52px 32px">
+        <h1 style="margin:2px 0 6px;letter-spacing:0.04em">SABRAGE</h1>
+        <div style="display:flex;align-items:center;gap:8px;margin:18px 0 30px;flex-wrap:wrap;font-family:var(--font-heading);font-weight:600;font-size:13px;letter-spacing:0.04em">
+          <sc-for list="{{ pipeChips }}" as="c" hint-placeholder-count="6">
+            <span style="display:inline-flex;align-items:center;gap:8px"><span style="border:1px solid var(--color-divider);padding:4px 12px;text-transform:uppercase">{{ c.n }}</span><sc-if value="{{ c.arrow }}" hint-placeholder-val="{{ true }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg></sc-if></span>
+          </sc-for>
+        </div>
+        <h6 style="color:var(--color-accent-700);margin-bottom:12px">Built on — upstream projects</h6>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:22px 26px">
+          <sc-for list="{{ upstream }}" as="u" hint-placeholder-count="6">
+            <div class="blueprint" style="padding:14px 16px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <div class="card-kicker" style="font-size:9.5px">{{ u.k }}</div>
+              <div style="font-family:var(--font-heading);font-weight:600;font-size:20px;line-height:1.15">{{ u.n }}</div>
+              <div style="font-size:13px;font-weight:500;color:var(--color-accent-700);margin:3px 0 1px">{{ u.by }}</div>
+              <div class="text-muted" style="font-size:12px;margin-bottom:8px">{{ u.d }}</div>
+              <div style="display:flex;align-items:center;gap:8px;margin-top:auto">
+                <span class="tag tag-outline">{{ u.lic }}</span>
+                <span class="text-muted" style="font-size:10.5px;font-family:ui-monospace,Menlo,monospace">{{ u.src }}</span>
+              </div>
+            </div>
+          </sc-for>
+        </div>
+        <div style="display:flex;align-items:center;gap:14px;margin-top:30px">
+          <button class="btn btn-primary" onClick="{{ goLibrary }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>Open Library</button>
+          <button class="btn btn-secondary" onClick="{{ openSetup }}">Setup</button>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- LIBRARY -->
+    <sc-if value="{{ isLibrary }}" hint-placeholder-val="{{ true }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <div>
+          <h3 style="margin:0">Library</h3>
+        </div>
+        <button class="btn btn-primary" onClick="{{ openAdd }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>Add game</button>
+      </div>
+      <div style="flex:1;min-height:0;display:flex;overflow:hidden">
+        <div style="flex:1;min-width:0;overflow:auto;padding:20px 28px">
+          <div style="display:grid;grid-template-columns:2.6fr 0.8fr 0.9fr 1.1fr 1.6fr 0.9fr;gap:0 12px;padding:0 10px 7px;border-bottom:1px solid var(--color-divider)">
+            <span style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 60%,transparent)">Game</span>
+            <span style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 60%,transparent)">Version</span>
+            <span style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 60%,transparent)">Bottle</span>
+            <span style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 60%,transparent)">Status</span>
+            <span style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 60%,transparent)">Last session</span>
+            <span></span>
+          </div>
+          <sc-for list="{{ games }}" as="g" hint-placeholder-count="3">
+            <div style="border-bottom:1px solid color-mix(in srgb,var(--color-text) 8%,transparent)">
+              <div onClick="{{ g.select }}" style="display:grid;grid-template-columns:2.6fr 0.8fr 0.9fr 1.1fr 1.6fr 0.9fr;gap:0 12px;align-items:center;padding:9px 10px;cursor:pointer;font-size:14px;background:{{ g.rowBg }}" style-hover="background:color-mix(in srgb,var(--color-text) 4%,transparent)">
+                <div style="display:flex;align-items:center;gap:9px">
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="var(--color-neutral-600)" stroke-width="1.5" style="flex:none;transform:rotate({{ g.chev }});transition:transform 0.15s"><polyline points="9 18 15 12 9 6"></polyline></svg>
+                  <div><div style="font-weight:500">{{ g.name }}</div><div class="text-muted" style="font-size:11.5px">{{ g.sub }}</div></div>
+                </div>
+                <div>{{ g.version }}</div>
+                <div>{{ g.bottle }}</div>
+                <div><span class="tag {{ g.tagClass }}">{{ g.status }}</span></div>
+                <div class="text-muted" style="font-size:12.5px">{{ g.last }}</div>
+                <div style="text-align:right;white-space:nowrap"><button class="btn btn-primary" onClick="{{ g.run }}" style="padding:4px 14px;font-size:13px"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>Run</button></div>
+              </div>
+              <sc-if value="{{ g.open }}" hint-placeholder-val="{{ false }}">
+                <div style="padding:14px 10px 16px 31px;background:color-mix(in srgb,var(--color-accent) 5%,transparent);border-top:1px dashed var(--color-divider)">
+                  <div style="display:grid;grid-template-columns:1.4fr 1fr 1fr 1.3fr;gap:18px;font-size:12.5px">
+                    <div><div style="font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent);margin-bottom:2px">Install dir</div><div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;word-break:break-all">{{ g.dir }}</div></div>
+                    <div><div style="font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent);margin-bottom:2px">Bottle</div>{{ g.bottle }} · win11_64 · DXMT</div>
+                    <div><div style="font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent);margin-bottom:2px">Patches</div>Goldberg steam_api64.dll</div>
+                    <div><div style="font-size:10.5px;letter-spacing:0.08em;text-transform:uppercase;color:color-mix(in srgb,var(--color-text) 55%,transparent);margin-bottom:2px">Last session</div>{{ g.lastStats }}</div>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-top:13px">
+                    <button class="btn btn-primary" onClick="{{ g.run }}" style="padding:4px 16px;font-size:13px">Run through bridge</button>
+                    <button class="btn btn-secondary" onClick="{{ g.edit }}" style="padding:4px 16px;font-size:13px">Edit configuration…</button>
+                    <button class="btn btn-ghost" onClick="{{ goDoctor }}" style="padding:4px 10px;font-size:13px">Doctor</button>
+                  </div>
+                </div>
+              </sc-if>
+            </div>
+          </sc-for>
+          <p class="text-muted" style="font-size:12px;margin-top:14px">Run resets the bottle's wineserver, preflights the bridge, applies the Goldberg emulator and routes audio — then launches through DXMT → oxrsys → ALVR.</p>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- EDIT GAME -->
+    <sc-if value="{{ isEdit }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <div>
+          <h3 style="margin:0;display:flex;align-items:center;gap:8px"><button class="btn btn-ghost btn-icon" onClick="{{ cancelEdit }}" style="width:30px;height:30px"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="19" y1="12" x2="5" y2="12"></line><polyline points="12 19 5 12 12 5"></polyline></svg></button>Edit — {{ editGame.name }}</h3>
+        </div>
+        <div style="display:flex;gap:8px">
+          <button class="btn btn-secondary" onClick="{{ cancelEdit }}">Cancel</button>
+          <button class="btn btn-primary" onClick="{{ saveEdit }}">Save configuration</button>
+        </div>
+      </div>
+      <div style="flex:1;min-height:0;overflow:auto;padding:22px 28px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start">
+          <div style="display:flex;flex-direction:column;gap:22px">
+            <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <h6 style="color:var(--color-accent-700)">Identity &amp; paths</h6>
+              <div class="field" style="margin-top:10px"><label>Display name</label><input class="input" defaultValue="{{ editGame.name }}"></div>
+              <div class="field" style="margin-top:10px"><label>Install dir (the folder containing the .exe)</label>
+                <div style="display:flex;gap:8px"><input class="input" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px" defaultValue="{{ editGame.dir }}"><button class="btn btn-secondary" style="flex:none">Browse…</button></div>
+                <div class="text-muted" style="font-size:11px;margin-top:3px">A folder outside the bottle is reached through its z: drive — Doctor checks it.</div>
+              </div>
+              <div class="field" style="margin-top:10px"><label>CrossOver bottle</label>
+                <div style="display:flex;gap:8px"><input class="input" defaultValue="{{ editGame.bottle }}" readOnly><button class="btn btn-ghost" style="flex:none">Manage in CrossOver…</button></div>
+                <div class="text-muted" style="font-size:11px;margin-top:3px">win11_64 · graphics backend forced to DXMT at launch.</div>
+              </div>
+            </div>
+            <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <h6 style="color:var(--color-accent-700)">Patches</h6>
+              <div style="display:flex;flex-direction:column;gap:11px;margin-top:10px">
+                <sc-for list="{{ editTogs }}" as="t" hint-placeholder-count="2">
+                  <div>
+                    <label class="radio" style="align-items:flex-start">
+                      <input type="checkbox" checked="{{ t.on }}" onChange="{{ t.flip }}">
+                      <span class="dot" style="border-radius:0;margin-top:2px"></span>
+                      <span><span style="font-size:13.5px">{{ t.label }}</span><br><span class="text-muted" style="font-size:11px">{{ t.note }}</span></span>
+                    </label>
+                    <sc-if value="{{ t.subOn }}" hint-placeholder-val="{{ false }}">
+                      <div style="display:flex;flex-direction:column;gap:7px;margin:9px 0 2px 26px">
+                        <sc-for list="{{ gbeFlags }}" as="f" hint-placeholder-count="3">
+                          <label class="radio" style="align-items:flex-start">
+                            <input type="checkbox" checked="{{ f.on }}" onChange="{{ f.flip }}">
+                            <span class="dot" style="border-radius:0;margin-top:1px"></span>
+                            <span><span style="font-size:12.5px">{{ f.label }}</span> <span class="text-muted" style="font-size:11px;font-family:ui-monospace,Menlo,monospace">{{ f.file }}</span></span>
+                          </label>
+                        </sc-for>
+                        <div class="field" style="margin-top:2px">
+                          <label>Steam App ID <span class="text-muted" style="font-family:ui-monospace,Menlo,monospace;text-transform:none;letter-spacing:0">steam_appid.txt</span></label>
+                          <input class="input" defaultValue="{{ editGame.appid }}" style="max-width:160px">
+                        </div>
+                      </div>
+                    </sc-if>
+                  </div>
+                </sc-for>
+              </div>
+            </div>
+          </div>
+          <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <h6 style="color:var(--color-accent-700)">Streaming — per-game overrides</h6>
+            <label class="radio" style="align-items:flex-start;margin-top:10px">
+              <input type="checkbox" checked="{{ editUseGlobal }}" onChange="{{ flipUseGlobal }}">
+              <span class="dot" style="border-radius:0;margin-top:2px"></span>
+              <span><span style="font-size:13.5px">Use global streaming settings</span><br><span class="text-muted" style="font-size:11px">Bitrate {{ bitrate }} Mbps · codec auto · encoder auto (arm64 helper) — from Settings.</span></span>
+            </label>
+            <sc-if value="{{ editCustom }}" hint-placeholder-val="{{ false }}">
+              <div class="field" style="margin-top:14px">
+                <label>Base bitrate — {{ editBitrate }} Mbps</label>
+                <input type="range" min="20" max="100" step="1" value="{{ editBitrate }}" onChange="{{ setEditBitrate }}" style="width:100%">
+              </div>
+              <div class="field" style="margin-top:14px"><label>Video codec</label>
+                <div class="seg"><sc-for list="{{ eCodecOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="ecodec" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+              </div>
+              <div class="field" style="margin-top:14px"><label>Encoder process</label>
+                <div class="seg"><sc-for list="{{ eEncOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="eenc" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+                <div class="text-muted" style="font-size:11px;margin-top:3px">inproc = Rosetta H.264 fallback, macOS 27+ only.</div>
+              </div>
+              <div class="field" style="margin-top:14px">
+                <label>Resolution scale — {{ eResScale }}×</label>
+                <input type="range" min="0.5" max="1" step="0.05" value="{{ eResScale }}" onChange="{{ setEResScale }}" style="width:100%">
+              </div>
+              <div class="field" style="margin-top:14px"><label>Refresh rate</label>
+                <div class="seg"><sc-for list="{{ eHzOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="ehz" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+              </div>
+            </sc-if>
+            <div class="hr" style="margin:16px 0 12px"></div>
+            <div class="text-muted" style="font-size:11.5px">Overrides are written to the game's entry only; the runtime toml at ~/Library/Application Support/OXRSys/ stays the global source.</div>
+          </div>
+        </div>
+      </div>
+    </sc-if>
+
+    <!-- SESSION -->
+    <sc-if value="{{ isSession }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <div>
+          <h3 style="margin:0;display:flex;align-items:center;gap:12px">Session<span class="tag {{ sessTagClass }}">{{ sessTag }}</span></h3>
+        </div>
+        <sc-if value="{{ sessionActive }}" hint-placeholder-val="{{ false }}">
+          <button class="btn btn-secondary" onClick="{{ stopSession }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><rect x="5" y="5" width="14" height="14"></rect></svg>Stop session</button>
+        </sc-if>
+      </div>
+      <sc-if value="{{ sessionEmpty }}" hint-placeholder-val="{{ false }}">
+        <div style="flex:1;display:grid;place-items:center">
+          <div style="text-align:center;max-width:380px">
+            <h4>No active session</h4>
+            <p class="text-muted" style="font-size:13px">Launch a game from the Library. Put the headset on and open the ALVR client — the first frame can take ~30 s.</p>
+            <button class="btn btn-secondary" onClick="{{ goLibrary }}">Open Library</button>
+          </div>
+        </div>
+      </sc-if>
+      <sc-if value="{{ sessionHasData }}" hint-placeholder-val="{{ false }}">
+      <div style="flex:1;min-height:0;overflow:auto;padding:20px 28px;display:flex;flex-direction:column;gap:18px">
+        <div style="display:grid;grid-template-columns:repeat(6,1fr);gap:14px">
+          <sc-for list="{{ statCards }}" as="s" hint-placeholder-count="6">
+            <div class="blueprint" style="padding:12px 14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <div class="card-kicker" style="font-size:9.5px">{{ s.k }}</div>
+              <div style="font-family:var(--font-heading);font-weight:600;font-size:26px;line-height:1.1">{{ s.v }}</div>
+              <div class="text-muted" style="font-size:10.5px">{{ s.sub }}</div>
+            </div>
+          </sc-for>
+        </div>
+        <sc-if value="{{ isCharts }}" hint-placeholder-val="{{ true }}">
+          <div class="blueprint" style="padding:16px 18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;flex-wrap:wrap;gap:6px">
+              <div class="card-kicker">Latency · last 48 s</div>
+              <div style="display:flex;gap:14px;font-size:11px" class="text-muted">
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;height:2px;background:var(--color-accent-700)"></span>motion→photon</span>
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;height:2px;background:var(--color-accent-400)"></span>encoder</span>
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;height:2px;background:var(--color-neutral-400)"></span>vsync queue</span>
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;border-top:1.5px dashed var(--color-accent-800)"></span>p95 {{ p95 }} ms</span>
+              </div>
+            </div>
+            <div style="position:relative;height:170px;margin:14px 4px 4px 34px">
+              <div class="text-muted" style="position:absolute;left:-34px;top:-6px;font-size:10px">160</div>
+              <div class="text-muted" style="position:absolute;left:-34px;top:calc(25% - 6px);font-size:10px">120</div>
+              <div class="text-muted" style="position:absolute;left:-34px;top:calc(50% - 6px);font-size:10px">80</div>
+              <div class="text-muted" style="position:absolute;left:-34px;top:calc(75% - 6px);font-size:10px">40</div>
+              <div class="text-muted" style="position:absolute;left:-34px;bottom:-6px;font-size:10px">0 ms</div>
+              <svg viewBox="0 0 960 170" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;overflow:visible;display:block">
+                <line x1="0" y1="0" x2="960" y2="0" stroke="color-mix(in srgb,#1d1f20 8%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="42.5" x2="960" y2="42.5" stroke="color-mix(in srgb,#1d1f20 8%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="85" x2="960" y2="85" stroke="color-mix(in srgb,#1d1f20 8%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="127.5" x2="960" y2="127.5" stroke="color-mix(in srgb,#1d1f20 8%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="170" x2="960" y2="170" stroke="color-mix(in srgb,#1d1f20 25%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="{{ p95Y }}" x2="960" y2="{{ p95Y }}" stroke="var(--color-accent-800)" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"></line>
+                <polyline points="{{ vqPts }}" fill="none" stroke="var(--color-neutral-400)" stroke-width="1.2" vector-effect="non-scaling-stroke"></polyline>
+                <polyline points="{{ encPts }}" fill="none" stroke="var(--color-accent-400)" stroke-width="1.2" vector-effect="non-scaling-stroke"></polyline>
+                <polyline points="{{ m2pPts }}" fill="none" stroke="var(--color-accent-700)" stroke-width="1.8" vector-effect="non-scaling-stroke"></polyline>
+              </svg>
+            </div>
+            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-top:16px">
+              <div class="card-kicker" style="font-size:9.5px">Dropped frames / s — shedding at the {{ bitrate }} Mbps cap</div>
+              <div style="display:flex;gap:14px;font-size:11px" class="text-muted">
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;height:2px;background:var(--color-accent-500)"></span>dropped</span>
+                <span style="display:inline-flex;align-items:center;gap:5px"><span style="width:14px;border-top:1.5px dashed var(--color-accent-800)"></span>burst &gt; 8 f/s</span>
+              </div>
+            </div>
+            <div style="position:relative;height:64px;margin:12px 4px 4px 34px">
+              <div class="text-muted" style="position:absolute;left:-34px;top:-6px;font-size:10px">16</div>
+              <div class="text-muted" style="position:absolute;left:-34px;top:calc(50% - 6px);font-size:10px">8</div>
+              <div class="text-muted" style="position:absolute;left:-34px;bottom:-6px;font-size:10px">0 f/s</div>
+              <svg viewBox="0 0 960 64" preserveAspectRatio="none" style="position:absolute;inset:0;width:100%;height:100%;overflow:visible;display:block">
+                <line x1="0" y1="0" x2="960" y2="0" stroke="color-mix(in srgb,#1d1f20 8%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="32" x2="960" y2="32" stroke="var(--color-accent-800)" stroke-dasharray="5 4" vector-effect="non-scaling-stroke"></line>
+                <line x1="0" y1="64" x2="960" y2="64" stroke="color-mix(in srgb,#1d1f20 25%,transparent)" vector-effect="non-scaling-stroke"></line>
+                <polygon points="{{ dropArea }}" fill="color-mix(in srgb, #5980a6 14%, transparent)" stroke="none"></polygon>
+                <polyline points="{{ dropPts }}" fill="none" stroke="var(--color-accent-500)" stroke-width="1.5" vector-effect="non-scaling-stroke"></polyline>
+              </svg>
+            </div>
+          </div>
+          <div class="blueprint" style="padding:16px 18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <div class="card-kicker">Frame pipeline · where the milliseconds go</div>
+            <div style="display:flex;height:26px;margin:12px 0 10px;border:1px solid var(--color-divider)">
+              <sc-for list="{{ pipe }}" as="p" hint-placeholder-count="5">
+                <div title="{{ p.name }}" style="width:{{ p.w }}%;background:{{ p.bg }};border-right:1px solid var(--color-bg)"></div>
+              </sc-for>
+            </div>
+            <div style="display:flex;flex-wrap:wrap;gap:16px;font-size:12px">
+              <sc-for list="{{ pipe }}" as="p" hint-placeholder-count="5">
+                <span style="display:inline-flex;align-items:center;gap:6px"><span style="width:9px;height:9px;background:{{ p.bg }}"></span>{{ p.name }} <span class="text-muted">{{ p.ms }} ms</span></span>
+              </sc-for>
+            </div>
+          </div>
+        </sc-if>
+        <sc-if value="{{ isNumeric }}" hint-placeholder-val="{{ false }}">
+          <div style="display:grid;grid-template-columns:repeat(5,1fr);gap:14px">
+            <sc-for list="{{ pipe }}" as="p" hint-placeholder-count="5">
+              <div class="blueprint" style="padding:14px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+                <div class="card-kicker" style="font-size:9.5px">{{ p.name }}</div>
+                <div style="font-family:var(--font-heading);font-weight:600;font-size:34px">{{ p.ms }}<span style="font-size:15px;color:var(--color-neutral-600)"> ms</span></div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+        <div style="display:flex;justify-content:space-between;align-items:center;font-size:12px" class="text-muted">
+          <span>Client 192.168.1.44 · Quest 3 · WiFi 6 GHz · 3008×1664 @ 72 · elapsed {{ elapsed }}</span>
+          <span>Pause = X/A or the Quest system button — the left menu button can't pause (Unity limitation on every OpenXR runtime)</span>
+        </div>
+      </div>
+      </sc-if>
+    </sc-if>
+
+    <!-- DOCTOR -->
+    <sc-if value="{{ isDoctor }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <div>
+          <h3 style="margin:0">Doctor</h3>
+        </div>
+        <div style="display:flex;gap:8px;align-items:center">
+          <span class="text-muted" style="font-size:12px">{{ doctorSummary }}</span>
+          <button class="btn btn-primary" onClick="{{ runDoctor }}">{{ doctorBtn }}</button>
+        </div>
+      </div>
+      <div style="flex:1;min-height:0;overflow:auto;padding:16px 28px 24px">
+        <sc-for list="{{ doctorRows }}" as="c" hint-placeholder-count="8">
+          <div>
+            <sc-if value="{{ c.hasG }}" hint-placeholder-val="{{ false }}"><h6 style="margin:18px 0 4px;color:var(--color-accent-700)">{{ c.g }}</h6></sc-if>
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:6px 8px;border-bottom:1px solid color-mix(in srgb,var(--color-text) 7%,transparent);opacity:{{ c.op }}">
+              <span style="width:16px;flex:none;padding-top:2px">
+                <sc-if value="{{ c.isOk }}" hint-placeholder-val="{{ true }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2"><polyline points="20 6 9 17 4 12"></polyline></svg></sc-if>
+                <sc-if value="{{ c.isWarn }}" hint-placeholder-val="{{ false }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-neutral-600)" stroke-width="1.5"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg></sc-if>
+                <sc-if value="{{ c.isFail }}" hint-placeholder-val="{{ false }}"><svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-900)" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></sc-if>
+                <sc-if value="{{ c.isWait }}" hint-placeholder-val="{{ false }}"><span style="display:block;width:11px;height:11px;margin:2px;border:1px solid var(--color-divider)"></span></sc-if>
+                <sc-if value="{{ c.isRun }}" hint-placeholder-val="{{ false }}"><span style="display:block;width:11px;height:11px;margin:2px;border:1.5px solid var(--color-accent-300);border-top-color:var(--color-accent-700);border-radius:50%;animation:spin 0.7s linear infinite"></span></sc-if>
+              </span>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px">{{ c.l }}</div>
+                <sc-if value="{{ c.hasR }}" hint-placeholder-val="{{ false }}"><div class="text-muted" style="font-size:11.5px">{{ c.r }}</div></sc-if>
+              </div>
+              <sc-if value="{{ c.hasFix }}" hint-placeholder-val="{{ false }}"><button class="btn btn-secondary" onClick="{{ fixDoctor }}" style="padding:2px 12px;font-size:12px">{{ c.fix }}</button></sc-if>
+            </div>
+          </div>
+        </sc-for>
+      </div>
+    </sc-if>
+
+    <!-- LOGS -->
+    <sc-if value="{{ isLogs }}" hint-placeholder-val="{{ false }}">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <div>
+          <h3 style="margin:0">Logs</h3>
+        </div>
+        <div class="seg">
+          <sc-for list="{{ logFilters }}" as="f" hint-placeholder-count="4">
+            <label class="seg-opt"><input type="radio" name="logf" checked="{{ f.on }}" onChange="{{ f.pick }}">{{ f.label }}</label>
+          </sc-for>
+        </div>
+      </div>
+      <div style="flex:1;min-height:0;overflow:auto;padding:14px 28px;font-family:ui-monospace,Menlo,monospace;font-size:11.5px;line-height:1.7">
+        <sc-for list="{{ logRows }}" as="ln" hint-placeholder-count="12">
+          <div style="display:flex;gap:12px;border-bottom:1px solid color-mix(in srgb,var(--color-text) 4%,transparent);padding:1px 0">
+            <span class="text-muted" style="flex:none">{{ ln.t }}</span>
+            <span style="flex:none;width:52px;color:var(--color-accent-700)">{{ ln.ch }}</span>
+            <span style="white-space:pre-wrap;word-break:break-word">{{ ln.txt }}</span>
+          </div>
+        </sc-for>
+      </div>
+      <div class="text-muted" style="padding:8px 28px;border-top:1px solid var(--color-divider);font-size:11px;font-family:ui-monospace,Menlo,monospace">logs/beatsaber-20260807-091204.log · wine/openxr debug channels off (enable Verbose in Settings)</div>
+    </sc-if>
+
+    <!-- SETTINGS -->
+    <sc-if value="{{ isSettings }}" hint-placeholder-val="{{ false }}">
+      <div style="padding:22px 28px 14px;border-bottom:1px solid var(--color-divider)">
+        <h3 style="margin:0">Settings</h3>
+      </div>
+      <div style="flex:1;min-height:0;overflow:auto;padding:22px 28px">
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:22px;align-items:start">
+          <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+            <h6 style="color:var(--color-accent-700)">Streaming</h6>
+            <div class="field" style="margin-top:10px">
+              <label>Base bitrate — {{ bitrate }} Mbps</label>
+              <input type="range" min="20" max="100" step="1" value="{{ bitrate }}" onChange="{{ setBitrate }}" style="width:100%">
+              <div class="text-muted" style="font-size:11px;margin-top:3px">Template writes 42; measured sessions ran at 80 (~5–6 dropped frames/s at the cap — tuning open). ALVR's adaptive loop adjusts from the base.</div>
+            </div>
+            <div class="field" style="margin-top:14px"><label>Video codec</label>
+              <div class="seg"><sc-for list="{{ codecOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="codec" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+              <div class="text-muted" style="font-size:11px;margin-top:3px">Honored for real on the helper path; the in-process fallback is H.264-only.</div>
+            </div>
+            <div class="field" style="margin-top:14px"><label>Encoder process</label>
+              <div class="seg"><sc-for list="{{ encOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="enc" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+              <div class="text-muted" style="font-size:11px;margin-top:3px">auto / native — out-of-process arm64 helper, HW HEVC (hard-required at launch). inproc — Rosetta H.264 fallback, macOS 27+.</div>
+            </div>
+            <div class="field" style="margin-top:14px"><label>Streaming protocol</label>
+              <div class="seg"><sc-for list="{{ protoOpts }}" as="o" hint-placeholder-count="2"><label class="seg-opt"><input type="radio" name="proto" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+              <div class="text-muted" style="font-size:11px;margin-top:3px">alvr = WiFi/USB, the supported path. oxrsys = legacy USB-only client (adb reverse tunnels); the pre-launch gate warns on it.</div>
+            </div>
+            <div class="field" style="margin-top:14px">
+              <label>Resolution scale — {{ resScale }}× ({{ resPx }})</label>
+              <input type="range" min="0.5" max="1" step="0.05" value="{{ resScale }}" onChange="{{ setResScale }}" style="width:100%">
+              <div class="text-muted" style="font-size:11px;margin-top:3px">Encode-side downscale; 1.0 = native. 3008×1664 @ 1.0 verified.</div>
+            </div>
+            <div style="display:flex;gap:18px;margin-top:14px">
+              <div class="field" style="flex:1"><label>Refresh rate</label>
+                <div class="seg"><sc-for list="{{ hzOpts }}" as="o" hint-placeholder-count="3"><label class="seg-opt"><input type="radio" name="hz" checked="{{ o.on }}" onChange="{{ o.pick }}">{{ o.label }}</label></sc-for></div>
+                <div class="text-muted" style="font-size:11px;margin-top:3px">72 Hz verified</div>
+              </div>
+            </div>
+          </div>
+          <div style="display:flex;flex-direction:column;gap:22px">
+            <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <h6 style="color:var(--color-accent-700)">Audio &amp; launch</h6>
+              <div style="display:flex;flex-direction:column;gap:11px;margin-top:10px">
+                <sc-for list="{{ toggles }}" as="t" hint-placeholder-count="4">
+                  <label class="radio" style="align-items:flex-start">
+                    <input type="checkbox" checked="{{ t.on }}" onChange="{{ t.flip }}">
+                    <span class="dot" style="border-radius:0;margin-top:2px"></span>
+                    <span><span style="font-size:13.5px">{{ t.label }}</span><br><span class="text-muted" style="font-size:11px">{{ t.note }}</span></span>
+                  </label>
+                </sc-for>
+                <sc-if value="{{ verboseOn }}" hint-placeholder-val="{{ false }}">
+                  <div class="field" style="margin-left:26px">
+                    <label>WINEDEBUG channels</label>
+                    <input class="input" defaultValue="fixme-all,+openxr" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px">
+                    <div class="text-muted" style="font-size:11px;margin-top:3px">Passed as WINEDEBUG; default without verbose is -all.</div>
+                  </div>
+                </sc-if>
+              </div>
+            </div>
+            <div class="blueprint" style="padding:18px"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+              <h6 style="color:var(--color-accent-700)">Paths</h6>
+              <div class="field" style="margin-top:10px"><label>CrossOver bottle</label><input class="input" value="Steam" readOnly></div>
+              <div class="field" style="margin-top:10px"><label>Beat Saber 1.29.4 install dir</label>
+                <div style="display:flex;gap:8px"><input class="input" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px" value="…/Steam/steamapps/common/Beat Saber 1294" readOnly><button class="btn btn-secondary" style="flex:none">Browse…</button></div>
+              </div>
+              <div class="text-muted" style="font-size:11px;margin-top:10px;font-family:ui-monospace,Menlo,monospace">~/Library/Application Support/OXRSys/oxrsys-runtime.toml — written once by setup, never overwritten.</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </sc-if>
+  </div>
+
+  <!-- ── launch gate modal ── -->
+  <sc-if value="{{ gateOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;inset:0;z-index:40;display:grid;place-items:center;background:color-mix(in srgb,var(--color-neutral-900) 45%,transparent)">
+      <div class="dialog blueprint elev-lg" style="width:600px;background:var(--color-bg);max-height:86%;overflow:auto"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div>
+          <div class="card-kicker">Pre-launch gate</div>
+          <div class="dialog-title" style="display:flex;justify-content:space-between;align-items:baseline">{{ gateTitle }}<span class="text-muted" style="font-size:13px;font-family:var(--font-body)">{{ gateProgress }}</span></div>
+        </div>
+        <div style="display:flex;flex-direction:column">
+          <sc-for list="{{ gateRows }}" as="c" hint-placeholder-count="6">
+            <div style="display:flex;align-items:flex-start;gap:10px;padding:5px 4px;border-bottom:1px solid color-mix(in srgb,var(--color-text) 6%,transparent);opacity:{{ c.op }}">
+              <span style="width:16px;flex:none;padding-top:2px">
+                <sc-if value="{{ c.isOk }}" hint-placeholder-val="{{ true }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2"><polyline points="20 6 9 17 4 12"></polyline></svg></sc-if>
+                <sc-if value="{{ c.isFail }}" hint-placeholder-val="{{ false }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-900)" stroke-width="2.5"><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg></sc-if>
+                <sc-if value="{{ c.isWait }}" hint-placeholder-val="{{ false }}"><span style="display:block;width:10px;height:10px;margin:2px;border:1px solid var(--color-divider)"></span></sc-if>
+                <sc-if value="{{ c.isRun }}" hint-placeholder-val="{{ false }}"><span style="display:block;width:10px;height:10px;margin:2px;border:1.5px solid var(--color-accent-300);border-top-color:var(--color-accent-700);border-radius:50%;animation:spin 0.7s linear infinite"></span></sc-if>
+              </span>
+              <div style="flex:1;min-width:0">
+                <div style="font-size:13px">{{ c.l }}</div>
+                <sc-if value="{{ c.showR }}" hint-placeholder-val="{{ false }}"><div style="font-size:11.5px;color:var(--color-accent-800)">{{ c.r }}</div></sc-if>
+              </div>
+              <sc-if value="{{ c.showFix }}" hint-placeholder-val="{{ false }}"><button class="btn btn-primary" onClick="{{ fixGate }}" style="padding:2px 14px;font-size:12px">Fix</button></sc-if>
+            </div>
+          </sc-for>
+        </div>
+        <div class="text-muted" style="font-size:11.5px">Launching resets the bottle's wineserver, stages Goldberg, routes audio → BlackHole 2ch and opens the ALVR dashboard.</div>
+        <div class="dialog-actions">
+          <button class="btn btn-secondary" onClick="{{ closeGate }}">Cancel</button>
+          <button class="btn btn-primary" onClick="{{ launch }}" disabled="{{ launchDisabled }}"><svg width="12" height="12" viewBox="0 0 24 24" fill="currentColor" stroke="none"><polygon points="6 3 20 12 6 21 6 3"></polygon></svg>Launch</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ── add-game wizard ── -->
+  <sc-if value="{{ addOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;inset:0;z-index:40;display:grid;place-items:center;background:color-mix(in srgb,var(--color-neutral-900) 45%,transparent)">
+      <div class="dialog blueprint elev-lg" style="width:560px;background:var(--color-bg)"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div>
+          <div class="card-kicker">Add game · step {{ addStepN }} of 3</div>
+          <div class="dialog-title">{{ addTitle }}</div>
+        </div>
+        <sc-if value="{{ addIs0 }}" hint-placeholder-val="{{ true }}">
+          <div style="display:flex;flex-direction:column;gap:12px">
+            <div class="field"><label>Display name</label><input class="input" placeholder="e.g. Beat Saber 1.29.4" defaultValue=""></div>
+            <div class="seg" style="align-self:flex-start">
+              <label class="seg-opt"><input type="radio" name="src" checked="{{ srcFolder }}" onChange="{{ pickFolder }}">Point at install folder</label>
+              <label class="seg-opt"><input type="radio" name="src" checked="{{ srcDepot }}" onChange="{{ pickDepot }}">Download Steam depot</label>
+            </div>
+            <sc-if value="{{ srcFolder }}" hint-placeholder-val="{{ true }}">
+              <div class="field"><label>Game folder (the dir containing the .exe)</label>
+                <div style="display:flex;gap:8px"><input class="input" placeholder="/Users/you/Games/Beat Saber 1294" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px"><button class="btn btn-secondary" style="flex:none">Browse…</button></div>
+                <div class="text-muted" style="font-size:11px;margin-top:3px">A folder outside the bottle is reached through its z: drive (checked by Doctor).</div>
+              </div>
+            </sc-if>
+            <sc-if value="{{ srcDepot }}" hint-placeholder-val="{{ false }}">
+              <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px">
+                <div class="field"><label>App ID</label><input class="input" defaultValue="620980"></div>
+                <div class="field"><label>Depot ID</label><input class="input" defaultValue="620981"></div>
+                <div class="field" style="grid-column:1/-1"><label>Manifest</label><input class="input" defaultValue="6291266771922375922" style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px"></div>
+                <div class="field" style="grid-column:1/-1"><label>Steam login (owns the game; Steam never runs)</label><input class="input" placeholder="steam-user"></div>
+              </div>
+              <div class="text-muted" style="font-size:11px">Downloads the pinned depot with DepotDownloader — e.g. Beat Saber 1.29.4, the last build before the Meta account gate and the first with native OpenXR.</div>
+            </sc-if>
+          </div>
+        </sc-if>
+        <sc-if value="{{ addIs1 }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;flex-direction:column;gap:10px">
+            <label class="radio" style="align-items:flex-start;border:1px solid var(--color-divider);padding:10px 12px"><input type="radio" name="bot" checked="{{ botExisting }}" onChange="{{ pickBotExisting }}"><span class="dot" style="margin-top:2px"></span><span>Use bottle <b>Steam</b><br><span class="text-muted" style="font-size:11.5px">win11_64 · graphics backend DXMT · bridge installed</span></span></label>
+            <label class="radio" style="align-items:flex-start;border:1px solid var(--color-divider);padding:10px 12px"><input type="radio" name="bot" checked="{{ botNew }}" onChange="{{ pickBotNew }}"><span class="dot" style="margin-top:2px"></span><span>Create a new win11_64 bottle<br><span class="text-muted" style="font-size:11.5px">Made in CrossOver; Sabrage then installs wineopenxr + the OpenXR manifest into it.</span></span></label>
+            <sc-if value="{{ botNew }}" hint-placeholder-val="{{ false }}"><div class="field"><label>New bottle name</label><input class="input" placeholder="e.g. VR"></div></sc-if>
+          </div>
+        </sc-if>
+        <sc-if value="{{ addIs2 }}" hint-placeholder-val="{{ false }}">
+          <div style="display:flex;flex-direction:column;gap:11px">
+            <label class="radio" style="align-items:flex-start"><input type="checkbox" defaultChecked><span class="dot" style="border-radius:0;margin-top:2px"></span><span>Apply Goldberg Steam emulator<br><span class="text-muted" style="font-size:11px">Replaces steam_api64.dll (original backed up). Offline, networking + overlay disabled — avoids the Meta account gate; no real Steam at runtime.</span></span></label>
+            <label class="radio" style="align-items:flex-start"><input type="checkbox" defaultChecked><span class="dot" style="border-radius:0;margin-top:2px"></span><span>Route audio to the headset<br><span class="text-muted" style="font-size:11px">All Mac output goes to BlackHole 2ch while the game runs; restored on exit.</span></span></label>
+            <div class="hr" style="margin:4px 0"></div>
+            <div style="font-size:12.5px" class="text-muted">On finish the game is added as <b>Untested</b>. The pre-launch gate verifies the bridge on first run.</div>
+          </div>
+        </sc-if>
+        <div class="dialog-actions">
+          <button class="btn btn-ghost" onClick="{{ closeAdd }}" style="margin-right:auto">Cancel</button>
+          <sc-if value="{{ addCanBack }}" hint-placeholder-val="{{ false }}"><button class="btn btn-secondary" onClick="{{ addBack }}">Back</button></sc-if>
+          <button class="btn btn-primary" onClick="{{ addNext }}">{{ addNextLabel }}</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+  <!-- ── setup assistant ── -->
+  <sc-if value="{{ setupOpen }}" hint-placeholder-val="{{ false }}">
+    <div style="position:absolute;inset:0;z-index:40;display:grid;place-items:center;background:color-mix(in srgb,var(--color-neutral-900) 45%,transparent)">
+      <div class="dialog blueprint elev-lg" style="width:620px;background:var(--color-bg);max-height:88%;overflow:auto"><i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+        <div style="display:flex;gap:6px">
+          <sc-for list="{{ setupDots }}" as="d" hint-placeholder-count="4">
+            <div style="flex:1;height:3px;background:{{ d.bg }}"></div>
+          </sc-for>
+        </div>
+        <div>
+          <div class="card-kicker">Setup assistant · step {{ setupStepN }} of 4</div>
+          <div class="dialog-title">{{ setupTitle }}</div>
+        </div>
+        <sc-if value="{{ setupIs0 }}" hint-placeholder-val="{{ true }}">
+          <div class="dialog-body" style="margin:0">Sabrage builds the bridge locally. These need to be on your Mac first:</div>
+          <div style="display:flex;flex-direction:column;font-size:13px">
+            <sc-for list="{{ reqRows }}" as="r" hint-placeholder-count="5">
+              <div style="display:flex;gap:10px;align-items:flex-start;padding:5px 2px;border-bottom:1px solid color-mix(in srgb,var(--color-text) 6%,transparent)">
+                <sc-if value="{{ r.ok }}" hint-placeholder-val="{{ true }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2" style="flex:none;margin-top:3px"><polyline points="20 6 9 17 4 12"></polyline></svg></sc-if>
+                <sc-if value="{{ r.miss }}" hint-placeholder-val="{{ false }}"><svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-neutral-600)" stroke-width="1.5" style="flex:none;margin-top:3px"><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg></sc-if>
+                <div style="flex:1">{{ r.l }}<sc-if value="{{ r.hasCmd }}" hint-placeholder-val="{{ false }}"><div style="font-family:ui-monospace,Menlo,monospace;font-size:11px;background:var(--color-surface);border:1px solid var(--color-divider);padding:4px 8px;margin-top:4px">{{ r.cmd }}</div></sc-if></div>
+              </div>
+            </sc-for>
+          </div>
+        </sc-if>
+        <sc-if value="{{ setupIs1 }}" hint-placeholder-val="{{ false }}">
+          <div class="dialog-body" style="margin:0">CrossOver 26.2 found at /Applications/CrossOver.app. The bridge lives in a <b>win11_64</b> bottle whose graphics backend must be DXMT.</div>
+          <label class="radio" style="align-items:flex-start;border:1px solid var(--color-divider);padding:10px 12px"><input type="radio" name="sbot" defaultChecked><span class="dot" style="margin-top:2px"></span><span>Use existing bottle <b>Steam</b> (win11_64)<br><span class="text-muted" style="font-size:11.5px">Backend is currently "auto" — Sabrage will force DXMT (the CrossOver GUI can reset this; Run re-checks it).</span></span></label>
+          <label class="radio" style="align-items:flex-start;border:1px solid var(--color-divider);padding:10px 12px"><input type="radio" name="sbot"><span class="dot" style="margin-top:2px"></span><span>Create a new bottle in CrossOver first<br><span class="text-muted" style="font-size:11.5px">Template win11_64 — then come back and pick it here.</span></span></label>
+        </sc-if>
+        <sc-if value="{{ setupIs2 }}" hint-placeholder-val="{{ false }}">
+          <div class="dialog-body" style="margin:0">Fetches sha256-pinned binaries and builds the bridge. One sudo prompt — the host OpenXR manifest at /usr/local/share/openxr is root-owned.</div>
+          <div style="display:flex;flex-direction:column;font-size:13px">
+            <sc-for list="{{ buildRows }}" as="b" hint-placeholder-count="5">
+              <div style="display:flex;gap:10px;align-items:center;padding:5px 2px;border-bottom:1px solid color-mix(in srgb,var(--color-text) 6%,transparent)">
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2" style="flex:none"><polyline points="20 6 9 17 4 12"></polyline></svg>
+                <div style="flex:1">{{ b.l }}</div>
+                <span class="text-muted" style="font-size:11.5px">{{ b.d }}</span>
+              </div>
+            </sc-for>
+          </div>
+          <div class="text-muted" style="font-size:11.5px">Runtime config written to ~/Library/Application Support/OXRSys/oxrsys-runtime.toml (protocol = alvr, bitrate 42) — never overwritten once it exists.</div>
+        </sc-if>
+        <sc-if value="{{ setupIs3 }}" hint-placeholder-val="{{ false }}">
+          <div class="dialog-body" style="margin:0">The Quest runs the stock <b>ALVR client v20.14.1</b> — the version must match the embedded server core.</div>
+          <div style="display:flex;flex-direction:column;gap:9px;font-size:13px">
+            <div style="display:flex;gap:10px"><span style="flex:none;width:20px;height:20px;border:1px solid var(--color-divider);display:grid;place-items:center;font-family:var(--font-heading);font-size:12px">1</span><span>Enable Developer Mode in the Meta Horizon phone app (free developer account), accept the USB-debugging prompt in the headset.</span></div>
+            <div style="display:flex;gap:10px"><span style="flex:none;width:20px;height:20px;border:1px solid var(--color-divider);display:grid;place-items:center;font-family:var(--font-heading);font-size:12px">2</span><span>Connect the Quest over USB once — Sabrage sideloads <span style="font-family:ui-monospace,Menlo,monospace;font-size:11.5px">alvr_client_android.apk</span> via adb (or use SideQuest).</span></div>
+            <div style="display:flex;gap:10px"><span style="flex:none;width:20px;height:20px;border:1px solid var(--color-divider);display:grid;place-items:center;font-family:var(--font-heading);font-size:12px">3</span><span>Join the same 5/6 GHz WiFi as the Mac. LAN clients are auto-trusted — no pairing dance. USB-wired streaming: enable Wired mode in Settings.</span></div>
+          </div>
+          <div style="display:flex;gap:10px;align-items:center;border:1px solid var(--color-divider);padding:8px 12px;font-size:12.5px"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="1.5"><path d="M12 20h.01"></path><path d="M2 8.82a15 15 0 0 1 20 0"></path><path d="M5 12.86a10 10 0 0 1 14 0"></path><path d="M8.5 16.43a5 5 0 0 1 7 0"></path></svg>Quest 3 detected over adb — ALVR client v20.14.1 installed.</div>
+        </sc-if>
+        <div class="dialog-actions">
+          <button class="btn btn-ghost" onClick="{{ closeSetup }}" style="margin-right:auto">Close</button>
+          <sc-if value="{{ setupCanBack }}" hint-placeholder-val="{{ false }}"><button class="btn btn-secondary" onClick="{{ setupBack }}">Back</button></sc-if>
+          <button class="btn btn-primary" onClick="{{ setupNext }}">{{ setupNextLabel }}</button>
+        </div>
+      </div>
+    </div>
+  </sc-if>
+
+</div>
+</x-import>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;$preview&quot;:{&quot;width&quot;:1400,&quot;height&quot;:940},
+&quot;sessionLayout&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;charts + breakdown&quot;,&quot;options&quot;:[&quot;charts + breakdown&quot;,&quot;numeric grid&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Layout variants&quot;},
+&quot;gateFailure&quot;:{&quot;editor&quot;:&quot;boolean&quot;,&quot;default&quot;:true,&quot;tsType&quot;:&quot;boolean&quot;,&quot;section&quot;:&quot;Simulation&quot;}}">
+const DOCTOR = [
+  {g:'Hardware / OS', l:'Apple Silicon (Apple M3 Max)', st:'ok'},
+  {l:'macOS 27.1 — VT encodes BGRA directly under Rosetta (in-process fallback OK)', st:'ok'},
+  {g:'CrossOver & bottle', l:'CrossOver 26.2 at /Applications/CrossOver.app', st:'ok'},
+  {l:"Bottle 'Steam' exists (cxbottle.conf)", st:'ok'},
+  {l:'Bottle template win11_64', st:'ok'},
+  {l:'Bottle graphics backend = dxmt', st:'ok'},
+  {g:'Toolchain', l:'cmake · ninja · git · curl · x86_64-w64-mingw32-gcc', st:'ok'},
+  {l:'rustup with x86_64-apple-darwin target', st:'ok'},
+  {g:'Submodules & pinned binaries', l:'Submodules oxrsys / wineopenxr / ALVR initialized', st:'ok'},
+  {l:'ALVR oxrsys patch set present (v20.14.1 branch)', st:'ok'},
+  {l:'dxmt-artifacts (monofunc fork) — provenance verified', st:'ok'},
+  {l:'Goldberg steam_api64.dll (sha256 verified)', st:'ok'},
+  {g:'Game', l:'Beat Saber 1.29.4 at …/steamapps/common/Beat Saber 1294', st:'ok'},
+  {g:'Build outputs', l:'oxrsys runtime + embedded ALVR core + wineopenxr built', st:'ok'},
+  {l:'Encoder helper staged next to the runtime dylib — arm64', st:'ok'},
+  {g:'Bridge overlay', l:'Global DXMT overlay current (d3d11.dll / winemetal.so)', st:'fail', r:'A CrossOver update reverted the overlay — re-installing the bridge re-applies it (stock is backed up).', fix:'Re-install bridge'},
+  {l:'Bottle system32/wineopenxr.dll current', st:'ok'},
+  {l:'Host OpenXR registration → oxrsys x86_64 dylib', st:'ok'},
+  {l:'Bottle ActiveRuntime registry key', st:'ok'},
+  {g:'Runtime config', l:'oxrsys-runtime.toml — protocol = alvr', st:'ok'},
+  {l:'session.json — no stale manual-IP pins', st:'ok'},
+  {g:'Headset', l:'No Quest over adb', st:'warn', r:'Fine for WiFi streaming; connect USB once to install the client.'},
+  {l:'ALVR client v20.14.1 on the Quest (last seen over adb)', st:'ok'},
+  {g:'Audio & ports', l:'BlackHole 2ch + switchaudio-osx present', st:'ok'},
+  {l:'Streaming ports 9943 / 9944 free — no stale adb forwards', st:'ok'},
+];
+const GATE = [
+  {l:'Beat Saber.exe present at the install dir'},
+  {l:'Version 1.29.4 (pre Meta-gate build)'},
+  {l:'Bridge built — oxrsys dylib + wineopenxr.dll'},
+  {l:'Host OpenXR registration (active_runtime.x86_64.json)'},
+  {l:'Bottle wineopenxr.dll + OpenXR manifest + ActiveRuntime key'},
+  {l:'CrossOver DXMT overlay current'},
+  {l:'Bottle graphics backend = DXMT', canFail:true, r:"The CrossOver GUI 'auto' setting no longer selects DXMT — the game stalls before D3D11 init. Fix forces dxmt in cxbottle.conf."},
+  {l:'Goldberg steam_api64.dll staged (sha256 verified)'},
+  {l:'Runtime config — protocol = alvr'},
+  {l:'Encoder helper staged (arm64, HW HEVC)'},
+  {l:'Streaming ports 9943 / 9944 free'},
+  {l:"Wineserver reset for bottle 'Steam'"},
+];
+const LOGS0 = [
+  {t:'09:12:01', ch:'run', txt:"== wine-vr demo run =="},
+  {t:'09:12:01', ch:'run', txt:"-- resetting wineserver for bottle 'Steam'"},
+  {t:'09:12:03', ch:'run', txt:"ok wineserver down"},
+  {t:'09:12:03', ch:'run', txt:"-- Goldberg: already installed (steam_appid 620980, offline + no overlay)"},
+  {t:'09:12:04', ch:'run', txt:"audio: default output -> BlackHole 2ch (was: MacBook Pro Speakers)"},
+  {t:'09:12:04', ch:'run', txt:"dashboard: ALVR server dashboard opening (connects once the game is up)"},
+  {t:'09:12:04', ch:'run', txt:"-- launching Beat Saber through the bridge · log: logs/beatsaber-20260807-091204.log"},
+  {t:'09:12:09', ch:'wine', txt:"DXMT: d3d11 device on Apple M3 Max (Metal 3), swapchain BGRA8 zero-copy import"},
+  {t:'09:12:10', ch:'oxrsys', txt:"[info] runtime loaded x86_64 (Rosetta) · protocol=alvr · encoder_process=auto"},
+  {t:'09:12:10', ch:'oxrsys', txt:"[info] helper: posix_spawn oxrsys-encoder-helper (arm64) · bootstrap_check_in ok"},
+  {t:'09:12:11', ch:'oxrsys', txt:"[info] helper: VideoToolbox HEVC Main low-latency ready in 398 ms"},
+  {t:'09:12:14', ch:'alvr', txt:"client discovered 192.168.1.44 (Quest 3) — LAN auto-trust, no pairing"},
+  {t:'09:12:15', ch:'alvr', txt:"streaming 3008x1664@72 · HEVC · base 80 Mbps (adaptive)"},
+  {t:'09:12:15', ch:'oxrsys', txt:"[info] xrBeginSession — compose in-process, 3 IOSurface-backed BGRA slots"},
+  {t:'09:12:44', ch:'alvr', txt:"stats: m2p p50 102.9 ms · encoder 38.6 · network 7.0 · decode 16.9 · vsync_q 25.0"},
+];
+const REQ = [
+  {l:'Xcode Command Line Tools (git, python3, clang)', ok:true},
+  {l:'Homebrew', ok:true},
+  {l:'cmake · ninja · mingw-w64 · android-platform-tools', ok:true, cmd:'brew install cmake ninja mingw-w64 android-platform-tools'},
+  {l:'rustup with the x86_64-apple-darwin target (brew\u2019s rustup is keg-only — use rustup.rs)', ok:false, cmd:'rustup toolchain install stable && rustup target add x86_64-apple-darwin'},
+  {l:'Optional — in-headset audio (reboot after)', ok:true, cmd:'brew install switchaudio-osx blackhole-2ch'},
+];
+const BUILD = [
+  {l:'Fetch submodules + sha256-pinned binaries (DXMT, Goldberg)', d:'~1 min'},
+  {l:'Build oxrsys runtime (x86_64) + embedded ALVR core', d:'~6 min'},
+  {l:'Build wineopenxr (PE + unix side)', d:'~2 min'},
+  {l:'Overlay DXMT + wineopenxr into CrossOver (stock backed up)', d:'sudo'},
+  {l:'Write oxrsys-runtime.toml · register host OpenXR runtime', d:'sudo'},
+];
+const SETUP_TITLES = ['Requirements', 'CrossOver & bottle', 'Build & install the bridge', 'Headset client'];
+const ADD_TITLES = ['Where is the game?', 'Which bottle runs it?', 'Patches & options'];
+const rnd = (base, spread) => base + (Math.random() - 0.5) * spread;
+
+class Component extends DCLogic {
+  state = {
+    screen: 'about', selGame: 0, detailOpen: false, editIdx: 0,
+    editCfg: {useGlobal:true, codec:'auto', enc:'auto', scale:1.0, hz:'72 Hz', bitrate:80, goldberg:true, audio:true, gbeOffline:true, gbeNoNet:true, gbeNoOverlay:true},
+    games: [
+      {name:'Beat Saber', sub:'Windows x64 · native OpenXR', version:'1.29.4', bottle:'Steam', status:'Ready', tag:'tag-accent', last:'Today 09:12 · 102.9 ms p50', dir:'…/Steam/steamapps/common/Beat Saber 1294', lastStats:'72 fps · HEVC · 102.9 ms p50 / 130.5 p95 (WiFi on-head)', appid:'620980'},
+      {name:'Pistol Whip', sub:'Windows x64', version:'—', bottle:'Steam', status:'Untested', tag:'tag-neutral', last:'Never', dir:'…/Steam/steamapps/common/Pistol Whip', lastStats:'No sessions yet', appid:'561911'},
+      {name:'Synth Riders', sub:'Windows x64', version:'—', bottle:'—', status:'Needs setup', tag:'tag-outline', last:'Never', dir:'Not set', lastStats:'No sessions yet', appid:'885000'},
+    ],
+    gateOpen:false, gateN:0, gatePhase:'idle', gateFixed:false, gateGame:'Beat Saber 1.29.4',
+    sessionActive:false, sessionEnded:false, ticks:0, hist:[],
+    doctorN: DOCTOR.length, doctorRan:true, doctorFixed:false,
+    setupOpen:false, setupStep:0, addOpen:false, addStep:0, addSrc:'folder', addBot:'existing',
+    logFilter:'all',
+    settings:{bitrate:80, codec:'auto', enc:'auto', protocol:'alvr', scale:1.0, hz:'72 Hz', audio:true, dashboard:true, wired:false, verbose:false},
+  };
+  componentWillUnmount() { clearInterval(this._gt); clearInterval(this._st); }
+  openGate = (name) => {
+    clearInterval(this._gt);
+    this.setState({gateOpen:true, gateN:0, gatePhase:'running', gateFixed:false, gateGame:name});
+    this._gt = setInterval(() => this.stepGate(), 260);
+  };
+  stepGate() {
+    const {gateN, gateFixed} = this.state;
+    const failIdx = GATE.findIndex(c => c.canFail);
+    const wantFail = (this.props.gateFailure ?? true) && !gateFixed;
+    if (gateN >= GATE.length) { clearInterval(this._gt); this.setState({gatePhase:'ready'}); return; }
+    if (wantFail && gateN === failIdx) { clearInterval(this._gt); this.setState({gateN: gateN + 1, gatePhase:'blocked'}); return; }
+    this.setState({gateN: gateN + 1, gatePhase: gateN + 1 >= GATE.length ? 'ready' : 'running'});
+    if (gateN + 1 >= GATE.length) clearInterval(this._gt);
+  }
+  fixGate = () => {
+    this.setState({gateFixed:true, gatePhase:'running'});
+    this._gt = setInterval(() => this.stepGate(), 260);
+  };
+  sample(t) {
+    // shapes from the measured sessions: encoder ~flat 38, network ~7 with WiFi
+    // jitter spikes, vsync queue oscillating with frame pacing, drops bursting
+    // with the spikes at the bitrate cap
+    const spike = Math.random() < 0.08;
+    const enc = rnd(38.4, 2.2);
+    const net = spike ? rnd(20, 16) : rnd(7, 1.8);
+    const dec = rnd(16.8, 1.4);
+    const dq = spike ? rnd(10, 8) : rnd(2, 1.4);
+    const vq = Math.max(8, 25 + 9 * Math.sin(t / 4.5) + rnd(0, 5));
+    const m2p = enc + net + dec + dq + vq + rnd(13.5, 2.5);
+    const drop = Math.max(0.5, spike ? rnd(11, 6) : rnd(5.4, 2.6));
+    return {enc, net, dec, dq, vq, m2p, drop, spike};
+  }
+  launch = () => {
+    clearInterval(this._st);
+    this._t = 20;
+    const seed = Array.from({length:20}, (_, i) => this.sample(i));
+    this.setState({gateOpen:false, screen:'session', sessionActive:true, sessionEnded:false, ticks:0, hist:seed});
+    this._st = setInterval(() => this.setState(s => ({
+      hist: s.hist.concat(this.sample(this._t++)).slice(-48),
+      ticks: s.ticks + 1,
+    })), 800);
+  };
+  stopSession = () => { clearInterval(this._st); this.setState({sessionActive:false, sessionEnded:true}); };
+  runDoctor = () => {
+    clearInterval(this._dt);
+    this.setState({doctorN:0, doctorRan:true});
+    this._dt = setInterval(() => this.setState(s => {
+      if (s.doctorN >= DOCTOR.length) { clearInterval(this._dt); return null; }
+      return {doctorN: s.doctorN + 1};
+    }), 110);
+  };
+  fixDoctor = () => this.setState({doctorFixed:true});
+  mkSeg(key, opts, name) {
+    return opts.map(o => ({label:o, name, on:this.state.settings[key] === o, pick:() => this.setState(s => ({settings:{...s.settings, [key]:o}}))}));
+  }
+  renderVals() {
+    const S = this.state, P = this.props;
+    const nav = {}; ['about','library','session','doctor','logs','settings'].forEach(k => {
+      const on = S.screen === k || (k === 'library' && S.screen === 'edit');
+      nav[k] = `display:flex;align-items:center;gap:10px;padding:7px 10px;cursor:pointer;font-size:13px;letter-spacing:0.04em;text-transform:uppercase;font-family:var(--font-heading);font-weight:600;${on ? 'background:color-mix(in srgb,var(--color-accent) 12%,transparent);color:var(--color-accent-700);box-shadow:inset 2px 0 0 var(--color-accent)' : 'color:var(--color-neutral-700)'}`;
+    });
+    const go = k => () => this.setState({screen:k});
+    const games = S.games.map((g, i) => {
+      const open = S.detailOpen && S.selGame === i;
+      return {...g, tagClass:g.tag, open, chev: open ? '90deg' : '0deg',
+        rowBg: open ? 'color-mix(in srgb,var(--color-accent) 7%,transparent)' : 'transparent',
+        select: () => this.setState(s => ({selGame:i, detailOpen: !(s.detailOpen && s.selGame === i)})),
+        edit: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.setState({screen:'edit', editIdx:i}); },
+        run: (e) => { if (e && e.stopPropagation) e.stopPropagation(); this.openGate(`${g.name} ${g.version !== '—' ? g.version : ''}`.trim()); },
+      };
+    });
+    const editGame = S.games[S.editIdx] || S.games[0];
+    const mkESeg = (key, opts, name) => opts.map(o => ({label:o, name, on:S.editCfg[key] === o, pick:() => this.setState(s => ({editCfg:{...s.editCfg, [key]:o}}))}));
+    const editTogs = [
+      {key:'goldberg', label:'Goldberg Steam emulator', note:'Replaces steam_api64.dll (original backed up) — avoids the Meta account gate; no real Steam at runtime.', sub:true},
+      {key:'audio', label:'Route audio to the headset for this game', note:'Mac output → BlackHole 2ch while it runs; restored on exit.'},
+    ].map(t => ({...t, on:S.editCfg[t.key], subOn:!!t.sub && S.editCfg[t.key], flip:() => this.setState(s => ({editCfg:{...s.editCfg, [t.key]:!s.editCfg[t.key]}}))}));
+    const gbeFlags = [
+      {key:'gbeOffline', label:'Offline mode', file:'offline.txt'},
+      {key:'gbeNoNet', label:'Disable networking', file:'disable_networking.txt'},
+      {key:'gbeNoOverlay', label:'Disable overlay', file:'disable_overlay.txt'},
+    ].map(f => ({...f, on:S.editCfg[f.key], flip:() => this.setState(s => ({editCfg:{...s.editCfg, [f.key]:!s.editCfg[f.key]}}))}));
+    // gate rows
+    const failIdx = GATE.findIndex(c => c.canFail);
+    const gateRows = GATE.map((c, i) => {
+      let st = 'wait';
+      if (i < S.gateN) st = 'ok';
+      if (i === S.gateN && S.gatePhase === 'running') st = 'run';
+      if (S.gatePhase === 'blocked' && i === failIdx && !S.gateFixed) st = 'fail';
+      if (S.gateFixed && i === failIdx && i < S.gateN) st = 'ok';
+      return {l:c.l, r:c.r, op: st === 'wait' ? 0.4 : 1,
+        isOk: st === 'ok', isFail: st === 'fail', isWait: st === 'wait', isRun: st === 'run',
+        showR: st === 'fail', showFix: st === 'fail'};
+    });
+    const gateOks = gateRows.filter(r => r.isOk).length;
+    // doctor rows
+    const doctorRows = DOCTOR.map((c, i) => {
+      let st = i < S.doctorN ? c.st : 'wait';
+      if (i === S.doctorN && S.doctorN < DOCTOR.length && S.doctorRan) st = 'run';
+      let l = c.l, r = c.r, fix = c.fix;
+      if (c.st === 'fail' && S.doctorFixed && st === 'fail') { st = 'ok'; l = c.l + ' — re-applied'; r = null; fix = null; }
+      return {l, g:c.g, hasG: !!c.g, r, hasR: !!r && st !== 'wait', fix, hasFix: !!fix && st === 'fail',
+        op: st === 'wait' ? 0.35 : 1, isOk: st === 'ok', isWarn: st === 'warn', isFail: st === 'fail', isWait: st === 'wait', isRun: st === 'run'};
+    });
+    const done = S.doctorN >= DOCTOR.length;
+    const fails = done ? doctorRows.filter(r => r.isFail).length : 0;
+    const warns = done ? doctorRows.filter(r => r.isWarn).length : 0;
+    // session stats
+    const h = S.hist;
+    const last = h[h.length - 1] || {m2p:103, enc:38.6, net:7, dec:16.9, dq:2.1, vq:25, drop:5.4};
+    const m2ps = h.map(s => s.m2p);
+    const sorted = [...m2ps].sort((a, b) => a - b);
+    const q = p => sorted.length ? sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * p))] : 0;
+    const p50 = q(0.5).toFixed(1), p95 = q(0.95).toFixed(1);
+    const toPts = arr => arr.map((v, i) => `${(i / Math.max(arr.length - 1, 1) * 960).toFixed(1)},${((1 - Math.min(v, 165) / 160) * 170).toFixed(1)}`).join(' ');
+    const m2pPts = toPts(m2ps), encPts = toPts(h.map(s => s.enc)), vqPts = toPts(h.map(s => s.vq));
+    const p95Y = ((1 - q(0.95) / 160) * 170).toFixed(1);
+    const drops = h.map(s => s.drop);
+    const dropPts = drops.map((v, i) => `${(i / Math.max(drops.length - 1, 1) * 960).toFixed(1)},${((1 - Math.min(v, 16) / 16) * 64).toFixed(1)}`).join(' ');
+    const dropArea = drops.length ? `0,64 ${dropPts} 960,64` : '';
+    const parts = [['Encoder', last.enc], ['Network', last.net], ['Quest decode', last.dec], ['Decode queue', last.dq], ['Vsync queue', last.vq]];
+    const sum = parts.reduce((a, p) => a + p[1], 0);
+    const shades = ['var(--color-accent-700)','var(--color-accent-500)','var(--color-accent-400)','var(--color-neutral-400)','var(--color-accent-300)'];
+    const pipe = parts.map((p, i) => ({name:p[0], ms:p[1].toFixed(1), w:(p[1] / sum * 100).toFixed(1), bg:shades[i]}));
+    const dropped = last.drop.toFixed(1);
+    const statCards = [
+      {k:'Motion → photon', v:`${last.m2p.toFixed(0)} ms`, sub:`p50 ${p50} · p95 ${p95}`},
+      {k:'Frame rate', v:'72', sub:'fps · matches refresh'},
+      {k:'Bitrate', v:`${S.settings.bitrate}`, sub:'Mbps base · adaptive'},
+      {k:'Dropped', v:dropped, sub:'frames/s at cap'},
+      {k:'Codec', v:'HEVC', sub:'arm64 helper · VideoToolbox'},
+      {k:'Transport', v:'WiFi', sub:'Quest 3 · 6 GHz'},
+    ];
+    const mm = Math.floor(S.ticks * 0.8 / 60), ss = Math.floor(S.ticks * 0.8 % 60);
+    // logs
+    const logFilters = ['all','run','wine','oxrsys','alvr'].map(f => ({label:f, on:S.logFilter === f, pick:() => this.setState({logFilter:f})}));
+    const logRows = LOGS0.filter(l => S.logFilter === 'all' || l.ch === S.logFilter);
+    // settings
+    const toggles = [
+      {key:'audio', label:'Route audio to the headset', note:'All Mac output → BlackHole 2ch while a game runs; device + volume restored on exit.'},
+      {key:'dashboard', label:'Open the ALVR server dashboard on launch', note:'Polls 127.0.0.1:8082 inside the game process until it appears.'},
+      {key:'wired', label:'Wired (USB) streaming', note:'adb forward tcp:9943/9944 — a normal run clears the forwards (left behind they break WiFi discovery).'},
+      {key:'verbose', label:'Verbose wine/openxr debug channels', note:'Console stays quiet by default; this restores the firehose into the log.'},
+    ].map(t => ({...t, on:S.settings[t.key], flip:() => this.setState(s => ({settings:{...s.settings, [t.key]:!s.settings[t.key]}}))}));
+    // wizards
+    const setupDots = [0,1,2,3].map(i => ({bg: i <= S.setupStep ? 'var(--color-accent)' : 'var(--color-neutral-300)'}));
+    const sessTag = S.sessionActive ? 'Streaming — Quest 3' : S.sessionEnded ? 'Ended' : 'Idle';
+    return {
+      winProps: {width:1280, height:840, title:'Sabrage — wine-vr bridge'},
+      nav, goAbout:go('about'), goLibrary:go('library'), goSession:go('session'), goDoctor:go('doctor'), goLogs:go('logs'), goSettings:go('settings'),
+      isAbout:S.screen === 'about',
+      pipeChips:[{n:'Game (D3D11)', arrow:true},{n:'CrossOver / Wine', arrow:true},{n:'DXMT → Metal', arrow:true},{n:'oxrsys runtime', arrow:true},{n:'HEVC helper', arrow:true},{n:'ALVR → Quest 3', arrow:false}],
+      upstream:[
+        {k:'Windows layer', n:'Wine / CrossOver', by:'Wine project · CodeWeavers', d:'Runs the Windows x64 game in a bottle.', lic:'LGPL-2.1', src:'winehq.org'},
+        {k:'Graphics', n:'DXMT', by:'3Shain', d:'D3D11 → Metal translation, zero-copy.', lic:'MIT', src:'github.com/3Shain/dxmt'},
+        {k:'OpenXR runtime', n:'OpenXR-OSX (oxrsys)', by:'Yannick Comte (demonixis)', d:'The OpenXR runtime for macOS.', lic:'Open source', src:'github.com/demonixis/OpenXR-OSX'},
+        {k:'Wine bridge', n:'wineopenxr', by:'Valve', d:'Bridges OpenXR calls from Wine to the host.', lic:'LGPL-2.1', src:'github.com/ValveSoftware'},
+        {k:'Streaming', n:'ALVR', by:'alvr-org community', d:'Streams frames + tracking to the Quest.', lic:'MIT', src:'github.com/alvr-org/ALVR'},
+        {k:'Steam shim', n:'Goldberg emulator', by:'Mr_Goldberg', d:'steam_api64.dll drop-in — boots offline.', lic:'LGPL-3.0', src:'gitlab.com/Mr_Goldberg'},
+      ],
+      isLibrary:S.screen === 'library', isSession:S.screen === 'session', isDoctor:S.screen === 'doctor', isLogs:S.screen === 'logs', isSettings:S.screen === 'settings',
+      statusLine: S.sessionActive ? 'Streaming · 72 fps' : 'Bridge ready',
+      statusDotBg: S.sessionActive ? 'var(--color-accent)' : 'var(--color-neutral-400)',
+      doctorBadge: fails > 0,
+      games,
+      m2pPts, encPts, vqPts, p95Y, dropPts, dropArea,
+      isEdit:S.screen === 'edit', editGame, editTogs, gbeFlags,
+      cancelEdit:() => this.setState({screen:'library'}),
+      saveEdit:() => this.setState({screen:'library', detailOpen:true}),
+      editUseGlobal:S.editCfg.useGlobal, editCustom:!S.editCfg.useGlobal,
+      flipUseGlobal:() => this.setState(s => ({editCfg:{...s.editCfg, useGlobal:!s.editCfg.useGlobal}})),
+      editBitrate:S.editCfg.bitrate, setEditBitrate:e => this.setState(s => ({editCfg:{...s.editCfg, bitrate:+e.target.value}})),
+      eCodecOpts:mkESeg('codec', ['auto','h265','h264'], 'ecodec'),
+      eEncOpts:mkESeg('enc', ['auto','native','inproc'], 'eenc'),
+      eResScale:Number(S.editCfg.scale).toFixed(2),
+      setEResScale:e => this.setState(s => ({editCfg:{...s.editCfg, scale:+e.target.value}})),
+      eHzOpts:mkESeg('hz', ['72 Hz','80 Hz','90 Hz'], 'ehz'),
+      gateOpen:S.gateOpen, gateRows, closeGate:() => { clearInterval(this._gt); this.setState({gateOpen:false}); },
+      gateTitle:`Pre-launch check — ${S.gateGame}`,
+      gateProgress:`${gateOks} / ${GATE.length}`,
+      fixGate:this.fixGate, launch:this.launch, launchDisabled:S.gatePhase !== 'ready',
+      sessionActive:S.sessionActive, sessionEnded:S.sessionEnded,
+      sessionEmpty: !S.sessionActive && !S.sessionEnded,
+      sessionHasData: S.sessionActive || S.sessionEnded,
+      sessTag, sessTagClass: S.sessionActive ? 'tag-accent' : 'tag-neutral',
+      stopSession:this.stopSession,
+      isCharts:(P.sessionLayout ?? 'charts + breakdown') === 'charts + breakdown',
+      isNumeric:(P.sessionLayout ?? 'charts + breakdown') !== 'charts + breakdown',
+      statCards, pipe, p50, p95,
+      elapsed:`${String(mm).padStart(2,'0')}:${String(ss).padStart(2,'0')}`,
+      doctorRows, runDoctor:this.runDoctor, fixDoctor:this.fixDoctor,
+      doctorBtn: done ? 'Re-run doctor' : 'Running…',
+      doctorSummary: !done ? `check ${Math.min(S.doctorN + 1, DOCTOR.length)} of ${DOCTOR.length}` : fails === 0 ? `All ${DOCTOR.length} checks passed · ${warns} warning${warns === 1 ? '' : 's'}` : `${fails} check failed, ${warns} warning — remedies inline`,
+      logFilters, logRows,
+      bitrate:S.settings.bitrate, setBitrate:e => this.setState(s => ({settings:{...s.settings, bitrate:+e.target.value}})),
+      codecOpts:this.mkSeg('codec', ['auto','h265','h264'], 'codec'),
+      encOpts:this.mkSeg('enc', ['auto','native','inproc'], 'enc'),
+      protoOpts:this.mkSeg('protocol', ['alvr','oxrsys (legacy)'], 'proto'),
+      verboseOn:S.settings.verbose,
+      resScale:Number(S.settings.scale).toFixed(2),
+      resPx:`${Math.round(3008 * S.settings.scale)}×${Math.round(1664 * S.settings.scale)}`,
+      setResScale:e => this.setState(s => ({settings:{...s.settings, scale:+e.target.value}})),
+      hzOpts:this.mkSeg('hz', ['72 Hz','80 Hz','90 Hz'], 'hz'),
+      toggles,
+      setupOpen:S.setupOpen, openSetup:() => this.setState({setupOpen:true, setupStep:0}),
+      closeSetup:() => this.setState({setupOpen:false}),
+      setupStep:S.setupStep, setupStepN:S.setupStep + 1, setupTitle:SETUP_TITLES[S.setupStep],
+      setupIs0:S.setupStep === 0, setupIs1:S.setupStep === 1, setupIs2:S.setupStep === 2, setupIs3:S.setupStep === 3,
+      setupCanBack:S.setupStep > 0, setupDots,
+      setupNext:() => S.setupStep < 3 ? this.setState(s => ({setupStep:s.setupStep + 1})) : this.setState({setupOpen:false}),
+      setupBack:() => this.setState(s => ({setupStep:Math.max(0, s.setupStep - 1)})),
+      setupNextLabel:S.setupStep === 3 ? 'Done' : 'Continue',
+      reqRows:REQ.map(r => ({...r, miss:!r.ok, hasCmd:!!r.cmd})),
+      buildRows:BUILD,
+      addOpen:S.addOpen, openAdd:() => this.setState({addOpen:true, addStep:0}),
+      closeAdd:() => this.setState({addOpen:false}),
+      addStepN:S.addStep + 1, addTitle:ADD_TITLES[S.addStep],
+      addIs0:S.addStep === 0, addIs1:S.addStep === 1, addIs2:S.addStep === 2,
+      addCanBack:S.addStep > 0,
+      addBack:() => this.setState(s => ({addStep:Math.max(0, s.addStep - 1)})),
+      addNext:() => S.addStep < 2 ? this.setState(s => ({addStep:s.addStep + 1})) : this.setState(s => ({addOpen:false, games:[...s.games, {name:'New game', sub:'Windows x64', version:'—', bottle:s.addBot === 'existing' ? 'Steam' : 'VR', status:'Untested', tag:'tag-neutral', last:'Never', dir:'…', lastStats:'No sessions yet'}]})),
+      addNextLabel:S.addStep === 2 ? 'Add game' : 'Continue',
+      srcFolder:S.addSrc === 'folder', srcDepot:S.addSrc === 'depot',
+      pickFolder:() => this.setState({addSrc:'folder'}), pickDepot:() => this.setState({addSrc:'depot'}),
+      botExisting:S.addBot === 'existing', botNew:S.addBot === 'new',
+      pickBotExisting:() => this.setState({addBot:'existing'}), pickBotNew:() => this.setState({addBot:'new'}),
+    };
+  }
+}
+</script>
+</body>
+</html>
