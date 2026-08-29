@@ -1,5 +1,6 @@
 <script lang="ts">
   import NavItem from "./NavItem.svelte";
+  import { stageStore } from "../stores/stage.svelte";
   import type { Screen } from "../types";
 
   interface Props {
@@ -80,7 +81,7 @@
       No backend yet
     </div>
     <div class="text-muted bottle-line">Bottle · not detected yet</div>
-    <button class="btn btn-ghost setup-btn" disabled title="Setup assistant lands in Phase 6">Setup</button>
+    <button class="btn btn-ghost setup-btn" onclick={() => stageStore.openStagesPanel()}>Setup</button>
     <div class="text-muted version-line">BRIDGE — · ALVR v20.14.1</div>
   </div>
 </div>

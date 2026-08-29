@@ -108,8 +108,13 @@ pub fn run() {
         }))
         .invoke_handler(tauri::generate_handler![
             commands::run_doctor,
-            commands::get_app_state
+            commands::get_app_state,
+            commands::run_stage,
+            commands::cancel_stage,
+            commands::fix,
+            commands::stop_session
         ])
+        .manage(commands::RunRegistry::default())
         .setup(|app| {
             let handle = app.handle();
             let menu = build_menu(handle)?;

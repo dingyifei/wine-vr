@@ -69,6 +69,89 @@ pub fn which(name: &str) -> Option<PathBuf> {
         .find(|cand| is_executable(cand))
 }
 
+// ── repo-root discovery ───────────────────────────────────────────────────────
+
+/// Environment override for the repo root, checked by [`resolve_repo_root`].
+pub const REPO_ROOT_ENV: &str = "SABRAGE_REPO_ROOT";
+
+/// The two files whose presence together identify a wine-vr checkout.
+///
+/// `demo.sh` alone is too weak (any script by that name); the pair is what the
+/// dispatcher itself relies on (`source "$ROOT/scripts/demo/lib.sh"`).
+pub const REPO_ROOT_MARKERS: [&str; 2] = ["demo.sh", "scripts/demo/lib.sh"];
+
+/// Resolve the wine-vr checkout root, in precedence order:
+///
+/// 1. `override_root`, when the caller has one (CLI `--repo-root`, the GUI's
+///    persisted `settings.repo_root`);
+/// 2. the `SABRAGE_REPO_ROOT` environment variable, when non-empty;
+/// 3. a walk up from `std::env::current_exe()`'s ancestors, looking for the
+///    first directory holding both [`REPO_ROOT_MARKERS`].
+///
+/// Cases 1 and 2 are canonicalized (falling back to the path as given when the
+/// directory does not exist yet), because the host OpenXR manifest embeds this
+/// path as an absolute string and `install.sh` compares those bytes literally —
+/// a `..`-laden or symlinked root would make the two front-ends thrash each
+/// other with sudo prompts.
+///
+/// An explicit root is **not** validated against [`REPO_ROOT_MARKERS`]: pointing
+/// at a scratch tree is exactly how the dry-run and fixture tests work, and
+/// doctor's own rows report a wrong root far more legibly than a Fatal here.
+///
+/// This is the single home for the logic; `sabrage-cli/src/main.rs` and
+/// `src-tauri/src/commands.rs` both call this function rather than carrying
+/// their own copies.
+pub fn resolve_repo_root(override_root: Option<&str>) -> Result<PathBuf, SabrageError> {
+    if let Some(explicit) = override_root.filter(|s| !s.is_empty()) {
+        return Ok(canonicalize_lossy(PathBuf::from(explicit)));
+    }
+    if let Some(from_env) = std::env::var(REPO_ROOT_ENV).ok().filter(|s| !s.is_empty()) {
+        return Ok(canonicalize_lossy(PathBuf::from(from_env)));
+    }
+    let exe = std::env::current_exe().map_err(|e| {
+        SabrageError::fatal(
+            format!("cannot resolve Sabrage's own executable path: {e}"),
+            format!("set {REPO_ROOT_ENV} to the wine-vr checkout"),
+        )
+    })?;
+    find_repo_root_from(&exe).ok_or_else(|| {
+        SabrageError::fatal(
+            format!(
+                "could not locate the wine-vr repo root (looked for demo.sh + \
+                 scripts/demo/lib.sh in every directory above {}); set \
+                 {REPO_ROOT_ENV} to override",
+                exe.display()
+            ),
+            format!(
+                "set {REPO_ROOT_ENV} to the wine-vr checkout, or run Sabrage from a build \
+                 under that checkout"
+            ),
+        )
+    })
+}
+
+/// `canonicalize`, or the path unchanged when it cannot be resolved (it may not
+/// exist yet — a fixture root about to be created, say).
+fn canonicalize_lossy(p: PathBuf) -> PathBuf {
+    p.canonicalize().unwrap_or(p)
+}
+
+/// First ancestor of `start` (excluding `start` itself, which is an executable
+/// path, not a directory) that contains both [`REPO_ROOT_MARKERS`].
+///
+/// Public because it is testable without an installed binary, and because the
+/// CLI/Tauri layers may want to probe a candidate path before persisting it.
+pub fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
+    let mut dir = start.parent();
+    while let Some(d) = dir {
+        if REPO_ROOT_MARKERS.iter().all(|m| d.join(m).is_file()) {
+            return Some(d.to_path_buf());
+        }
+        dir = d.parent();
+    }
+    None
+}
+
 /// The typed lib.sh path set. Built once per operation; no ambient globals.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Paths {
@@ -330,6 +413,50 @@ pub fn resolve_bs_dir(bottle: Option<&Bottle>, bs_dir_override: Option<&Path>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real checkout, three levels above this crate's manifest.
+    fn real_repo_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root resolves")
+    }
+
+    #[test]
+    fn repo_root_walks_up_to_the_marker_pair() {
+        let root = real_repo_root();
+        assert_eq!(
+            find_repo_root_from(&root.join("sabrage/target/debug/sabrage")),
+            Some(root.clone())
+        );
+        assert_eq!(
+            find_repo_root_from(&root.join("a/b/Sabrage.app/Contents/MacOS/sabrage-app")),
+            Some(root)
+        );
+        assert_eq!(
+            find_repo_root_from(Path::new("/nonexistent/sabrage/bin/sabrage")),
+            None
+        );
+    }
+
+    #[test]
+    fn explicit_override_wins_and_is_canonicalized() {
+        let root = real_repo_root();
+        let messy = format!("{}/sabrage/..", root.display());
+        assert_eq!(resolve_repo_root(Some(&messy)).unwrap(), root);
+        // An empty override falls through to the next source rather than
+        // resolving to "".
+        assert_ne!(
+            resolve_repo_root(Some("")).ok(),
+            Some(PathBuf::from("")),
+            "empty override must not be taken literally"
+        );
+        // A non-existent explicit root is accepted verbatim (fixture roots).
+        assert_eq!(
+            resolve_repo_root(Some("/nonexistent/sabrage/fixture")).unwrap(),
+            PathBuf::from("/nonexistent/sabrage/fixture")
+        );
+    }
 
     #[test]
     fn paths_are_derived_from_the_explicit_root() {

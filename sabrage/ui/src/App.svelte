@@ -1,5 +1,7 @@
 <script lang="ts">
   import Sidebar from "./components/Sidebar.svelte";
+  import GateModal from "./components/GateModal.svelte";
+  import StagesPanel from "./components/StagesPanel.svelte";
   import About from "./screens/About.svelte";
   import Library from "./screens/Library.svelte";
   import Session from "./screens/Session.svelte";
@@ -7,6 +9,7 @@
   import Logs from "./screens/Logs.svelte";
   import Settings from "./screens/Settings.svelte";
   import { doctorStore } from "./stores/doctor.svelte";
+  import { stageStore } from "./stores/stage.svelte";
   import type { Screen } from "./types";
 
   let screen = $state<Screen>("about");
@@ -34,6 +37,9 @@
       <Settings />
     {/if}
   </main>
+
+  <StagesPanel open={stageStore.stagesPanelOpen} onClose={stageStore.closeStagesPanel} />
+  <GateModal request={stageStore.gate} onClose={stageStore.closeGate} />
 </div>
 
 <style>

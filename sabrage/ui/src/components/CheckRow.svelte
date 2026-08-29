@@ -1,16 +1,23 @@
 <script lang="ts">
   import type { DoctorRow } from "../stores/doctor.svelte";
+  import { contractFixIdToAction } from "../ipc";
 
   interface Props {
     row: DoctorRow;
     /** This row is the one standing in for "currently running" (see the store's `runningSlug`). */
     isRunning?: boolean;
+    /** Disables the Fix button — set while a fix for THIS row is in flight. */
+    busy?: boolean;
+    /** Present only when `row.fix` resolves to a modelled `FixAction`
+     * (`contractFixIdToAction`); omit to render no Fix button at all. */
+    onFix?: (fixId: string) => void;
   }
 
-  let { row, isRunning = false }: Props = $props();
+  let { row, isRunning = false, busy = false, onFix }: Props = $props();
 
   const spinning = $derived(row.phase === "waiting" && isRunning);
   const placeholder = $derived(row.phase === "waiting" && !isRunning);
+  const showFix = $derived(!!row.fix && !!onFix && contractFixIdToAction(row.fix) !== null);
 </script>
 
 <div class="check-row" class:dim={row.phase === "waiting"}>
@@ -45,6 +52,11 @@
       <div class="text-muted remedy">{row.remedy}</div>
     {/if}
   </div>
+  {#if showFix}
+    <button class="btn btn-secondary fix-btn" disabled={busy} onclick={() => onFix?.(row.fix!)}>
+      {busy ? "Fixing…" : "Fix"}
+    </button>
+  {/if}
 </div>
 
 <style>
@@ -108,5 +120,11 @@
   .remedy {
     font-size: 11.5px;
     margin-top: 1px;
+  }
+  .fix-btn {
+    flex: none;
+    align-self: center;
+    font-size: 12px;
+    padding: 2px 10px;
   }
 </style>

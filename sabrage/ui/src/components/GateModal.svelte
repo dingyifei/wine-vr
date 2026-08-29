@@ -1,0 +1,502 @@
+<script lang="ts">
+  import {
+    runStage,
+    cancelStage,
+    applyFix,
+    FIX_META,
+    type StageEvent,
+    type StageOutcome,
+    type Severity,
+    type FixAction,
+  } from "../ipc";
+  import { stageStore, type GateRequest } from "../stores/stage.svelte";
+
+  interface Props {
+    /** `null` renders nothing. Set via `stageStore.openGate(...)`. */
+    request: GateRequest | null;
+    onClose: () => void;
+  }
+  let { request, onClose }: Props = $props();
+
+  type Row =
+    | { kind: "section"; title: string }
+    | { kind: "line"; step: string | null; severity: Severity; text: string; remedy: string | null }
+    | { kind: "autoFixed"; step: string; description: string }
+    | { kind: "needsAdmin"; step: string; reason: string }
+    | { kind: "fatal"; message: string; remedy: string | null; fix: FixAction | null };
+
+  let runId = $state<string | null>(null);
+  let rows = $state<Row[]>([]);
+  let consoleLines = $state<string[]>([]);
+  let consoleOpen = $state(false);
+  let latestProgress = $state<{ label: string; current: number; total: number | null } | null>(null);
+  let running = $state(false);
+  let finished = $state<StageOutcome | null>(null);
+  let invokeError = $state<string | null>(null);
+  // Set when a `fatal` event already rendered the condition as a row; the
+  // rejected promise that follows carries the same text (`SabrageError::Fatal`
+  // displays as its message verbatim), so it must not be shown twice — the
+  // same "already reported as FATAL" predicate the CLI applies. Genuine
+  // invoke-layer rejections (repo-root resolution, serde) never set it.
+  let sawFatal = $state(false);
+  let confirmFix = $state<FixAction | null>(null);
+  let fixBusy = $state(false);
+  let fixError = $state<string | null>(null);
+
+  let rowsEl: HTMLDivElement | null = $state(null);
+  let consoleEl: HTMLPreElement | null = $state(null);
+  let started: GateRequest | null = null;
+
+  // Fresh `openGate(...)` calls always hand in a new object, so identity
+  // comparison is enough to detect "a new run was requested" — including a
+  // Fix button re-opening the same modal for a different stage.
+  $effect(() => {
+    const r = request;
+    if (r && r !== started && !running) {
+      started = r;
+      void start(r);
+    }
+    if (!r) {
+      started = null;
+    }
+  });
+
+  $effect(() => {
+    void rows.length;
+    if (rowsEl) rowsEl.scrollTop = rowsEl.scrollHeight;
+  });
+
+  $effect(() => {
+    void consoleLines.length;
+    if (consoleOpen && consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
+  });
+
+  function reset() {
+    runId = null;
+    rows = [];
+    consoleLines = [];
+    consoleOpen = false;
+    latestProgress = null;
+    finished = null;
+    invokeError = null;
+    sawFatal = false;
+    confirmFix = null;
+    fixError = null;
+  }
+
+  async function start(req: GateRequest) {
+    reset();
+    running = true;
+    try {
+      finished = await runStage(
+        req.stage,
+        { bottle: req.bottle, bsDir: req.bsDir, dryRun: req.dryRun },
+        handleEvent,
+      );
+    } catch (e) {
+      if (!sawFatal) invokeError = e instanceof Error ? e.message : String(e);
+    } finally {
+      running = false;
+      req.onFinished?.();
+    }
+  }
+
+  function pushConsole(chunk: string) {
+    consoleLines.push(chunk);
+    if (consoleLines.length > 2000) {
+      consoleLines = consoleLines.slice(consoleLines.length - 2000);
+    }
+  }
+
+  function handleEvent(ev: StageEvent) {
+    switch (ev.kind) {
+      case "stageStarted":
+        runId = ev.runId;
+        break;
+      case "section":
+        rows.push({ kind: "section", title: ev.title });
+        break;
+      case "line":
+        rows.push({ kind: "line", step: ev.step, severity: ev.severity, text: ev.text, remedy: ev.remedy });
+        break;
+      case "output":
+        pushConsole(ev.chunk);
+        break;
+      case "progress":
+        latestProgress = { label: ev.label, current: ev.current, total: ev.total };
+        break;
+      case "autoFixed":
+        rows.push({ kind: "autoFixed", step: ev.step, description: ev.description });
+        break;
+      case "needsAdmin":
+        rows.push({ kind: "needsAdmin", step: ev.step, reason: ev.reason });
+        break;
+      case "fatal":
+        sawFatal = true;
+        rows.push({ kind: "fatal", message: ev.message, remedy: ev.remedy, fix: ev.fix });
+        break;
+      case "stageFinished":
+        latestProgress = null;
+        break;
+    }
+  }
+
+  async function cancel() {
+    if (runId) await cancelStage(runId);
+  }
+
+  function requestFix(action: FixAction) {
+    const meta = FIX_META[action];
+    if (meta.stage) {
+      // A whole-stage remedy (e.g. "run setup" after a build failure): reopen
+      // this same modal against that stage instead of a second dialog.
+      stageStore.openGate({ stage: meta.stage, bottle: request?.bottle, bsDir: request?.bsDir });
+      return;
+    }
+    if (meta.destructive) {
+      confirmFix = action;
+    } else {
+      void doApplyFix(action);
+    }
+  }
+
+  async function doApplyFix(action: FixAction) {
+    confirmFix = null;
+    fixBusy = true;
+    fixError = null;
+    try {
+      const report = await applyFix(action, { bottle: request?.bottle, bsDir: request?.bsDir }, true, handleEvent);
+      rows.push({ kind: "line", step: null, severity: "ok", text: report.description, remedy: null });
+      if (report.changed && request) {
+        void start(request);
+      }
+    } catch (e) {
+      fixError = e instanceof Error ? e.message : String(e);
+    } finally {
+      fixBusy = false;
+    }
+  }
+
+  function cap(s: string): string {
+    return s.length ? s[0].toUpperCase() + s.slice(1) : s;
+  }
+</script>
+
+{#snippet okIcon()}
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2"
+    ><polyline points="20 6 9 17 4 12"></polyline></svg
+  >
+{/snippet}
+{#snippet warnIcon()}
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-neutral-600)" stroke-width="1.5"
+    ><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
+    ></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg
+  >
+{/snippet}
+{#snippet failIcon()}
+  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-900)" stroke-width="2.5"
+    ><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg
+  >
+{/snippet}
+{#snippet lockIcon()}
+  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="1.5"
+    ><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg
+  >
+{/snippet}
+{#snippet lineIcon(severity: Severity)}
+  {#if severity === "ok"}
+    {@render okIcon()}
+  {:else if severity === "warn"}
+    {@render warnIcon()}
+  {:else if severity === "fail"}
+    {@render failIcon()}
+  {:else}
+    <span class="info-dot" aria-hidden="true"></span>
+  {/if}
+{/snippet}
+
+{#if request}
+  <div class="gate-backdrop">
+    <div class="dialog blueprint elev-lg gate-dialog">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <div>
+        <div class="card-kicker">Pipeline</div>
+        <div class="dialog-title gate-title">
+          <span>{cap(request.stage)}</span>
+          {#if latestProgress}
+            <span class="text-muted gate-progress">{latestProgress.label}</span>
+          {/if}
+        </div>
+      </div>
+
+      {#if latestProgress}
+        <div class="progress-track">
+          <div
+            class="progress-fill"
+            class:indeterminate={latestProgress.total == null}
+            style={latestProgress.total != null
+              ? `width:${Math.min(100, (latestProgress.current / latestProgress.total) * 100)}%`
+              : undefined}
+          ></div>
+        </div>
+      {/if}
+
+      <div class="gate-rows" bind:this={rowsEl}>
+        {#if rows.length === 0 && running}
+          <p class="text-muted gate-empty">Starting…</p>
+        {/if}
+        {#each rows as row, i (i)}
+          {#if row.kind === "section"}
+            <h6 class="gate-section">-- {row.title}</h6>
+          {:else if row.kind === "line"}
+            <div class="gate-row">
+              <span class="icon">{@render lineIcon(row.severity)}</span>
+              <div class="body">
+                <div class="text" class:muted={row.severity === "info"}>{row.text}</div>
+                {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
+              </div>
+            </div>
+          {:else if row.kind === "autoFixed"}
+            <div class="gate-row">
+              <span class="icon">{@render okIcon()}</span>
+              <div class="body"><div class="text">{row.description}</div></div>
+            </div>
+          {:else if row.kind === "needsAdmin"}
+            <div class="admin-note">
+              {@render lockIcon()}
+              <div>
+                <div>{row.reason}</div>
+                <div class="text-muted">
+                  macOS will ask for your password — this writes the host OpenXR registration.
+                </div>
+              </div>
+            </div>
+          {:else if row.kind === "fatal"}
+            <div class="gate-row fatal-row">
+              <span class="icon">{@render failIcon()}</span>
+              <div class="body">
+                <div class="text">{row.message}</div>
+                {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
+              </div>
+              {#if row.fix}
+                <button
+                  class="btn btn-primary gate-fix-btn"
+                  title={FIX_META[row.fix].title}
+                  disabled={fixBusy}
+                  onclick={() => requestFix(row.fix!)}
+                >
+                  {FIX_META[row.fix].stage ? `Open ${cap(FIX_META[row.fix].stage!)}` : "Fix"}
+                </button>
+              {/if}
+            </div>
+          {/if}
+        {/each}
+      </div>
+
+      {#if confirmFix}
+        <div class="confirm-inline">
+          <div class="text-muted">{FIX_META[confirmFix].title} — this cannot be undone. Continue?</div>
+          <div class="confirm-actions">
+            <button class="btn btn-secondary" onclick={() => (confirmFix = null)}>Cancel</button>
+            <button class="btn btn-primary" onclick={() => doApplyFix(confirmFix!)}>Yes, continue</button>
+          </div>
+        </div>
+      {/if}
+      {#if fixError}
+        <div class="text-muted fix-error">Fix failed: {fixError}</div>
+      {/if}
+
+      {#if consoleLines.length > 0}
+        <button class="btn btn-ghost console-toggle" onclick={() => (consoleOpen = !consoleOpen)}>
+          {consoleOpen ? "Hide" : "Show"} console output ({consoleLines.length} lines)
+        </button>
+        {#if consoleOpen}
+          <pre class="console" bind:this={consoleEl}>{consoleLines.join("\n")}</pre>
+        {/if}
+      {/if}
+
+      {#if invokeError}
+        <div class="gate-row fatal-row">
+          <span class="icon">{@render failIcon()}</span>
+          <div class="body"><div class="text">{invokeError}</div></div>
+        </div>
+      {/if}
+
+      {#if finished}
+        <div class="text-muted gate-outcome">
+          {finished.ok
+            ? `${cap(finished.stage)} completed.`
+            : `${cap(finished.stage)} failed (exit ${finished.exitCodeEquiv}).`}
+        </div>
+      {/if}
+
+      <div class="dialog-actions">
+        {#if running}
+          <button class="btn btn-ghost" onclick={onClose}>Hide</button>
+          <button class="btn btn-secondary" onclick={cancel} disabled={!runId}>Cancel</button>
+        {:else}
+          <button class="btn btn-primary" onclick={onClose}>Close</button>
+        {/if}
+      </div>
+    </div>
+  </div>
+{/if}
+
+<style>
+  .gate-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 40;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--color-neutral-900) 45%, transparent);
+  }
+  .gate-dialog {
+    width: 600px;
+    max-width: calc(100vw - 32px);
+    max-height: 86vh;
+    overflow: auto;
+    background: var(--color-bg);
+  }
+  .gate-title {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: 12px;
+  }
+  .gate-progress {
+    font-size: 12px;
+    font-family: var(--font-body);
+    font-weight: 400;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .progress-track {
+    height: 3px;
+    background: var(--color-divider);
+    overflow: hidden;
+  }
+  .progress-fill {
+    height: 100%;
+    background: var(--color-accent);
+    transition: width 0.2s ease;
+  }
+  .progress-fill.indeterminate {
+    width: 30%;
+    animation: gate-indeterminate 1.1s ease-in-out infinite;
+  }
+  @keyframes gate-indeterminate {
+    0% {
+      transform: translateX(-100%);
+    }
+    100% {
+      transform: translateX(333%);
+    }
+  }
+  .gate-rows {
+    display: flex;
+    flex-direction: column;
+    max-height: 320px;
+    overflow-y: auto;
+  }
+  .gate-empty {
+    padding: 10px 4px;
+    margin: 0;
+  }
+  .gate-section {
+    margin: 10px 0 2px;
+    color: var(--color-accent-700);
+    font-size: 11.5px;
+  }
+  .gate-row {
+    display: flex;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 5px 4px;
+    border-bottom: 1px solid color-mix(in srgb, var(--color-text) 6%, transparent);
+  }
+  .gate-row .icon {
+    width: 16px;
+    flex: none;
+    padding-top: 2px;
+    display: block;
+  }
+  .gate-row .body {
+    flex: 1;
+    min-width: 0;
+  }
+  .gate-row .text {
+    font-size: 13px;
+  }
+  .gate-row .text.muted {
+    color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  }
+  .gate-row .remedy {
+    font-size: 11.5px;
+    margin-top: 1px;
+  }
+  .fatal-row {
+    background: color-mix(in srgb, var(--color-accent-900) 8%, transparent);
+  }
+  .gate-fix-btn {
+    flex: none;
+    align-self: center;
+    padding: 2px 14px;
+    font-size: 12px;
+  }
+  .info-dot {
+    display: block;
+    width: 6px;
+    height: 6px;
+    margin: 6px;
+    border-radius: 50%;
+    background: var(--color-neutral-500);
+  }
+  .admin-note {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    border: 1px solid var(--color-divider);
+    padding: 8px 12px;
+    font-size: 12.5px;
+    background: color-mix(in srgb, var(--color-accent) 8%, transparent);
+  }
+  .confirm-inline {
+    border: 1px solid var(--color-divider);
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    font-size: 13px;
+  }
+  .confirm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+  }
+  .fix-error {
+    color: var(--color-accent-900);
+    font-size: 12px;
+  }
+  .console-toggle {
+    align-self: flex-start;
+    font-size: 12px;
+    padding: 2px 4px;
+  }
+  .console {
+    margin: 0;
+    max-height: 180px;
+    overflow: auto;
+    background: var(--color-surface);
+    border: 1px solid var(--color-divider);
+    padding: 8px 10px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 11px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
+  .gate-outcome {
+    font-size: 12px;
+  }
+</style>

@@ -2,8 +2,20 @@
   import { onMount } from "svelte";
   import CheckRow from "../components/CheckRow.svelte";
   import { doctorStore } from "../stores/doctor.svelte";
+  import { stageStore } from "../stores/stage.svelte";
+  import { applyFix, contractFixIdToAction, FIX_META, type FixAction } from "../ipc";
+
+  interface FixError {
+    slug: string;
+    message: string;
+    remedy: string | null;
+    fix: FixAction | null;
+  }
 
   let selectedBottle = $state("");
+  let fixBusySlug = $state<string | null>(null);
+  let fixError = $state<FixError | null>(null);
+  let confirmFix = $state<{ slug: string; action: FixAction } | null>(null);
 
   function pickDefaultBottle(bottles: string[]): string {
     return bottles.includes("Steam") ? "Steam" : (bottles[0] ?? "");
@@ -17,6 +29,80 @@
 
   async function runChecks() {
     await doctorStore.run({ bottle: selectedBottle || null });
+  }
+
+  /** Handles a CheckRow's Fix button. Whole-stage fixes (`run-setup` /
+   * `run-build` / `run-install`) open the shared GateModal so the run streams
+   * exactly like a Pipeline-panel invocation; the rest run in place via
+   * `fix()` and re-run doctor afterward — a destructive one confirms first. */
+  function handleFixRequest(slug: string, fixId: string) {
+    const action = contractFixIdToAction(fixId);
+    if (!action) return;
+    dispatchFix(slug, action);
+  }
+
+  /** The part of `handleFixRequest` that only needs an already-resolved
+   * `FixAction` — shared with the error banner's "try the suggested fix"
+   * button, whose `FixAction` comes straight off a `Fatal` event rather than
+   * a contract id string. */
+  function dispatchFix(slug: string, action: FixAction) {
+    const meta = FIX_META[action];
+    if (meta.stage) {
+      stageStore.openGate({
+        stage: meta.stage,
+        bottle: selectedBottle || null,
+        onFinished: () => void runChecks(),
+      });
+      return;
+    }
+    if (meta.destructive) {
+      confirmFix = { slug, action };
+      return;
+    }
+    void runFix(slug, action);
+  }
+
+  function cap(s: string): string {
+    return s.length ? s[0].toUpperCase() + s.slice(1) : s;
+  }
+
+  interface FatalInfo {
+    message: string;
+    remedy: string | null;
+    fix: FixAction | null;
+  }
+
+  async function runFix(slug: string, action: FixAction) {
+    fixBusySlug = slug;
+    fixError = null;
+    confirmFix = null;
+    // A failing fix announces itself as a `Fatal` event on this same stream
+    // (message + structured remedy + a possible follow-up fix id) before the
+    // `applyFix` promise ever rejects — capture it so the error state below
+    // can show the same detail the GateModal shows for a stage's own Fatal,
+    // instead of only the rejected promise's bare message.
+    let fatal: FatalInfo | null = null;
+    try {
+      await applyFix(action, { bottle: selectedBottle || null }, true, (ev) => {
+        if (ev.kind === "fatal") {
+          fatal = { message: ev.message, remedy: ev.remedy, fix: ev.fix };
+        }
+      });
+    } catch (e) {
+      // `fatal` is only ever reassigned inside the callback above, so
+      // TypeScript's control-flow narrowing — which can't prove that
+      // callback ran before this line — types every read of it here as the
+      // initializer's literal `null`, not the declared union. The cast back
+      // to the declared type is what the runtime already knows to be true;
+      // the truthiness check below still does the actual branching.
+      const captured = fatal as FatalInfo | null;
+      fixError = captured
+        ? { slug, message: captured.message, remedy: captured.remedy, fix: captured.fix }
+        : { slug, message: e instanceof Error ? e.message : String(e), remedy: null, fix: null };
+    } finally {
+      fixBusySlug = null;
+      void runChecks();
+    }
   }
 
   /** "bottle-bridge" -> "Bottle Bridge" — the contract's `group` field, title-cased. */
@@ -91,11 +177,47 @@
         {#if i === 0 || row.group !== doctorStore.rows[i - 1].group}
           <h6 class="group-header">{titleCase(row.group)}</h6>
         {/if}
-        <CheckRow {row} isRunning={row.slug === doctorStore.runningSlug} />
+        <CheckRow
+          {row}
+          isRunning={row.slug === doctorStore.runningSlug}
+          busy={fixBusySlug === row.slug}
+          onFix={(fixId) => handleFixRequest(row.slug, fixId)}
+        />
       {/each}
     </div>
   {/if}
 </div>
+
+{#if fixError}
+  <div class="fix-error-banner">
+    <div class="text-muted">Fix failed: {fixError.message}</div>
+    {#if fixError.remedy}<div class="fix-error-remedy">{fixError.remedy}</div>{/if}
+    {#if fixError.fix}
+      <button
+        class="btn btn-ghost fix-error-retry"
+        onclick={() => dispatchFix(fixError!.slug, fixError!.fix!)}
+      >
+        {FIX_META[fixError.fix].stage ? `Open ${cap(FIX_META[fixError.fix].stage!)}` : "Try suggested fix"}
+      </button>
+    {/if}
+  </div>
+{/if}
+
+{#if confirmFix}
+  <div class="confirm-backdrop">
+    <div class="dialog blueprint elev-md confirm-dialog">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <div class="dialog-title">{FIX_META[confirmFix.action].title}</div>
+      <p class="dialog-body">This cannot be undone. Continue?</p>
+      <div class="dialog-actions">
+        <button class="btn btn-secondary" onclick={() => (confirmFix = null)}>Cancel</button>
+        <button class="btn btn-primary" onclick={() => runFix(confirmFix!.slug, confirmFix!.action)}>
+          Yes, continue
+        </button>
+      </div>
+    </div>
+  </div>
+{/if}
 
 <style>
   .screen-header {
@@ -158,6 +280,49 @@
   }
   .error-card p {
     font-size: 13px;
+    margin: 0;
+  }
+  .fix-error-banner {
+    position: fixed;
+    left: 50%;
+    bottom: 20px;
+    transform: translateX(-50%);
+    background: var(--color-bg);
+    border: 1px solid var(--color-divider);
+    padding: 8px 14px;
+    font-size: 12.5px;
+    color: var(--color-accent-900);
+    box-shadow: var(--shadow-md);
+    z-index: 45;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    max-width: 460px;
+  }
+  .fix-error-remedy {
+    font-size: 11.5px;
+    color: color-mix(in srgb, var(--color-text) 60%, transparent);
+  }
+  .fix-error-retry {
+    align-self: flex-start;
+    font-size: 11.5px;
+    padding: 2px 8px;
+    margin-top: 2px;
+  }
+  .confirm-backdrop {
+    position: fixed;
+    inset: 0;
+    z-index: 45;
+    display: grid;
+    place-items: center;
+    background: color-mix(in srgb, var(--color-neutral-900) 45%, transparent);
+  }
+  .confirm-dialog {
+    width: 380px;
+    max-width: calc(100vw - 32px);
+    background: var(--color-bg);
+  }
+  .confirm-dialog .dialog-body {
     margin: 0;
   }
 </style>

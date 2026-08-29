@@ -12,3 +12,25 @@ toml = "1"
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
+
+# ── Phase 2 (stages) ──────────────────────────────────────────────────────────
+# Deliberately NOT added: reqwest / flate2 / tar. setup's download execs
+# `curl -fL --retry 3` and its extraction execs `tar -xzf`, exactly like
+# scripts/demo/setup.sh — parity-faithful (same tool, same flags, same failure
+# text) and three fewer dependency trees. See executor.rs.
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "sync", "time", "fs", "macros"] }
+# CancellationToken only (tokio_util::sync is unconditional; no feature needed).
+# The \n-AND-\r output splitter in process.rs is hand-rolled rather than a
+# tokio_util::codec::Decoder, so the "codec" feature stays off.
+tokio-util = "0.7.19"
+# killpg(SIGTERM/SIGKILL) for the process-group cancellation escalation.
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+# Process enumeration for stop: by RESOLVED EXECUTABLE PATH for the two reaps
+# (`process::find_processes_by_exe` replaces the shell's `pkill -f`), and by
+# argv for the Beat Saber survivor probe (`stop::find_processes_by_cmdline`,
+# `with_cmd(UpdateKind::Always)` — the same substring match as `pgrep -f`),
+# which is why both refresh kinds are needed (PARITY.md "Stop", design-core
+# §10 divergence 7).
+sysinfo = "0.39.6"
+# run_id for the event stream; "serde" so StageEvent serializes it directly.
+uuid = { version = "1.26.0", features = ["v4", "serde"] }

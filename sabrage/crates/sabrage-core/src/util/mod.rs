@@ -8,10 +8,21 @@ pub mod winpath;
 pub use hash::{file_sha256_matches, sha256_bytes, sha256_file};
 pub use winpath::win_path;
 
+/// lib.sh's `helper_is_arm64` and the `lipo -archs` capture behind it.
+///
+/// They live in [`crate::checks::build`] — that is the single implementation —
+/// and are re-exported here because the fix and stage layers need them too
+/// (`build` arch-gates the helper it produced; `fix.restage-helper` arch-gates
+/// the source before staging it). Re-export rather than a second copy: the
+/// `arm64e`-must-not-satisfy rule is a parity invariant, and two copies of a
+/// rule are one copy too many.
+pub use crate::checks::build::{helper_is_arm64, lipo_archs_stdout};
+
 use std::io::Read;
 use std::path::Path;
 
-use crate::contract::{CONTRACT_FILES, CONTRACT_GEN_REL_PATH, HOST_MANIFEST_PLACEHOLDER};
+use crate::contract::{contract, CONTRACT_FILES, CONTRACT_GEN_REL_PATH, HOST_MANIFEST_PLACEHOLDER};
+use crate::paths::Paths;
 
 /// `cmp -s "$1" "$2"`: true iff both files exist, are readable, and are
 /// byte-identical. Any error (missing, permission, directory) is `false`,
@@ -236,6 +247,54 @@ pub fn toml_template() -> &'static str {
     crate::contract::RUNTIME_TOML_TEMPLATE
 }
 
+// ── DXMT artifact set ─────────────────────────────────────────────────────────
+
+/// lib.sh's `dxmt_files_ok()`: every `[dxmt] files` entry present under
+/// `ext/dxmt-artifacts/`.
+///
+/// ```zsh
+/// dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
+/// ```
+///
+/// ALL of them, never a subset: `install` refuses to half-apply the overlay,
+/// and a partial overlay black-windows the game with no error of its own.
+pub fn dxmt_files_ok(paths: &Paths) -> bool {
+    contract()
+        .dxmt
+        .files
+        .iter()
+        .all(|f| paths.dxmt_art.join(f).is_file())
+}
+
+/// lib.sh's `dxmt_ok()`: the `.sha256` provenance marker matches the pin **and**
+/// every file is present.
+///
+/// ```zsh
+/// dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
+/// ```
+///
+/// The marker is compared through command-substitution semantics, so trailing
+/// newlines are irrelevant — a marker written by either front-end reads as
+/// current to the other. See [`contract_marker_bytes`] for the write side.
+pub fn dxmt_ok(paths: &Paths) -> bool {
+    let marker = std::fs::read_to_string(paths.dxmt_art.join(".sha256")).unwrap_or_default();
+    strip_trailing_newlines(&marker) == contract().deps.dxmt_tgz_sha256 && dxmt_files_ok(paths)
+}
+
+/// The exact bytes of the `.sha256` provenance marker `setup` writes:
+///
+/// ```zsh
+/// print -r -- "$DXMT_TGZ_SHA256" > "$DXMT_ART/.sha256"
+/// ```
+///
+/// i.e. the pin plus **one** trailing newline. `print -r --` adds exactly one;
+/// writing zero or two would still *read* as current (command substitution eats
+/// them) but would make the two front-ends write different bytes for the same
+/// state, which is the drift this crate exists to prevent.
+pub fn contract_marker_bytes(sha: &str) -> String {
+    format!("{sha}\n")
+}
+
 // ── contract sync ─────────────────────────────────────────────────────────────
 
 /// The `meta.contract-sync` hash, recomputed from the contract files **on disk**
@@ -327,6 +386,55 @@ mod tests {
             want, have,
             "contract/ and scripts/demo/contract.gen.sh out of sync"
         );
+    }
+
+    #[test]
+    fn dxmt_helpers_need_every_file_and_a_current_marker() {
+        let root = std::env::temp_dir().join(format!("sabrage-util-dxmt-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let paths = Paths::new(&root);
+        let pin = &contract().deps.dxmt_tgz_sha256;
+
+        assert!(!dxmt_files_ok(&paths));
+        assert!(!dxmt_ok(&paths));
+
+        // All five files, no marker: files ok, dxmt_ok still false.
+        for f in &contract().dxmt.files {
+            let p = paths.dxmt_art.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+        assert!(dxmt_files_ok(&paths));
+        assert!(!dxmt_ok(&paths));
+
+        // Marker written the way setup does it.
+        let marker = paths.dxmt_art.join(".sha256");
+        std::fs::write(&marker, contract_marker_bytes(pin)).unwrap();
+        assert!(dxmt_ok(&paths));
+        // A marker with no trailing newline still reads as current.
+        std::fs::write(&marker, pin).unwrap();
+        assert!(dxmt_ok(&paths));
+        // A stale marker does not.
+        std::fs::write(&marker, contract_marker_bytes("deadbeef")).unwrap();
+        assert!(!dxmt_ok(&paths));
+
+        // One missing file sinks both.
+        std::fs::remove_file(paths.dxmt_art.join(&contract().dxmt.files[0])).unwrap();
+        assert!(!dxmt_files_ok(&paths));
+        std::fs::write(&marker, contract_marker_bytes(pin)).unwrap();
+        assert!(!dxmt_ok(&paths));
+
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn marker_bytes_are_the_pin_plus_exactly_one_newline() {
+        let pin = &contract().deps.dxmt_tgz_sha256;
+        let bytes = contract_marker_bytes(pin);
+        assert_eq!(bytes, format!("{pin}\n"));
+        assert!(bytes.ends_with('\n'));
+        assert!(!bytes.ends_with("\n\n"));
+        assert_eq!(strip_trailing_newlines(&bytes), pin);
     }
 
     #[test]

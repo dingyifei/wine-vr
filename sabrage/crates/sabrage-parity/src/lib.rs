@@ -468,6 +468,70 @@ mod tests {
             );
         }
 
+        /// The bytes install layer 4 actually **writes** — not merely the ones
+        /// `util` can render.
+        ///
+        /// install.sh writes the manifest with `print -- "$WANT"`, so the live
+        /// `/usr/local/share/openxr/1/active_runtime.x86_64.json` ends
+        /// `7d 0a 7d 0a` (`}\n}\n`). The comparison form
+        /// (`render_host_manifest`, what `$(<file)` yields) is that minus the
+        /// final newline, and the two are one byte apart: writing the wrong one
+        /// ships a host manifest that differs from `./demo.sh install`'s on the
+        /// single most drift-sensitive artifact in the pipeline. The Phase-2
+        /// review found exactly that — the util helpers were right and the
+        /// install call site passed the other one.
+        ///
+        /// So this golden pins the **write path's own** byte source, read off
+        /// the on-disk template, and the shape that makes the mistake
+        /// unexpressible: `write_host_manifest_privileged` takes the dylib
+        /// path, never pre-rendered content (see the compile-time tripwire
+        /// below). Driving layer 4 end to end needs an async runtime this crate
+        /// deliberately does not depend on; that half lives in sabrage-core's
+        /// `layer_four_stages_the_host_manifest_file_form_byte_for_byte`, which
+        /// runs `install::run` under a recording dry-run executor.
+        #[test]
+        fn the_privileged_write_stages_the_file_form_of_the_host_manifest() {
+            let root = repo_root();
+            let template =
+                std::fs::read_to_string(root.join("contract/active_runtime.x86_64.json.template"))
+                    .expect("contract/active_runtime.x86_64.json.template reads");
+            let dylib = Path::new("/repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib");
+            let comparison_form = template
+                .trim_end_matches('\n')
+                .replace("@OXR_DYLIB@", &dylib.to_string_lossy());
+            let file_form = format!("{comparison_form}\n");
+
+            assert_eq!(
+                sabrage_core::privilege::host_manifest_bytes(dylib),
+                file_form,
+                "install layer 4 must stage `print -- \"$WANT\"`'s bytes"
+            );
+            assert!(file_form.ends_with("}\n"), "{file_form:?}");
+            assert_eq!(
+                file_form.len(),
+                comparison_form.len() + 1,
+                "exactly one newline apart from the currency-test form"
+            );
+            assert_ne!(
+                sabrage_core::privilege::host_manifest_bytes(dylib),
+                comparison_form,
+                "the comparison form must never be what lands on disk"
+            );
+        }
+
+        /// Compile-time half of the golden above: the privileged write takes a
+        /// **path**, so no caller can hand it the newline-less comparison form.
+        /// If the signature ever goes back to accepting rendered content, this
+        /// stops compiling and the parity suite goes red before anything runs.
+        #[allow(dead_code)]
+        async fn write_path_takes_a_dylib_path_not_content(
+            ctx: &sabrage_core::StageCtx,
+            oxr_dylib: &Path,
+            dest: &Path,
+        ) -> sabrage_core::Result<sabrage_core::PrivilegedWrite> {
+            sabrage_core::privilege::write_host_manifest_privileged(ctx, oxr_dylib, dest).await
+        }
+
         #[test]
         fn toml_template_matches_the_on_disk_contract_file() {
             let root = repo_root();

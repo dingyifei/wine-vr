@@ -83,7 +83,7 @@ fn is_executable(p: &Path) -> bool {
 /// binary, missing `path`) or emits nothing to stdout — exactly the shell's
 /// `$(lipo -archs "$OXR_HELPER_BIN" 2>/dev/null)` in the FAIL message, which
 /// captures stdout regardless of `lipo`'s exit status.
-fn lipo_archs_stdout(path: &Path) -> String {
+pub fn lipo_archs_stdout(path: &Path) -> String {
     match std::process::Command::new("lipo")
         .arg("-archs")
         .arg(path)
@@ -96,7 +96,11 @@ fn lipo_archs_stdout(path: &Path) -> String {
     }
 }
 
-/// lib.sh's `helper_is_arm64()`:
+/// lib.sh's `helper_is_arm64()`. This is its single home in the crate;
+/// `crate::util` re-exports it for the fix and stage layers (the build stage
+/// arch-gates the helper it just built, and `fix.restage-helper` arch-gates its
+/// source before staging it).
+///
 /// ```zsh
 /// helper_is_arm64() { [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64; }
 /// ```
@@ -104,7 +108,7 @@ fn lipo_archs_stdout(path: &Path) -> String {
 /// space-separated arch list, so a fat `x86_64 arm64e` binary must NOT match
 /// (the `e` glues onto `arm64` as a word character) while `x86_64 arm64` and
 /// thin `arm64` must.
-fn helper_is_arm64(path: &Path) -> bool {
+pub fn helper_is_arm64(path: &Path) -> bool {
     if !is_executable(path) {
         return false;
     }
