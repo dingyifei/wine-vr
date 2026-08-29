@@ -1,0 +1,15 @@
+[2026-08-10 01:30:15.921] [info] OXRSys: Client connected (Quest (ALVR)), receiving tracking
+[2026-08-10 01:30:16.372] [info] NativeHelperEncoderTransport: helper pid 59278 up (arm64 native, macOS 27, capsH264=0x3 capsH265=0x3)
+[2026-08-10 01:30:16.382] [info] OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)
+[2026-08-07 22:56:35.735] [info] OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (H.264, in-process)
+[2026-08-10 01:34:20.088] [info] OXRSys: Session state -> 4
+[2026-08-10 01:34:37.627] [info] OXRSys/ALVR: client connected
+[2026-08-10 01:34:37.637] [info] OXRSys: Client connected (Quest (ALVR)), receiving tracking
+[2026-08-10 01:36:50.185] [info] OXRSys: Session state -> 5
+[2026-08-10 01:41:35.085] [error] OXRSys/ALVR: encoder helper died (failure 1 this session)
+[2026-08-10 01:41:35.499] [info] NativeHelperEncoderTransport: helper pid 79215 up (arm64 native, macOS 27, capsH264=0x3 capsH265=0x3)
+[2026-08-10 01:41:35.504] [info] OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)
+[2026-08-10 01:49:19.538] [debug] OXRSys/ALVR: battery 72%
+[2026-08-10 01:49:18.398] [info] OXRSys/ALVR: enc1s n=73 drop=1 key=0 totalMs p50=32.2 p95=38.8 max=42.1 cbMs p95=33.8 gpuMs p95=0.00 sendMs p50=0.01 p95=0.02 max=0.0 nalKB p50=134 max=296
+[2026-08-10 01:49:39.286] [warning] OXRSys/ALVR: tracking stale >500ms (headset asleep or receive stall)
+[2026-08-10 01:49:40.506] [info] OXRSys/ALVR: client disconnected

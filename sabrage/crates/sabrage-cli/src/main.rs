@@ -1,11 +1,18 @@
 //! `sabrage` — the native Sabrage pipeline CLI.
 //!
-//! Phase 1 shipped `sabrage doctor`. Phase 2 adds the four mutating stages —
+//! Phase 1 shipped `sabrage doctor`. Phase 2 added the four mutating stages —
 //! `setup`, `build`, `install`, `stop` — as thin renderers over
-//! [`sabrage_core::stages::run_stage`]: this file owns argument parsing and
-//! turning a [`sabrage_core::StageEvent`] stream into the exact console text
-//! its `demo.sh` equivalent prints, nothing more (the stage bodies themselves
-//! live in `sabrage-core`). `run`/`all` still fall through to the usage text,
+//! [`sabrage_core::stages::run_stage`]. Phase 3 adds `run` (the same renderer,
+//! over [`sabrage_core::stages::run::run`], which is real — a running
+//! `sabrage run` launches wine and the game exactly as `./demo.sh run` does;
+//! `cmd_stage`'s own doc explains why that already-real body still stays out
+//! of this file's unit tests) and `all` (a caller-level loop over
+//! [`sabrage_core::Stage::ALL_CHAIN`] — never a sixth [`Stage`], mirroring
+//! `demo.sh`'s own `for stage in setup build install run` re-exec loop). This
+//! file owns argument parsing and turning a [`sabrage_core::StageEvent`]
+//! stream into the exact console text its `demo.sh` equivalent prints,
+//! nothing more (the stage bodies themselves live in `sabrage-core`).
+//! Anything else on the command line still falls through to the usage text,
 //! exit 2 — the same fallback `demo.sh`'s own `case` uses for an unrecognized
 //! `CMD`.
 //!
@@ -17,8 +24,8 @@
 //! (`demo.sh`'s flag `while` runs before the `case "$CMD"` dispatch, lines
 //! 30-42), so `setup`/`build`/`install`/`stop` all accept
 //! `--bottle`/`--bs-dir`/`--no-audio`/`--no-dashboard`/`--wired`/`--verbose`
-//! too, even though only `run` (not yet implemented here) reads the last
-//! four:
+//! too, even though only `run` (and, by inheriting `run`, `all`) reads the
+//! last four:
 //!
 //! ```zsh
 //! while [ $# -gt 0 ]; do
@@ -55,15 +62,15 @@ use std::env;
 use std::io::IsTerminal;
 use std::path::PathBuf;
 use std::process::exit;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use sabrage_core::checks::{run_doctor, CheckCtx, CheckOptions, CheckOutcome, CheckStatus};
 use sabrage_core::tap::render_tap;
 use sabrage_core::{
-    resolve_repo_root, run_stage, EventSink, Paths, PlannedAction, SabrageError, Severity, Stage,
-    StageCtx, StageEvent, StageOptions, Stream,
+    require_bottle, resolve_repo_root, run_stage, EventSink, Paths, PlannedAction, SabrageError,
+    Severity, Stage, StageCtx, StageEvent, StageOptions, StageOutcome, Stream,
 };
 
 const ANSI_GREEN: &str = "\x1b[32m";
@@ -82,20 +89,30 @@ Commands:
   build               build oxrsys (with ALVR core) + wineopenxr (like ./demo.sh build)
   install             install the bridge into CrossOver + the bottle + host loader
                       (like ./demo.sh install; the only stage that may ask for a password)
+  run                 launch Beat Saber through the bridge (like ./demo.sh run)
   stop                stop the game + wineserver for a bottle (like ./demo.sh stop)
+  all                 setup, then build, then install, then run, stopping at the first
+                      failure (like ./demo.sh all)
 
 Options (every command above):
   --bottle <name>     CrossOver bottle (or env WINEVR_BOTTLE)
   --bs-dir <path>     Beat Saber 1.29.4 install dir (or env WINEVR_BS_DIR)
-  --no-audio          (reserved; unused before the run stage)
-  --no-dashboard      (reserved; unused before the run stage)
-  --wired             (reserved; unused before the run stage)
-  --verbose           (reserved; unused before the run stage)
+  --no-audio          run only: leave the Mac's audio output alone (or env WINEVR_NO_AUDIO)
+  --no-dashboard      run only: don't launch the ALVR server dashboard (or env WINEVR_NO_DASHBOARD)
+  --wired             run only: USB streaming — forward tcp:9943/tcp:9944 instead of
+                      clearing them (or env WINEVR_WIRED)
+  --verbose           run only: restore the wine/openxr debug firehose in the console/log
+                      (or env WINEVR_VERBOSE)
+
+  (every command above accepts all six flags, matching demo.sh's own flag loop, which
+  runs before it dispatches on the subcommand; only run — and, by extension, all — reads
+  the last four. sabrage's own --help lists --wired/--verbose in full: demo.sh's usage
+  text truncates them, a declared divergence, see sabrage/PARITY.md)
 
 Options (doctor only):
   --tap <file>        write parity tap lines (\"<slug> <status>\") to file, truncated first
 
-Options (setup/build/install/stop only):
+Options (setup/build/install/run/stop/all only):
   --dry-run           plan the stage's writes/spawns without touching anything (sabrage-only)
   --quiet             don't pass a child process's own output through (sabrage-only)
 
@@ -125,7 +142,9 @@ async fn main() {
         "setup" => exit(cmd_stage(Stage::Setup, &args[1..]).await),
         "build" => exit(cmd_stage(Stage::Build, &args[1..]).await),
         "install" => exit(cmd_stage(Stage::Install, &args[1..]).await),
+        "run" => exit(cmd_stage(Stage::Run, &args[1..]).await),
         "stop" => exit(cmd_stage(Stage::Stop, &args[1..]).await),
+        "all" => exit(cmd_all(&args[1..]).await),
         _ => {
             print!("{USAGE}");
             exit(2);
@@ -527,72 +546,160 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, String> {
     Ok(out)
 }
 
-/// Render one [`StageEvent`] exactly the way its `demo.sh` equivalent prints
-/// it. `bottle_label` is the actual bottle name once one is known, else the
-/// literal `<name>` placeholder — [`format_footer`]'s convention, reused here
-/// for `install`'s closing line.
-fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: bool, quiet: bool) {
+/// One line [`stage_event_lines`] wants printed, tagged with the stream it
+/// belongs on.
+///
+/// A plain value type purely so "this event prints nothing" — [`Check`],
+/// [`Launched`], [`AutoFixed`], [`Progress`] — is something a test can assert
+/// on directly (`stage_event_lines(...) == vec![]`) instead of a `println!`
+/// side effect it would otherwise have to intercept.
+///
+/// [`Check`]: StageEvent::Check
+/// [`Launched`]: StageEvent::Launched
+/// [`AutoFixed`]: StageEvent::AutoFixed
+/// [`Progress`]: StageEvent::Progress
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RenderedLine {
+    Stdout(String),
+    Stderr(String),
+}
+
+/// The pure projection [`render_stage_event`] prints: exactly the lines
+/// `demo.sh`'s equivalent would have written for one [`StageEvent`], on
+/// whichever stream they belong on. `bottle_label` is the actual bottle name
+/// once one is known, else the literal `<name>` placeholder —
+/// [`format_footer`]'s convention, reused here for `install`'s closing line.
+fn stage_event_lines(
+    ev: &StageEvent,
+    bottle_label: &str,
+    colors: bool,
+    quiet: bool,
+) -> Vec<RenderedLine> {
     match ev {
         StageEvent::StageStarted { stage, .. } => {
-            println!("== wine-vr demo {stage} ==");
+            vec![RenderedLine::Stdout(format!("== wine-vr demo {stage} =="))]
         }
-        StageEvent::Section { title, .. } => {
-            println!("-- {title}");
-        }
+        StageEvent::Section { title, .. } => vec![RenderedLine::Stdout(format!("-- {title}"))],
         StageEvent::Line {
             severity,
             text,
             remedy,
             ..
-        } => {
-            println!(
-                "{}",
-                format_line_event(*severity, text, remedy.as_deref(), colors)
-            );
-        }
+        } => vec![RenderedLine::Stdout(format_line_event(
+            *severity,
+            text,
+            remedy.as_deref(),
+            colors,
+        ))],
         StageEvent::Output { stream, chunk, .. } => {
-            if !quiet {
+            if quiet {
+                vec![]
+            } else {
                 match stream {
-                    Stream::Stdout => println!("{chunk}"),
-                    Stream::Stderr => eprintln!("{chunk}"),
+                    Stream::Stdout => vec![RenderedLine::Stdout(chunk.clone())],
+                    Stream::Stderr => vec![RenderedLine::Stderr(chunk.clone())],
                 }
             }
         }
-        StageEvent::Progress { .. } => {
-            // Nothing extra: ninja's "[n/m]" and curl's progress bar already
-            // arrive as `Output` chunks straight from the child.
-        }
-        StageEvent::AutoFixed { description, .. } => {
-            // Not reachable from setup/build/install/stop today — only a
-            // launch preflight applies fixes (Phase 3) — rendered defensively
-            // in the same `ok` shape lib.sh's own self-heals use.
-            println!("{}", ok_row(&format!("auto-fixed: {description}"), colors));
-        }
-        StageEvent::NeedsAdmin { reason, .. } => {
-            println!("{}", info_row(reason));
-        }
+        // Nothing extra: ninja's "[n/m]" and curl's progress bar already
+        // arrive as `Output` chunks straight from the child.
+        StageEvent::Progress { .. } => vec![],
+        // Every fix already emits its own shell-verbatim `ok`/`warn` row (a
+        // `Line`) onto this same sink — printing this too would double the
+        // row on the console. `AutoFixed` stays a structured signal the GUI
+        // renders (which fix ran); the console has nothing to add.
+        StageEvent::AutoFixed { .. } => vec![],
+        StageEvent::NeedsAdmin { reason, .. } => vec![RenderedLine::Stdout(info_row(reason))],
+        // A raw `print -r --` line: verbatim, no marker, no indent of our
+        // own. `print ""` arrives here as an empty string and must still
+        // print its (empty) line.
+        StageEvent::Text { text, .. } => vec![RenderedLine::Stdout(text.clone())],
+        // run.sh's preflight prints nothing for a check that passes and
+        // `die`s (a `Fatal`) for one that does not, so the console has
+        // nothing to add here. The GUI shows every row.
+        StageEvent::Check { .. } => vec![],
+        // The launch banner is printed as `Text` lines, exactly as run.sh
+        // prints it; this event is state for the GUI, not console output.
+        StageEvent::Launched { .. } => vec![],
         StageEvent::Fatal {
             message, remedy, ..
-        } => {
-            for line in fatal_lines(message, remedy.as_deref(), colors) {
-                eprintln!("{line}");
-            }
-        }
+        } => fatal_lines(message, remedy.as_deref(), colors)
+            .into_iter()
+            .map(RenderedLine::Stderr)
+            .collect(),
         StageEvent::StageFinished { stage, ok, .. } => {
             if *ok {
-                if let Some(line) = closing_line(*stage, bottle_label) {
-                    println!("{line}");
-                }
+                closing_line(*stage, bottle_label)
+                    .into_iter()
+                    .map(RenderedLine::Stdout)
+                    .collect()
+            } else {
+                vec![]
             }
         }
     }
 }
 
+/// Render one [`StageEvent`] exactly the way its `demo.sh` equivalent prints
+/// it, by printing [`stage_event_lines`]'s projection of it.
+fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: bool, quiet: bool) {
+    for line in stage_event_lines(ev, bottle_label, colors, quiet) {
+        match line {
+            RenderedLine::Stdout(s) => println!("{s}"),
+            RenderedLine::Stderr(s) => eprintln!("{s}"),
+        }
+    }
+}
+
+/// Merge parsed CLI flags onto the env-derived base — `WINEVR_*` is the base,
+/// flags override, exactly [`StageOptions::from_env`]'s own precedence rule
+/// (`demo.sh` exporting over whatever the caller's shell already had set)
+/// applied to all six flags in one place. `--dry-run` has no env counterpart,
+/// so `parsed.dry_run` wins outright rather than only-if-true.
+///
+/// Factored out of [`cmd_stage`]/[`cmd_all`] so the forwarding of
+/// `--wired`/`--no-audio`/`--no-dashboard` — parsed since Phase 2 for
+/// grammar parity, but silently dropped on the floor until now because
+/// `StageOptions` carried no field for them — is directly testable without
+/// resolving a repo root or building a [`StageCtx`].
+fn merge_stage_options(env_opts: StageOptions, parsed: &StageArgs) -> StageOptions {
+    let mut opts = env_opts;
+    if let Some(b) = &parsed.bottle {
+        opts.bottle_name = Some(b.clone());
+    }
+    if let Some(d) = &parsed.bs_dir {
+        opts.bs_dir_override = Some(d.clone());
+    }
+    if parsed.verbose {
+        opts.verbose = true;
+    }
+    if parsed.wired {
+        opts.wired = true;
+    }
+    if parsed.no_audio {
+        opts.no_audio = true;
+    }
+    if parsed.no_dashboard {
+        opts.no_dashboard = true;
+    }
+    opts.dry_run = parsed.dry_run;
+    opts
+}
+
 /// Run one stage and return the process exit code (never calls `exit` itself,
-/// so `main` stays the only place that does). Today's stage bodies are all
-/// `todo!()` — see `sabrage-core/src/stages/*.rs` — so this wires the
-/// plumbing up to and through [`run_stage`] correctly for when they land; it
-/// is exercised up to that boundary by this file's tests.
+/// so `main` stays the only place that does).
+///
+/// `setup`/`build`/`install`/`stop`'s bodies are real as of Phase 2, and
+/// [`Stage::Run`]'s (`sabrage_core::stages::run::run`) is real as of Phase 3
+/// — it actually launches wine and the game. That makes all five stage
+/// bodies equally off-limits for this file's unit tests (this task's hard
+/// rules: no launching the game, no touching the machine), so `cmd_stage`'s
+/// tests may drive `cmd_stage(Stage::Run, …)` (and the other four stages)
+/// end-to-end **only** up to the point this function resolves a repo root
+/// and builds a [`StageCtx`]: an argument error or a `resolve_repo_root`
+/// failure returns before either happens and is exercised directly; anything
+/// past that boundary is exercised through the pure helpers instead
+/// ([`merge_stage_options`], [`stage_event_lines`], [`report_stage_result`]).
 async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     let parsed = match parse_stage_args(args) {
         Ok(p) => p,
@@ -610,23 +717,7 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
         }
     };
 
-    // WINEVR_* env is the base; CLI flags override — same precedence as doctor.
-    let mut opts = StageOptions::from_env();
-    if let Some(b) = parsed.bottle {
-        opts.bottle_name = Some(b);
-    }
-    if let Some(d) = parsed.bs_dir {
-        opts.bs_dir_override = Some(d);
-    }
-    if parsed.verbose {
-        opts.verbose = true;
-    }
-    opts.dry_run = parsed.dry_run;
-    // `--wired`/`--no-audio`/`--no-dashboard` are parsed (so the shell's own
-    // "accept, don't reject" grammar is matched byte-for-byte) but otherwise
-    // dropped here: `StageOptions` carries no field for them yet — they are
-    // Phase 3 launch options (see `StageOptions`'s own doc comment) and
-    // `demo.sh` never reads them before `run` either.
+    let opts = merge_stage_options(StageOptions::from_env(), &parsed);
 
     let bottle_label = opts
         .bottle_name
@@ -642,7 +733,7 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     let ctx = StageCtx::new(Paths::new(&repo_root), opts, sink, Default::default());
     {
         let cancel = ctx.cancel.clone();
-        watch_sigint(move || cancel.cancel());
+        watch_termination_signals(move || cancel.cancel());
     }
 
     let is_dry_run = ctx.executor.is_dry_run();
@@ -663,6 +754,15 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
         }
     }
 
+    report_stage_result(result)
+}
+
+/// Project a finished stage's [`run_stage`] result onto the exit code
+/// `./demo.sh <stage>` would have produced — for `run`, that is wine's own
+/// exit status, [`StageOutcome::exit_code_equiv`]. Factored out of
+/// [`cmd_stage`] so [`cmd_all`]'s per-stage loop body reports an error
+/// identically instead of drifting from it.
+fn report_stage_result(result: std::result::Result<StageOutcome, SabrageError>) -> i32 {
     match result {
         Ok(outcome) => outcome.exit_code_equiv,
         Err(e) => {
@@ -726,58 +826,258 @@ fn render_dry_run_plan(plan: &[PlannedAction]) -> Vec<String> {
     lines
 }
 
-// ── Ctrl-C handling ──────────────────────────────────────────────────────────
+// ── `sabrage all` ────────────────────────────────────────────────────────────
+//
+// `demo.sh`'s `all)` case is a caller-level loop that re-execs itself once per
+// stage (`for stage in setup build install run; do … "$ROOT/demo.sh" "$stage"
+// || exit $?; done`), after one `require_bottle` up front "to fail fast before
+// the expensive fetch/build stages". `Stage` deliberately has no `All` member
+// (see its own doc comment) — this is that same loop, native-side, over
+// [`Stage::ALL_CHAIN`].
+//
+// One divergence, declared here for `sabrage/PARITY.md`: `demo.sh` prints
+// `"\n##### demo.sh: $stage #####"` before re-exec'ing each stage; `sabrage
+// all` does not reproduce that separator, because every stage already
+// announces itself on the same sink via its own `StageStarted` banner
+// (`"== wine-vr demo <stage> =="`, rendered by `stage_event_lines` exactly as
+// it is for a standalone `sabrage <stage>`) — printing both would say which
+// stage is starting twice.
+
+/// Run `stages` in order via `run_one`, stopping at the first stage whose
+/// exit code is non-zero and returning that code (or `0` once every stage in
+/// `stages` has exited `0`) — `demo.sh`'s own `|| exit $?`.
+///
+/// Factored out of [`run_all`] so a test can substitute a fake `run_one` and
+/// assert "stops at the first failure" without going anywhere near
+/// [`run_stage`]: every one of `Stage::Setup`/`Build`/`Install`/`Run`'s
+/// bodies really does touch the machine (`Run` launches wine and the game),
+/// and none of them is something a unit test may invoke (this task's hard
+/// rules).
+async fn run_chain<F, Fut>(stages: &[Stage], mut run_one: F) -> i32
+where
+    F: FnMut(Stage) -> Fut,
+    Fut: std::future::Future<Output = i32>,
+{
+    for &stage in stages {
+        let code = run_one(stage).await;
+        if code != 0 {
+            return code;
+        }
+    }
+    0
+}
+
+/// The core of `all`, split from [`cmd_all`] so it can be driven with a
+/// caller-built `paths`/`opts` pair — never [`StageOptions::from_env`] —
+/// which is what makes this deterministic in a test regardless of the *real*
+/// `WINEVR_BOTTLE`/CrossOver state on whatever machine runs this suite (hard
+/// rule: a test must never depend on, let alone mutate, real machine state).
+///
+/// Requires a bottle up front via [`require_bottle`] — lib.sh's own die text,
+/// through the exact `StageCtx`-shaped path that function expects — then
+/// chains [`Stage::ALL_CHAIN`] through [`run_stage`] via [`run_chain`],
+/// building a **fresh** [`StageCtx`] per stage (fresh `run_id`, fresh
+/// executor — [`StageCtx::new`] mints both) but the same `paths`/`opts`/
+/// `sink`, and one cancellation token shared across every stage so a single
+/// Ctrl-C reaches whichever stage is currently running. `--dry-run` applies
+/// uniformly because every per-stage `StageCtx` inherits `opts.dry_run`, each
+/// printing its own trailing dry-run plan exactly as a standalone
+/// `sabrage <stage> --dry-run` would.
+async fn run_all(paths: &Paths, opts: &StageOptions, sink: &EventSink) -> i32 {
+    // Doubles as the source of the `CancellationToken` every per-stage
+    // `StageCtx` below shares — `StageCtx`'s own field, so this file never has
+    // to name the type (see the Ctrl-C section's comment on that).
+    let precheck = StageCtx::new(
+        paths.clone(),
+        opts.clone(),
+        sink.clone(),
+        Default::default(),
+    );
+    if require_bottle(&precheck).is_err() {
+        // `require_bottle` already emitted the `Fatal` onto `sink`.
+        return 1;
+    }
+    let cancel = precheck.cancel.clone();
+    {
+        let c = cancel.clone();
+        watch_termination_signals(move || c.cancel());
+    }
+
+    run_chain(&Stage::ALL_CHAIN, |stage| {
+        let ctx = StageCtx::new(paths.clone(), opts.clone(), sink.clone(), cancel.clone());
+        async move {
+            let is_dry_run = ctx.executor.is_dry_run();
+            let result = run_stage(stage, &ctx).await;
+            if is_dry_run {
+                for line in render_dry_run_plan(&ctx.executor.planned()) {
+                    println!("{line}");
+                }
+            }
+            report_stage_result(result)
+        }
+    })
+    .await
+}
+
+/// `sabrage all`'s CLI glue: parse (same six flags + `--dry-run`/`--quiet` as
+/// every other stage command — [`parse_stage_args`]), resolve a repo root,
+/// merge onto the `WINEVR_*` base ([`merge_stage_options`]), then hand off to
+/// [`run_all`].
+async fn cmd_all(args: &[String]) -> i32 {
+    let parsed = match parse_stage_args(args) {
+        Ok(p) => p,
+        Err(msg) => {
+            eprintln!("{msg}");
+            return 2;
+        }
+    };
+
+    let repo_root = match resolve_repo_root(None) {
+        Ok(p) => p,
+        Err(e) => {
+            print_bootstrap_error(&e);
+            return e.exit_code();
+        }
+    };
+
+    let opts = merge_stage_options(StageOptions::from_env(), &parsed);
+    let bottle_label = opts
+        .bottle_name
+        .clone()
+        .unwrap_or_else(|| "<name>".to_string());
+    let colors = use_colors();
+    let quiet = parsed.quiet;
+    let sink: EventSink = Arc::new(move |ev: StageEvent| {
+        render_stage_event(&ev, &bottle_label, colors, quiet);
+    });
+
+    run_all(&Paths::new(&repo_root), &opts, &sink).await
+}
+
+// ── Ctrl-C / SIGTERM handling ─────────────────────────────────────────────
 //
 // `tokio::signal::ctrl_c()` needs the `signal` feature; sabrage-cli's `tokio`
 // dependency only has `rt-multi-thread`/`macros` (see `Cargo.toml`'s own
 // comment), and this crate may not edit Cargo manifests (Frame-owned — see
-// this task's hard rules). A raw `SIGINT` trap plus a polling `std::thread`
+// this task's hard rules). A raw signal trap plus a polling `std::thread`
 // needs neither: every Rust binary already links the C runtime that provides
-// `signal(2)`, and the handler itself does the one thing that is
-// async-signal-safe here — a relaxed atomic store — leaving the actual
+// `signal(2)`, and each handler does the one thing that is
+// async-signal-safe here — two relaxed atomic stores — leaving the actual
 // cancellation (`sabrage_core`'s `CancellationToken::cancel()`, which is what
 // makes `process::spawn_streamed`'s `killpg(SIGTERM)`→`SIGKILL` escalation
 // fire for a running cmake/ninja/curl child) to a plain OS thread.
 //
-// `watch_sigint`/`watch_flag` are generic over a plain `FnOnce` callback
-// rather than over the cancellation type itself, so this file never has to
-// name `tokio_util::sync::CancellationToken` — sabrage-cli has no direct
-// dependency on `tokio-util` (only `sabrage-core` does; see its Cargo.toml).
-// `cmd_stage` supplies it pre-captured in a closure instead.
+// `watch_termination_signals`/`watch_flag` are generic over a plain `FnOnce`
+// callback rather than over the cancellation type itself, so this file never
+// has to name `tokio_util::sync::CancellationToken` — sabrage-cli has no
+// direct dependency on `tokio-util` (only `sabrage-core` does; see its
+// Cargo.toml). `cmd_stage`/`run_all` supply it pre-captured in a closure
+// instead.
 //
-// The watcher must not go one-shot after the first Ctrl-C: a second SIGINT
-// has to be able to kill the process even while the first one's cancellation
-// is still winding down a child (or during a phase with no child at all, e.g.
-// `stop`'s non-executor code paths) — the same "impatient user, no more Mr.
-// Nice trap" escape hatch a `./demo.sh` invocation gets for free from the
-// shell's own default SIGINT disposition. So the loop keeps running past the
-// first fire: the first delivery runs `on_signal` once (unchanged), every
-// later one restores `SIG_DFL` and re-raises SIGINT on ourselves, so the
-// *kernel's* default action (terminate) applies — the process dies "killed by
-// SIGINT", exit 130, rather than us picking that number by hand. The handler
-// counts deliveries rather than setting a flag, so two signals arriving inside
-// one poll interval still read as two.
+// `demo.sh`'s `run.sh` traps *both* `INT` and `TERM` (lines 180-181) with the
+// same teardown body — stop wine, close the dashboard, reap the encoder
+// helper, restore audio — so `kill <pid>` on a running `./demo.sh run` takes
+// the identical path a Ctrl-C does. `sabrage run` matches that: `SIGINT` and
+// `SIGTERM` share one state machine here, not two independent ones, so
+// either kind reaches the same cancellation.
+//
+// The watcher must not go one-shot after the first signal: a second signal —
+// of *either* kind — has to be able to kill the process even while the first
+// one's cancellation is still winding down a child (or during a phase with
+// no child at all, e.g. `stop`'s non-executor code paths) — the same
+// "impatient user, no more Mr. Nice trap" escape hatch a `./demo.sh`
+// invocation gets for free from the shell's own default disposition. So the
+// loop keeps running past the first fire: the first delivery of either
+// SIGINT or SIGTERM runs `on_signal` once (unchanged), every later one of
+// *either* kind restores `SIG_DFL` for *both* signals and re-raises
+// whichever one was actually received, so the *kernel's* default action
+// (terminate) applies — the process dies "killed by SIGINT" (exit 130) or
+// "killed by SIGTERM" (exit 143) depending on what the second delivery was,
+// rather than us picking either number by hand. The handler counts
+// deliveries rather than setting a flag, so two signals arriving inside one
+// poll interval still read as two.
+//
+// # A second signal of a *different* kind is still fatal
+//
+// `SIGINT` and `SIGTERM` increment the *same* `SIGNAL_COUNT` — there is no
+// separate "SIGINT slot" and "SIGTERM slot" for the watcher to fall behind on
+// independently. A `SIGINT` first, `SIGTERM` second (or the reverse) is
+// exactly as fatal as two of the same kind: the first of either cancels, the
+// second of either — regardless of which one arrived first — restores both
+// dispositions and re-raises itself. `LAST_SIGNAL` records which signal
+// number the *most recent* delivery was, written by each handler immediately
+// before it bumps the shared counter, so the fatal action re-raises the one
+// the user actually just sent rather than always SIGINT.
+//
+// # A signal during `run` (and `all`, while its chain is on `Run`)
+//
+// The first signal — SIGINT or SIGTERM — cancels the token `cmd_stage`/
+// `run_all` handed to the stage's `StageCtx`, which is `run`'s own
+// cancellation path: it stops wine, restores audio, and returns
+// `Err(SabrageError::Cancelled)` — `report_stage_result` maps that to exit
+// 130 through the ordinary error tail (`sabrage_core::error`'s
+// `exit_code()`), **regardless of which signal triggered the cancellation**.
+// That is a declared divergence from `demo.sh`: `run.sh`'s own TERM trap
+// re-raises TERM after its teardown and so exits 143 on a TERM-initiated
+// shutdown, while `sabrage run` collapses both signals onto the same
+// "cancelled" outcome and always exits 130 for a *completed* cancellation —
+// the signal's identity only survives long enough to pick the exit code of
+// an *impatient* second signal (see `sabrage/PARITY.md`). A second signal
+// does **not** wait for that teardown to finish: per the state machine above
+// it restores `SIG_DFL` for both signals and re-raises whichever one just
+// arrived, so `sabrage` itself dies immediately. Because the wine child is
+// spawned *detached* — its own process group, never `kill_on_drop(true)` —
+// an impatient double-tap during `run` leaves wine (and the game) running
+// unsupervised: the audio device may still be routed to BlackHole, the ALVR
+// dashboard may still be open, and `session-state.json` still describes
+// both. Nothing left in this process can finish that teardown once the
+// second signal lands — the next `sabrage run` or `sabrage stop` for that
+// bottle is what reconciles the guards (`sabrage_core::session::reconcile`).
 
-/// Poll interval for the Ctrl-C watcher thread — frequent enough that a
+/// Poll interval for the signal watcher thread — frequent enough that a
 /// human doesn't perceive the delay, infrequent enough to cost nothing idle.
 const CTRL_C_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// How many `SIGINT`s the handler has seen. A **count**, not a flag: two
-/// signals delivered inside one [`CTRL_C_POLL_INTERVAL`] (a fast double-tap,
-/// or the `kill -INT` pair an automated test sends) collapsed into a single
-/// observation under a `swap(false, ..)`'d `AtomicBool`, so the second Ctrl-C
-/// was silently lost and the process stayed in its "cancelling" state — the
-/// one gap left in "a second Ctrl-C is always fatal". `fetch_add` on an
-/// `AtomicUsize` is as async-signal-safe as the store it replaces.
-static SIGINT_COUNT: AtomicUsize = AtomicUsize::new(0);
+/// `SIGINT`'s signal number — 2 on every platform this ships to (macOS).
+const SIGINT: i32 = 2;
 
-/// `SIG_DFL` — restoring it before re-raising `SIGINT` on the second Ctrl-C
-/// lets the OS's own default disposition (terminate) apply, rather than us
-/// synthesizing the exit code by hand.
+/// `SIGTERM`'s signal number — 15 on every platform this ships to (macOS).
+/// `run.sh`'s line 181 traps this one too, with the same teardown as its
+/// `INT` trap — see the module doc above.
+const SIGTERM: i32 = 15;
+
+/// How many `SIGINT`/`SIGTERM` deliveries the handlers have seen, combined.
+/// A **count**, not a flag: two signals delivered inside one
+/// [`CTRL_C_POLL_INTERVAL`] (a fast double-tap, or the `kill` pair an
+/// automated test sends) collapsed into a single observation under a
+/// `swap(false, ..)`'d `AtomicBool`, so the second signal was silently lost
+/// and the process stayed in its "cancelling" state — the one gap left in "a
+/// second signal is always fatal". `fetch_add` on an `AtomicUsize` is as
+/// async-signal-safe as the store it replaces. Shared by both signals on
+/// purpose (see the module doc's "second signal of a different kind" note):
+/// there is one state machine here, not two.
+static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Which of `SIGINT`/`SIGTERM` the *most recent* delivery was — read only by
+/// the fatal second action, to decide which one to re-raise. Each handler
+/// stores here *before* bumping `SIGNAL_COUNT`, so by the time the watcher
+/// observes a given increment this holds at least as recent a value as that
+/// delivery.
+static LAST_SIGNAL: AtomicI32 = AtomicI32::new(SIGINT);
+
+/// `SIG_DFL` — restoring it before re-raising a signal on the second
+/// delivery lets the OS's own default disposition (terminate) apply, rather
+/// than us synthesizing the exit code by hand.
 const SIG_DFL: usize = 0;
 
 extern "C" fn on_sigint(_signum: i32) {
-    SIGINT_COUNT.fetch_add(1, Ordering::Relaxed);
+    LAST_SIGNAL.store(SIGINT, Ordering::Relaxed);
+    SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
+}
+
+extern "C" fn on_sigterm(_signum: i32) {
+    LAST_SIGNAL.store(SIGTERM, Ordering::Relaxed);
+    SIGNAL_COUNT.fetch_add(1, Ordering::Relaxed);
 }
 
 extern "C" {
@@ -788,39 +1088,54 @@ extern "C" {
     /// declaration pass *either* a real handler (`on_sigint as usize`) *or*
     /// the `SIG_DFL` sentinel (`0`) without a raw function-pointer transmute.
     fn signal(signum: i32, handler: usize) -> usize;
-    /// `raise(2)` — used only to re-deliver `SIGINT` to this process itself
-    /// after restoring `SIG_DFL`, on a second Ctrl-C.
+    /// `raise(2)` — used only to re-deliver a signal to this process itself
+    /// after restoring `SIG_DFL`, on a second delivery.
     fn raise(signum: i32) -> i32;
 }
 
-/// Install the real `SIGINT` trap and spawn the watcher thread that calls
-/// `on_signal` once, the moment the trap first fires (and is fatal to the
-/// process on the next one — see the module doc above).
-fn watch_sigint(on_signal: impl FnOnce() + Send + 'static) {
-    watch_flag(&SIGINT_COUNT, on_signal);
+/// Install the real `SIGINT` **and** `SIGTERM` traps and spawn the one
+/// watcher thread that calls `on_signal` once, the moment either trap first
+/// fires (and is fatal to the process on the next delivery of *either*
+/// kind — see the module doc above). Both signals feed the same
+/// `SIGNAL_COUNT`, so this spawns exactly one watcher for both — calling
+/// `watch_flag` a second time (once per signal) would instead spawn two
+/// independent pollers racing each other over that one counter.
+fn watch_termination_signals(on_signal: impl FnOnce() + Send + 'static) {
+    watch_flag(&SIGNAL_COUNT, on_signal);
     unsafe {
-        signal(2, on_sigint as *const () as usize); // SIGINT == 2 on every platform this ships to (macOS).
+        signal(SIGINT, on_sigint as *const () as usize);
+        signal(SIGTERM, on_sigterm as *const () as usize);
     }
 }
 
-/// Restore `SIGINT`'s default disposition and re-raise it on ourselves, so
-/// the kernel's own default action (terminate) applies. This is the real
-/// production "second Ctrl-C" action; tests exercise
-/// [`watch_flag_with_second_action`] with a fake in its place; a real second
-/// SIGINT during a test run would otherwise kill the test binary.
-fn terminate_via_default_sigint_disposition() {
+/// Restore both `SIGINT`'s and `SIGTERM`'s default disposition and re-raise
+/// whichever one was actually received (`LAST_SIGNAL`), so the kernel's own
+/// default action (terminate) applies and the process dies under the
+/// signal's own name — "killed by SIGTERM" (exit 143) for a second `kill
+/// <pid>`, "killed by SIGINT" (exit 130) for a second Ctrl-C/`kill -INT` —
+/// rather than us picking either number by hand. This is the real production
+/// second-signal action (both traps installed by [`watch_termination_signals`]
+/// share it); tests exercise [`watch_flag_with_second_action`] with a fake in
+/// its place, since a real second SIGINT/SIGTERM during a test run would
+/// otherwise kill the test binary.
+fn terminate_via_default_disposition_of_last_signal() {
     unsafe {
-        signal(2, SIG_DFL);
-        raise(2);
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        raise(LAST_SIGNAL.load(Ordering::Relaxed));
     }
 }
 
-/// The polling primitive `watch_sigint` builds on, factored out so it is
-/// testable without installing a real signal handler or touching the
-/// process-wide [`SIGINT_COUNT`] counter. Delegates to
+/// The polling primitive [`watch_termination_signals`] builds on, factored
+/// out so it is testable without installing a real signal handler or
+/// touching the process-wide [`SIGNAL_COUNT`] counter. Delegates to
 /// [`watch_flag_with_second_action`] with the real fatal second action.
 fn watch_flag(counter: &'static AtomicUsize, on_signal: impl FnOnce() + Send + 'static) {
-    watch_flag_with_second_action(counter, on_signal, terminate_via_default_sigint_disposition);
+    watch_flag_with_second_action(
+        counter,
+        on_signal,
+        terminate_via_default_disposition_of_last_signal,
+    );
 }
 
 /// `watch_flag`'s full generality: keeps polling `counter` for as long as the
@@ -867,6 +1182,7 @@ mod tests {
     // Production code counts SIGINTs in an `AtomicUsize`; the tests still use a
     // plain flag for "did this callback fire".
     use std::sync::atomic::AtomicBool;
+    use std::sync::Mutex as StdMutex;
 
     // ── doctor arg parsing ───────────────────────────────────────────────────
 
@@ -1096,6 +1412,72 @@ mod tests {
         );
     }
 
+    // ── merge_stage_options ──────────────────────────────────────────────────
+
+    #[test]
+    fn merge_stage_options_forwards_all_six_flags_onto_the_env_base() {
+        // The bug this closes: `--wired`/`--no-audio`/`--no-dashboard` were
+        // parsed (so the shell's own grammar was matched byte-for-byte) but
+        // then silently dropped — `StageOptions` carried no field for them at
+        // the time, and nothing ever set the three that were added since.
+        let parsed = StageArgs {
+            bottle: Some("Steam".to_string()),
+            bs_dir: Some(PathBuf::from("/games/bs")),
+            wired: true,
+            no_audio: true,
+            no_dashboard: true,
+            verbose: true,
+            dry_run: true,
+            quiet: false,
+        };
+        let opts = merge_stage_options(StageOptions::default(), &parsed);
+        assert_eq!(opts.bottle_name.as_deref(), Some("Steam"));
+        assert_eq!(opts.bs_dir_override, Some(PathBuf::from("/games/bs")));
+        assert!(opts.wired);
+        assert!(opts.no_audio);
+        assert!(opts.no_dashboard);
+        assert!(opts.verbose);
+        assert!(opts.dry_run);
+    }
+
+    #[test]
+    fn merge_stage_options_env_base_survives_when_no_flag_overrides_it() {
+        // WINEVR_* is the base; a flag *absent* from the command line must
+        // never clear a value the environment already set (the same
+        // "exporting over whatever the shell already had" precedence
+        // `StageOptions::from_env` documents).
+        let env_opts = StageOptions {
+            bottle_name: Some("FromEnv".to_string()),
+            wired: true,
+            no_audio: true,
+            no_dashboard: true,
+            verbose: true,
+            ..Default::default()
+        };
+        let opts = merge_stage_options(env_opts, &StageArgs::default());
+        assert_eq!(opts.bottle_name.as_deref(), Some("FromEnv"));
+        assert!(opts.wired && opts.no_audio && opts.no_dashboard && opts.verbose);
+        // `dry_run` has no env counterpart: `parsed.dry_run` (false here)
+        // wins outright rather than only-if-true.
+        assert!(!opts.dry_run);
+    }
+
+    #[test]
+    fn merge_stage_options_flags_only_ever_add_never_clear() {
+        // A flag that is `false` in `parsed` must not stomp a `true` the env
+        // base already had — every boolean flag is `if parsed.x { opts.x =
+        // true }`, never a plain assignment.
+        let env_opts = StageOptions {
+            wired: true,
+            ..Default::default()
+        };
+        let parsed = StageArgs {
+            wired: false,
+            ..Default::default()
+        };
+        assert!(merge_stage_options(env_opts, &parsed).wired);
+    }
+
     // ── stage rendering ──────────────────────────────────────────────────────
 
     #[test]
@@ -1224,6 +1606,218 @@ mod tests {
         assert_eq!(closing_line(Stage::Run, "Steam"), None);
     }
 
+    // ── stage_event_lines (Phase 3: run) ─────────────────────────────────────
+    //
+    // Pure projection, so "renders to nothing" is a value these assert on
+    // directly instead of a `println!` side effect they would have to
+    // intercept.
+
+    #[test]
+    fn text_event_prints_verbatim_including_empty_and_leading_spaces() {
+        let empty = StageEvent::Text {
+            run_id: Default::default(),
+            step: None,
+            text: String::new(),
+        };
+        assert_eq!(
+            stage_event_lines(&empty, "<name>", false, false),
+            vec![RenderedLine::Stdout(String::new())],
+            "run.sh's `print \"\"` must still emit its (empty) line"
+        );
+
+        let indented = StageEvent::Text {
+            run_id: Default::default(),
+            step: Some("run.8.launch".to_string()),
+            text: "   exe: Z:\\Beat Saber.exe".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&indented, "<name>", false, false),
+            vec![RenderedLine::Stdout(
+                "   exe: Z:\\Beat Saber.exe".to_string()
+            )],
+            "leading spaces belong to the shell's own line, not our indent"
+        );
+    }
+
+    #[test]
+    fn check_launched_and_auto_fixed_events_render_to_nothing() {
+        use sabrage_core::{FixAction, Gate};
+
+        let check = StageEvent::Check {
+            run_id: Default::default(),
+            step: "run.1.preflight".to_string(),
+            outcome: CheckOutcome::pass("run.wine-exec", "wine present"),
+            gate: Gate::Block,
+        };
+        assert_eq!(stage_event_lines(&check, "<name>", false, false), vec![]);
+
+        let launched = StageEvent::Launched {
+            run_id: Default::default(),
+            pid: 4242,
+            start_time: 1,
+            log_path: "/x/beatsaber-20260829-000000.log".to_string(),
+            started_at_unix_ms: 1,
+        };
+        assert_eq!(stage_event_lines(&launched, "<name>", false, false), vec![]);
+
+        // Every fix already emits its own shell-verbatim `ok`/`warn` `Line` on
+        // the same sink; printing this too would double the console row.
+        let auto_fixed = StageEvent::AutoFixed {
+            run_id: Default::default(),
+            step: "run.1.preflight".to_string(),
+            fix: FixAction::SetGraphicsBackend,
+            description: "bottle graphics backend forced to dxmt".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&auto_fixed, "<name>", false, false),
+            vec![]
+        );
+    }
+
+    #[test]
+    fn progress_event_renders_to_nothing() {
+        let ev = StageEvent::Progress {
+            run_id: Default::default(),
+            step: "setup.1".to_string(),
+            label: "curl".to_string(),
+            current: 10,
+            total: Some(100),
+        };
+        assert_eq!(stage_event_lines(&ev, "<name>", false, false), vec![]);
+    }
+
+    #[test]
+    fn needs_admin_event_renders_as_an_info_row() {
+        let ev = StageEvent::NeedsAdmin {
+            run_id: Default::default(),
+            step: "install.4.host-manifest".to_string(),
+            reason: "macOS will ask for your password".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&ev, "<name>", false, false),
+            vec![RenderedLine::Stdout(
+                "  macOS will ask for your password".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn stage_started_section_and_line_events_compose_through_the_shared_helpers() {
+        let started = StageEvent::StageStarted {
+            run_id: Default::default(),
+            stage: Stage::Run,
+        };
+        assert_eq!(
+            stage_event_lines(&started, "<name>", false, false),
+            vec![RenderedLine::Stdout("== wine-vr demo run ==".to_string())]
+        );
+
+        let section = StageEvent::Section {
+            run_id: Default::default(),
+            title: "Goldberg".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&section, "<name>", false, false),
+            vec![RenderedLine::Stdout("-- Goldberg".to_string())]
+        );
+
+        let line = StageEvent::Line {
+            run_id: Default::default(),
+            step: None,
+            severity: Severity::Ok,
+            text: "wineserver down".to_string(),
+            remedy: None,
+        };
+        assert_eq!(
+            stage_event_lines(&line, "<name>", false, false),
+            vec![RenderedLine::Stdout("  OK   wineserver down".to_string())]
+        );
+    }
+
+    #[test]
+    fn output_event_respects_quiet_and_routes_by_stream() {
+        let out = StageEvent::Output {
+            run_id: Default::default(),
+            step: "build.1".to_string(),
+            stream: Stream::Stdout,
+            chunk: "[1/9] cc foo.c".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&out, "<name>", false, false),
+            vec![RenderedLine::Stdout("[1/9] cc foo.c".to_string())]
+        );
+        assert_eq!(
+            stage_event_lines(&out, "<name>", false, true),
+            vec![],
+            "--quiet suppresses a child's own output passthrough"
+        );
+
+        let err = StageEvent::Output {
+            run_id: Default::default(),
+            step: "build.1".to_string(),
+            stream: Stream::Stderr,
+            chunk: "warning: x".to_string(),
+        };
+        assert_eq!(
+            stage_event_lines(&err, "<name>", false, false),
+            vec![RenderedLine::Stderr("warning: x".to_string())]
+        );
+    }
+
+    #[test]
+    fn fatal_and_stage_finished_events_compose_through_the_shared_helpers() {
+        let fatal = StageEvent::Fatal {
+            run_id: Default::default(),
+            message: "boom".to_string(),
+            remedy: Some("fix it".to_string()),
+            fix: None,
+        };
+        assert_eq!(
+            stage_event_lines(&fatal, "<name>", false, false),
+            vec![
+                RenderedLine::Stderr("FATAL boom".to_string()),
+                RenderedLine::Stderr("       remedy: fix it".to_string()),
+            ]
+        );
+
+        let finished_ok = StageEvent::StageFinished {
+            run_id: Default::default(),
+            stage: Stage::Setup,
+            ok: true,
+            exit_code_equiv: 0,
+        };
+        assert_eq!(
+            stage_event_lines(&finished_ok, "<name>", false, false),
+            vec![RenderedLine::Stdout(
+                "\nsetup complete — next: ./demo.sh build".to_string()
+            )]
+        );
+
+        // run.sh's own closing text arrives as a `Text` event, not a banner
+        // here — `closing_line(Run, _)` is `None`.
+        let finished_run_ok = StageEvent::StageFinished {
+            run_id: Default::default(),
+            stage: Stage::Run,
+            ok: true,
+            exit_code_equiv: 0,
+        };
+        assert_eq!(
+            stage_event_lines(&finished_run_ok, "<name>", false, false),
+            vec![]
+        );
+
+        let finished_failed = StageEvent::StageFinished {
+            run_id: Default::default(),
+            stage: Stage::Setup,
+            ok: false,
+            exit_code_equiv: 1,
+        };
+        assert_eq!(
+            stage_event_lines(&finished_failed, "<name>", false, false),
+            vec![]
+        );
+    }
+
     // ── dry-run plan rendering ───────────────────────────────────────────────
 
     #[test]
@@ -1266,12 +1860,115 @@ mod tests {
         );
     }
 
-    // ── Ctrl-C watcher ───────────────────────────────────────────────────────
+    // ── `sabrage run` / `sabrage all` wiring ─────────────────────────────────
+    //
+    // `Stage::Run`'s body (`sabrage_core::stages::run::run`) is real as of
+    // Phase 3 — it actually launches wine and the game — and `Stage::Setup`/
+    // `Build`/`Install`'s bodies really do touch the machine too; none of the
+    // four may be reached from a unit test (this task's hard rules). Every
+    // test below stays on the safe side of that boundary: an argument error
+    // returns before `resolve_repo_root` is even called, and `run_all`'s
+    // bottle precheck (driven with a hand-built `opts`, never
+    // `StageOptions::from_env()`, so it is deterministic regardless of the
+    // *real* machine's `WINEVR_BOTTLE`/CrossOver state) dies before
+    // `run_chain`/`run_stage` are ever reached.
+
+    fn capturing_sink() -> (EventSink, Arc<StdMutex<Vec<StageEvent>>>) {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s = seen.clone();
+        (Arc::new(move |ev| s.lock().unwrap().push(ev)), seen)
+    }
+
+    #[tokio::test]
+    async fn run_stage_rejects_a_bad_argument_before_touching_anything() {
+        assert_eq!(cmd_stage(Stage::Run, &args(&["--nope"])).await, 2);
+        assert_eq!(cmd_stage(Stage::Run, &args(&["--bottle"])).await, 2);
+    }
+
+    #[tokio::test]
+    async fn all_rejects_a_bad_argument_before_touching_anything() {
+        assert_eq!(cmd_all(&args(&["--nope"])).await, 2);
+        assert_eq!(cmd_all(&args(&["--bs-dir"])).await, 2);
+    }
+
+    #[tokio::test]
+    async fn run_chain_stops_at_the_first_nonzero_exit_code() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let c = calls.clone();
+        let code = run_chain(&Stage::ALL_CHAIN, move |stage| {
+            let c = c.clone();
+            async move {
+                c.lock().unwrap().push(stage);
+                if stage == Stage::Build {
+                    5
+                } else {
+                    0
+                }
+            }
+        })
+        .await;
+        assert_eq!(code, 5);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![Stage::Setup, Stage::Build],
+            "must stop before Install/Run once Build has already failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_chain_runs_every_stage_when_all_of_them_succeed() {
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let c = calls.clone();
+        let code = run_chain(&Stage::ALL_CHAIN, move |stage| {
+            let c = c.clone();
+            async move {
+                c.lock().unwrap().push(stage);
+                0
+            }
+        })
+        .await;
+        assert_eq!(code, 0);
+        assert_eq!(*calls.lock().unwrap(), Stage::ALL_CHAIN.to_vec());
+    }
+
+    #[tokio::test]
+    async fn run_all_requires_a_bottle_before_touching_run_stage() {
+        let paths = Paths::new("/nonexistent/sabrage/repo");
+        let opts = StageOptions {
+            bottle_name: Some("Sabrage-Cli-Test-Bottle-Does-Not-Exist".to_string()),
+            ..Default::default()
+        };
+        let (sink, seen) = capturing_sink();
+        let code = run_all(&paths, &opts, &sink).await;
+        assert_eq!(code, 1);
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .all(|e| !matches!(e, StageEvent::StageStarted { .. })),
+            "require_bottle must fail before any stage starts: {seen:?}"
+        );
+        assert!(seen.iter().any(|e| matches!(e, StageEvent::Fatal { .. })));
+    }
+
+    #[tokio::test]
+    async fn run_all_with_no_bottle_name_dies_before_touching_run_stage() {
+        let paths = Paths::new("/nonexistent/sabrage/repo");
+        let (sink, seen) = capturing_sink();
+        let code = run_all(&paths, &StageOptions::default(), &sink).await;
+        assert_eq!(code, 1);
+        assert!(seen
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|e| !matches!(e, StageEvent::StageStarted { .. })));
+    }
+
+    // ── Ctrl-C / SIGTERM watcher ─────────────────────────────────────────────
 
     #[test]
     fn watch_flag_invokes_the_callback_once_the_flag_is_set() {
-        // A private static, never touched by `watch_sigint`'s real
-        // `SIGINT_COUNT` — this exercises the same polling primitive in
+        // A private static, never touched by `watch_termination_signals`'s
+        // real `SIGNAL_COUNT` — this exercises the same polling primitive in
         // isolation, with no signal handler involved.
         static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
         let fired = Arc::new(AtomicBool::new(false));
@@ -1293,9 +1990,9 @@ mod tests {
         // callback fired, so nothing was left reading the flag for a second
         // Ctrl-C. Exercised here via the injectable second action
         // (`watch_flag_with_second_action`) rather than
-        // `watch_flag`/`terminate_via_default_sigint_disposition` directly —
-        // that path really does `raise(SIGINT)` on the calling process, which
-        // would kill this test binary.
+        // `watch_flag`/`terminate_via_default_disposition_of_last_signal`
+        // directly — that path really does `raise()` on the calling process,
+        // which would kill this test binary.
         static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
@@ -1364,6 +2061,67 @@ mod tests {
             second_calls.load(Ordering::SeqCst),
             1,
             "the second signal of a same-interval burst must still be fatal"
+        );
+    }
+
+    #[test]
+    fn a_second_signal_of_a_different_kind_is_still_fatal_and_reraises_that_kind() {
+        // Production shares one `SIGNAL_COUNT` between the real `SIGINT` and
+        // `SIGTERM` handlers, with `LAST_SIGNAL` recording which signal
+        // number the *most recent* delivery was (see the module doc above):
+        // the first delivery of *either* kind cancels, and the second — of
+        // either kind, not necessarily the same one — is fatal and re-raises
+        // whichever one actually just arrived. Reproduced here with
+        // process-local fakes standing in for the two real handlers and
+        // `LAST_SIGNAL`, for the same reason the tests above avoid installing
+        // a real trap: a real second SIGINT/SIGTERM during a test run would
+        // kill the test binary.
+        static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
+        static TEST_LAST_KIND: AtomicI32 = AtomicI32::new(0);
+
+        let deliver = |kind: i32| {
+            TEST_LAST_KIND.store(kind, Ordering::Relaxed);
+            TEST_COUNT.fetch_add(1, Ordering::Relaxed);
+        };
+
+        let first_calls = Arc::new(AtomicUsize::new(0));
+        let reraised_kind = Arc::new(AtomicI32::new(0));
+        let f1 = first_calls.clone();
+        let rk = reraised_kind.clone();
+        watch_flag_with_second_action(
+            &TEST_COUNT,
+            move || {
+                f1.fetch_add(1, Ordering::SeqCst);
+            },
+            move || {
+                rk.store(TEST_LAST_KIND.load(Ordering::Relaxed), Ordering::SeqCst);
+            },
+        );
+
+        deliver(SIGINT); // stands in for the first Ctrl-C / `kill -INT`
+        std::thread::sleep(CTRL_C_POLL_INTERVAL * 4);
+        assert_eq!(
+            first_calls.load(Ordering::SeqCst),
+            1,
+            "first signal of either kind cancels"
+        );
+        assert_eq!(
+            reraised_kind.load(Ordering::SeqCst),
+            0,
+            "second action must not fire on the first signal"
+        );
+
+        deliver(SIGTERM); // a *different* kind arrives second — still fatal
+        std::thread::sleep(CTRL_C_POLL_INTERVAL * 4);
+        assert_eq!(
+            first_calls.load(Ordering::SeqCst),
+            1,
+            "first action must not fire again on the second signal"
+        );
+        assert_eq!(
+            reraised_kind.load(Ordering::SeqCst),
+            SIGTERM,
+            "the second signal reraises whichever kind actually arrived, not the first kind"
         );
     }
 }

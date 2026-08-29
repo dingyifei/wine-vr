@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
@@ -430,7 +431,14 @@ async fn pump<R>(
 // ── reaping ───────────────────────────────────────────────────────────────────
 
 /// One matched process.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Serializable because it is the **process identity** persisted in
+/// `session-state.json` ([`crate::session::state::SessionState`]): after a
+/// crash, `pid` alone cannot say whether the wine process still running under
+/// that number is *the* wine process this Sabrage launched, and signalling a
+/// recycled pid is the one unrecoverable mistake the reconcile path can make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ProcInfo {
     pub pid: u32,
     /// Seconds since the epoch, as reported by the OS. Distinguishes a recycled
@@ -438,6 +446,55 @@ pub struct ProcInfo {
     pub start_time: u64,
     /// The resolved executable path that matched.
     pub exe: PathBuf,
+}
+
+impl ProcInfo {
+    /// Observe one live pid, or `None` when the OS has no such process.
+    ///
+    /// Refreshes exactly that pid rather than the whole table
+    /// ([`find_processes_by_exe`] must scan everything; this must not).
+    pub fn observe(pid: u32) -> Option<ProcInfo> {
+        use sysinfo::{
+            Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind,
+        };
+
+        let refresh = ProcessRefreshKind::nothing().with_exe(UpdateKind::Always);
+        let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+        let target = SysPid::from_u32(pid);
+        sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, refresh);
+        let proc_ = sys.process(target)?;
+        Some(ProcInfo {
+            pid,
+            start_time: proc_.start_time(),
+            exe: proc_.exe().map(Path::to_path_buf).unwrap_or_default(),
+        })
+    }
+
+    /// Is the process this identity names **still the same process**?
+    ///
+    /// True iff the pid is alive *and* the pid observed right now reports the
+    /// same `start_time`. That pair is the recycled-pid guard: pids wrap, start
+    /// times do not.
+    ///
+    /// `exe` is deliberately **not** compared. CrossOver's `wine` launcher
+    /// `exec`s into the real loader, which replaces the executable image —
+    /// same pid, same start time, a different `exe` path — so an exe equality
+    /// test would classify every live session as "not mine" a few hundred
+    /// milliseconds after launch.
+    ///
+    /// A `start_time` of 0 is the "could not observe at spawn" fallback
+    /// [`crate::executor::Executor::spawn_detached`] records; it can never
+    /// equal a real start time, so such an identity reports `false` here — the
+    /// conservative answer (treat it as an identity mismatch, never signal it).
+    pub fn is_same_process(&self) -> bool {
+        if !is_alive(self.pid) {
+            return false;
+        }
+        match ProcInfo::observe(self.pid) {
+            Some(current) => current.start_time == self.start_time,
+            None => false,
+        }
+    }
 }
 
 /// Every running process whose executable **is** `path`, ordered by pid.
@@ -470,6 +527,119 @@ pub fn find_processes_by_exe(path: &Path) -> Vec<ProcInfo> {
         .collect();
     found.sort_by_key(|p| p.pid);
     found
+}
+
+/// True when any element of `cmd` — or the whitespace-joined command line as a
+/// whole, the shape `pgrep -f` scans — contains `needle`.
+///
+/// Wine puts the game's own path on the command line as a single `Z:\...`
+/// Windows-path argument (e.g. `Z:\repo\…\Beat Saber.exe`), so per-element and
+/// whole-line matching agree in the real case; both are checked so a
+/// hypothetical split across two argv elements still matches.
+///
+/// Lives here (rather than beside its first caller in
+/// [`crate::stages::stop`]) because Phase 3 needs the same shape twice more:
+/// run.sh's wineserver-timeout warning quotes `pgrep -lf wineserver`, and the
+/// cancellation teardown probes for survivors the same way.
+pub fn cmdline_contains(cmd: &[String], needle: &str) -> bool {
+    cmd.iter().any(|arg| arg.contains(needle)) || cmd.join(" ").contains(needle)
+}
+
+/// Every running process whose command line matches [`cmdline_contains`] for
+/// `needle`, pid-ordered — the argv-based match `pgrep -f` performs, unlike
+/// [`find_processes_by_exe`]'s exact exe-path equality (used by the reap
+/// steps). See this module's header, and PARITY.md "Stop", for why the two
+/// probes make opposite trade-offs on purpose.
+pub fn find_processes_by_cmdline(needle: &str) -> Vec<ProcInfo> {
+    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+
+    let refresh = ProcessRefreshKind::nothing()
+        .with_exe(UpdateKind::Always)
+        .with_cmd(UpdateKind::Always);
+    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
+    let mut found: Vec<ProcInfo> = sys
+        .processes()
+        .iter()
+        .filter_map(|(pid, proc_)| {
+            let cmd: Vec<String> = proc_
+                .cmd()
+                .iter()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect();
+            cmdline_contains(&cmd, needle).then(|| ProcInfo {
+                pid: pid.as_u32(),
+                start_time: proc_.start_time(),
+                exe: proc_.exe().map(Path::to_path_buf).unwrap_or_default(),
+            })
+        })
+        .collect();
+    found.sort_by_key(|p| p.pid);
+    found
+}
+
+// ── read-only probes ──────────────────────────────────────────────────────────
+
+/// What [`capture`] came back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Captured {
+    pub status: ExitStatus,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl Captured {
+    /// `stdout` with trailing newlines stripped, the way `$(…)` capture works.
+    pub fn stdout_trimmed(&self) -> &str {
+        self.stdout.trim_end_matches('\n')
+    }
+}
+
+/// Run a **read-only probe** and capture both pipes.
+///
+/// For the handful of run-stage probes whose *output* is the point and whose
+/// effect is nil: `adb devices`, `adb forward --list`,
+/// `SwitchAudioSource -a -t output`, `SwitchAudioSource -c -t output`. Those
+/// are the same class of thing the check layer already shells out to directly,
+/// and streaming them as [`StageEvent::Output`] would print machine-readable
+/// noise the shell never prints.
+///
+/// **Mutations must never come through here.** `adb forward`,
+/// `adb forward --remove`, `adb reverse --remove-all`,
+/// `SwitchAudioSource -t output -s …`, `wineserver -k` and every other write
+/// go through [`crate::executor::Executor::run_child`], which is what makes
+/// `--dry-run` plan them instead of performing them. A probe routed through
+/// this function is invisible to the plan — correct for a probe, a silent
+/// dry-run hole for anything else.
+///
+/// stdin is `/dev/null`; there is no process group and no cancellation hook
+/// (these all return in milliseconds), and `spec.env_path` is applied so a
+/// Finder-launched `.app` still finds `adb` (see [`default_child_path`]).
+pub async fn capture(spec: &ChildSpec) -> Result<Captured> {
+    let mut cmd = tokio::process::Command::new(&spec.program);
+    cmd.args(&spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    if let Some(dir) = &spec.cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    if let Some(path) = &spec.env_path {
+        cmd.env("PATH", path);
+    }
+    let out = cmd
+        .output()
+        .await
+        .map_err(|e| SabrageError::io(PathBuf::from(&spec.program), e))?;
+    Ok(Captured {
+        status: out.status,
+        stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
+        stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
+    })
 }
 
 fn signal_pid(pid: u32, sig: Signal) -> std::io::Result<()> {
@@ -694,5 +864,111 @@ mod tests {
         assert_eq!(s.cwd, Some(PathBuf::from("/repo")));
         assert_eq!(s.env_path.as_deref(), Some("/opt/homebrew/bin"));
         assert_eq!(s.kill_grace, DEFAULT_KILL_GRACE);
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    use crate::events::step;
+    use uuid::Uuid;
+
+    #[test]
+    fn observing_this_process_agrees_with_the_full_scan() {
+        let me = std::process::id();
+        let observed = ProcInfo::observe(me).expect("own pid is observable");
+        assert_eq!(observed.pid, me);
+        assert!(observed.start_time > 0);
+
+        // The single-pid refresh and the whole-table scan must agree.
+        let exe = std::env::current_exe().unwrap();
+        let scanned = find_processes_by_exe(&exe)
+            .into_iter()
+            .find(|p| p.pid == me)
+            .expect("own pid in the scan");
+        assert_eq!(scanned.start_time, observed.start_time);
+
+        // A pid that cannot exist for this user.
+        assert!(ProcInfo::observe(u32::MAX - 1).is_none());
+    }
+
+    #[test]
+    fn identity_rejects_a_recycled_pid_and_the_unobservable_fallback() {
+        let mut me = ProcInfo::observe(std::process::id()).unwrap();
+        assert!(me.is_same_process());
+
+        // Same pid, different start time = a recycled pid: never ours.
+        me.start_time += 1;
+        assert!(!me.is_same_process());
+
+        // The spawn-time fallback (start_time 0) is deliberately unverifiable.
+        let fallback = ProcInfo {
+            pid: std::process::id(),
+            start_time: 0,
+            exe: PathBuf::from("/bin/sh"),
+        };
+        assert!(!fallback.is_same_process());
+
+        // A dead pid is not the same process either.
+        let dead = ProcInfo {
+            pid: u32::MAX - 1,
+            start_time: 1,
+            exe: PathBuf::new(),
+        };
+        assert!(!dead.is_same_process());
+    }
+
+    #[test]
+    fn proc_info_round_trips_as_camel_case_json() {
+        let p = ProcInfo {
+            pid: 4242,
+            start_time: 1786300214,
+            exe: PathBuf::from("/bin/sh"),
+        };
+        let j = serde_json::to_value(&p).unwrap();
+        assert_eq!(j["startTime"], 1786300214u64);
+        assert_eq!(j["pid"], 4242);
+        assert_eq!(serde_json::from_value::<ProcInfo>(j).unwrap(), p);
+    }
+
+    #[tokio::test]
+    async fn capture_collects_both_pipes_and_the_status() {
+        let spec = ChildSpec::new("/bin/sh", step::BUILD_TOOLS, Uuid::nil())
+            .arg("-c")
+            .arg("printf 'devices\\n'; printf 'oops\\n' >&2; exit 2");
+        let out = capture(&spec).await.unwrap();
+        assert_eq!(out.stdout, "devices\n");
+        assert_eq!(out.stdout_trimmed(), "devices");
+        assert_eq!(out.stderr, "oops\n");
+        assert_eq!(exit_code_of(out.status), 2);
+
+        // A missing program is an Io error naming it, not a panic.
+        let missing = ChildSpec::new("/nonexistent/sabrage/adb", step::BUILD_TOOLS, Uuid::nil());
+        assert_eq!(capture(&missing).await.unwrap_err().kind(), "io");
+    }
+
+    #[test]
+    fn cmdline_matching_is_the_pgrep_f_shape() {
+        assert!(cmdline_contains(
+            &["wine".into(), "Z:\\games\\Beat Saber.exe".into()],
+            "Beat Saber.exe"
+        ));
+        // Split across two argv elements still matches via the joined line.
+        assert!(cmdline_contains(
+            &["Beat".into(), "Saber.exe".into()],
+            "Beat Saber.exe"
+        ));
+        assert!(!cmdline_contains(&["wineserver".into()], "Beat Saber.exe"));
+        assert!(!cmdline_contains(&[], "Beat Saber.exe"));
+        // The scan itself finds this test binary, whose argv carries the
+        // filter name — the same false-positive class `pgrep -f` has, which is
+        // why the reap steps match on the exe path instead (module header).
+        let me = std::process::id();
+        let filter = std::env::args().nth(1).unwrap_or_default();
+        if !filter.is_empty() {
+            assert!(find_processes_by_cmdline(&filter)
+                .iter()
+                .any(|p| p.pid == me));
+        }
     }
 }

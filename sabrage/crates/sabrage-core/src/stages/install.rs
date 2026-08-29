@@ -548,6 +548,17 @@ mod tests {
             self.inner.touch(path)
         }
 
+        fn spawn_detached<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+            stdio: crate::executor::DetachedStdio,
+        ) -> crate::executor::BoxFuture<'a, Result<Option<crate::executor::DetachedChild>>>
+        {
+            // install never launches anything detached; delegate rather than
+            // unreachable!(), so the fake stays a faithful pass-through.
+            self.inner.spawn_detached(spec, stdio)
+        }
+
         fn run_child<'a>(
             &'a self,
             spec: &'a crate::process::ChildSpec,

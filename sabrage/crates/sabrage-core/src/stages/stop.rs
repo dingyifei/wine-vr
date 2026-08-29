@@ -16,6 +16,22 @@
 //!    output is still `BlackHole 2ch`; otherwise report the current device.
 //!    Silent entirely when `SwitchAudioSource` is not installed.
 //!
+//! Between 3 and 4 sits the one thing stop.sh cannot do:
+//! [`crate::session::reconcile::finish_stopped_session`] reads
+//! `session-state.json` and, when the wine pid it names is now dead, actually
+//! **restores** the previous session's guards — the audio device above all —
+//! instead of only warning about them. It runs *before* [`report_audio`] on
+//! purpose, so the `stop.4.audio` row reports the device it just put back.
+//! Its rows carry their own step (`session.reconcile`) and its own section
+//! banner; a `stop` with no leftover record emits nothing at all and step 4
+//! reads exactly as it always did. Being additive, it is also not allowed to
+//! *cost* this stage anything: it reports its own failures and returns
+//! `Ok(())`, so the only error it can hand back is
+//! [`SabrageError::Cancelled`] (its own "Failure policy" section). The `?`
+//! below is therefore the cancellation path, not an abort path — a broken
+//! `SwitchAudioSource` or `adb` recorded by the previous session must never
+//! stop this one from reporting the ports and the audio device.
+//!
 //! # Mutations go through the executor
 //!
 //! `wineserver -k`/`-w` and every reap kill are spawned via
@@ -60,8 +76,11 @@
 //!
 //! # Declared divergences (see `sabrage/PARITY.md`)
 //!
-//! * The survivor probe is **argv-based by design**: [`find_processes_by_cmdline`]
-//!   scans each process's command line (`sysinfo`'s `cmd()`, refreshed
+//! * The survivor probe is **argv-based by design**:
+//!   [`crate::process::find_processes_by_cmdline`] (moved there in Phase 3 —
+//!   run.sh's wineserver-timeout warning and the cancellation teardown need
+//!   the same probe)
+//!   which scans each process's command line (`sysinfo`'s `cmd()`, refreshed
 //!   alongside `exe()`) for the substring `"Beat Saber.exe"` — the same shape
 //!   `pgrep -f 'Beat Saber.exe'` matches, including the `Z:\...\Beat
 //!   Saber.exe` Windows-path form Wine puts on the game's argv even though the
@@ -79,6 +98,14 @@
 //!   mentioning the path) is a worse failure mode there than an
 //!   under-detecting probe would be here, so the two steps make opposite
 //!   trade-offs on purpose.
+//! * The **persisted guard restore** between steps 3 and 4
+//!   ([`crate::session::reconcile::finish_stopped_session`]) has no shell
+//!   counterpart at all: `run.sh`'s guards are shell traps, which a `SIGKILL`
+//!   or a power loss skips entirely, and `stop.sh` can therefore only *warn*
+//!   that the Mac's output is still `BlackHole 2ch` with nothing on the machine
+//!   able to say what it was before. This is additive — it changes no shell
+//!   text, and with no `session-state.json` on disk the stage behaves exactly
+//!   as before.
 //! * [`stale_listeners`] and its `lsof` invocation duplicate
 //!   `checks::network`'s private `stale_listeners()` byte-for-byte (same args,
 //!   same `awk`-shaped parse). That function is private to its module and this
@@ -88,29 +115,23 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
-use std::time::Duration;
 
 use crate::error::{Result, SabrageError};
 use crate::events::{step, StepId};
 use crate::paths::{which, Bottle};
-use crate::process::{self, ProcInfo};
+use crate::process::{self, find_processes_by_cmdline, ProcInfo};
 use crate::stages::{require_bottle, StageCtx};
 
-/// How long to wait for `wineserver -w` to return before giving up on it.
+/// How long to wait for `wineserver -w` to return before giving up on it —
+/// 4 s, never fatal.
 ///
-/// Mirrors `lib.sh`'s `stop_wine` polling loop (`for _i in {1..40}; do … sleep
-/// 0.1; done`, i.e. ~4 s of best-effort waiting, never fatal) as one bounded
-/// wait rather than a hand-rolled poll loop.
-///
-/// This — and a `RUN_WINESERVER_WAIT` counterpart for Phase 3's launch
-/// preflight (`lib.sh`'s run-side wait is a *fatal* 5 s budget) — belongs in
-/// `stages/mod.rs` so both stages share one named constant; that file is not
-/// this task's to edit, so it is defined here instead. Reported for the run
-/// agent to relocate/duplicate when Phase 3 lands.
-pub const STOP_WINESERVER_WAIT: Duration = Duration::from_secs(4);
+/// Relocated to [`crate::stages`] in Phase 3, next to its deliberately
+/// distinct sibling [`crate::stages::RUN_WINESERVER_WAIT`] (5 s, fatal), and
+/// re-exported here so `stop::STOP_WINESERVER_WAIT` keeps resolving.
+pub use crate::stages::STOP_WINESERVER_WAIT;
 
 /// The substring `pgrep -f 'Beat Saber.exe'` matches on argv — matched the
-/// same way here by [`find_processes_by_cmdline`] (see the module docs'
+/// same way here by [`crate::process::find_processes_by_cmdline`] (see the module docs'
 /// "argv-based by design" note). Also the exe-basename fallback text in
 /// [`format_survivors`] when a survivor's exe path has no file name.
 const BEAT_SABER_EXE_SUFFIX: &str = "Beat Saber.exe";
@@ -149,6 +170,12 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         None,
     )
     .await?;
+    checkpoint(ctx)?;
+    // Sabrage-only: finish the *previous* session's teardown (restore the audio
+    // device, close its dashboard, drop its `--wired` forwards) now that its
+    // wine process is gone, so the audio row below reports the restored device.
+    // `?` here only ever propagates cancellation — see the module docs.
+    crate::session::reconcile::finish_stopped_session(ctx).await?;
     checkpoint(ctx)?;
     report_audio(ctx).await;
     checkpoint(ctx)?;
@@ -216,51 +243,6 @@ async fn stop_wine(ctx: &StageCtx, bottle: &Bottle) -> Result<()> {
         .env("WINEPREFIX", prefix);
     let _ = tokio::time::timeout(STOP_WINESERVER_WAIT, ctx.executor.run_child(&wait)).await;
     checkpoint(ctx)
-}
-
-/// True when any element of `cmd` — or the whitespace-joined command line as a
-/// whole, the shape `pgrep -f` scans — contains `needle`. Wine puts the game's
-/// own path on the command line as a single `Z:\...` Windows-path argument
-/// (e.g. `Z:\repo\ext\oxrsys\build-x64\Beat Saber.exe`), so per-element and
-/// whole-line matching agree in the real case; both are checked so a
-/// hypothetical split across two argv elements still matches.
-fn cmdline_contains(cmd: &[String], needle: &str) -> bool {
-    cmd.iter().any(|arg| arg.contains(needle)) || cmd.join(" ").contains(needle)
-}
-
-/// Every running process whose command line matches [`cmdline_contains`] for
-/// `needle`, pid-ordered — the argv-based match `pgrep -f` performs, unlike
-/// [`crate::process::find_processes_by_exe`]'s exact exe-path equality (used
-/// by the two reap steps). Not exposed by `crate::process` — this file's
-/// ownership does not extend there — so it lives here as a small local
-/// counterpart to that function, over `sysinfo`'s `cmd()` instead of `exe()`.
-fn find_processes_by_cmdline(needle: &str) -> Vec<ProcInfo> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
-
-    let refresh = ProcessRefreshKind::nothing()
-        .with_exe(UpdateKind::Always)
-        .with_cmd(UpdateKind::Always);
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
-
-    let mut found: Vec<ProcInfo> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, proc_)| {
-            let cmd: Vec<String> = proc_
-                .cmd()
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            cmdline_contains(&cmd, needle).then(|| ProcInfo {
-                pid: pid.as_u32(),
-                start_time: proc_.start_time(),
-                exe: proc_.exe().map(Path::to_path_buf).unwrap_or_default(),
-            })
-        })
-        .collect();
-    found.sort_by_key(|p| p.pid);
-    found
 }
 
 /// `"<pid> <exe-basename>"` per survivor, space-joined with a trailing space —
@@ -468,9 +450,12 @@ async fn report_audio(ctx: &StageCtx) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Moved to `crate::process` in Phase 3; the tests below still cover it
+    // here because this file is where its one production caller lives.
     use crate::events::Severity;
     use crate::executor::{DryRunExecutor, Executor, PlannedKind};
     use crate::paths::Paths;
+    use crate::process::cmdline_contains;
     use crate::stages::{null_sink, StageCtx, StageOptions};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
@@ -677,13 +662,25 @@ mod tests {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let s = seen.clone();
         let sink: crate::stages::EventSink = Arc::new(move |ev| s.lock().unwrap().push(ev));
-        let ctx = StageCtx::new(
-            Paths::new("/nonexistent/sabrage-stop-test"),
-            opts,
-            sink,
-            CancellationToken::new(),
-        );
+        let mut paths = Paths::new("/nonexistent/sabrage-stop-test");
+        // Load-bearing: `run` reconciles `session-state.json` between steps 3
+        // and 4, and `Paths::new` derives that path from the real `$HOME`.
+        // Without this override a stop test would read — and with a real
+        // executor delete — the developer's own live session record.
+        paths.sabrage_appsup = scratch_dir();
+        let ctx = StageCtx::new(paths, opts, sink, CancellationToken::new());
         (ctx, seen)
+    }
+
+    /// A unique path under the system temp dir. **Not** created: tests that only
+    /// need "no session record here" want it absent, and the one test that
+    /// writes a record creates it itself.
+    fn scratch_dir() -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "sabrage-stop-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ))
     }
 
     #[tokio::test]
@@ -882,6 +879,120 @@ mod tests {
                  (wineserver={wineserver:?}): {evs:?}"
             );
         }
+    }
+
+    // ── the reconcile pass may not cost the stage its last rows (finding #6) ──
+
+    /// A pid no process can have on macOS (`kern.maxproc` is five digits), so
+    /// the recorded wine process classifies as `Dead` without a pid-reuse race.
+    /// Deliberately not `u32::MAX`, which is `-1` as an `i32`.
+    const DEAD_PID: u32 = 2_147_483_646;
+
+    /// Finding #6, at the stage level. The reconcile pass between steps 3 and 4
+    /// is *additive*, so a failure inside it must be reported rather than abort
+    /// the stage on the way to the ports and audio rows — `stop.sh` has no step
+    /// that can end the script.
+    ///
+    /// Made to fail deterministically and machine-independently: the record
+    /// carries a `--wired` forward and `adb` points at a path that does not
+    /// exist, so the `forward --remove` child fails at `spawn` with `ENOENT`.
+    /// That is the exact `Err` shape `stop::run`'s `?` used to hand upward.
+    /// Nothing is spawned, signalled or written anywhere on the machine: no
+    /// wineserver, nothing matching either reap path, and the store is a fresh
+    /// temp directory.
+    #[tokio::test]
+    async fn a_failed_reconcile_is_reported_and_the_stage_still_reaches_its_audio_row() {
+        use crate::session::state::{self, SessionState, WiredForward};
+
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let (mut ctx, seen) = test_ctx(StageOptions {
+            dry_run: false,
+            bottle_name: Some("SabrageStopTest".to_string()),
+            ..Default::default()
+        });
+        assert!(!ctx.executor.is_dry_run());
+        ctx.bottle = Some(Bottle::unvalidated("SabrageStopTest"));
+        ctx.paths.sabrage_appsup = dir.clone();
+        ctx.paths.wineserver = None;
+        ctx.paths.oxr_helper_staged = PathBuf::from("/nonexistent/sabrage/helper");
+        ctx.paths.alvr_dashboard = PathBuf::from("/nonexistent/sabrage/dashboard");
+        ctx.paths.adb = Some(dir.join("bin/adb"));
+
+        let mut state = SessionState::new(
+            uuid::Uuid::new_v4(),
+            "SabrageStopTest",
+            "/games/Beat Saber 1294",
+            "/repo/logs/beatsaber-20260829-101112.log",
+            1_786_300_214_181,
+        );
+        state.wine = Some(ProcInfo {
+            pid: DEAD_PID,
+            start_time: 1,
+            exe: PathBuf::from("/nonexistent/sabrage/wine"),
+        });
+        state.wired_forwards = vec![WiredForward {
+            serial: "1WMHH000X00000".to_string(),
+            port: 9943,
+        }];
+        let path = ctx.paths.session_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut bytes = serde_json::to_vec_pretty(&state).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&path, bytes).unwrap();
+
+        crate::stages::run_stage_holding_lock(crate::stages::Stage::Stop, &ctx)
+            .await
+            .expect("a failed reconcile must not fail the stop stage");
+
+        let evs = seen.lock().unwrap().clone();
+        assert!(
+            evs.iter()
+                .any(|e| matches!(e, crate::events::StageEvent::StageFinished { ok: true, .. })),
+            "{evs:?}"
+        );
+        let lines: Vec<(Severity, Option<String>, String)> = evs
+            .iter()
+            .filter_map(|e| match e {
+                crate::events::StageEvent::Line {
+                    severity,
+                    step,
+                    text,
+                    ..
+                } => Some((*severity, step.clone(), text.clone())),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            lines.iter().any(|(sev, step, text)| *sev == Severity::Warn
+                && step.as_deref() == Some(crate::session::reconcile::STEP)
+                && text.starts_with("previous session not fully restored: ")),
+            "the failure is reported: {lines:?}"
+        );
+        // …and the two steps that come after it still ran.
+        assert!(
+            lines
+                .iter()
+                .any(|(_, step, _)| step.as_deref() == Some(step::STOP_PORTS)),
+            "report_ports never ran: {lines:?}"
+        );
+        let audio_rows = lines
+            .iter()
+            .filter(|(_, step, _)| step.as_deref() == Some(step::STOP_AUDIO))
+            .count();
+        if which("SwitchAudioSource").is_some() {
+            // One row normally; two when this Mac's output happens to be sitting
+            // on BlackHole 2ch (warn + restore hint). Either proves step 4 ran,
+            // which is what a failed reconcile used to cost.
+            assert!(audio_rows >= 1, "the audio row is the point: {lines:?}");
+        } else {
+            assert_eq!(audio_rows, 0, "silent without the tool: {lines:?}");
+        }
+        assert!(
+            state::load(&path).unwrap().is_some(),
+            "the record is kept so the next stop can retry"
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// The narrower window finding #3 named: cancellation landing after the

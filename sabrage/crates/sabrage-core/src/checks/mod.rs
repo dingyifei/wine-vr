@@ -524,12 +524,15 @@ pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
         .collect();
 
     if strict {
-        // Run-only preflights have no doctor evaluator BY DESIGN (their
-        // launch-preflight implementations land in Phase 2), so strictness
-        // covers every group except NO_DOCTOR_ROW_GROUP.
+        // Every contract slug is bound, run-only preflights included: they have
+        // no doctor *row* ([`NO_DOCTOR_ROW_GROUP`] keeps them out of
+        // [`Registry::doctor_checks`]), but they do have evaluators, which the
+        // launch preflight resolves through this same registry. There is no
+        // group-shaped exemption left — a slug added to the contract without an
+        // evaluator is an immediate hard error wherever it lives.
         let missing: Vec<String> = checks
             .iter()
-            .filter(|c| c.eval.is_none() && c.spec.group != NO_DOCTOR_ROW_GROUP)
+            .filter(|c| c.eval.is_none())
             .map(|c| c.slug().to_string())
             .collect();
         if !missing.is_empty() {
@@ -540,10 +543,11 @@ pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
     Ok(Registry { checks })
 }
 
-/// The registry, built strictly: every doctor-visible contract slug must have
-/// a bound evaluator (run-only preflights excepted — Phase 2 binds those on
-/// the launch path). "Added a slug to the contract, forgot the evaluator" is
-/// an immediate hard error here, which is the point.
+/// The registry, built strictly: **every** contract slug must have a bound
+/// evaluator, run-only preflights included ([`run_only`] binds those; they are
+/// hidden from doctor by [`Registry::doctor_checks`], not by being unbound).
+/// "Added a slug to the contract, forgot the evaluator" is an immediate hard
+/// error here, which is the point.
 pub fn registry() -> Registry {
     build_registry(true).expect("evaluator registrations are consistent with the contract")
 }
@@ -618,19 +622,15 @@ mod tests {
 
     #[test]
     fn unknown_and_duplicate_registrations_are_errors_even_leniently() {
-        // Every doctor-visible slug is bound, so BOTH builds must succeed —
-        // strictness only exempts the run-only group (Phase 2 binds those on
-        // the launch path, never here).
+        // Every contract slug is bound, so BOTH builds must succeed and
+        // strictness now exempts nothing at all.
         assert!(build_registry(false).is_ok());
         assert!(build_registry(true).is_ok());
-        // The only unbound slugs are the run-only preflights.
-        for slug in registry().unbound() {
-            assert_eq!(
-                contract().check(slug).unwrap().group,
-                NO_DOCTOR_ROW_GROUP,
-                "unbound slug {slug} is not a run-only preflight"
-            );
-        }
+        assert!(
+            registry().unbound().is_empty(),
+            "unbound slugs: {:?}",
+            registry().unbound()
+        );
     }
 
     #[test]
@@ -641,7 +641,13 @@ mod tests {
         let ctx = CheckCtx::new(Paths::new("/nonexistent/repo"), CheckOptions::new());
         let reg = registry();
         let visible = reg.doctor_checks().count();
-        assert_eq!(visible, reg.len() - reg.unbound().len());
+        let run_only = contract()
+            .checks
+            .iter()
+            .filter(|c| c.group == NO_DOCTOR_ROW_GROUP)
+            .count();
+        assert!(run_only > 0, "the contract still declares run-only slugs");
+        assert_eq!(visible, reg.len() - run_only);
         let mut seen = 0usize;
         let report = run_doctor_with(&reg, &ctx, &mut |_| seen += 1);
         assert_eq!(seen, visible);

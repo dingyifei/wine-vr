@@ -9,7 +9,7 @@
 // other stage) all go through this one entry point instead of each owning a
 // separate dialog instance.
 
-import type { Stage } from "../ipc";
+import type { LaunchOpts, Stage } from "../ipc";
 
 export interface GateRequest {
   stage: Stage;
@@ -17,11 +17,22 @@ export interface GateRequest {
   bsDir?: string | null;
   dryRun?: boolean;
   /**
+   * Present only when `stage === "run"`. `sessionStore.launch(launch)` has
+   * already been called (by whoever opened this gate — the Session screen's
+   * Launch/Dry-run buttons) by the time the modal mounts; GateModal does NOT
+   * call `runStage` for this stage — it reads `sessionStore.launchRows` /
+   * `sessionStore.launching` instead, and uses `launch` only to re-issue the
+   * same launch from a Retry button after a Fatal row.
+   */
+  launch?: LaunchOpts;
+  /**
    * Called once the run settles — successfully, with a Fatal, or via an
    * invoke() rejection (a cancelled run still settles one of these ways).
    * Not called again on a later Fix retry from within the same gate; that
    * retry is its own settlement and gets its own call. Doctor.svelte uses
-   * this to re-run its checks after a whole-stage fix completes.
+   * this to re-run its checks after a whole-stage fix completes. Unused for
+   * `stage === "run"` — the session store's own reactive state is the
+   * settlement signal there.
    */
   onFinished?: () => void;
 }

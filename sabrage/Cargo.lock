@@ -2886,6 +2886,7 @@ dependencies = [
 name = "sabrage-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "nix",
  "serde",
@@ -2903,6 +2904,7 @@ dependencies = [
 name = "sabrage-parity"
 version = "0.1.0"
 dependencies = [
+ "chrono",
  "hex",
  "regex",
  "sabrage-contract-gen",

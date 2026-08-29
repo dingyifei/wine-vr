@@ -580,15 +580,17 @@ mod tests {
 
         #[test]
         fn steam_appid_txt_content_has_no_trailing_newline() {
-            // run.sh: `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"` — no
-            // `sabrage-core` run stage exists yet to pin this against directly,
-            // so this test pins the *value* a future run stage must write:
-            // the contract's `game.appid`, rendered with no trailing newline
-            // (`printf '%s'`, never `print`/`println`). sabrage-core exposes
-            // this today as `contract().game.appid` (a typed `u64`, parsed
-            // from contract/pipeline.toml) rather than a dedicated
-            // `consts::BS_APPID` — that is sufficient for this golden and
-            // requires no frame change.
+            // run.sh: `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"` —
+            // `stages::run::actions::goldberg_stage` writes this file for
+            // real now, from the exact expression this test pins:
+            // `contract().game.appid.to_string()`, rendered with no trailing
+            // newline (`printf '%s'`, never `print`/`println`). This golden
+            // does not re-exercise the write itself — sabrage-core's own
+            // `goldberg_stage` tests already do that against a fixture
+            // executor — it only pins the *value and shape* the contract
+            // must keep producing, so a contract change (a different appid
+            // type, or the game section growing a formatted-string field)
+            // that would silently change the on-disk bytes fails here first.
             let appid = sabrage_core::contract().game.appid.to_string();
             assert_eq!(appid, "620980");
             assert!(!appid.ends_with('\n'));
@@ -664,25 +666,546 @@ mod tests {
         /// Hermetic mirror of sabrage-core's registry invariants so CI (which
         /// runs only this crate + contract-gen on ubuntu) gates them: the
         /// strict registry must build, cover the contract in order, and leave
-        /// no doctor-visible slug unbound. A mis-registered evaluator would
-        /// otherwise ship CI-green and panic at runtime in the CLI and app.
+        /// **no** slug unbound — run-only preflights included. A mis-registered
+        /// evaluator would otherwise ship CI-green and panic at runtime in the
+        /// CLI and app.
+        ///
+        /// Phase 3 removed the `NO_DOCTOR_ROW_GROUP` exemption `build_registry`
+        /// used to grant the three `run-only` slugs (they have no doctor
+        /// *row*, but `checks::run_only` binds a real evaluator for each, which
+        /// `stages::run::preflight` resolves through this same registry) — see
+        /// `checks::mod`'s own doc comment on `build_registry`. This test
+        /// pins that: `strict = true` now means every contract slug, with no
+        /// group-shaped carve-out left.
         #[test]
         fn strict_registry_builds_and_covers_the_contract_in_order() {
-            use sabrage_core::checks::{build_registry, NO_DOCTOR_ROW_GROUP};
-            let reg = build_registry(true)
-                .expect("strict registry builds (every doctor-visible slug bound)");
+            use sabrage_core::checks::build_registry;
+            let reg = build_registry(true).expect(
+                "strict registry builds — every contract slug, run-only preflights included, \
+                 must have a bound evaluator",
+            );
             let bound: Vec<&str> = reg.checks().iter().map(|c| c.slug()).collect();
             let declared = sabrage_core::contract().check_slugs();
             assert_eq!(bound, declared, "registry order must equal contract order");
             for c in reg.checks() {
-                if c.spec.group != NO_DOCTOR_ROW_GROUP {
-                    assert!(
-                        c.eval.is_some(),
-                        "doctor-visible slug {} has no evaluator",
-                        c.slug()
-                    );
+                assert!(
+                    c.eval.is_some(),
+                    "contract slug {} has no bound evaluator",
+                    c.slug()
+                );
+            }
+        }
+    }
+
+    // ── (7) run launch preflight <-> contract, in both directions ────────────
+
+    /// `run_sh_tags` (module 4) ties run.sh's `# preflight:`/`# launch-action:`
+    /// tags to the contract. This module closes the other side of the same
+    /// loop: the **native** slug/id lists, read from `sabrage-core` itself
+    /// rather than re-derived, must equal the same contract data. Together the
+    /// two prove shell tags == contract == native, not just shell == contract.
+    mod run_launch_preflight_parity {
+        use sabrage_core::{contract, Gate};
+
+        /// `stages::run::preflight::preflight_slugs()` — the list the launch
+        /// preflight actually walks — must be exactly the contract's
+        /// native-gating check slugs, in contract order.
+        #[test]
+        fn preflight_slugs_equal_the_contracts_native_gating_checks_in_order() {
+            let want: Vec<&str> = contract()
+                .checks
+                .iter()
+                .filter(|c| c.native_gate != Gate::None)
+                .map(|c| c.slug.as_str())
+                .collect();
+            assert_eq!(
+                sabrage_core::stages::run::preflight::preflight_slugs(),
+                want,
+                "preflight_slugs() must be exactly contract().checks with native_gate != none, \
+                 in contract order"
+            );
+        }
+
+        /// `stages::run::actions::LAUNCH_ACTION_IDS` — the Rust constant the
+        /// launch stage actually executes in order — must equal the contract's
+        /// `[[launch_action]]` ids, in order, and there must be exactly 7 of
+        /// them: run.sh's seven `# launch-action:` tags (checked against the
+        /// contract by `run_sh_tags::launch_action_tags_match_the_contracts_order`),
+        /// the contract's own `[[launch_action]]` table, and this constant.
+        #[test]
+        fn launch_action_ids_equal_the_contracts_order_and_there_are_exactly_seven() {
+            let want: Vec<&str> = contract()
+                .launch_actions
+                .iter()
+                .map(|a| a.id.as_str())
+                .collect();
+            assert_eq!(
+                want.len(),
+                7,
+                "the contract must declare exactly 7 launch actions"
+            );
+            assert_eq!(
+                sabrage_core::stages::run::actions::LAUNCH_ACTION_IDS.to_vec(),
+                want,
+                "LAUNCH_ACTION_IDS must equal contract().launch_actions' ids, in order"
+            );
+        }
+    }
+
+    // ── (8) launch artifact/behavior goldens ──────────────────────────────────
+
+    mod launch_goldens {
+        use sabrage_core::executor::PlannedKind;
+        use sabrage_core::{contract, Bottle, Paths, StageCtx, StageOptions};
+        use std::path::{Path, PathBuf};
+        use std::sync::Arc;
+
+        /// A dependency-free `block_on`.
+        ///
+        /// `sabrage-parity` carries no async runtime at all — every dependency
+        /// in `Cargo.toml` is a `dev-dependency`, and none of them is `tokio`
+        /// (adding one is a `Cargo.toml` edit outside this crate's ownership
+        /// this phase). Every `DryRunExecutor` method
+        /// [`sabrage_core::stages::run::actions::goldberg_stage`] drives
+        /// (`copy_if_changed`/`write_atomic`/`create_dir_all`) is
+        /// `Box::pin(async move { … Ok(…) })` with no real `.await` inside — it
+        /// resolves on the very first poll — so a hand-rolled poll loop over
+        /// [`std::task::Waker::noop`] (stable since 1.85) drives it to
+        /// completion with no dependency at all.
+        fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+            use std::task::{Context, Poll, Waker};
+            let waker = Waker::noop();
+            let mut cx = Context::from_waker(waker);
+            let mut fut = Box::pin(fut);
+            loop {
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(v) => return v,
+                    Poll::Pending => std::thread::yield_now(),
                 }
             }
+        }
+
+        fn scratch(tag: &str) -> PathBuf {
+            let p = std::env::temp_dir().join(format!(
+                "sabrage-parity-launch-{tag}-{}",
+                std::process::id()
+            ));
+            std::fs::remove_dir_all(&p).ok();
+            std::fs::create_dir_all(&p).unwrap();
+            p
+        }
+
+        fn silent_sink() -> sabrage_core::EventSink {
+            Arc::new(|_| {})
+        }
+
+        // ── steam_appid.txt bytes ────────────────────────────────────────────
+
+        /// run.sh:150 — `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"`:
+        /// the appid digits, and nothing else — no trailing newline. Driven
+        /// through the real `actions::goldberg_stage` under `--dry-run` (never
+        /// a copy of its recipe), so a call-site regression — util's helper is
+        /// right and the call site passes something else, exactly the bug the
+        /// Phase-2 review found on the host manifest — would turn this red:
+        /// the plan's `Write` action for `steam_appid.txt` records `"<n>
+        /// bytes"`, and `n` must equal the appid string's own length with no
+        /// byte added or dropped.
+        #[test]
+        fn steam_appid_txt_is_written_as_exactly_the_appid_digits_with_no_trailing_newline() {
+            let root = scratch("goldberg");
+            let bs_dir = root.join("BeatSaber");
+            std::fs::create_dir_all(&bs_dir).unwrap();
+            // The game-root fallback `steam_api_path` checks second — no
+            // plugin subdirectory needed for this golden.
+            std::fs::write(bs_dir.join("steam_api64.dll"), b"steam").unwrap();
+
+            let paths = Paths::new(&root);
+            std::fs::create_dir_all(paths.gbe_dll.parent().unwrap()).unwrap();
+            std::fs::write(&paths.gbe_dll, b"goldberg-bytes").unwrap();
+
+            let opts = StageOptions {
+                bs_dir_override: Some(bs_dir),
+                dry_run: true,
+                ..StageOptions::default()
+            };
+            let ctx = StageCtx::new(paths, opts, silent_sink(), Default::default());
+
+            block_on(sabrage_core::stages::run::actions::goldberg_stage(&ctx))
+                .expect("a dry run plans goldberg-stage cleanly, never errors");
+
+            let appid = contract().game.appid.to_string();
+            assert_eq!(appid, "620980");
+            assert!(!appid.ends_with('\n'), "printf '%s', never print/println");
+
+            let plan = ctx.executor.planned();
+            let appid_write = plan
+                .iter()
+                .find(|a| {
+                    a.kind == PlannedKind::Write
+                        && a.dst
+                            .as_deref()
+                            .is_some_and(|d| d.ends_with("steam_appid.txt"))
+                })
+                .expect("steam_appid.txt is planned by goldberg_stage");
+            assert_eq!(
+                appid_write.reason,
+                format!("{} bytes", appid.len()),
+                "steam_appid.txt must be exactly the appid digits — no trailing newline, \
+                 no other byte"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // ── wine_env ─────────────────────────────────────────────────────────
+
+        /// run.sh:242-248, table form. The load-bearing branch is `WINEDEBUG`:
+        /// the caller's preset wins in **both** the verbose and non-verbose
+        /// arms (`${WINEDEBUG:-…}`), and an inherited empty string is treated
+        /// like unset (zsh's `:-`, not `-`).
+        #[test]
+        fn wine_env_table() {
+            use sabrage_core::stages::run::actions::wine_env;
+            let runtime_json = Path::new("/repo/ext/oxrsys/build-x64/runtime/oxrsys-runtime.json");
+            let appid = 620980u64;
+
+            fn get(env: &[(String, String)], key: &str) -> String {
+                env.iter()
+                    .find(|(k, _)| k == key)
+                    .unwrap_or_else(|| panic!("{key} missing from wine_env"))
+                    .1
+                    .clone()
+            }
+
+            let env = wine_env(false, None, appid, runtime_json);
+            assert_eq!(get(&env, "WINEDEBUG"), "-all");
+            assert_eq!(
+                get(&env, "XR_RUNTIME_JSON"),
+                runtime_json.display().to_string()
+            );
+            assert_eq!(get(&env, "CX_GRAPHICS_BACKEND"), "dxmt");
+            assert_eq!(get(&env, "SteamAppId"), "620980");
+            assert_eq!(get(&env, "SteamGameId"), "620980");
+
+            assert_eq!(
+                get(&wine_env(true, None, appid, runtime_json), "WINEDEBUG"),
+                "fixme-all,+openxr"
+            );
+
+            // Caller-set WINEDEBUG wins in BOTH branches.
+            assert_eq!(
+                get(
+                    &wine_env(false, Some("+d3d11"), appid, runtime_json),
+                    "WINEDEBUG"
+                ),
+                "+d3d11"
+            );
+            assert_eq!(
+                get(
+                    &wine_env(true, Some("+d3d11"), appid, runtime_json),
+                    "WINEDEBUG"
+                ),
+                "+d3d11"
+            );
+
+            // An inherited empty value is treated like unset.
+            assert_eq!(
+                get(&wine_env(false, Some(""), appid, runtime_json), "WINEDEBUG"),
+                "-all"
+            );
+            assert_eq!(
+                get(&wine_env(true, Some(""), appid, runtime_json), "WINEDEBUG"),
+                "fixme-all,+openxr"
+            );
+        }
+
+        // ── wine_spec argv ───────────────────────────────────────────────────
+
+        /// `"$WINE" --bottle "$WINEVR_BOTTLE" --no-update --cx-app "$BS_WIN"`.
+        #[test]
+        fn wine_spec_argv_matches_run_shs_command_line() {
+            let root = scratch("winespec");
+            let mut paths = Paths::new(&root);
+            paths.wine = Some(root.join("CrossOver/bin/wine"));
+
+            let opts = StageOptions {
+                bottle_name: Some("Steam".to_string()),
+                bs_dir_override: Some(root.join("BeatSaber")),
+                ..StageOptions::default()
+            };
+            let ctx = StageCtx::new(paths, opts, silent_sink(), Default::default());
+            let bottle = Bottle::unvalidated("Steam");
+
+            let spec = sabrage_core::stages::run::actions::wine_spec(&ctx, &bottle);
+            assert_eq!(
+                spec.program,
+                ctx.paths.wine.clone().unwrap().into_os_string()
+            );
+
+            let want_win = sabrage_core::util::win_path(
+                Some(&bottle.prefix),
+                &ctx.bs_dir.join("Beat Saber.exe"),
+            );
+            let want_args: Vec<std::ffi::OsString> =
+                ["--bottle", "Steam", "--no-update", "--cx-app"]
+                    .into_iter()
+                    .map(std::ffi::OsString::from)
+                    .chain(std::iter::once(std::ffi::OsString::from(want_win)))
+                    .collect();
+            assert_eq!(
+                spec.args, want_args,
+                "argv must be exactly: --bottle <name> --no-update --cx-app <win path>"
+            );
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+
+        // ── wine_log_candidate ───────────────────────────────────────────────
+
+        /// `date +%Y%m%d-%H%M%S` for attempt 0; Sabrage's own `-{n+1}` suffix
+        /// on a collision (declared divergence — PARITY.md).
+        #[test]
+        fn wine_log_candidate_matches_run_shs_date_stamp_and_the_dash_two_collision_suffix() {
+            use chrono::TimeZone;
+            let logs_dir = Path::new("/repo/logs");
+            let now = chrono::Local
+                .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
+                .unwrap();
+
+            let p0 = sabrage_core::logs::wine_log_candidate(logs_dir, now, 0);
+            assert_eq!(p0, logs_dir.join("beatsaber-20260829-101112.log"));
+            let re = regex::Regex::new(r"^beatsaber-\d{8}-\d{6}\.log$").unwrap();
+            assert!(
+                re.is_match(p0.file_name().unwrap().to_str().unwrap()),
+                "attempt 0's name must match run.sh's `date +%Y%m%d-%H%M%S` shape exactly"
+            );
+
+            let p1 = sabrage_core::logs::wine_log_candidate(logs_dir, now, 1);
+            assert_eq!(p1, logs_dir.join("beatsaber-20260829-101112-2.log"));
+        }
+    }
+
+    // ── (9) run.sh die/warn/banner text pinned verbatim ───────────────────────
+
+    /// `stages::run` reproduces a long list of run.sh's `die`/`warn`/`info`/
+    /// banner strings verbatim, scattered as `&str` literals across
+    /// `preflight.rs`, `actions.rs`, `guards.rs` and `mod.rs` — most of them
+    /// not contract-derived, so nothing above catches one going stale. Several
+    /// of the native functions that own this text are `pub(crate)`
+    /// (`banner_events`, `bs_win_path`), so this crate cannot call them
+    /// directly; instead every fragment below is copied **from the native
+    /// source** (confirmed against the actual `&str` literal at the call site,
+    /// not just the doc comment) and pinned here as a substring of the on-disk
+    /// `run.sh` — this module never calls native code at all.
+    ///
+    /// The two sides of the parity are pinned by two different test suites:
+    /// editing a native literal without updating `run.sh` turns
+    /// **sabrage-core's own** frozen-text unit tests red (they call the
+    /// native function directly and pin its return value —
+    /// `guards::tests::the_guard_texts_are_run_shs_verbatim`,
+    /// `mod::tests::the_closing_lines_are_run_shs_verbatim`,
+    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, and
+    /// their neighbors); editing `run.sh`'s wording without updating the
+    /// native literal turns **this module's** tests red instead, since they
+    /// only pin the same fragment as a substring of the on-disk file.
+    mod run_sh_text_parity {
+        use super::repo_root;
+
+        fn run_sh() -> String {
+            std::fs::read_to_string(repo_root().join("scripts/demo/run.sh"))
+                .expect("scripts/demo/run.sh reads")
+        }
+
+        fn assert_verbatim(text: &str, fragment: &str, native_site: &str) {
+            assert!(
+                text.contains(fragment),
+                "run.sh no longer contains {fragment:?}, which {native_site} reproduces verbatim"
+            );
+        }
+
+        #[test]
+        fn preflight_die_and_warn_text_is_verbatim_in_run_sh() {
+            let text = run_sh();
+            for (fragment, site) in [
+                (
+                    "bridge not built — ./demo.sh build",
+                    "checks::run_only::run_bridge_built",
+                ),
+                (
+                    "Goldberg dll missing — ./demo.sh setup",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "CrossOver DXMT overlay stale (CrossOver update?)",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "bottle wineopenxr.dll stale/missing",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "bottle OpenXR manifest missing",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "bottle ActiveRuntime registry key missing",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "host OpenXR registration missing",
+                    "stages::run::preflight::block_die",
+                ),
+                (
+                    "could not force graphics backend to dxmt in",
+                    "stages::run::preflight::post_fix_die",
+                ),
+                (
+                    "the Meta gate may block startup",
+                    "stages::run::preflight::gate (game.version)",
+                ),
+                (
+                    "encoder_process=inproc — in-process x86_64 encode (native helper disabled)",
+                    "stages::run::preflight::emit_encoder_notice",
+                ),
+                (
+                    "the runtime treats unknown values as auto",
+                    "stages::run::preflight::emit_encoder_notice",
+                ),
+                (
+                    "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk",
+                    "checks::run_only::run_wired_adb",
+                ),
+                (
+                    "--wired: no Quest over adb — connect USB and check 'adb devices'",
+                    "checks::run_only::run_wired_adb",
+                ),
+            ] {
+                assert_verbatim(&text, fragment, site);
+            }
+        }
+
+        #[test]
+        fn launch_action_text_is_verbatim_in_run_sh() {
+            let text = run_sh();
+            for (fragment, site) in [
+                (
+                    "kill the listed wineserver(s) manually, then re-run",
+                    "stages::run::actions::wineserver_reset",
+                ),
+                (
+                    "wineserver still alive after 5s:",
+                    "stages::run::actions::wineserver_reset (RUN_WINESERVER_WAIT = 5s)",
+                ),
+                (
+                    "resetting wineserver for bottle '",
+                    "stages::run::actions::wineserver_reset",
+                ),
+                ("wineserver down", "stages::run::actions::wineserver_reset"),
+                (
+                    "steam_api64.dll not found under",
+                    "stages::run::actions::goldberg_stage",
+                ),
+                (
+                    "backup of original steam_api64.dll failed",
+                    "stages::run::actions::goldberg_stage",
+                ),
+                (
+                    "goldberg already installed",
+                    "stages::run::actions::goldberg_stage",
+                ),
+                (
+                    "goldberg install failed",
+                    "stages::run::actions::goldberg_stage",
+                ),
+                (
+                    "cleared adb reverse tunnels (ALVR manages its own)",
+                    "stages::run::actions::adb_reverse_cleanup",
+                ),
+                (
+                    "wired mode: adb forward",
+                    "stages::run::actions::adb_forward_hygiene",
+                ),
+                (
+                    "a later non-wired run clears these two",
+                    "stages::run::actions::adb_forward_hygiene",
+                ),
+                (
+                    "cleared stale adb forward",
+                    "fixes::adb (fix.remove-adb-forwards)",
+                ),
+                (
+                    "encoder helper: reaped (left over from the runtime)",
+                    "stages::run::mod::HELPER_REAPED_LINE",
+                ),
+            ] {
+                assert_verbatim(&text, fragment, site);
+            }
+        }
+
+        #[test]
+        fn audio_and_dashboard_guard_text_is_verbatim_in_run_sh() {
+            let text = run_sh();
+            for (fragment, site) in [
+                (
+                    "audio routing disabled (--no-audio) — sound stays on the Mac",
+                    "stages::run::guards",
+                ),
+                (
+                    "could not switch output to BlackHole 2ch — audio stays on the Mac",
+                    "stages::run::guards",
+                ),
+                (
+                    "BlackHole 2ch not present (brew install blackhole-2ch + reboot) — audio stays on the Mac",
+                    "stages::run::guards",
+                ),
+                (
+                    "audio: default output -> BlackHole 2ch (was:",
+                    "stages::run::guards",
+                ),
+                (
+                    "ALVR dashboard disabled (--no-dashboard)",
+                    "stages::run::guards",
+                ),
+                (
+                    "dashboard: ALVR server dashboard opening (connects once the game is up)",
+                    "stages::run::guards",
+                ),
+                (
+                    "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)",
+                    "stages::run::guards",
+                ),
+                ("dashboard: closed", "stages::run::guards"),
+            ] {
+                assert_verbatim(&text, fragment, site);
+            }
+        }
+
+        /// run.sh:252-260's six-line banner block.
+        #[test]
+        fn the_launch_banner_lines_are_verbatim_in_run_sh() {
+            let text = run_sh();
+            for fragment in [
+                "launching Beat Saber through the bridge",
+                "   put the headset ON and open the ALVR client; first frame can take ~30s.",
+                "   pause in-game = X/A button or the Quest system button",
+                "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)",
+                "   stop: Ctrl-C here, or ./demo.sh stop --bottle",
+                "from another shell",
+                "   exe: ",
+                "   log: ",
+            ] {
+                assert_verbatim(&text, fragment, "stages::run::actions::banner_events");
+            }
+            assert_verbatim(
+                &text,
+                "wine exited with status",
+                "stages::run::mod::wine_exit_line",
+            );
+            assert_verbatim(
+                &text,
+                "interrupted: stopping wine",
+                "stages::run::mod::run (INT teardown section)",
+            );
         }
     }
 }

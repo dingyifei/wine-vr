@@ -1,6 +1,8 @@
+use std::sync::atomic::Ordering;
+
 use tauri::{
     menu::{Menu, MenuItem, PredefinedMenuItem, Submenu},
-    Manager,
+    Emitter, Manager,
 };
 
 mod commands;
@@ -67,22 +69,23 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
         ],
     )?;
 
-    // Pipeline submenu: disabled placeholders, real commands land in Phase 1+.
+    // Pipeline submenu: real commands as of Phase 3 (`on_menu_event` in `run()`
+    // below maps each id to a `menu://…` event the frontend listens for).
     let run_doctor = MenuItem::with_id(
         handle,
         "pipeline_run_doctor",
         "Run Doctor",
-        false,
+        true,
         Some("CmdOrCtrl+D"),
     )?;
     let launch = MenuItem::with_id(
         handle,
         "pipeline_launch",
         "Launch",
-        false,
+        true,
         Some("CmdOrCtrl+R"),
     )?;
-    let stop = MenuItem::with_id(handle, "pipeline_stop", "Stop", false, Some("CmdOrCtrl+."))?;
+    let stop = MenuItem::with_id(handle, "pipeline_stop", "Stop", true, Some("CmdOrCtrl+."))?;
     let pipeline_menu =
         Submenu::with_items(handle, "Pipeline", true, &[&run_doctor, &launch, &stop])?;
 
@@ -98,8 +101,24 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
     )
 }
 
+/// Builds and runs the app.
+///
+/// Uses the callback form of `run` (`.build(context)?.run(|app, event| …)`
+/// rather than `.run(context)`) specifically so `RunEvent::ExitRequested` and
+/// `RunEvent::WindowEvent { event: WindowEvent::CloseRequested, .. }` can be
+/// intercepted: this app has exactly one window, and closing it is app-quit
+/// in every way that matters (critique.md, "app-quit semantics for a live
+/// session"), so both are gated by the same rule
+/// ([`commands::should_intercept_quit`]) — only a session this process is
+/// still supervising, and only while the pending quit has not already been
+/// approved, is worth stopping the OS teardown for. When it fires, the
+/// handler calls `prevent_exit`/`prevent_close` and emits
+/// `app://quit-requested`; the frontend's dialog resolves that through
+/// `commands::resolve_quit`, whose `Stop`/`Keep` arms flip `QuitApproved`
+/// before calling `app.exit(0)` themselves — which re-enters this same
+/// handler, and this time passes through untouched.
 pub fn run() {
-    tauri::Builder::default()
+    let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Focus the existing main window instead of spawning a second instance.
             if let Some(window) = app.get_webview_window("main") {
@@ -112,15 +131,76 @@ pub fn run() {
             commands::run_stage,
             commands::cancel_stage,
             commands::fix,
-            commands::stop_session
+            commands::stop_session,
+            commands::launch,
+            commands::get_session_status,
+            commands::detach_session,
+            commands::reconcile_session,
+            commands::start_log_tail,
+            commands::stop_log_tail,
+            commands::list_past_runs,
+            commands::get_log_source_path,
+            commands::resolve_quit,
         ])
         .manage(commands::RunRegistry::default())
+        .manage(commands::TailRegistry::default())
+        .manage(commands::SessionMonitorState::default())
+        .manage(commands::QuitApproved::default())
         .setup(|app| {
             let handle = app.handle();
             let menu = build_menu(handle)?;
             app.set_menu(menu)?;
+            // Pipeline menu -> `menu://…` events; the frontend's screens are
+            // the ones that know how to actually run doctor/launch/stop.
+            app.on_menu_event(|app_handle, event| {
+                let topic = match event.id().as_ref() {
+                    "pipeline_run_doctor" => Some("menu://doctor"),
+                    "pipeline_launch" => Some("menu://launch"),
+                    "pipeline_stop" => Some("menu://stop"),
+                    _ => None,
+                };
+                if let Some(topic) = topic {
+                    let _ = app_handle.emit(topic, ());
+                }
+            });
+            commands::spawn_session_status_broadcaster(app.handle().clone());
             Ok(())
         })
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application");
+
+    // The callback form (rather than `.run(context)`) is what lets
+    // `ExitRequested`/`CloseRequested` be intercepted at all — see
+    // `commands.rs`'s module doc for why `detach_session`/`resolve_quit`
+    // exist. Both arms share one rule
+    // (`commands::should_intercept_quit`): only a session this process is
+    // still supervising, and only while the pending quit has not already
+    // been approved, is worth stopping the OS from tearing down for.
+    app.run(|app_handle, event| match event {
+        tauri::RunEvent::ExitRequested { api, .. } => {
+            let quit_approved = app_handle.state::<commands::QuitApproved>();
+            if commands::should_intercept_quit(
+                quit_approved.0.load(Ordering::SeqCst),
+                sabrage_core::live_session().is_some(),
+            ) {
+                api.prevent_exit();
+                let _ = app_handle.emit("app://quit-requested", ());
+            }
+        }
+        tauri::RunEvent::WindowEvent {
+            label,
+            event: tauri::WindowEvent::CloseRequested { api, .. },
+            ..
+        } if label == "main" => {
+            let quit_approved = app_handle.state::<commands::QuitApproved>();
+            if commands::should_intercept_quit(
+                quit_approved.0.load(Ordering::SeqCst),
+                sabrage_core::live_session().is_some(),
+            ) {
+                api.prevent_close();
+                let _ = app_handle.emit("app://quit-requested", ());
+            }
+        }
+        _ => {}
+    });
 }

@@ -29,8 +29,9 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio_util::sync::CancellationToken;
@@ -120,6 +121,9 @@ pub enum PlannedKind {
     Touch,
     /// A child process would be spawned.
     Spawn,
+    /// A child process would be spawned **detached** — surviving this process,
+    /// writing straight into a log file. Only the wine launch does this.
+    SpawnDetached,
 }
 
 impl PlannedAction {
@@ -163,6 +167,17 @@ impl PlannedAction {
                 Some(cwd) => format!("would spawn: {} (in {})", self.reason, cwd.display()),
                 None => format!("would spawn: {}", self.reason),
             },
+            // Like Spawn, `reason` is the argv; `dst` is the log file the
+            // child's stdout+stderr would be redirected into (absent = the
+            // shell's `>/dev/null 2>&1`, which is how the dashboard runs).
+            PlannedKind::SpawnDetached => {
+                let target = self
+                    .dst
+                    .as_deref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "/dev/null".to_string());
+                format!("would launch (detached): {} > {}", self.reason, target)
+            }
         }
     }
 }
@@ -279,6 +294,54 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// Spawn a child, streaming its output. Non-zero exit is returned as an
     /// `Ok(ExitStatus)`, not an error — see [`crate::process::run_ok`].
     fn run_child<'a>(&'a self, spec: &'a ChildSpec) -> BoxFuture<'a, Result<ExitStatus>>;
+
+    /// Spawn a **detached** child: its own process group, no pipes this
+    /// process pumps, and — the whole point — `kill_on_drop(false)`, so it
+    /// outlives Sabrage.
+    ///
+    /// Exactly two callers, both in the run stage: the wine launch (with
+    /// [`DetachedStdio::LogFile`]) and the ALVR dashboard (with
+    /// [`DetachedStdio::Null`], mirroring run.sh's `>/dev/null 2>&1 &`).
+    /// Everything else uses [`Executor::run_child`].
+    ///
+    /// This is the primitive [`crate::process::spawn_streamed`]'s header
+    /// forbids itself from being: that one sets `kill_on_drop(true)`, which
+    /// applied to the wine child would SIGKILL the CrossOver wine wrapper
+    /// mid-session the moment Sabrage quits — leaving wineserver and the game
+    /// running, orphaned, with the headset still streaming. Neither teardown
+    /// nor detach (design-core §3.3; critique.md, "app-quit semantics for a
+    /// live session"). App-quit runs the INT path *deliberately* or detaches
+    /// *deliberately*; it never happens as a side effect of a dropped future.
+    ///
+    /// Returns `Ok(None)` under [`DryRunExecutor`] — a dry run never spawns —
+    /// so callers must treat "no child" as the planned case, not as failure.
+    fn spawn_detached<'a>(
+        &'a self,
+        spec: &'a ChildSpec,
+        stdio: DetachedStdio,
+    ) -> BoxFuture<'a, Result<Option<DetachedChild>>>;
+}
+
+/// Where a detached child's stdout and stderr go.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DetachedStdio {
+    /// `>/dev/null 2>&1` — the ALVR dashboard.
+    Null,
+    /// Both pipes point at this one file, opened `create_new` (never
+    /// truncating an existing log) and `dup`ed so the child's own writes
+    /// interleave in order. The wine launch.
+    LogFile(PathBuf),
+}
+
+/// A live detached child plus the identity that outlives it.
+///
+/// `identity` is what gets persisted: after Sabrage restarts, `child` is gone
+/// but [`crate::process::ProcInfo::is_same_process`] can still tell the
+/// original process from a recycled pid.
+#[derive(Debug)]
+pub struct DetachedChild {
+    pub identity: process::ProcInfo,
+    pub child: tokio::process::Child,
 }
 
 // ── real ──────────────────────────────────────────────────────────────────────
@@ -493,6 +556,110 @@ impl Executor for RealExecutor {
 
     fn run_child<'a>(&'a self, spec: &'a ChildSpec) -> BoxFuture<'a, Result<ExitStatus>> {
         Box::pin(async move { process::spawn_streamed(spec, &self.sink, &self.cancel).await })
+    }
+
+    fn spawn_detached<'a>(
+        &'a self,
+        spec: &'a ChildSpec,
+        stdio: DetachedStdio,
+    ) -> BoxFuture<'a, Result<Option<DetachedChild>>> {
+        Box::pin(async move {
+            self.guard()?;
+            spawn_detached_real(spec, stdio).await.map(Some)
+        })
+    }
+}
+
+/// How long to keep asking `sysinfo` about a just-spawned pid before giving up
+/// on observing its start time, and how often. macOS usually answers on the
+/// first try; a loaded machine occasionally needs a second one.
+const OBSERVE_RETRY: Duration = Duration::from_millis(40);
+const OBSERVE_ATTEMPTS: u32 = 5;
+
+async fn spawn_detached_real(spec: &ChildSpec, stdio: DetachedStdio) -> Result<DetachedChild> {
+    let mut cmd = tokio::process::Command::new(&spec.program);
+    cmd.args(&spec.args).stdin(Stdio::null());
+
+    let log_path = match &stdio {
+        DetachedStdio::Null => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+            None
+        }
+        DetachedStdio::LogFile(path) => {
+            // create_new: an existing log is NEVER truncated. On EEXIST the
+            // caller picks another name (`logs::wine_log_candidate`'s `-2`
+            // suffix on a same-second collision) — the one place where losing
+            // a previous run's log would be silent and unrecoverable.
+            let file = std::fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(path)
+                .map_err(|e| SabrageError::io(path, e))?;
+            // One fd, dup'ed: stdout and stderr share a file offset, so the
+            // child's interleaving is preserved exactly as `> >(tee $LOG) 2>&1`
+            // preserves it.
+            let err = file.try_clone().map_err(|e| SabrageError::io(path, e))?;
+            cmd.stdout(Stdio::from(file)).stderr(Stdio::from(err));
+            Some(path.clone())
+        }
+    };
+
+    if let Some(dir) = &spec.cwd {
+        cmd.current_dir(dir);
+    }
+    for (k, v) in &spec.env {
+        cmd.env(k, v);
+    }
+    if let Some(path) = &spec.env_path {
+        cmd.env("PATH", path);
+    }
+    // Own process group, like every other child — but NOT kill_on_drop: a
+    // detached child must survive this process exiting. That is the whole
+    // point of this function (design-core §3.3; critique.md's app-quit issue).
+    cmd.process_group(0).kill_on_drop(false);
+
+    let child = cmd.spawn().map_err(|e| {
+        // A failed spawn leaves the freshly created log file behind with
+        // nothing to write into it; the caller's next attempt would then skip
+        // that name for no reason.
+        if let Some(p) = &log_path {
+            let _ = std::fs::remove_file(p);
+        }
+        SabrageError::io(PathBuf::from(&spec.program), e)
+    })?;
+    let pid = child.id().ok_or_else(|| {
+        SabrageError::fatal_bare(format!(
+            "{} exited before it could be supervised",
+            spec.argv0()
+        ))
+    })?;
+
+    Ok(DetachedChild {
+        identity: observe_with_retry(pid, &spec.program).await,
+        child,
+    })
+}
+
+/// [`process::ProcInfo::observe`], retried for ~200 ms.
+///
+/// Falls back to `start_time: 0` when the process table still cannot see the
+/// pid — a value no live process reports, so
+/// [`process::ProcInfo::is_same_process`] answers `false` for it and the
+/// reconcile path treats such a session as an identity mismatch (restore the
+/// guards, never signal the pid) rather than trusting a bare pid.
+async fn observe_with_retry(pid: u32, program: &std::ffi::OsStr) -> process::ProcInfo {
+    for attempt in 0..OBSERVE_ATTEMPTS {
+        if let Some(info) = process::ProcInfo::observe(pid) {
+            return info;
+        }
+        if attempt + 1 < OBSERVE_ATTEMPTS {
+            tokio::time::sleep(OBSERVE_RETRY).await;
+        }
+    }
+    process::ProcInfo {
+        pid,
+        start_time: 0,
+        exe: PathBuf::from(program),
     }
 }
 
@@ -727,6 +894,28 @@ impl Executor for DryRunExecutor {
                 &spec.display(),
             );
             Ok(process::exit_status_from_code(0))
+        })
+    }
+
+    fn spawn_detached<'a>(
+        &'a self,
+        spec: &'a ChildSpec,
+        stdio: DetachedStdio,
+    ) -> BoxFuture<'a, Result<Option<DetachedChild>>> {
+        Box::pin(async move {
+            let log = match &stdio {
+                DetachedStdio::Null => None,
+                DetachedStdio::LogFile(p) => Some(p.clone()),
+            };
+            self.record(
+                PlannedKind::SpawnDetached,
+                None,
+                log.as_deref(),
+                &spec.display(),
+            );
+            // No child, and no log file created either: a dry run of `run`
+            // must not leave a zero-byte beatsaber-<ts>.log behind.
+            Ok(None)
         })
     }
 }
@@ -997,6 +1186,20 @@ mod tests {
                 act(PlannedKind::Spawn, None, Some("/repo"), "ninja -C build"),
                 "would spawn: ninja -C build (in /repo)",
             ),
+            (
+                act(
+                    PlannedKind::SpawnDetached,
+                    None,
+                    Some("/repo/logs/beatsaber-20260829-101112.log"),
+                    "wine --bottle Steam --no-update --cx-app C:\\Beat Saber.exe",
+                ),
+                "would launch (detached): wine --bottle Steam --no-update --cx-app \
+                 C:\\Beat Saber.exe > /repo/logs/beatsaber-20260829-101112.log",
+            ),
+            (
+                act(PlannedKind::SpawnDetached, None, None, "alvr_dashboard"),
+                "would launch (detached): alvr_dashboard > /dev/null",
+            ),
         ];
         for (action, want) in cases {
             assert_eq!(action.describe(), want);
@@ -1011,5 +1214,114 @@ mod tests {
             tmp_path(Path::new("/a/b/dxmt-artifacts.tar.gz")),
             PathBuf::from("/a/b/dxmt-artifacts.tar.gz.tmp")
         );
+    }
+}
+
+#[cfg(test)]
+mod detached_tests {
+    use super::*;
+    use crate::events::step;
+
+    fn sinks() -> (RunId, EventSink, CancellationToken) {
+        let sink: EventSink = Arc::new(|_| {});
+        (uuid::Uuid::new_v4(), sink, CancellationToken::new())
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sabrage-detach-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The whole point of the primitive: both pipes land in the log, the child
+    /// outlives the future that spawned it, and its identity is observable.
+    #[tokio::test]
+    async fn a_detached_child_writes_both_pipes_into_the_log_and_is_identified() {
+        let dir = scratch("log");
+        let log = dir.join("beatsaber-20260829-101112.log");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let spec = ChildSpec::new("/bin/sh", step::BUILD_TOOLS, run_id)
+            .arg("-c")
+            .arg("printf 'out\\n'; printf 'err\\n' >&2");
+
+        let mut d = ex
+            .spawn_detached(&spec, DetachedStdio::LogFile(log.clone()))
+            .await
+            .unwrap()
+            .expect("a real executor spawns");
+        assert_eq!(d.identity.pid, d.child.id().unwrap());
+        d.child.wait().await.unwrap();
+
+        let text = std::fs::read_to_string(&log).unwrap();
+        assert!(text.contains("out") && text.contains("err"), "{text:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `create_new`: an existing log is never truncated — the caller must pick
+    /// another name (`logs::wine_log_candidate`'s `-2` suffix).
+    #[tokio::test]
+    async fn an_existing_log_is_never_truncated() {
+        let dir = scratch("exists");
+        let log = dir.join("beatsaber-20260829-101112.log");
+        std::fs::write(&log, b"a previous run\n").unwrap();
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let spec = ChildSpec::new("/bin/echo", step::BUILD_TOOLS, run_id);
+
+        let err = ex
+            .spawn_detached(&spec, DetachedStdio::LogFile(log.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), "io");
+        assert_eq!(std::fs::read(&log).unwrap(), b"a previous run\n");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_neither_spawns_nor_creates_the_log() {
+        let dir = scratch("dry");
+        let log = dir.join("beatsaber-20260829-101112.log");
+        let (run_id, sink, cancel) = sinks();
+        let ex = DryRunExecutor::new(run_id, sink, cancel);
+        let spec = ChildSpec::new("/bin/echo", step::BUILD_TOOLS, run_id).arg("hi");
+
+        assert!(ex
+            .spawn_detached(&spec, DetachedStdio::LogFile(log.clone()))
+            .await
+            .unwrap()
+            .is_none());
+        assert!(!log.exists(), "dry run created the log file");
+
+        let plan = ex.planned();
+        assert_eq!(plan[0].kind, PlannedKind::SpawnDetached);
+        assert_eq!(plan[0].dst.as_deref(), Some(log.as_path()));
+        assert!(plan[0]
+            .describe()
+            .ends_with(&format!("> {}", log.display())));
+
+        // Null stdio renders as /dev/null, the dashboard's shape.
+        ex.spawn_detached(&spec, DetachedStdio::Null).await.unwrap();
+        assert_eq!(
+            ex.planned()[1].describe(),
+            "would launch (detached): /bin/echo hi > /dev/null"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_run_refuses_to_launch() {
+        let (run_id, sink, _) = sinks();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let spec = ChildSpec::new("/bin/echo", step::BUILD_TOOLS, run_id);
+        let err = ex
+            .spawn_detached(&spec, DetachedStdio::Null)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled));
     }
 }

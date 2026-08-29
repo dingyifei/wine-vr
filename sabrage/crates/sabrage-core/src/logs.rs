@@ -1,0 +1,941 @@
+//! Log files: naming the wine console log, tailing the three live sources, and
+//! listing past runs.
+//!
+//! # The wine console log
+//!
+//! run.sh:
+//!
+//! ```zsh
+//! mkdir -p "$ROOT/logs"
+//! LOG="$ROOT/logs/beatsaber-$(date +%Y%m%d-%H%M%S).log"
+//! "$WINE" … > >(tee "$LOG") 2>&1 &
+//! ```
+//!
+//! Two things follow. The name is **local** civil time (`date` with no `-u`),
+//! which is why this crate depends on `chrono` at all — `std::time` has no
+//! calendar. And the shell can collide: two launches in the same second write
+//! the same path, and `tee` truncates, so the first run's log is simply gone.
+//! [`wine_log_candidate`] adds a `-2`, `-3`, … suffix instead — a declared
+//! divergence (PARITY.md, "Planned for later phases"; design-core §10.9),
+//! enforced by opening the file `create_new` in
+//! [`crate::executor::Executor::spawn_detached`] so the collision is detected
+//! rather than assumed.
+//!
+//! Sabrage also replaces `tee` itself: the child writes into the file
+//! descriptor directly, and the tail below reads the same file. `tee` can lose
+//! the last buffer when the pipeline is torn down; a file fd cannot.
+//!
+//! # Tailing
+//!
+//! [`Tailer`] is rotation-aware — inode change **or** a size that shrank means
+//! the file was replaced or truncated, and the tailer reopens from the start
+//! and says so ([`LogBatch::rotated`]). A partial final line is buffered until
+//! its newline arrives, so a half-written line never reaches the UI as a
+//! complete one. Splitting reuses [`crate::process::ChunkSplitter`] — the same
+//! `\n`/`\r`/`\r\n`-tolerant state machine `spawn_streamed` already uses for
+//! wine/build-tool output — rather than a second hand-rolled copy of the same
+//! rule.
+
+use std::collections::VecDeque;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::error::{Result, SabrageError};
+use crate::paths::Paths;
+use crate::process::ChunkSplitter;
+
+// ── naming ────────────────────────────────────────────────────────────────────
+
+/// The filename stem run.sh builds with `date +%Y%m%d-%H%M%S`.
+pub const WINE_LOG_PREFIX: &str = "beatsaber-";
+
+/// The candidate path for attempt `attempt` of this launch's console log,
+/// given an already-formatted `YYYYmmdd-HHMMSS` stamp.
+///
+/// * `attempt == 0` → `beatsaber-YYYYmmdd-HHMMSS.log`, byte-identical to the
+///   shell's name for the same instant;
+/// * `attempt == n >= 1` → the same name with `-{n+1}` before `.log`, i.e.
+///   `beatsaber-20260829-101112-2.log` for the first collision.
+///
+/// Takes `stamp` as a plain string rather than a `chrono` type so nothing
+/// calling this — including test code in other crates — needs a date/time
+/// library dependency just to name a log file candidate: `chrono` is an
+/// implementation detail of [`wine_log_candidate`]'s stamp computation, not a
+/// fact this API should force on its callers.
+pub fn wine_log_candidate_stamped(logs_dir: &Path, stamp: &str, attempt: u32) -> PathBuf {
+    let name = if attempt == 0 {
+        format!("{WINE_LOG_PREFIX}{stamp}.log")
+    } else {
+        format!("{WINE_LOG_PREFIX}{stamp}-{}.log", attempt + 1)
+    };
+    logs_dir.join(name)
+}
+
+/// [`wine_log_candidate_stamped`], formatting `stamp` from `local_now` the way
+/// run.sh's own `date +%Y%m%d-%H%M%S` does.
+///
+/// `local_now` is passed in rather than read here so the rule is testable
+/// without freezing the clock.
+pub fn wine_log_candidate(
+    logs_dir: &Path,
+    local_now: chrono::DateTime<chrono::Local>,
+    attempt: u32,
+) -> PathBuf {
+    let stamp = local_now.format("%Y%m%d-%H%M%S").to_string();
+    wine_log_candidate_stamped(logs_dir, &stamp, attempt)
+}
+
+// ── sources ───────────────────────────────────────────────────────────────────
+
+/// One tailable log.
+///
+/// `File` is a struct variant rather than a newtype because the enum is
+/// internally tagged (`{"kind":"file","path":"…"}`) and serde cannot serialize
+/// an internally tagged newtype variant wrapping a non-map value.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
+pub enum LogSource {
+    /// The live session's `logs/beatsaber-<ts>.log`, or the newest one when no
+    /// session is running.
+    WineConsole,
+    /// `~/Library/Application Support/OXRSys/oxrsys-runtime.log`.
+    OxrsysRuntime,
+    /// `~/Library/Application Support/OXRSys/alvr/session_log.txt` — unbounded,
+    /// so it is only ever tailed from the end.
+    AlvrSession,
+    /// A specific past run, from [`list_past_runs`].
+    File { path: PathBuf },
+}
+
+/// Resolve a [`LogSource`] to a path on this machine.
+///
+/// [`LogSource::WineConsole`] prefers the live session's own `log_path`
+/// ([`crate::session::live_session`], then the persisted
+/// [`crate::session::state::SessionState`] — only when that file still exists
+/// on disk) and falls back to the newest `logs/beatsaber-*.log`. `None` when
+/// nothing matches — an empty `logs/` directory on a fresh checkout is normal,
+/// not an error. A corrupt or missing `session-state.json` is treated the same
+/// as "no persisted session" rather than surfaced as an error: this is a
+/// best-effort resolution, not a mutation.
+pub fn resolve_source(paths: &Paths, source: &LogSource) -> Option<PathBuf> {
+    match source {
+        LogSource::WineConsole => {
+            if let Some(handle) = crate::session::live_session() {
+                return Some(handle.log_path);
+            }
+            if let Ok(Some(state)) = crate::session::state::load(&paths.session_state_path()) {
+                if state.log_path.is_file() {
+                    return Some(state.log_path);
+                }
+            }
+            list_past_runs(&paths.logs_dir())
+                .into_iter()
+                .next()
+                .map(|r| r.path)
+        }
+        LogSource::OxrsysRuntime => Some(paths.oxr_appsup.join("oxrsys-runtime.log")),
+        LogSource::AlvrSession => Some(paths.oxr_appsup.join("alvr/session_log.txt")),
+        LogSource::File { path } => Some(path.clone()),
+    }
+}
+
+// ── tailing ───────────────────────────────────────────────────────────────────
+
+/// One poll's worth of new lines.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LogBatch {
+    /// Complete lines only, without their newlines.
+    pub lines: Vec<String>,
+    /// The file was replaced (new inode) or truncated: `lines` restarts from
+    /// the beginning of the new file. The UI clears its buffer on this.
+    pub rotated: bool,
+    /// This batch hit [`MAX_LINES_PER_POLL`]: the remaining lines are already
+    /// buffered internally (never dropped) and arrive on a later
+    /// [`Tailer::poll`] call — the file is producing faster than the caller is
+    /// polling.
+    pub truncated: bool,
+    /// The file these lines came from, for the pane header.
+    pub path: String,
+}
+
+/// Per-poll delivery cap, so one burst cannot make a single `poll()` call
+/// block the UI thread rendering thousands of lines at once. The remainder
+/// stays in [`Tailer`]'s internal queue and is delivered on the next call.
+const MAX_LINES_PER_POLL: usize = 2000;
+
+/// Bound on the backward read [`Tailer::open`] does for a `from_end` preload,
+/// regardless of `tail_lines` — the unbounded `alvr/session_log.txt` must
+/// never turn "open a log pane" into "read the whole file".
+const TAIL_PRELOAD_CAP_BYTES: u64 = 256 * 1024;
+
+/// A rotation-aware line tailer.
+///
+/// One per open log pane. Not `Clone`: it owns a file handle and a byte cursor.
+pub struct Tailer {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    offset: u64,
+    /// Device+inode of the open file, for rotation detection. Always `Some`
+    /// exactly when `file` is `Some` — the two are maintained together.
+    identity: Option<(u64, u64)>,
+    /// `\n`/`\r`/`\r\n`-tolerant splitter; its internal buffer *is* the
+    /// "partial final line" the doc below promises never shows up early.
+    splitter: ChunkSplitter,
+    /// Lines already split out of the file but not yet handed to a caller —
+    /// either the `from_end` preload, or the overflow from a batch that hit
+    /// [`MAX_LINES_PER_POLL`].
+    pending: VecDeque<String>,
+}
+
+/// `(dev, ino)` — the pair that changes when a path starts naming a different
+/// file (rename+recreate, or `logrotate`'s copy step), even though a
+/// same-inode truncate-in-place leaves it unchanged (caught separately by
+/// `len < offset`).
+fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (meta.dev(), meta.ino())
+}
+
+impl Tailer {
+    /// Open `path` for tailing.
+    ///
+    /// A path that does not exist yet is not an error: `file`/`identity` stay
+    /// `None`, and the first [`poll`](Tailer::poll) that finds the file has
+    /// since appeared treats that as a fresh open (`rotated: true`) — the log
+    /// pane for a session that has not launched yet, or `alvr/session_log.txt`
+    /// before ALVR has written a byte, are both normal states, not errors.
+    ///
+    /// `from_end` starts at EOF with the last `tail_lines` lines pre-loaded —
+    /// mandatory for `alvr/session_log.txt`, which is unbounded (design-core
+    /// §7). `from_end == false` reads the whole file first (nothing is
+    /// preloaded; the first [`poll`](Tailer::poll) simply starts at offset 0),
+    /// which is what a past run's log wants.
+    pub fn open(path: &Path, from_end: bool, tail_lines: usize) -> Result<Tailer> {
+        let mut file = match std::fs::File::open(path) {
+            Ok(f) => Some(f),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => return Err(SabrageError::io(path, e)),
+        };
+
+        let mut offset = 0u64;
+        let mut identity = None;
+        let mut splitter = ChunkSplitter::new();
+        let mut pending = VecDeque::new();
+
+        if let Some(f) = file.as_mut() {
+            let meta = f.metadata().map_err(|e| SabrageError::io(path, e))?;
+            identity = Some(file_identity(&meta));
+            let len = meta.len();
+
+            if from_end {
+                offset = len;
+                if tail_lines > 0 && len > 0 {
+                    let read_len = len.min(TAIL_PRELOAD_CAP_BYTES);
+                    let start = len - read_len;
+                    f.seek(SeekFrom::Start(start))
+                        .map_err(|e| SabrageError::io(path, e))?;
+                    let mut buf = vec![0u8; read_len as usize];
+                    f.read_exact(&mut buf)
+                        .map_err(|e| SabrageError::io(path, e))?;
+
+                    let mut lines: Vec<String> = Vec::new();
+                    splitter.push(&buf, &mut |l| lines.push(l));
+                    if start > 0 && !lines.is_empty() {
+                        // The first fragment is missing its head — we started
+                        // reading mid-file. Never show it as a complete line.
+                        lines.remove(0);
+                    }
+                    if lines.len() > tail_lines {
+                        lines.drain(0..lines.len() - tail_lines);
+                    }
+                    pending = lines.into();
+                    // `splitter` still holds any genuine trailing partial line
+                    // (the file's tail had no terminator yet at the moment we
+                    // read it) — left in place so the very next `poll()`
+                    // completes it, exactly like an ordinary mid-stream
+                    // partial.
+                }
+            }
+        }
+
+        Ok(Tailer {
+            path: path.to_path_buf(),
+            file,
+            offset,
+            identity,
+            splitter,
+            pending,
+        })
+    }
+
+    /// Read whatever has arrived since the last poll.
+    ///
+    /// Detects rotation (inode change) and truncation (size < offset) first;
+    /// either reopens from the start with [`LogBatch::rotated`] set. A file
+    /// that has vanished yields an empty batch rather than an error — the next
+    /// poll picks it up when it comes back.
+    pub fn poll(&mut self) -> Result<LogBatch> {
+        let path_str = self.path.display().to_string();
+
+        let meta = match std::fs::metadata(&self.path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.file = None;
+                self.identity = None;
+                let (lines, truncated) = self.drain_capped();
+                return Ok(LogBatch {
+                    lines,
+                    rotated: false,
+                    truncated,
+                    path: path_str,
+                });
+            }
+            Err(e) => return Err(SabrageError::io(&self.path, e)),
+        };
+
+        let current_id = file_identity(&meta);
+        let len = meta.len();
+        // `self.identity` is `None` exactly when there is no open file yet —
+        // either this is the first time the path has ever existed, or it
+        // vanished on a previous poll and has just reappeared. Either way
+        // that is a fresh open, not a continuation.
+        let rotated = match self.identity {
+            None => true,
+            Some(id) => id != current_id || len < self.offset,
+        };
+
+        if rotated {
+            let file =
+                std::fs::File::open(&self.path).map_err(|e| SabrageError::io(&self.path, e))?;
+
+            // Anything still queued in `pending` was already read out of the
+            // *previous* incarnation of this path — real content, just not yet
+            // handed to a caller because an earlier poll hit
+            // `MAX_LINES_PER_POLL` (possibly while the path had vanished; see
+            // the `NotFound` arm above, which drains but never clears
+            // `pending` on its own). `LogBatch::truncated` promises those
+            // lines are "never dropped" — a rotation must not silently break
+            // that promise by wiping `pending` out from under them. Drain and
+            // deliver them now, under `rotated: true` so the UI still clears
+            // its buffer, and pick up the reopened file's own content on the
+            // next `poll()`.
+            if !self.pending.is_empty() {
+                let (lines, truncated) = self.drain_capped();
+                self.file = Some(file);
+                self.identity = Some(current_id);
+                self.offset = 0;
+                self.splitter = ChunkSplitter::new();
+                return Ok(LogBatch {
+                    lines,
+                    rotated: true,
+                    truncated,
+                    path: path_str,
+                });
+            }
+
+            self.file = Some(file);
+            self.identity = Some(current_id);
+            self.offset = 0;
+            self.splitter = ChunkSplitter::new();
+        }
+
+        let file = self
+            .file
+            .as_mut()
+            .expect("identity is Some here: either just (re)opened above, or already open");
+        file.seek(SeekFrom::Start(self.offset))
+            .map_err(|e| SabrageError::io(&self.path, e))?;
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf)
+            .map_err(|e| SabrageError::io(&self.path, e))?;
+        self.offset += buf.len() as u64;
+
+        let Tailer {
+            splitter, pending, ..
+        } = self;
+        splitter.push(&buf, &mut |l| pending.push_back(l));
+
+        let (lines, truncated) = self.drain_capped();
+        Ok(LogBatch {
+            lines,
+            rotated,
+            truncated,
+            path: path_str,
+        })
+    }
+
+    /// Take up to [`MAX_LINES_PER_POLL`] lines off the front of `pending`,
+    /// leaving the rest queued for the next call.
+    fn drain_capped(&mut self) -> (Vec<String>, bool) {
+        let mut lines = Vec::with_capacity(self.pending.len().min(MAX_LINES_PER_POLL));
+        while lines.len() < MAX_LINES_PER_POLL {
+            match self.pending.pop_front() {
+                Some(l) => lines.push(l),
+                None => break,
+            }
+        }
+        let truncated = !self.pending.is_empty();
+        (lines, truncated)
+    }
+}
+
+// ── past runs ─────────────────────────────────────────────────────────────────
+
+/// One `logs/beatsaber-*.log` on disk.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PastRun {
+    pub path: PathBuf,
+    pub file_name: String,
+    pub size: u64,
+    pub modified_unix_ms: u64,
+}
+
+/// Every `beatsaber-*.log` in `logs_dir`, newest first.
+///
+/// Lists the **shell's** runs too: both front-ends write into the same
+/// `logs/` directory, on purpose. A missing `logs_dir` (nothing has ever run)
+/// yields an empty list, not an error.
+pub fn list_past_runs(logs_dir: &Path) -> Vec<PastRun> {
+    let Ok(read_dir) = std::fs::read_dir(logs_dir) else {
+        return Vec::new();
+    };
+
+    let mut runs: Vec<PastRun> = read_dir
+        .filter_map(|e| e.ok())
+        .filter_map(|entry| {
+            let file_name = entry.file_name().into_string().ok()?;
+            if !file_name.starts_with(WINE_LOG_PREFIX) || !file_name.ends_with(".log") {
+                return None;
+            }
+            let meta = entry.metadata().ok()?;
+            if !meta.is_file() {
+                return None;
+            }
+            let modified_unix_ms = meta
+                .modified()
+                .ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or(0);
+            Some(PastRun {
+                path: entry.path(),
+                file_name,
+                size: meta.len(),
+                modified_unix_ms,
+            })
+        })
+        .collect();
+
+    runs.sort_by_key(|r| std::cmp::Reverse(r.modified_unix_ms));
+    runs
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use tokio_util::sync::CancellationToken;
+    use uuid::Uuid;
+
+    fn scratch(tag: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("sabrage-logs-test-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// A [`Paths`] rooted entirely under `root` — including `oxr_appsup` and
+    /// `sabrage_appsup`, which [`Paths::new`] otherwise derives from the real
+    /// `$HOME`. A test must never touch the real `~/Library`.
+    fn fixture_paths(root: &Path) -> Paths {
+        let mut paths = Paths::new(root);
+        paths.oxr_appsup = root.join("home/Library/Application Support/OXRSys");
+        paths.sabrage_appsup = root.join("home/Library/Application Support/Sabrage");
+        paths
+    }
+
+    fn set_mtime(path: &Path, unix_secs: u64) {
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(unix_secs);
+        let f = std::fs::OpenOptions::new().write(true).open(path).unwrap();
+        f.set_modified(t).unwrap();
+    }
+
+    // ── wine_log_candidate ───────────────────────────────────────────────────
+
+    #[test]
+    fn attempt_zero_matches_the_shells_date_stamp() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
+            .unwrap();
+        let p = wine_log_candidate(Path::new("/repo/logs"), now, 0);
+        assert_eq!(p, PathBuf::from("/repo/logs/beatsaber-20260829-101112.log"));
+    }
+
+    #[test]
+    fn collisions_get_a_dash_n_plus_one_suffix() {
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
+            .unwrap();
+        assert_eq!(
+            wine_log_candidate(Path::new("/repo/logs"), now, 1),
+            PathBuf::from("/repo/logs/beatsaber-20260829-101112-2.log")
+        );
+        assert_eq!(
+            wine_log_candidate(Path::new("/repo/logs"), now, 3),
+            PathBuf::from("/repo/logs/beatsaber-20260829-101112-4.log")
+        );
+    }
+
+    #[test]
+    fn wine_log_candidate_delegates_to_the_stamped_form_byte_for_byte() {
+        // The chrono-typed convenience wrapper must produce exactly what a
+        // caller building the same stamp by hand (no chrono in sight) gets
+        // from `wine_log_candidate_stamped` — proving the split introduced no
+        // drift between the two.
+        let now = chrono::Local
+            .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
+            .unwrap();
+        for attempt in [0, 1, 3] {
+            assert_eq!(
+                wine_log_candidate(Path::new("/repo/logs"), now, attempt),
+                wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", attempt)
+            );
+        }
+    }
+
+    #[test]
+    fn wine_log_candidate_stamped_takes_no_date_time_type_at_all() {
+        // The whole point of the split (F16): a caller — including test code
+        // in another crate — never needs to know chrono exists.
+        assert_eq!(
+            wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", 0),
+            PathBuf::from("/repo/logs/beatsaber-20260829-101112.log")
+        );
+        assert_eq!(
+            wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", 1),
+            PathBuf::from("/repo/logs/beatsaber-20260829-101112-2.log")
+        );
+    }
+
+    // ── LogSource wire shape ─────────────────────────────────────────────────
+
+    #[test]
+    fn log_source_file_is_a_struct_variant_on_the_wire() {
+        let s = LogSource::File {
+            path: PathBuf::from("/repo/logs/x.log"),
+        };
+        let j = serde_json::to_value(&s).unwrap();
+        assert_eq!(
+            j,
+            serde_json::json!({"kind": "file", "path": "/repo/logs/x.log"})
+        );
+        assert_eq!(serde_json::from_value::<LogSource>(j).unwrap(), s);
+
+        assert_eq!(
+            serde_json::to_value(LogSource::WineConsole).unwrap(),
+            serde_json::json!({"kind": "wineConsole"})
+        );
+        assert_eq!(
+            serde_json::to_value(LogSource::OxrsysRuntime).unwrap(),
+            serde_json::json!({"kind": "oxrsysRuntime"})
+        );
+        assert_eq!(
+            serde_json::to_value(LogSource::AlvrSession).unwrap(),
+            serde_json::json!({"kind": "alvrSession"})
+        );
+    }
+
+    // ── resolve_source ───────────────────────────────────────────────────────
+
+    #[test]
+    fn resolve_source_maps_the_two_fixed_oxrsys_paths_and_the_file_variant() {
+        let dir = scratch("resolve-fixed");
+        let paths = fixture_paths(&dir);
+        assert_eq!(
+            resolve_source(&paths, &LogSource::OxrsysRuntime),
+            Some(paths.oxr_appsup.join("oxrsys-runtime.log"))
+        );
+        assert_eq!(
+            resolve_source(&paths, &LogSource::AlvrSession),
+            Some(paths.oxr_appsup.join("alvr/session_log.txt"))
+        );
+        let explicit = dir.join("some/past-run.log");
+        assert_eq!(
+            resolve_source(
+                &paths,
+                &LogSource::File {
+                    path: explicit.clone()
+                }
+            ),
+            Some(explicit)
+        );
+    }
+
+    #[test]
+    fn resolve_source_wine_console_is_none_when_nothing_matches() {
+        let dir = scratch("resolve-none");
+        let paths = fixture_paths(&dir);
+        assert_eq!(resolve_source(&paths, &LogSource::WineConsole), None);
+    }
+
+    #[test]
+    fn resolve_source_wine_console_falls_back_to_persisted_state_log_if_it_exists() {
+        let dir = scratch("resolve-state");
+        let paths = fixture_paths(&dir);
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        std::fs::create_dir_all(&paths.sabrage_appsup).unwrap();
+
+        let state_log = paths.logs_dir().join("beatsaber-fromstate.log");
+        std::fs::write(&state_log, b"x\n").unwrap();
+        // A newer file also sits in logs/ — the persisted state must still win
+        // over "newest", per priority order.
+        let newer = paths.logs_dir().join("beatsaber-newer.log");
+        std::fs::write(&newer, b"y\n").unwrap();
+
+        let json = format!(
+            r#"{{"version":1,"runId":"00000000-0000-0000-0000-000000000000","bottle":"Steam","bsDir":"/games/bs","startedAtUnixMs":0,"logPath":"{}"}}"#,
+            state_log.display()
+        );
+        std::fs::write(paths.session_state_path(), json).unwrap();
+
+        assert_eq!(
+            resolve_source(&paths, &LogSource::WineConsole),
+            Some(state_log)
+        );
+    }
+
+    #[test]
+    fn resolve_source_wine_console_skips_a_persisted_state_whose_log_file_is_gone() {
+        let dir = scratch("resolve-state-gone");
+        let paths = fixture_paths(&dir);
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+        std::fs::create_dir_all(&paths.sabrage_appsup).unwrap();
+
+        let missing_log = paths.logs_dir().join("beatsaber-vanished.log"); // never created
+        let json = format!(
+            r#"{{"version":1,"runId":"00000000-0000-0000-0000-000000000000","bottle":"Steam","bsDir":"/games/bs","startedAtUnixMs":0,"logPath":"{}"}}"#,
+            missing_log.display()
+        );
+        std::fs::write(paths.session_state_path(), json).unwrap();
+
+        let real_log = paths.logs_dir().join("beatsaber-real.log");
+        std::fs::write(&real_log, b"ok\n").unwrap();
+
+        assert_eq!(
+            resolve_source(&paths, &LogSource::WineConsole),
+            Some(real_log)
+        );
+    }
+
+    #[test]
+    fn resolve_source_wine_console_falls_back_to_the_newest_past_run() {
+        let dir = scratch("resolve-newest");
+        let paths = fixture_paths(&dir);
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+
+        let older = paths.logs_dir().join("beatsaber-20260101-000000.log");
+        let newer = paths.logs_dir().join("beatsaber-20260201-000000.log");
+        std::fs::write(&older, b"a\n").unwrap();
+        std::fs::write(&newer, b"b\n").unwrap();
+        set_mtime(&older, 1_000_000_000);
+        set_mtime(&newer, 2_000_000_000);
+
+        assert_eq!(resolve_source(&paths, &LogSource::WineConsole), Some(newer));
+    }
+
+    #[test]
+    fn resolve_source_wine_console_prefers_the_live_session_over_everything() {
+        // Touches the process-global LIVE_SESSION slot; self-contained
+        // set→read→clear within one test, matching `session::mod`'s own test.
+        use crate::process::ProcInfo;
+        use crate::session::{
+            clear_live_session, live_session, set_live_session, LiveSessionHandle,
+        };
+
+        let dir = scratch("resolve-live");
+        let paths = fixture_paths(&dir);
+        std::fs::create_dir_all(paths.logs_dir()).unwrap();
+
+        let live_log = paths.logs_dir().join("beatsaber-live.log");
+        std::fs::write(&live_log, b"live\n").unwrap();
+        let stale_log = paths.logs_dir().join("beatsaber-stale.log");
+        std::fs::write(&stale_log, b"stale\n").unwrap();
+        set_mtime(&stale_log, 9_999_999_999); // newer than live_log's mtime, must still lose
+
+        let run_id = Uuid::new_v4();
+        set_live_session(LiveSessionHandle {
+            run_id,
+            bottle: "Steam".into(),
+            identity: ProcInfo {
+                pid: 1,
+                start_time: 1,
+                exe: PathBuf::from("/bin/true"),
+            },
+            log_path: live_log.clone(),
+            started_at_unix_ms: 0,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        });
+
+        let resolved = resolve_source(&paths, &LogSource::WineConsole);
+        clear_live_session(run_id);
+        assert!(live_session().is_none());
+
+        assert_eq!(resolved, Some(live_log));
+    }
+
+    // ── list_past_runs ───────────────────────────────────────────────────────
+
+    #[test]
+    fn list_past_runs_lists_newest_first_and_ignores_non_matching_entries() {
+        let dir = scratch("past-runs");
+        std::fs::write(dir.join("beatsaber-20260101-000000.log"), b"a").unwrap();
+        std::fs::write(dir.join("beatsaber-20260201-000000.log"), b"bb").unwrap();
+        std::fs::write(dir.join("notes.txt"), b"irrelevant").unwrap();
+        std::fs::create_dir_all(dir.join("beatsaber-adir.log")).unwrap(); // a directory: must be skipped
+
+        set_mtime(&dir.join("beatsaber-20260101-000000.log"), 1_000_000_000);
+        set_mtime(&dir.join("beatsaber-20260201-000000.log"), 2_000_000_000);
+
+        let runs = list_past_runs(&dir);
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[0].file_name, "beatsaber-20260201-000000.log");
+        assert_eq!(runs[1].file_name, "beatsaber-20260101-000000.log");
+        assert_eq!(runs[0].size, 2);
+    }
+
+    #[test]
+    fn list_past_runs_is_empty_for_a_missing_directory() {
+        assert!(list_past_runs(Path::new("/does/not/exist/at/all/sabrage-test")).is_empty());
+    }
+
+    // ── Tailer ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn poll_returns_newly_appended_lines() {
+        let dir = scratch("append");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"line1\nline2\n").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines, vec!["line1", "line2"]);
+        assert!(!b1.rotated);
+        assert!(!b1.truncated);
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "line3").unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert_eq!(b2.lines, vec!["line3"]);
+    }
+
+    #[test]
+    fn poll_detects_rotation_by_rename() {
+        let dir = scratch("rotate");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"old1\nold2\n").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines, vec!["old1", "old2"]);
+
+        std::fs::rename(&path, dir.join("a.log.bak")).unwrap();
+        std::fs::write(&path, b"new1\n").unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert!(b2.rotated);
+        assert_eq!(b2.lines, vec!["new1"]);
+    }
+
+    #[test]
+    fn poll_detects_in_place_truncation() {
+        let dir = scratch("truncate");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"aaaaaaaaaa\nbbbbbbbbbb\n").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines, vec!["aaaaaaaaaa", "bbbbbbbbbb"]);
+        assert!(!b1.rotated);
+
+        // Same path truncated shorter than our offset (logrotate copytruncate).
+        std::fs::write(&path, b"short\n").unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert!(
+            b2.rotated,
+            "shrinking below the last offset must be treated as rotation"
+        );
+        assert_eq!(b2.lines, vec!["short"]);
+    }
+
+    #[test]
+    fn a_trailing_partial_line_is_buffered_until_its_newline_arrives() {
+        let dir = scratch("partial");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"complete\nhalf").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(
+            b1.lines,
+            vec!["complete"],
+            "the unterminated tail must not show yet"
+        );
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "-line").unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert_eq!(b2.lines, vec!["half-line"]);
+    }
+
+    #[test]
+    fn open_from_end_preloads_the_last_tail_lines_lines() {
+        let dir = scratch("preload");
+        let path = dir.join("a.log");
+        let content: String = (1..=10).map(|n| format!("line{n}\n")).collect();
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut t = Tailer::open(&path, true, 3).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines, vec!["line8", "line9", "line10"]);
+
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        writeln!(f, "line11").unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert_eq!(b2.lines, vec!["line11"]);
+    }
+
+    #[test]
+    fn open_from_end_with_zero_tail_lines_starts_at_eof() {
+        let dir = scratch("preload-zero");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"old1\nold2\n").unwrap();
+
+        let mut t = Tailer::open(&path, true, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert!(b1.lines.is_empty(), "nothing preloaded, nothing new yet");
+    }
+
+    #[test]
+    fn open_and_poll_tolerate_a_file_that_does_not_exist_yet() {
+        let dir = scratch("missing");
+        let path = dir.join("not-yet.log");
+
+        let mut t = Tailer::open(&path, false, 5).unwrap();
+        let b1 = t.poll().unwrap();
+        assert!(b1.lines.is_empty() && !b1.rotated);
+
+        std::fs::write(&path, b"first\n").unwrap();
+        let b2 = t.poll().unwrap();
+        assert_eq!(b2.lines, vec!["first"]);
+        assert!(
+            b2.rotated,
+            "a file appearing for the first time counts as a fresh open"
+        );
+    }
+
+    #[test]
+    fn a_burst_over_the_cap_is_deferred_not_dropped() {
+        let dir = scratch("burst");
+        let path = dir.join("a.log");
+        let content: String = (0..2500).map(|n| format!("l{n}\n")).collect();
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines.len(), MAX_LINES_PER_POLL);
+        assert!(b1.truncated);
+        assert_eq!(b1.lines[0], "l0");
+
+        let b2 = t.poll().unwrap();
+        assert_eq!(b2.lines.len(), 500);
+        assert!(!b2.truncated);
+        assert_eq!(b2.lines[0], "l2000");
+        assert_eq!(*b2.lines.last().unwrap(), "l2499");
+    }
+
+    /// F14 (finding 14): a backlog queued in `pending` from *before* the path
+    /// vanished must survive a vanish-then-reappear cycle, even when that
+    /// backlog itself spans more than one `MAX_LINES_PER_POLL`-capped poll —
+    /// the exact shape that let the old code's unconditional
+    /// `self.pending.clear()` in the reopen branch discard real, already-read
+    /// content no caller had seen yet.
+    #[test]
+    fn a_backlog_queued_before_a_vanish_survives_reappearance_uncut() {
+        let dir = scratch("vanish-reappear");
+        let path = dir.join("a.log");
+        // 4500 lines: one poll's cap (2000) leaves a remainder (2500) that
+        // itself does not fit in a single further poll either.
+        let content: String = (0..4500).map(|n| format!("l{n}\n")).collect();
+        std::fs::write(&path, content.as_bytes()).unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines.len(), MAX_LINES_PER_POLL);
+        assert!(b1.truncated);
+        assert_eq!(b1.lines[0], "l0");
+        assert_eq!(*b1.lines.last().unwrap(), "l1999");
+
+        // The file vanishes with 2500 lines still queued in `pending`.
+        std::fs::remove_file(&path).unwrap();
+
+        let b2 = t.poll().unwrap();
+        assert!(!b2.rotated, "a vanish alone is not a rotation");
+        assert_eq!(b2.lines.len(), MAX_LINES_PER_POLL);
+        assert!(
+            b2.truncated,
+            "500 lines of the original backlog are still queued"
+        );
+        assert_eq!(b2.lines[0], "l2000");
+        assert_eq!(*b2.lines.last().unwrap(), "l3999");
+
+        // It reappears as a new file — genuinely rotated — while 500 lines
+        // from the vanished original are still sitting in `pending`.
+        std::fs::write(&path, b"new1\n").unwrap();
+
+        let b3 = t.poll().unwrap();
+        assert!(b3.rotated, "the path really did get a new file");
+        assert!(
+            !b3.truncated,
+            "the whole remaining backlog fit under the cap"
+        );
+        assert_eq!(
+            b3.lines.len(),
+            500,
+            "the pre-vanish backlog must be delivered, not dropped by the reopen"
+        );
+        assert_eq!(b3.lines[0], "l4000");
+        assert_eq!(*b3.lines.last().unwrap(), "l4499");
+
+        // Only now does the new file's own content show up.
+        let b4 = t.poll().unwrap();
+        assert!(!b4.rotated, "already reported as rotated in b3");
+        assert_eq!(b4.lines, vec!["new1"]);
+    }
+}

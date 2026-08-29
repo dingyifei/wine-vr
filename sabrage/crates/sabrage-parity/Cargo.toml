@@ -16,3 +16,6 @@ toml = "1"
 sha2 = "0.10"
 hex = "0.4"
 regex = "1"
+# Goldens for the wine log filename rule build their timestamps the same way
+# `logs::wine_log_candidate` does (local time, `date +%Y%m%d-%H%M%S` shape).
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

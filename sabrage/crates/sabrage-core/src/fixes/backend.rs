@@ -228,8 +228,54 @@ pub(crate) fn any_wineserver_alive(wineserver_exe: &Path) -> bool {
 
 // ── the fix ─────────────────────────────────────────────────────────────────
 
+/// What the shared body does when the bottle's own wineserver is alive.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WineserverPolicy {
+    /// Refuse with a Fatal — [`set_graphics_backend`], the doctor Fix button.
+    Refuse,
+    /// Edit anyway — [`set_graphics_backend_for_launch`]. See its doc for why
+    /// that is safe there and only there.
+    EditAnyway,
+}
+
 /// Rewrite the bottle's graphics backend to `dxmt`.
+///
+/// Refuses while the bottle's wineserver is live: a standalone fix (the doctor
+/// Fix button, `sabrage fix set-graphics-backend`) races the CrossOver GUI,
+/// which rewrites `cxbottle.conf` from memory on exit and would silently
+/// clobber the edit. The launch preflight uses
+/// [`set_graphics_backend_for_launch`] instead.
 pub async fn set_graphics_backend(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
+    rewrite(ctx, sink, WineserverPolicy::Refuse).await
+}
+
+/// [`set_graphics_backend`] **without** the live-wineserver refusal — the
+/// launch preflight's variant.
+///
+/// `run.sh` does not care about a live wineserver here, and it is right not to:
+/// it rewrites `cxbottle.conf` in preflight (lines 38–52) and then, two blocks
+/// later, the `wineserver-reset` launch action kills that very wineserver
+/// (`WINEPREFIX="$PREFIX" "$WINESERVER" -k`, line 129) before anything reads
+/// the file again. The refusal exists to protect an edit that has to *survive*
+/// alongside a running CrossOver; a launch's edit does not have to survive
+/// anything — the next thing it does is tear that session down. Refusing here
+/// would instead make a launch impossible in exactly the situation
+/// (`./demo.sh run` twice in a row, a stale wineserver from a crashed session)
+/// where run.sh launches fine, which is the failure mode the wineserver reset
+/// was written for.
+///
+/// The doctor Fix button keeps the refusing variant. Same three-branch rewrite,
+/// same `FixReport`, same verbatim console text — only the liveness gate
+/// differs.
+pub async fn set_graphics_backend_for_launch(
+    ctx: &StageCtx,
+    sink: &EventSink,
+) -> Result<FixReport> {
+    rewrite(ctx, sink, WineserverPolicy::EditAnyway).await
+}
+
+/// The body both entry points share.
+async fn rewrite(ctx: &StageCtx, sink: &EventSink, policy: WineserverPolicy) -> Result<FixReport> {
     let bottle = require_bottle(ctx)?;
     let conf_path = bottle.conf_path();
     let conf = std::fs::read_to_string(&conf_path)
@@ -242,18 +288,20 @@ pub async fn set_graphics_backend(ctx: &StageCtx, sink: &EventSink) -> Result<Fi
         ));
     }
 
-    if let Some(wineserver) = &ctx.paths.wineserver {
-        if bottle_wineserver_is_live(wineserver, &bottle.prefix) {
-            return Err(ctx.fatal(
-                format!(
-                    "refusing to edit {} while bottle '{}' has a live wineserver — CrossOver \
-                     may rewrite this file from memory on exit and clobber the change; stop \
-                     the session first",
-                    conf_path.display(),
-                    bottle.name
-                ),
-                Some(format!("./demo.sh stop --bottle {}", bottle.name)),
-            ));
+    if policy == WineserverPolicy::Refuse {
+        if let Some(wineserver) = &ctx.paths.wineserver {
+            if bottle_wineserver_is_live(wineserver, &bottle.prefix) {
+                return Err(ctx.fatal(
+                    format!(
+                        "refusing to edit {} while bottle '{}' has a live wineserver — CrossOver \
+                         may rewrite this file from memory on exit and clobber the change; stop \
+                         the session first",
+                        conf_path.display(),
+                        bottle.name
+                    ),
+                    Some(format!("./demo.sh stop --bottle {}", bottle.name)),
+                ));
+            }
         }
     }
 
@@ -601,5 +649,67 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    // ── set_graphics_backend_for_launch (the preflight variant) ─────────────
+
+    /// The whole point of the second entry point: run.sh rewrites
+    /// `cxbottle.conf` in preflight and kills that wineserver two blocks
+    /// later, so a live wineserver must not block a launch. Same fixture as
+    /// the refusal test above, opposite verdict.
+    #[tokio::test]
+    async fn for_launch_edits_even_while_the_bottles_wineserver_is_live() {
+        let root = scratch("for-launch-live");
+        let (mut ctx, conf) = fixture_ctx(&root, false);
+        std::fs::write(&conf, "\"CX_GRAPHICS_BACKEND\" = \"auto\"\n").unwrap();
+        ctx.paths.wineserver = Some(std::env::current_exe().expect("current_exe resolves"));
+
+        let sink: EventSink = Arc::new(|_| {});
+        let report = set_graphics_backend_for_launch(&ctx, &sink).await.unwrap();
+        assert!(report.changed);
+        assert_eq!(report.action, FixAction::SetGraphicsBackend);
+        assert_eq!(report.description, FORCED_DESCRIPTION);
+        assert!(matches_doctor_anchor(
+            &std::fs::read_to_string(&conf).unwrap()
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Everything except the liveness gate is the shared body, so the no-op
+    /// branch must behave identically through either door.
+    #[tokio::test]
+    async fn for_launch_is_a_noop_when_already_current() {
+        let root = scratch("for-launch-noop");
+        let (ctx, conf) = fixture_ctx(&root, false);
+        std::fs::write(&conf, "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n").unwrap();
+
+        let sink: EventSink = Arc::new(|_| {});
+        let report = set_graphics_backend_for_launch(&ctx, &sink).await.unwrap();
+        assert!(!report.changed);
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n"
+        );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn for_launch_still_requires_a_bottle() {
+        let root = scratch("for-launch-no-bottle");
+        let ctx = StageCtx::new(
+            Paths::new(&root),
+            StageOptions::default(),
+            null_sink(),
+            CancellationToken::new(),
+        );
+        let sink: EventSink = Arc::new(|_| {});
+        let err = set_graphics_backend_for_launch(&ctx, &sink)
+            .await
+            .unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("CrossOver bottle name required"));
     }
 }

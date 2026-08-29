@@ -20,6 +20,27 @@
 //! `tokio::sync::Mutex` is not reentrant, and taking it twice on one task
 //! deadlocks in silence.
 //!
+//! # Lock policy for `run` (the one exception)
+//!
+//! [`run_stage`]`(`[`Stage::Run`]`)` holds [`OPERATION_LOCK`] through
+//! **preflight + prepare + guards + spawn**, and **releases it the moment the
+//! wine child is up** — before Supervise. A session lasts hours: holding the
+//! lock for its duration would mean `stop`, every fix, and every other stage
+//! block until the user quits Beat Saber, which is precisely when they are
+//! most likely to reach for Stop.
+//!
+//! Mechanically: [`run_stage`] takes the guard and hands it to
+//! [`run::run`]`(ctx, Some(guard))`, which drops it at the launch boundary.
+//! [`run_stage_holding_lock`] passes `None` — the guard it inherits is never
+//! released, which is correct for a caller that already owns the lock and
+//! wrong for a real session, so that door is for tests and for whole-stage
+//! auto-fixes only.
+//!
+//! What this costs: between the release and the wine child exiting, a second
+//! operation *can* start. That is deliberate — `stop` during a live session is
+//! the whole point — and the run stage's teardown is written to tolerate a
+//! `stop` having already killed its child.
+//!
 //! # `all`
 //!
 //! `./demo.sh all` re-executes the dispatcher once per stage so each gets a
@@ -31,11 +52,13 @@
 
 pub mod build;
 pub mod install;
+pub mod run;
 pub mod setup;
 pub mod stop;
 
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
@@ -69,10 +92,13 @@ pub fn null_sink() -> EventSink {
 
 // ── options ───────────────────────────────────────────────────────────────────
 
-/// The stage-relevant slice of the `WINEVR_*` mirror.
+/// The stage-relevant slice of the `WINEVR_*` mirror — all six flags demo.sh
+/// accepts, plus Sabrage's own `dry_run`.
 ///
-/// `no_audio` / `no_dashboard` / `wired` are run-stage concerns and live in the
-/// Phase 3 launch options; a stage that needs them reads them from there.
+/// `no_audio` / `no_dashboard` / `wired` are read only by [`Stage::Run`] (and
+/// by the `run.wired-adb` preflight, which is why [`StageCtx::check_ctx`]
+/// forwards them), exactly as demo.sh reads `WINEVR_NO_AUDIO` /
+/// `WINEVR_NO_DASHBOARD` / `WINEVR_WIRED` only inside `run.sh`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StageOptions {
     /// `WINEVR_BOTTLE` / `--bottle`.
@@ -83,12 +109,22 @@ pub struct StageOptions {
     pub dry_run: bool,
     /// `WINEVR_VERBOSE` / `--verbose`.
     pub verbose: bool,
+    /// `WINEVR_NO_AUDIO` / `--no-audio`: leave the Mac's audio output alone.
+    pub no_audio: bool,
+    /// `WINEVR_NO_DASHBOARD` / `--no-dashboard`: do not launch `alvr_dashboard`.
+    pub no_dashboard: bool,
+    /// `WINEVR_WIRED` / `--wired`: USB streaming — create the `tcp:9943`/
+    /// `tcp:9944` adb forwards instead of clearing them.
+    pub wired: bool,
 }
 
 impl StageOptions {
     /// Read the `WINEVR_*` environment exactly as demo.sh does (any non-empty
     /// value is true). `dry_run` has no shell counterpart and stays false.
     pub fn from_env() -> StageOptions {
+        fn flag(name: &str) -> bool {
+            std::env::var_os(name).is_some_and(|v| !v.is_empty())
+        }
         StageOptions {
             bottle_name: std::env::var("WINEVR_BOTTLE")
                 .ok()
@@ -98,7 +134,10 @@ impl StageOptions {
                 .filter(|v| !v.is_empty())
                 .map(PathBuf::from),
             dry_run: false,
-            verbose: std::env::var_os("WINEVR_VERBOSE").is_some_and(|v| !v.is_empty()),
+            verbose: flag("WINEVR_VERBOSE"),
+            no_audio: flag("WINEVR_NO_AUDIO"),
+            no_dashboard: flag("WINEVR_NO_DASHBOARD"),
+            wired: flag("WINEVR_WIRED"),
         }
     }
 }
@@ -191,6 +230,13 @@ impl StageCtx {
                 bottle_name: self.opts.bottle_name.clone(),
                 bs_dir_override: self.opts.bs_dir_override.clone(),
                 verbose: self.opts.verbose,
+                // The launch preflight's own gating reads these: `wired`
+                // decides whether `run.wired-adb` is evaluated at all, and the
+                // other two mirror demo.sh's flags so a preflight row can say
+                // the same thing run.sh's would.
+                wired: self.opts.wired,
+                no_audio: self.opts.no_audio,
+                no_dashboard: self.opts.no_dashboard,
                 ..CheckOptions::new()
             },
         )
@@ -350,6 +396,36 @@ pub fn require_bottle(ctx: &StageCtx) -> Result<&Bottle> {
     }
 }
 
+// ── wineserver budgets ────────────────────────────────────────────────────────
+
+/// `run`'s wineserver-reset budget: **5 s, fatal on timeout**.
+///
+/// run.sh spells it as a poll loop over the backgrounded `wineserver -w`:
+///
+/// ```zsh
+/// for _i in {1..50}; do kill -0 $_wpid 2>/dev/null || break; sleep 0.1; done
+/// if kill -0 $_wpid 2>/dev/null; then
+///   kill $_wpid 2>/dev/null
+///   warn "wineserver still alive after 5s: $(pgrep -lf wineserver | tr '\n' ' ')"
+///   die "kill the listed wineserver(s) manually, then re-run"
+/// fi
+/// ```
+///
+/// Deliberately **distinct** from [`STOP_WINESERVER_WAIT`] — 5 s fatal here,
+/// 4 s advisory there (design-core §10, parity decision 18; PARITY.md's
+/// "wineserver budgets (5 s fatal / 4 s soft)"). Collapsing them into one
+/// constant would silently change one of the two behaviours.
+pub const RUN_WINESERVER_WAIT: Duration = Duration::from_secs(5);
+
+/// `stop`'s wineserver-wait budget: **4 s, never fatal**.
+///
+/// `lib.sh`'s `stop_wine` polls `for _i in {1..40}; do … sleep 0.1; done` and
+/// then simply gives up (`kill $_wp 2>/dev/null || true`). See
+/// [`RUN_WINESERVER_WAIT`] for why the two budgets stay apart.
+///
+/// Re-exported as `stages::stop::STOP_WINESERVER_WAIT`, where it used to live.
+pub const STOP_WINESERVER_WAIT: Duration = Duration::from_secs(4);
+
 // ── operation lock ────────────────────────────────────────────────────────────
 
 /// One mutating operation at a time — stage or fix.
@@ -405,6 +481,20 @@ impl StageOutcome {
             exit_code_equiv,
         }
     }
+
+    /// The outcome of a stage that ran to completion and produced an exit code.
+    ///
+    /// `ok == (code == 0)`. Every stage but `run` can only produce 0 here (a
+    /// failure is an `Err`); `run` returns **wine's own exit status**, which
+    /// demo.sh propagates verbatim (`exit $rc`) — so a game that crashed with
+    /// status 3 is a stage that finished, not-ok, with `exit_code_equiv: 3`.
+    pub fn from_code(stage: Stage, exit_code_equiv: i32) -> StageOutcome {
+        StageOutcome {
+            stage,
+            ok: exit_code_equiv == 0,
+            exit_code_equiv,
+        }
+    }
 }
 
 /// Run one stage, taking [`OPERATION_LOCK`] for its duration.
@@ -413,7 +503,20 @@ impl StageOutcome {
 /// last — on the failure path too, with the error's `exit_code_equiv` — so a UI
 /// that only listens to events never sees a stage that started and never ended.
 pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
-    let _guard = acquire_operation_lock().await;
+    let guard = acquire_operation_lock().await;
+    if stage == Stage::Run {
+        // The one stage that gives the lock back early — see this module's
+        // "Lock policy for `run`". The guard is *moved into* the stage, which
+        // drops it once the wine child is up; `run_stage` must not keep one of
+        // its own or the release would be a no-op.
+        ctx.emit(StageEvent::StageStarted {
+            run_id: ctx.run_id,
+            stage,
+        });
+        let result = run::run(ctx, Some(guard)).await;
+        return finish_stage(stage, ctx, result);
+    }
+    let _guard = guard;
     run_stage_holding_lock(stage, ctx).await
 }
 
@@ -430,8 +533,15 @@ pub async fn run_stage_holding_lock(stage: Stage, ctx: &StageCtx) -> Result<Stag
         stage,
     });
     let result = dispatch(stage, ctx).await;
+    finish_stage(stage, ctx, result)
+}
+
+/// Emit [`StageEvent::StageFinished`] for `result` and project it onto a
+/// [`StageOutcome`]. The single place the bracket closes, so both entry points
+/// (and the `run` special case) report identically.
+fn finish_stage(stage: Stage, ctx: &StageCtx, result: Result<i32>) -> Result<StageOutcome> {
     let outcome = match &result {
-        Ok(()) => StageOutcome::success(stage),
+        Ok(code) => StageOutcome::from_code(stage, *code),
         Err(e) => StageOutcome::failed(stage, e.exit_code()),
     };
     ctx.emit(StageEvent::StageFinished {
@@ -440,22 +550,25 @@ pub async fn run_stage_holding_lock(stage: Stage, ctx: &StageCtx) -> Result<Stag
         ok: outcome.ok,
         exit_code_equiv: outcome.exit_code_equiv,
     });
-    result.map(|()| outcome)
+    result.map(|_| outcome)
 }
 
-async fn dispatch(stage: Stage, ctx: &StageCtx) -> Result<()> {
+/// The exit-code-equivalent of one stage.
+///
+/// setup/build/install/stop map their `()` success onto `0`: demo.sh's
+/// dispatcher exits 0 for each of them or dies. Only `run` has a code of its
+/// own — wine's — and it is reached through [`run_stage`], never here, because
+/// this function cannot hand it the operation-lock guard to release.
+async fn dispatch(stage: Stage, ctx: &StageCtx) -> Result<i32> {
     match stage {
-        Stage::Setup => setup::run(ctx).await,
-        Stage::Build => build::run(ctx).await,
-        Stage::Install => install::run(ctx).await,
-        Stage::Stop => stop::run(ctx).await,
-        Stage::Run => Err(ctx.fatal(
-            "run lands in Phase 3",
-            Some(format!(
-                "./demo.sh run --bottle {}",
-                ctx.opts.bottle_name.as_deref().unwrap_or("<name>")
-            )),
-        )),
+        Stage::Setup => setup::run(ctx).await.map(|()| 0),
+        Stage::Build => build::run(ctx).await.map(|()| 0),
+        Stage::Install => install::run(ctx).await.map(|()| 0),
+        Stage::Stop => stop::run(ctx).await.map(|()| 0),
+        // Reached only via `run_stage_holding_lock` (tests, whole-stage
+        // auto-fixes): the caller already owns the lock, so the stage gets no
+        // guard to release and supervises with the lock still held.
+        Stage::Run => run::run(ctx, None).await,
     }
 }
 
@@ -527,28 +640,72 @@ mod tests {
 
     #[tokio::test]
     async fn run_stage_brackets_the_stage_with_events_even_when_it_fails() {
+        // `stop` with no bottle: `require_bottle` dies before touching the
+        // machine, which is the cheapest real failure any stage can have.
         let (ctx, seen) = ctx_with(StageOptions::default());
-        let err = run_stage(Stage::Run, &ctx).await.unwrap_err();
-        assert_eq!(err.to_string(), "run lands in Phase 3");
+        let err = run_stage(Stage::Stop, &ctx).await.unwrap_err();
+        assert!(err
+            .to_string()
+            .starts_with("CrossOver bottle name required"));
 
         let evs = seen.lock().unwrap().clone();
         assert!(matches!(
             evs.first(),
             Some(StageEvent::StageStarted {
-                stage: Stage::Run,
+                stage: Stage::Stop,
                 ..
             })
         ));
         assert!(matches!(
             evs.last(),
             Some(StageEvent::StageFinished {
-                stage: Stage::Run,
+                stage: Stage::Stop,
                 ok: false,
                 exit_code_equiv: 1,
                 ..
             })
         ));
         assert!(evs.iter().any(|e| matches!(e, StageEvent::Fatal { .. })));
+    }
+
+    #[test]
+    fn stage_outcome_from_code_is_ok_only_for_zero() {
+        // `run` propagates wine's status: a non-zero code is a stage that
+        // finished, not-ok — not an error.
+        assert_eq!(
+            StageOutcome::from_code(Stage::Run, 0),
+            StageOutcome::success(Stage::Run)
+        );
+        let crashed = StageOutcome::from_code(Stage::Run, 3);
+        assert!(!crashed.ok);
+        assert_eq!(crashed.exit_code_equiv, 3);
+    }
+
+    #[test]
+    fn the_two_wineserver_budgets_stay_distinct() {
+        // PARITY.md: 5 s fatal (run) vs 4 s soft (stop). Never unify.
+        assert_eq!(RUN_WINESERVER_WAIT, Duration::from_secs(5));
+        assert_eq!(STOP_WINESERVER_WAIT, Duration::from_secs(4));
+        assert_ne!(RUN_WINESERVER_WAIT, STOP_WINESERVER_WAIT);
+        // The re-export from `stop` is the same constant.
+        assert_eq!(stop::STOP_WINESERVER_WAIT, STOP_WINESERVER_WAIT);
+    }
+
+    #[test]
+    fn check_ctx_forwards_every_launch_flag() {
+        let (ctx, _) = ctx_with(StageOptions {
+            bottle_name: Some("Steam".into()),
+            verbose: true,
+            no_audio: true,
+            no_dashboard: true,
+            wired: true,
+            ..Default::default()
+        });
+        let cc = ctx.check_ctx();
+        assert!(cc.opts.verbose && cc.opts.no_audio && cc.opts.no_dashboard && cc.opts.wired);
+        assert_eq!(cc.opts.bottle_name.as_deref(), Some("Steam"));
+        // doctor parity: adb probing stays on unless a caller turns it off.
+        assert!(cc.opts.allow_adb_probes);
     }
 
     #[tokio::test]

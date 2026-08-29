@@ -46,6 +46,15 @@
 //! * [`fixes`] — the remedy actions doctor rows and the launch preflight offer
 //! * [`privilege`] — the pipeline's one privileged write
 //! * [`error`] — [`error::SabrageError`] and demo.sh exit-code mapping
+//!
+//! Phase 3 adds the launch half — [`stages::run`], the state machine behind
+//! `demo.sh run` — plus the two things a *session* needs that a stage does
+//! not:
+//! * [`session`] — the live handle, the broadcast [`session::SessionStatus`],
+//!   the crash-recovery [`session::state::SessionState`], and the file-only
+//!   telemetry watcher
+//! * [`logs`] — the wine console log's name, the rotation-aware tailer, and
+//!   the past-run list
 
 pub mod checks;
 pub mod contract;
@@ -53,9 +62,11 @@ pub mod error;
 pub mod events;
 pub mod executor;
 pub mod fixes;
+pub mod logs;
 pub mod paths;
 pub mod privilege;
 pub mod process;
+pub mod session;
 pub mod stages;
 pub mod tap;
 pub mod util;
@@ -64,14 +75,18 @@ pub use contract::{contract, Contract, Gate, CONTRACT};
 pub use error::{Result, SabrageError};
 pub use events::{step, Severity, Stage, StageEvent, StepId, Stream};
 pub use executor::{
-    dry_run_plan_body, BoxFuture, Copied, DryRunExecutor, Executor, PlannedAction, RealExecutor,
-    DRY_RUN_PLAN_EMPTY, DRY_RUN_PLAN_TITLE,
+    dry_run_plan_body, BoxFuture, Copied, DetachedChild, DetachedStdio, DryRunExecutor, Executor,
+    PlannedAction, RealExecutor, DRY_RUN_PLAN_EMPTY, DRY_RUN_PLAN_TITLE,
 };
 pub use fixes::{FixAction, FixDef, FixReport};
+pub use logs::{LogBatch, LogSource, PastRun, Tailer};
 pub use paths::{resolve_repo_root, Bottle, Paths};
 pub use privilege::{AdminMethod, PrivilegedWrite};
-pub use process::{ChildSpec, ProcInfo};
+pub use process::{capture, Captured, ChildSpec, ProcInfo};
+pub use session::{
+    live_session, EncoderInfo, LiveSessionHandle, SessionPhase, SessionStatus, LIVE_SESSION,
+};
 pub use stages::{
-    null_sink, operation_in_progress, require_bottle, run_stage, EventSink, StageCtx, StageOptions,
-    StageOutcome, OPERATION_LOCK,
+    null_sink, operation_in_progress, require_bottle, run, run_stage, EventSink, StageCtx,
+    StageOptions, StageOutcome, OPERATION_LOCK, RUN_WINESERVER_WAIT, STOP_WINESERVER_WAIT,
 };

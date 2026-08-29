@@ -96,7 +96,7 @@ impl Stage {
             Stage::Setup => step::SETUP,
             Stage::Build => step::BUILD,
             Stage::Install => step::INSTALL,
-            Stage::Run => &[],
+            Stage::Run => step::RUN,
             Stage::Stop => step::STOP,
         }
     }
@@ -250,6 +250,70 @@ pub enum StageEvent {
         fix: Option<FixAction>,
     },
 
+    /// A raw `print -r --` line, reproduced **verbatim** — leading spaces and
+    /// all, and possibly empty (`print ""`).
+    ///
+    /// [`StageEvent::Line`] cannot carry these: they are outside `lib.sh`'s
+    /// `info`/`ok`/`warn`/`fail` vocabulary, so a renderer must print them with
+    /// no marker, no colour, and no indent of its own. `run.sh` is where they
+    /// live — every one of these is a literal:
+    ///
+    /// ```zsh
+    /// print ""
+    /// print -r -- "-- launching Beat Saber through the bridge"
+    /// print -r -- "   put the headset ON and open the ALVR client; first frame can take ~30s."
+    /// print -r -- "   exe: $BS_WIN"
+    /// print -r -- "   log: $LOG"
+    /// print -r -- "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
+    /// print "audio: restored output -> $PREV_AUDIO_OUT"
+    /// print "dashboard: closed"
+    /// print "encoder helper: reaped (left over from the runtime)"
+    /// print -r -- "wine exited with status $rc (log: $LOG)"
+    /// ```
+    ///
+    /// (The `-- launching …` banner is *not* a [`StageEvent::Section`]: the
+    /// four indented lines under it are part of the same block and the CLI
+    /// must reproduce all five byte-for-byte.)
+    Text {
+        run_id: RunId,
+        /// `None` for lines a stage prints outside any step.
+        step: Option<String>,
+        /// The shell's line without its trailing newline. May be empty.
+        text: String,
+    },
+
+    /// One launch-preflight check resolved.
+    ///
+    /// The **final** outcome: a check gated `autofix` that failed, was fixed,
+    /// and passed the re-check emits exactly one `Check` (the passing one),
+    /// preceded by the [`StageEvent::AutoFixed`] describing the fix. `gate` is
+    /// the contract's `native_gate` for the slug, so a consumer can tell "this
+    /// warn is advisory" from "this warn would have blocked on the zsh side"
+    /// without re-reading the contract.
+    Check {
+        run_id: RunId,
+        step: String,
+        outcome: crate::checks::CheckOutcome,
+        gate: crate::contract::Gate,
+    },
+
+    /// The wine child is up: the run has left preflight/prepare and is now a
+    /// session.
+    ///
+    /// `pid` + `start_time` together are the process **identity**
+    /// ([`crate::process::ProcInfo`]) — the pair that survives into
+    /// `session-state.json` and lets a later reconcile tell this process from a
+    /// recycled pid. `started_at_unix_ms` is wall-clock, for the session
+    /// timer; `start_time` is the OS's own boot-relative-ish stamp and is
+    /// **not** a clock. `log_path` is the file the child writes to directly.
+    Launched {
+        run_id: RunId,
+        pid: u32,
+        start_time: u64,
+        log_path: String,
+        started_at_unix_ms: u64,
+    },
+
     /// The stage ended. `exit_code_equiv` is what `./demo.sh <stage>` would have
     /// exited with.
     StageFinished {
@@ -271,6 +335,9 @@ impl StageEvent {
             | StageEvent::Progress { run_id, .. }
             | StageEvent::AutoFixed { run_id, .. }
             | StageEvent::NeedsAdmin { run_id, .. }
+            | StageEvent::Text { run_id, .. }
+            | StageEvent::Check { run_id, .. }
+            | StageEvent::Launched { run_id, .. }
             | StageEvent::Fatal { run_id, .. }
             | StageEvent::StageFinished { run_id, .. } => *run_id,
         }
@@ -279,11 +346,12 @@ impl StageEvent {
     /// The step this event is attributed to, when it has one.
     pub fn step(&self) -> Option<&str> {
         match self {
-            StageEvent::Line { step, .. } => step.as_deref(),
+            StageEvent::Line { step, .. } | StageEvent::Text { step, .. } => step.as_deref(),
             StageEvent::Output { step, .. }
             | StageEvent::Progress { step, .. }
             | StageEvent::AutoFixed { step, .. }
-            | StageEvent::NeedsAdmin { step, .. } => Some(step),
+            | StageEvent::NeedsAdmin { step, .. }
+            | StageEvent::Check { step, .. } => Some(step),
             _ => None,
         }
     }
@@ -311,6 +379,15 @@ impl StageEvent {
         remedy: Option<String>,
     ) -> StageEvent {
         StageEvent::row(run_id, step, Severity::Fail, text, remedy)
+    }
+
+    /// A verbatim `print -r --` line. See [`StageEvent::Text`].
+    pub fn text(run_id: RunId, step: Option<StepId>, text: impl Into<String>) -> StageEvent {
+        StageEvent::Text {
+            run_id,
+            step: step.map(|s| s.to_string()),
+            text: text.into(),
+        }
     }
 
     fn row(
@@ -376,6 +453,40 @@ pub mod step {
     /// Layer 4: the host OpenXR registration — the pipeline's ONLY privileged write.
     pub const INSTALL_HOST_MANIFEST: StepId = "install.4.host-manifest";
 
+    // run.sh
+    /// The ordered preflight block (`# preflight:` / `# preflight-autofix:`
+    /// tags) — game presence/version, wine, bridge outputs, host manifest,
+    /// bottle currency, the DXMT overlay compare, the `cxbottle.conf` backend
+    /// autofix, Goldberg presence, `protocol`, and the helper arch autofix.
+    pub const RUN_PREFLIGHT: StepId = "run.1.preflight";
+    /// `launch-action: adb-forward-hygiene` — `--wired` creates
+    /// `tcp:9943`/`tcp:9944` per-serial; a normal run removes exactly those two.
+    pub const RUN_ADB_FORWARDS: StepId = "run.2.adb-forwards";
+    /// `launch-action: wineserver-reset` — `wineserver -k` then a bounded `-w`
+    /// wait ([`crate::stages::RUN_WINESERVER_WAIT`], **fatal** on timeout).
+    pub const RUN_WINESERVER: StepId = "run.3.wineserver";
+    /// `launch-action: goldberg-stage` — the `steam_api64.dll` swap (one
+    /// `.orig-steam` backup), `steam_appid.txt`, and the `steam_settings/` flags.
+    pub const RUN_GOLDBERG: StepId = "run.4.goldberg";
+    /// `launch-action: audio-route` — the guarded BlackHole 2ch switch.
+    pub const RUN_AUDIO: StepId = "run.5.audio";
+    /// `launch-action: dashboard` — the guarded `alvr_dashboard` spawn.
+    pub const RUN_DASHBOARD: StepId = "run.6.dashboard";
+    /// `launch-action: adb-reverse-cleanup` — `adb reverse --remove-all` on the
+    /// alvr path; the legacy oxrsys path additionally re-creates its tunnels
+    /// and `am start`s the Android client.
+    pub const RUN_ADB_REVERSE: StepId = "run.7.adb-reverse";
+    /// `launch-action: launch-wine` — the banner block and the detached spawn,
+    /// ending in [`super::StageEvent::Launched`].
+    pub const RUN_LAUNCH: StepId = "run.8.launch";
+    /// Waiting on the session: the wine child, the log tail, and the telemetry
+    /// watcher. Holds no operation lock (see [`crate::stages`]).
+    pub const RUN_SUPERVISE: StepId = "run.9.supervise";
+    /// Guard release (audio, dashboard, helper reap) plus, on the INT/TERM
+    /// path only, `stop_wine`. Ends with the verbatim
+    /// `wine exited with status <rc> (log: <path>)` line.
+    pub const RUN_TEARDOWN: StepId = "run.10.teardown";
+
     // stop.sh
     /// `wineserver -k` + bounded `-w` wait (4 s, non-fatal) and the survivor probe.
     pub const STOP_WINESERVER: StepId = "stop.1.wineserver";
@@ -404,6 +515,21 @@ pub mod step {
         INSTALL_BOTTLE,
         INSTALL_HOST_MANIFEST,
     ];
+    /// run's steps, in order — the launch state machine of design-core §3.2
+    /// (Preflight → Prepare → Guards → Launch → Supervise → Teardown), with
+    /// each `# launch-action:` tag of run.sh given its own id.
+    pub const RUN: &[StepId] = &[
+        RUN_PREFLIGHT,
+        RUN_ADB_FORWARDS,
+        RUN_WINESERVER,
+        RUN_GOLDBERG,
+        RUN_AUDIO,
+        RUN_DASHBOARD,
+        RUN_ADB_REVERSE,
+        RUN_LAUNCH,
+        RUN_SUPERVISE,
+        RUN_TEARDOWN,
+    ];
     /// stop's steps, in order.
     pub const STOP: &[StepId] = &[STOP_WINESERVER, STOP_PORTS, STOP_REAP, STOP_AUDIO];
 
@@ -413,6 +539,7 @@ pub mod step {
         v.extend_from_slice(SETUP);
         v.extend_from_slice(BUILD);
         v.extend_from_slice(INSTALL);
+        v.extend_from_slice(RUN);
         v.extend_from_slice(STOP);
         v
     }
@@ -455,8 +582,8 @@ mod tests {
         let all = step::all();
         let unique: std::collections::BTreeSet<_> = all.iter().collect();
         assert_eq!(unique.len(), all.len(), "duplicate step id");
-        assert_eq!(all.len(), 18);
-        for stage in [Stage::Setup, Stage::Build, Stage::Install, Stage::Stop] {
+        assert_eq!(all.len(), 28);
+        for stage in Stage::EVERY {
             for s in stage.steps() {
                 assert!(
                     s.starts_with(&format!("{}.", stage.as_str())),
@@ -464,7 +591,11 @@ mod tests {
                 );
             }
         }
-        assert!(Stage::Run.steps().is_empty(), "run lands in Phase 3");
+        // Every stage now owns steps — run landed in Phase 3.
+        assert_eq!(Stage::Run.steps(), step::RUN);
+        assert_eq!(Stage::Run.steps().len(), 10);
+        assert_eq!(Stage::Run.steps().first(), Some(&step::RUN_PREFLIGHT));
+        assert_eq!(Stage::Run.steps().last(), Some(&step::RUN_TEARDOWN));
     }
 
     #[test]
@@ -491,6 +622,49 @@ mod tests {
         assert_eq!(json["step"], "install.3.bottle");
         // Verbatim: no marker, no colour, no leading spaces.
         assert_eq!(json["text"], "ActiveRuntime registered");
+    }
+
+    #[test]
+    fn the_run_events_keep_their_wire_shape() {
+        // Text is verbatim: leading spaces survive, and an empty line is legal
+        // (run.sh's bare `print ""`).
+        let ev = StageEvent::text(rid(), None, "   exe: C:\\Beat Saber.exe");
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "text");
+        assert_eq!(json["text"], "   exe: C:\\Beat Saber.exe");
+        assert_eq!(json["step"], serde_json::Value::Null);
+        let empty = StageEvent::text(rid(), None, "");
+        assert_eq!(serde_json::to_value(&empty).unwrap()["text"], "");
+
+        let ev = StageEvent::Check {
+            run_id: rid(),
+            step: step::RUN_PREFLIGHT.into(),
+            outcome: crate::checks::CheckOutcome::fail(
+                "run.bridge-built",
+                "bridge not built",
+                "./demo.sh build",
+            ),
+            gate: crate::contract::Gate::Block,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "check");
+        assert_eq!(json["gate"], "block");
+        assert_eq!(json["outcome"]["slug"], "run.bridge-built");
+        assert_eq!(json["outcome"]["status"], "fail");
+
+        let ev = StageEvent::Launched {
+            run_id: rid(),
+            pid: 59004,
+            start_time: 1786300214,
+            log_path: "/repo/logs/beatsaber-20260829-101112.log".into(),
+            started_at_unix_ms: 1786300214181,
+        };
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["kind"], "launched");
+        assert_eq!(json["pid"], 59004);
+        assert_eq!(json["startTime"], 1786300214u64);
+        assert_eq!(json["startedAtUnixMs"], 1786300214181u64);
+        assert_eq!(json["logPath"], "/repo/logs/beatsaber-20260829-101112.log");
     }
 
     #[test]
@@ -529,6 +703,20 @@ mod tests {
                 step: step::INSTALL_HOST_MANIFEST.into(),
                 reason: "writes the host OpenXR registration".into(),
             },
+            StageEvent::text(rid(), Some(step::RUN_LAUNCH), "   log: /repo/logs/x.log"),
+            StageEvent::Check {
+                run_id: rid(),
+                step: step::RUN_PREFLIGHT.into(),
+                outcome: crate::checks::CheckOutcome::pass("run.wine-exec", "wine present"),
+                gate: crate::contract::Gate::Block,
+            },
+            StageEvent::Launched {
+                run_id: rid(),
+                pid: 4242,
+                start_time: 1786300214,
+                log_path: "/repo/logs/beatsaber-20260829-101112.log".into(),
+                started_at_unix_ms: 1786300214181,
+            },
             StageEvent::Fatal {
                 run_id: rid(),
                 message: "boom".into(),
@@ -550,6 +738,10 @@ mod tests {
         }
         assert_eq!(evs[3].step(), Some(step::BUILD_OXRSYS));
         assert_eq!(evs[2].step(), None);
-        assert_eq!(evs[7].step(), None);
+        // Text carries its step; Launched never does.
+        assert_eq!(evs[7].step(), Some(step::RUN_LAUNCH));
+        assert_eq!(evs[8].step(), Some(step::RUN_PREFLIGHT));
+        assert_eq!(evs[9].step(), None);
+        assert_eq!(evs[10].step(), None);
     }
 }

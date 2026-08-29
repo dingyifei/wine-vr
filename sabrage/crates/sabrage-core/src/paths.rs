@@ -36,6 +36,19 @@ pub fn bottles_root() -> PathBuf {
     home_dir().join("Library/Application Support/CrossOver/Bottles")
 }
 
+/// `~/Library/Application Support/Sabrage` — Sabrage's own store.
+///
+/// GUI-only state lives here and **never** in the repo or in OXRSys's
+/// directory (CLAUDE.md, "Sabrage ⇄ demo.sh parity"): settings, the game
+/// library, `oxrsys-runtime.toml` backups, per-run event logs, the staging
+/// file for the one privileged write ([`crate::privilege::sabrage_support_dir`]
+/// is a thin alias for this), and `session-state.json`
+/// ([`Paths::session_state_path`]). demo.sh knows nothing about any of it, so
+/// nothing here is a parity artifact.
+pub fn sabrage_support_dir() -> PathBuf {
+    home_dir().join("Library/Application Support/Sabrage")
+}
+
 /// Bottle names present on this machine, sorted. Mirrors the
 /// `ls "$HOME/Library/Application Support/CrossOver/Bottles"` in doctor's
 /// `bottle.named` remedy and lib.sh's `require_bottle`.
@@ -212,6 +225,13 @@ pub struct Paths {
 
     /// `ADB` — SDK platform-tools wins over `$PATH`; `None`, never `""`.
     pub adb: Option<PathBuf>,
+
+    /// Sabrage's own store, `~/Library/Application Support/Sabrage`
+    /// ([`sabrage_support_dir`]). Has no lib.sh counterpart — demo.sh has no
+    /// state of its own. A field rather than a call so tests can redirect it
+    /// away from the real `$HOME`, exactly as they already do with
+    /// `oxr_appsup`.
+    pub sabrage_appsup: PathBuf,
 }
 
 impl Paths {
@@ -280,6 +300,7 @@ impl Paths {
             wine,
             wineserver,
             adb,
+            sabrage_appsup: sabrage_support_dir(),
             root,
         }
     }
@@ -299,6 +320,28 @@ impl Paths {
     /// (the file doctor's `cfg.session-pins` inspects for stale manual IPs).
     pub fn alvr_session_json(&self) -> PathBuf {
         self.oxr_appsup.join("alvr/session.json")
+    }
+
+    /// `<root>/logs` — where `run` writes `beatsaber-<ts>.log`.
+    ///
+    /// run.sh: `mkdir -p "$ROOT/logs"` then
+    /// `LOG="$ROOT/logs/beatsaber-$(date +%Y%m%d-%H%M%S).log"`. The directory
+    /// is gitignored on purpose (CLAUDE.md, "Conventions") — it holds demo
+    /// runs' logs and both front-ends write into the same one, so the Logs
+    /// screen lists the shell's past runs too.
+    pub fn logs_dir(&self) -> PathBuf {
+        self.root.join("logs")
+    }
+
+    /// `<sabrage_appsup>/session-state.json` — the crash-recovery record
+    /// ([`crate::session::state::SessionState`]).
+    ///
+    /// Sabrage-only: demo.sh's guards are shell traps, which a `SIGKILL` or a
+    /// power loss simply skips, leaving the Mac's audio output on BlackHole
+    /// with nothing able to say what it was before. This file is what lets
+    /// the next launch (or Stop) put it back.
+    pub fn session_state_path(&self) -> PathBuf {
+        self.sabrage_appsup.join("session-state.json")
     }
 
     /// Render a repo-relative display path the way doctor does with
@@ -494,6 +537,15 @@ mod tests {
         assert_eq!(
             p.host_xr_json,
             PathBuf::from("/usr/local/share/openxr/1/active_runtime.x86_64.json")
+        );
+        assert_eq!(p.logs_dir(), PathBuf::from("/repo/logs"));
+        // Sabrage's own store is $HOME-derived, never repo-derived.
+        assert!(p
+            .sabrage_appsup
+            .ends_with("Library/Application Support/Sabrage"));
+        assert_eq!(
+            p.session_state_path(),
+            p.sabrage_appsup.join("session-state.json")
         );
         assert_eq!(p.rel_display(Path::new("/repo/ext/oxrsys")), "ext/oxrsys");
         assert_eq!(p.rel_display(Path::new("/elsewhere")), "/elsewhere");

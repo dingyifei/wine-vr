@@ -45,9 +45,14 @@ use crate::stages::{EventSink, StageCtx};
 /// clear" (see [`list_forwards`]), the same as any other query failure.
 const ADB_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// This fix's own step id — `run.sh`'s adb-forward hygiene is part of the
-/// launch preflight (Phase 3), which has not landed its own `run.*` step ids
-/// yet, so this borrows none of `events::step`'s stage-scoped constants.
+/// This fix's own step id, used when it runs **as a fix** — from the doctor's
+/// fix list or `fixes::apply`, where there is no stage step to belong to.
+///
+/// The launch path is the other caller and must *not* use it: run.sh's
+/// adb-forward hygiene is a numbered step of the run stage, and its rows have
+/// to sort and group with the rest of that stage's. It passes
+/// [`crate::events::step::RUN_ADB_FORWARDS`] to
+/// [`remove_adb_forwards_at`] instead.
 const STEP: StepId = "fix.remove-adb-forwards";
 
 /// Parse `adb forward --list`'s stdout: `<serial> <local> <remote>` rows, one
@@ -100,8 +105,25 @@ fn stale_local_specs() -> Vec<String> {
         .collect()
 }
 
-/// Remove the stale `tcp:9943`/`tcp:9944` forwards, per serial.
+/// Remove the stale `tcp:9943`/`tcp:9944` forwards, per serial, as the
+/// standalone fix — every row stamped [`STEP`].
 pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
+    remove_adb_forwards_at(ctx, sink, STEP).await
+}
+
+/// The same removal, stamped with a caller-supplied step id.
+///
+/// The behaviour is identical — same per-serial `adb forward --remove`, same
+/// `info` text, same tolerant "a failed removal prints nothing" rule; only the
+/// step the rows are attributed to changes. The launch path
+/// ([`crate::stages::run::actions::adb_forward_hygiene`]) passes
+/// [`crate::events::step::RUN_ADB_FORWARDS`], so its rows belong to the run
+/// stage's step 2 rather than to a fix that is not running.
+pub async fn remove_adb_forwards_at(
+    ctx: &StageCtx,
+    sink: &EventSink,
+    step: StepId,
+) -> Result<FixReport> {
     let Some(adb) = ctx.paths.adb.clone() else {
         return Ok(FixReport::unchanged(
             FixAction::RemoveAdbForwards,
@@ -111,7 +133,7 @@ pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
 
     let stale_locals = stale_local_specs();
     let dry_run = ctx.executor.is_dry_run();
-    let executor = ctx.executor_for(STEP);
+    let executor = ctx.executor_for(step);
 
     let mut cleared: Vec<String> = Vec::new();
     for (serial, local) in list_forwards(&adb).await {
@@ -119,7 +141,7 @@ pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
             continue;
         }
         let spec = ctx
-            .child(adb.clone(), STEP)
+            .child(adb.clone(), step)
             .args(["-s", &serial, "forward", "--remove", &local]);
         // NEVER `--remove-all` here — see this module's header. `run_child`
         // reports a non-zero exit as `Ok`, matching the shell's tolerant `&&`
@@ -133,7 +155,7 @@ pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
             "{verb} stale adb forward {local} on {serial} (left over from a --wired launch — \
              would otherwise break WiFi discovery)"
         );
-        sink(StageEvent::info(ctx.run_id, Some(STEP), line.clone()));
+        sink(StageEvent::info(ctx.run_id, Some(step), line.clone()));
         cleared.push(line);
     }
 
@@ -340,6 +362,42 @@ mod tests {
             .description
             .starts_with("would clear stale adb forward tcp:9943"));
         assert!(!log.exists(), "dry run must not actually spawn the removal");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[tokio::test]
+    async fn the_step_id_is_the_fixs_own_by_default_and_the_callers_with_at() {
+        // #16c: the standalone fix keeps `fix.remove-adb-forwards`; the launch
+        // path stamps the run stage's step instead, without forking the code.
+        let root = scratch("step-id");
+        let adb = root.join("adb.sh");
+        let log = root.join("removed.log");
+        write_fake_adb(&adb, "SERIALX tcp:9943 tcp:9943\n", &log);
+
+        let ctx = ctx_with_adb(&root, adb, true);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = std::sync::Arc::new(move |ev| s.lock().unwrap().push(ev));
+
+        let steps = |seen: &std::sync::Mutex<Vec<StageEvent>>| -> Vec<Option<String>> {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|e| matches!(e, StageEvent::Line { .. }))
+                .map(|e| e.step().map(str::to_string))
+                .collect()
+        };
+
+        remove_adb_forwards(&ctx, &sink).await.unwrap();
+        assert_eq!(steps(&seen), vec![Some(STEP.to_string())]);
+        assert_eq!(STEP, "fix.remove-adb-forwards");
+
+        seen.lock().unwrap().clear();
+        remove_adb_forwards_at(&ctx, &sink, crate::events::step::RUN_ADB_FORWARDS)
+            .await
+            .unwrap();
+        assert_eq!(steps(&seen), vec![Some("run.2.adb-forwards".to_string())]);
 
         std::fs::remove_dir_all(&root).ok();
     }

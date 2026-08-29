@@ -34,3 +34,12 @@ nix = { version = "0.31.3", default-features = false, features = ["signal", "pro
 sysinfo = "0.39.6"
 # run_id for the event stream; "serde" so StageEvent serializes it directly.
 uuid = { version = "1.26.0", features = ["v4", "serde"] }
+
+# ── Phase 3 (run) ─────────────────────────────────────────────────────────────
+# LOCAL wall-clock only, for the wine log filename: run.sh spells it
+# `date +%Y%m%d-%H%M%S`, which is the machine's local time — `std::time` has no
+# civil calendar at all, so a hand-rolled epoch→Y/M/D conversion would have to
+# reimplement the tz database to stay byte-identical with the shell.
+# default-features = false drops `oldtime`/`wasmbind`/`serde`; `clock` brings
+# `Local::now` (and its `iana-time-zone` lookup), `std` the error types.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }

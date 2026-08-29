@@ -705,8 +705,12 @@ pub fn is_inside_app_bundle(path: &Path) -> bool {
 /// Sabrage's own support directory, `~/Library/Application Support/Sabrage` —
 /// where the temp file for the privileged write is staged (never `/tmp`: a
 /// world-writable staging path for a root-installed file is a swap race).
+///
+/// One implementation, in [`crate::paths::sabrage_support_dir`]: Phase 3's
+/// session-state file lands in the same directory, and two spellings of one
+/// path is how the two front-ends of one store drift apart.
 pub fn sabrage_support_dir() -> PathBuf {
-    crate::paths::home_dir().join("Library/Application Support/Sabrage")
+    crate::paths::sabrage_support_dir()
 }
 
 #[cfg(test)]

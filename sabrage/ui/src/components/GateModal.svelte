@@ -4,26 +4,72 @@
     cancelStage,
     applyFix,
     FIX_META,
+    type CheckStatus,
     type StageEvent,
     type StageOutcome,
     type Severity,
     type FixAction,
   } from "../ipc";
   import { stageStore, type GateRequest } from "../stores/stage.svelte";
+  import { sessionStore } from "../stores/session.svelte";
+  import type { Screen } from "../types";
 
   interface Props {
     /** `null` renders nothing. Set via `stageStore.openGate(...)`. */
     request: GateRequest | null;
     onClose: () => void;
+    /** Wired from App.svelte — the run-mode "Open Session" button navigates
+     * here once a `launched` row arrives. Only used for `stage === "run"`. */
+    onNavigate?: (screen: Screen) => void;
   }
-  let { request, onClose }: Props = $props();
+  let { request, onClose, onNavigate }: Props = $props();
+
+  // Extracted from the imported union so the new payload shapes never drift
+  // from events.rs by hand — this is `Extract<StageEvent, {kind:"check"}>`
+  // etc., not a separately hand-typed mirror.
+  type CheckEv = Extract<StageEvent, { kind: "check" }>;
 
   type Row =
     | { kind: "section"; title: string }
     | { kind: "line"; step: string | null; severity: Severity; text: string; remedy: string | null }
+    | { kind: "text"; text: string }
     | { kind: "autoFixed"; step: string; description: string }
     | { kind: "needsAdmin"; step: string; reason: string }
-    | { kind: "fatal"; message: string; remedy: string | null; fix: FixAction | null };
+    | { kind: "fatal"; message: string; remedy: string | null; fix: FixAction | null }
+    | { kind: "check"; outcome: CheckEv["outcome"]; gate: CheckEv["gate"] }
+    | { kind: "launched"; pid: number; logPath: string };
+
+  /** One `StageEvent` -> the row it renders as, or `null` for the four kinds
+   * that drive other UI (progress bar, console pane, runId, finished banner)
+   * instead of a row of their own. Shared between the two rendering paths
+   * below: the accumulating `rows` array for setup/build/install/stop, and
+   * the pure `$derived` mapping over `sessionStore.launchRows` for run. */
+  function toRow(ev: StageEvent): Row | null {
+    switch (ev.kind) {
+      case "section":
+        return { kind: "section", title: ev.title };
+      case "line":
+        return { kind: "line", step: ev.step, severity: ev.severity, text: ev.text, remedy: ev.remedy };
+      case "text":
+        return { kind: "text", text: ev.text };
+      case "autoFixed":
+        return { kind: "autoFixed", step: ev.step, description: ev.description };
+      case "needsAdmin":
+        return { kind: "needsAdmin", step: ev.step, reason: ev.reason };
+      case "fatal":
+        return { kind: "fatal", message: ev.message, remedy: ev.remedy, fix: ev.fix };
+      case "check":
+        return { kind: "check", outcome: ev.outcome, gate: ev.gate };
+      case "launched":
+        return { kind: "launched", pid: ev.pid, logPath: ev.logPath };
+      default:
+        return null;
+    }
+  }
+
+  const isRunMode = $derived(request?.stage === "run");
+
+  // ── non-run modes (setup/build/install/stop): this component drives runStage itself ──
 
   let runId = $state<string | null>(null);
   let rows = $state<Row[]>([]);
@@ -42,6 +88,10 @@
   let confirmFix = $state<FixAction | null>(null);
   let fixBusy = $state(false);
   let fixError = $state<string | null>(null);
+  /** Run-mode-only echo of a successful non-destructive fix's description —
+   * the non-run path shows the same text as an inline `ok` row instead
+   * (`rows` isn't rendered in run mode). */
+  let fixNotice = $state<string | null>(null);
 
   let rowsEl: HTMLDivElement | null = $state(null);
   let consoleEl: HTMLPreElement | null = $state(null);
@@ -49,12 +99,18 @@
 
   // Fresh `openGate(...)` calls always hand in a new object, so identity
   // comparison is enough to detect "a new run was requested" — including a
-  // Fix button re-opening the same modal for a different stage.
+  // Fix button re-opening the same modal for a different stage. Run mode
+  // never calls `start()`: `sessionStore.launch(...)` was already invoked by
+  // whoever opened this gate, and this component only observes it.
   $effect(() => {
     const r = request;
     if (r && r !== started && !running) {
       started = r;
-      void start(r);
+      if (r.stage !== "run") {
+        void start(r);
+      } else {
+        resetRunModeLocals();
+      }
     }
     if (!r) {
       started = null;
@@ -82,6 +138,17 @@
     sawFatal = false;
     confirmFix = null;
     fixError = null;
+  }
+
+  function resetRunModeLocals() {
+    confirmFix = null;
+    fixError = null;
+    fixNotice = null;
+    autoCloseFired = false;
+    if (autoCloseTimer) {
+      clearTimeout(autoCloseTimer);
+      autoCloseTimer = null;
+    }
   }
 
   async function start(req: GateRequest) {
@@ -112,33 +179,24 @@
     switch (ev.kind) {
       case "stageStarted":
         runId = ev.runId;
-        break;
-      case "section":
-        rows.push({ kind: "section", title: ev.title });
-        break;
-      case "line":
-        rows.push({ kind: "line", step: ev.step, severity: ev.severity, text: ev.text, remedy: ev.remedy });
-        break;
+        return;
       case "output":
         pushConsole(ev.chunk);
-        break;
+        return;
       case "progress":
         latestProgress = { label: ev.label, current: ev.current, total: ev.total };
-        break;
-      case "autoFixed":
-        rows.push({ kind: "autoFixed", step: ev.step, description: ev.description });
-        break;
-      case "needsAdmin":
-        rows.push({ kind: "needsAdmin", step: ev.step, reason: ev.reason });
-        break;
-      case "fatal":
-        sawFatal = true;
-        rows.push({ kind: "fatal", message: ev.message, remedy: ev.remedy, fix: ev.fix });
-        break;
+        return;
       case "stageFinished":
         latestProgress = null;
+        return;
+      case "fatal":
+        sawFatal = true;
+        break;
+      default:
         break;
     }
+    const row = toRow(ev);
+    if (row) rows.push(row);
   }
 
   async function cancel() {
@@ -164,10 +222,15 @@
     confirmFix = null;
     fixBusy = true;
     fixError = null;
+    fixNotice = null;
     try {
       const report = await applyFix(action, { bottle: request?.bottle, bsDir: request?.bsDir }, true, handleEvent);
-      rows.push({ kind: "line", step: null, severity: "ok", text: report.description, remedy: null });
-      if (report.changed && request) {
+      if (isRunMode) {
+        fixNotice = report.description;
+      } else {
+        rows.push({ kind: "line", step: null, severity: "ok", text: report.description, remedy: null });
+      }
+      if (report.changed && request && request.stage !== "run") {
         void start(request);
       }
     } catch (e) {
@@ -180,6 +243,94 @@
   function cap(s: string): string {
     return s.length ? s[0].toUpperCase() + s.slice(1) : s;
   }
+
+  // ── run mode: sessionStore already started the launch, this component only observes ──
+
+  const runRows = $derived.by((): Row[] => {
+    if (!isRunMode) return [];
+    const out: Row[] = [];
+    for (const ev of sessionStore.launchRows) {
+      const row = toRow(ev);
+      if (row) out.push(row);
+    }
+    return out;
+  });
+  const runLaunchedEv = $derived.by(() => {
+    if (!isRunMode) return undefined;
+    return sessionStore.launchRows.find(
+      (ev): ev is Extract<StageEvent, { kind: "launched" }> => ev.kind === "launched",
+    );
+  });
+  const runFatalEv = $derived.by(() => {
+    if (!isRunMode) return undefined;
+    return sessionStore.launchRows.find((ev): ev is Extract<StageEvent, { kind: "fatal" }> => ev.kind === "fatal");
+  });
+  // The launch's own `runId`, off its first `stageStarted` row — the id
+  // `cancelStage` takes. `sabrage_core::stages::run_stage` takes
+  // `OPERATION_LOCK` for `Stage::Run` from `stageStarted` through `launched`
+  // (see that module's "Lock policy for `run`"); calling `sessionStore.stop()`
+  // — which runs the `stop` *stage* when nothing is in `live_session()` yet —
+  // during that window would block on the same lock until this very launch
+  // finishes on its own, and would also race a still-empty `status.bottle`.
+  // `cancelStage(runId)` fires the run's own cancel token instead, which
+  // needs no lock at all.
+  const runStartedEv = $derived.by(() => {
+    if (!isRunMode) return undefined;
+    return sessionStore.launchRows.find(
+      (ev): ev is Extract<StageEvent, { kind: "stageStarted" }> => ev.kind === "stageStarted",
+    );
+  });
+  // A dry run (or any launch that settles with neither a `launched` nor a
+  // `fatal` row) still needs a terminal state once the invocation resolves.
+  const runDone = $derived(isRunMode && !sessionStore.launching && !runLaunchedEv && !runFatalEv);
+
+  let cancelling = $state(false);
+  async function cancelRun() {
+    cancelling = true;
+    try {
+      if (runLaunchedEv) {
+        // The Cancel button (see the template) is never shown once
+        // `runLaunchedEv` exists — replaced by "Open Session" — but keep this
+        // branch as the correct fallback if that ever changes: past Launched,
+        // the run itself is what's live, not a stage waiting on the lock.
+        await sessionStore.stop();
+      } else if (runStartedEv) {
+        await cancelStage(runStartedEv.runId);
+      }
+      // else: no `stageStarted` row has arrived yet (the invoke() call is
+      // still in flight) and the run hasn't launched either — there is
+      // nothing safe to cancel yet; the button's `disabled` guard below keeps
+      // this branch from being reachable in practice.
+    } finally {
+      cancelling = false;
+    }
+  }
+
+  function retryLaunch() {
+    if (request?.launch) void sessionStore.launch(request.launch);
+  }
+
+  let autoCloseFired = false;
+  let autoCloseTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function openSessionNow() {
+    if (autoCloseTimer) {
+      clearTimeout(autoCloseTimer);
+      autoCloseTimer = null;
+    }
+    onNavigate?.("session");
+    onClose();
+  }
+
+  $effect(() => {
+    if (isRunMode && runLaunchedEv && !autoCloseFired) {
+      autoCloseFired = true;
+      autoCloseTimer = setTimeout(() => {
+        autoCloseTimer = null;
+        openSessionNow();
+      }, 1500);
+    }
+  });
 </script>
 
 {#snippet okIcon()}
@@ -214,6 +365,81 @@
     <span class="info-dot" aria-hidden="true"></span>
   {/if}
 {/snippet}
+{#snippet checkIcon(status: CheckStatus)}
+  {#if status === "pass"}
+    {@render okIcon()}
+  {:else if status === "warn"}
+    {@render warnIcon()}
+  {:else if status === "fail"}
+    {@render failIcon()}
+  {:else if status === "info"}
+    <span class="info-dot" aria-hidden="true"></span>
+  {:else}
+    <span class="empty-square" aria-hidden="true"></span>
+  {/if}
+{/snippet}
+
+{#snippet renderRow(row: Row)}
+  {#if row.kind === "section"}
+    <h6 class="gate-section">-- {row.title}</h6>
+  {:else if row.kind === "line"}
+    <div class="gate-row">
+      <span class="icon">{@render lineIcon(row.severity)}</span>
+      <div class="body">
+        <div class="text" class:muted={row.severity === "info"}>{row.text}</div>
+        {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
+      </div>
+    </div>
+  {:else if row.kind === "text"}
+    <pre class="gate-text">{row.text.length ? row.text : " "}</pre>
+  {:else if row.kind === "autoFixed"}
+    <div class="gate-row">
+      <span class="icon">{@render okIcon()}</span>
+      <div class="body"><div class="text">{row.description}</div></div>
+    </div>
+  {:else if row.kind === "needsAdmin"}
+    <div class="admin-note">
+      {@render lockIcon()}
+      <div>
+        <div>{row.reason}</div>
+        <div class="text-muted">
+          macOS will ask for your password — this writes the host OpenXR registration.
+        </div>
+      </div>
+    </div>
+  {:else if row.kind === "check"}
+    <div class="gate-row" class:dim={row.outcome.status === "skipped" || row.outcome.status === "not_implemented"}>
+      <span class="icon">{@render checkIcon(row.outcome.status)}</span>
+      <div class="body">
+        <div class="text">{row.outcome.message}</div>
+        {#if row.outcome.remedy}<div class="text-muted remedy">{row.outcome.remedy}</div>{/if}
+      </div>
+    </div>
+  {:else if row.kind === "launched"}
+    <div class="gate-row">
+      <span class="icon">{@render okIcon()}</span>
+      <div class="body"><div class="text">Beat Saber launched — pid {row.pid} — log {row.logPath}</div></div>
+    </div>
+  {:else if row.kind === "fatal"}
+    <div class="gate-row fatal-row">
+      <span class="icon">{@render failIcon()}</span>
+      <div class="body">
+        <div class="text">{row.message}</div>
+        {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
+      </div>
+      {#if row.fix}
+        <button
+          class="btn btn-primary gate-fix-btn"
+          title={FIX_META[row.fix].title}
+          disabled={fixBusy}
+          onclick={() => requestFix(row.fix!)}
+        >
+          {FIX_META[row.fix].stage ? `Open ${cap(FIX_META[row.fix].stage!)}` : "Fix"}
+        </button>
+      {/if}
+    </div>
+  {/if}
+{/snippet}
 
 {#if request}
   <div class="gate-backdrop">
@@ -241,57 +467,25 @@
         </div>
       {/if}
 
-      <div class="gate-rows" bind:this={rowsEl}>
-        {#if rows.length === 0 && running}
-          <p class="text-muted gate-empty">Starting…</p>
-        {/if}
-        {#each rows as row, i (i)}
-          {#if row.kind === "section"}
-            <h6 class="gate-section">-- {row.title}</h6>
-          {:else if row.kind === "line"}
-            <div class="gate-row">
-              <span class="icon">{@render lineIcon(row.severity)}</span>
-              <div class="body">
-                <div class="text" class:muted={row.severity === "info"}>{row.text}</div>
-                {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
-              </div>
-            </div>
-          {:else if row.kind === "autoFixed"}
-            <div class="gate-row">
-              <span class="icon">{@render okIcon()}</span>
-              <div class="body"><div class="text">{row.description}</div></div>
-            </div>
-          {:else if row.kind === "needsAdmin"}
-            <div class="admin-note">
-              {@render lockIcon()}
-              <div>
-                <div>{row.reason}</div>
-                <div class="text-muted">
-                  macOS will ask for your password — this writes the host OpenXR registration.
-                </div>
-              </div>
-            </div>
-          {:else if row.kind === "fatal"}
-            <div class="gate-row fatal-row">
-              <span class="icon">{@render failIcon()}</span>
-              <div class="body">
-                <div class="text">{row.message}</div>
-                {#if row.remedy}<div class="text-muted remedy">{row.remedy}</div>{/if}
-              </div>
-              {#if row.fix}
-                <button
-                  class="btn btn-primary gate-fix-btn"
-                  title={FIX_META[row.fix].title}
-                  disabled={fixBusy}
-                  onclick={() => requestFix(row.fix!)}
-                >
-                  {FIX_META[row.fix].stage ? `Open ${cap(FIX_META[row.fix].stage!)}` : "Fix"}
-                </button>
-              {/if}
-            </div>
+      {#if isRunMode}
+        <div class="gate-rows" bind:this={rowsEl}>
+          {#if runRows.length === 0 && sessionStore.launching}
+            <p class="text-muted gate-empty">Starting…</p>
           {/if}
-        {/each}
-      </div>
+          {#each runRows as row, i (i)}
+            {@render renderRow(row)}
+          {/each}
+        </div>
+      {:else}
+        <div class="gate-rows" bind:this={rowsEl}>
+          {#if rows.length === 0 && running}
+            <p class="text-muted gate-empty">Starting…</p>
+          {/if}
+          {#each rows as row, i (i)}
+            {@render renderRow(row)}
+          {/each}
+        </div>
+      {/if}
 
       {#if confirmFix}
         <div class="confirm-inline">
@@ -305,8 +499,11 @@
       {#if fixError}
         <div class="text-muted fix-error">Fix failed: {fixError}</div>
       {/if}
+      {#if isRunMode && fixNotice}
+        <div class="text-muted gate-outcome">{fixNotice}</div>
+      {/if}
 
-      {#if consoleLines.length > 0}
+      {#if !isRunMode && consoleLines.length > 0}
         <button class="btn btn-ghost console-toggle" onclick={() => (consoleOpen = !consoleOpen)}>
           {consoleOpen ? "Hide" : "Show"} console output ({consoleLines.length} lines)
         </button>
@@ -315,23 +512,54 @@
         {/if}
       {/if}
 
-      {#if invokeError}
+      {#if !isRunMode && invokeError}
         <div class="gate-row fatal-row">
           <span class="icon">{@render failIcon()}</span>
           <div class="body"><div class="text">{invokeError}</div></div>
         </div>
       {/if}
+      {#if isRunMode && sessionStore.lastError && !runFatalEv}
+        <div class="gate-row fatal-row">
+          <span class="icon">{@render failIcon()}</span>
+          <div class="body"><div class="text">{sessionStore.lastError}</div></div>
+        </div>
+      {/if}
 
-      {#if finished}
+      {#if !isRunMode && finished}
         <div class="text-muted gate-outcome">
           {finished.ok
             ? `${cap(finished.stage)} completed.`
             : `${cap(finished.stage)} failed (exit ${finished.exitCodeEquiv}).`}
         </div>
       {/if}
+      {#if isRunMode && runDone && sessionStore.lastOutcome}
+        <div class="text-muted gate-outcome">
+          {sessionStore.lastOutcome.ok
+            ? "Run completed."
+            : `Run failed (exit ${sessionStore.lastOutcome.exitCodeEquiv}).`}
+        </div>
+      {/if}
 
       <div class="dialog-actions">
-        {#if running}
+        {#if isRunMode}
+          {#if runLaunchedEv}
+            <button class="btn btn-primary" onclick={openSessionNow}>Open Session</button>
+          {:else if runFatalEv || runDone}
+            {#if runFatalEv && request.launch}
+              <button class="btn btn-secondary" onclick={retryLaunch}>Retry</button>
+            {/if}
+            <button class="btn btn-primary" onclick={onClose}>Close</button>
+          {:else}
+            <button class="btn btn-ghost" onclick={onClose}>Hide</button>
+            <button
+              class="btn btn-secondary"
+              onclick={cancelRun}
+              disabled={cancelling || (!runStartedEv && !runLaunchedEv)}
+            >
+              {cancelling ? "Stopping…" : "Cancel"}
+            </button>
+          {/if}
+        {:else if running}
           <button class="btn btn-ghost" onclick={onClose}>Hide</button>
           <button class="btn btn-secondary" onclick={cancel} disabled={!runId}>Cancel</button>
         {:else}
@@ -409,12 +637,23 @@
     color: var(--color-accent-700);
     font-size: 11.5px;
   }
+  .gate-text {
+    margin: 1px 4px;
+    font-family: ui-monospace, Menlo, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    word-break: break-word;
+  }
   .gate-row {
     display: flex;
     align-items: flex-start;
     gap: 10px;
     padding: 5px 4px;
     border-bottom: 1px solid color-mix(in srgb, var(--color-text) 6%, transparent);
+    transition: opacity 0.15s ease;
+  }
+  .gate-row.dim {
+    opacity: 0.4;
   }
   .gate-row .icon {
     width: 16px;
@@ -452,6 +691,13 @@
     margin: 6px;
     border-radius: 50%;
     background: var(--color-neutral-500);
+  }
+  .empty-square {
+    display: block;
+    width: 11px;
+    height: 11px;
+    margin: 2px;
+    border: 1px solid var(--color-divider);
   }
   .admin-note {
     display: flex;

@@ -1,6 +1,8 @@
 <script lang="ts">
   import NavItem from "./NavItem.svelte";
+  import { sessionStore } from "../stores/session.svelte";
   import { stageStore } from "../stores/stage.svelte";
+  import type { SessionStatus } from "../ipc";
   import type { Screen } from "../types";
 
   interface Props {
@@ -11,6 +13,38 @@
   }
 
   let { screen, onNavigate, doctorBadge = false }: Props = $props();
+
+  const status = $derived(sessionStore.status);
+
+  const PHASE_DOT: Record<SessionStatus["phase"], string> = {
+    idle: "dot-idle",
+    preflight: "dot-amber",
+    launching: "dot-amber",
+    running: "dot-accent",
+    stalled: "dot-alert",
+    stopping: "dot-amber",
+    exited: "dot-idle",
+    detached: "dot-idle",
+  };
+
+  function footerLabel(s: SessionStatus): string {
+    switch (s.phase) {
+      case "idle":
+      case "exited":
+        return "No session";
+      case "preflight":
+      case "launching":
+        return "Launching…";
+      case "running":
+        return s.bottle ? `Running · ${s.bottle}` : "Running";
+      case "stalled":
+        return "Stalled";
+      case "stopping":
+        return "Stopping…";
+      case "detached":
+        return "Detached";
+    }
+  }
 </script>
 
 <div class="sidebar">
@@ -75,12 +109,11 @@
   </nav>
 
   <div class="footer">
-    <!-- Honest stubs: no backend exists yet — real state arrives with get_app_state() in Phase 1 -->
     <div class="status-row">
-      <span class="status-dot"></span>
-      No backend yet
+      <span class="status-dot {PHASE_DOT[status.phase]}"></span>
+      {footerLabel(status)}
     </div>
-    <div class="text-muted bottle-line">Bottle · not detected yet</div>
+    <div class="text-muted bottle-line">Bottle · {status.bottle ?? "not selected"}</div>
     <button class="btn btn-ghost setup-btn" onclick={() => stageStore.openStagesPanel()}>Setup</button>
     <div class="text-muted version-line">BRIDGE — · ALVR v20.14.1</div>
   </div>
@@ -130,7 +163,18 @@
     width: 8px;
     height: 8px;
     flex: none;
+  }
+  .dot-idle {
     background: var(--color-neutral-400);
+  }
+  .dot-amber {
+    background: #b8862f;
+  }
+  .dot-accent {
+    background: var(--color-accent);
+  }
+  .dot-alert {
+    background: var(--color-accent-900);
   }
   .bottle-line {
     font-size: 11px;
