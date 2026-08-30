@@ -13,10 +13,10 @@
 //! [`FixAction::to_contract_id`] / [`FixAction::from_contract_id`] bridge the
 //! two. The prefix lives in exactly one constant ([`CONTRACT_FIX_PREFIX`]).
 //!
-//! Two contract fix ids are deliberately **not** modelled yet — see
-//! [`DEFERRED_CONTRACT_FIX_IDS`]. `from_contract_id` returns `None` for them
+//! One contract fix id is deliberately **not** modelled yet — see
+//! [`DEFERRED_CONTRACT_FIX_IDS`]. `from_contract_id` returns `None` for it
 //! rather than pretending; a test in this module pins that the set of unmodelled
-//! ids is exactly those two, so adding a fix to the contract without a variant
+//! ids is exactly that one, so adding a fix to the contract without a variant
 //! here fails the build's test run instead of silently disappearing.
 //!
 //! # Serialization guarantee
@@ -47,10 +47,11 @@ pub const CONTRACT_FIX_PREFIX: &str = "fix.";
 ///
 /// * `fix.create-z-drive` — creating `dosdevices/z:` in a bottle; only reachable
 ///   from `bottle.z-drive`, which no gate auto-fixes.
-/// * `fix.edit-protocol` — rewriting `protocol =` in `oxrsys-runtime.toml`;
-///   needs the comment-preserving `toml_edit` config editor (design-core §4.1),
-///   which lands with the Settings screen.
-pub const DEFERRED_CONTRACT_FIX_IDS: [&str; 2] = ["fix.create-z-drive", "fix.edit-protocol"];
+///
+/// `fix.edit-protocol` left this list in Phase 4, when the comment-preserving
+/// config editor it needed ([`crate::config::runtime_toml`], design-core §4.1)
+/// landed with the Settings screen.
+pub const DEFERRED_CONTRACT_FIX_IDS: [&str; 1] = ["fix.create-z-drive"];
 
 /// A mutation the pipeline can apply on the user's behalf.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -73,6 +74,15 @@ pub enum FixAction {
     /// still names it, marked `destructive` so it can never run unconfirmed, and
     /// superseded once the in-place config editor lands.
     DeleteSessionJson,
+    /// Set `protocol = "alvr"` in `oxrsys-runtime.toml`
+    /// (`cfg.protocol.supported` / `cfg.protocol.legacy-oxrsys`).
+    ///
+    /// The one fix that writes the runtime config. It goes through
+    /// [`crate::config::runtime_toml::write`], so it inherits that module's
+    /// rules: create-if-absent from the shared template, an in-place value edit
+    /// that moves no other byte, and a rolling backup under Sabrage's own
+    /// `backups/`.
+    EditProtocol,
     /// Run the whole `setup` stage.
     RunSetup,
     /// Run the whole `build` stage.
@@ -84,11 +94,12 @@ pub enum FixAction {
 
 impl FixAction {
     /// Every action, in registry order.
-    pub const EVERY: [FixAction; 7] = [
+    pub const EVERY: [FixAction; 8] = [
         FixAction::SetGraphicsBackend,
         FixAction::RestageHelper,
         FixAction::RemoveAdbForwards,
         FixAction::DeleteSessionJson,
+        FixAction::EditProtocol,
         FixAction::RunSetup,
         FixAction::RunBuild,
         FixAction::RunInstall,
@@ -101,6 +112,7 @@ impl FixAction {
             FixAction::RestageHelper => "restage-helper",
             FixAction::RemoveAdbForwards => "remove-adb-forwards",
             FixAction::DeleteSessionJson => "delete-session-json",
+            FixAction::EditProtocol => "edit-protocol",
             FixAction::RunSetup => "run-setup",
             FixAction::RunBuild => "run-build",
             FixAction::RunInstall => "run-install",
@@ -203,6 +215,13 @@ pub fn fix_defs() -> &'static [FixDef] {
             destructive: true,
             forbidden_while_session_live: true,
             title: "delete ALVR's session.json (clears pinned client IPs)",
+        },
+        FixDef {
+            action: FixAction::EditProtocol,
+            needs_admin: false,
+            destructive: false,
+            forbidden_while_session_live: true,
+            title: "set protocol = \"alvr\" in oxrsys-runtime.toml",
         },
         FixDef {
             action: FixAction::RunSetup,
@@ -310,6 +329,7 @@ pub async fn apply_holding_lock(
         FixAction::RestageHelper => helper::restage_helper(ctx, sink).await,
         FixAction::RemoveAdbForwards => adb::remove_adb_forwards(ctx, sink).await,
         FixAction::DeleteSessionJson => session_json::delete_session_json(ctx, sink).await,
+        FixAction::EditProtocol => crate::config::runtime_toml::edit_protocol(ctx, sink).await,
         // Unreachable: as_stage() handled these above.
         FixAction::RunSetup | FixAction::RunBuild | FixAction::RunInstall => {
             unreachable!("whole-stage fixes are dispatched by as_stage()")

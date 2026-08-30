@@ -1,0 +1,910 @@
+//! `library.json` — Sabrage's own game registry.
+//!
+//! demo.sh has no such concept — "a game" is just whatever `BS_DIR` happens to
+//! point at (design-core §4.3). This module is Sabrage-only state:
+//! `~/Library/Application Support/Sabrage/library.json`
+//! ([`crate::paths::sabrage_support_dir`], [`library_path`]). Read/write
+//! follow the same convention as [`super::settings`] and
+//! [`crate::session::state`] (missing file → default, corrupt file → `Err`,
+//! atomic pretty-JSON write through the [`Executor`]).
+//!
+//! [`validate`] is the other half of this module: read-only probes over a
+//! `(bs_dir, bottle)` pair, reusing the same rules `checks::bottle` and
+//! `checks::game` already encode for doctor — but expressed as a full
+//! snapshot ([`GameValidity`]) rather than a pass/fail/warn tap row, because
+//! the Library and Edit-game screens render every facet of it at once
+//! (design-app §4).
+
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use crate::contract::contract;
+use crate::error::{Result, SabrageError};
+use crate::executor::Executor;
+use crate::paths::{resolve_bs_dir, Bottle, Paths};
+use crate::stages::run::actions::steam_api_path;
+use crate::stages::StageOptions;
+use crate::util::{bs_version, file_sha256_matches};
+
+use super::goldberg::orig_steam_path;
+use super::settings::Settings;
+
+// ── per-game launch overrides + history ─────────────────────────────────────
+
+/// A per-game partial override of [`super::settings::LaunchDefaults`].
+/// `None` on any field means "use the global setting" — see
+/// [`effective_options`].
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct LaunchOverrides {
+    pub no_audio: Option<bool>,
+    pub no_dashboard: Option<bool>,
+    pub wired: Option<bool>,
+    pub verbose: Option<bool>,
+}
+
+/// The most recent launch of one game, as recorded by the Tauri launch
+/// command after a `run` stage returns (brief's "Existing command changes
+/// (C)" — this struct is what it writes via [`Library::record_last_session`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LastSession {
+    pub started_at_unix_ms: u64,
+    pub ended_at_unix_ms: u64,
+    pub exit_code: Option<i32>,
+    pub log_path: Option<String>,
+}
+
+/// One library entry: everything Sabrage knows about a Beat Saber install
+/// beyond what `checks`/`validate` can probe live.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GameEntry {
+    pub id: Uuid,
+    pub name: String,
+    pub bs_dir: String,
+    pub bottle: String,
+    pub appid: u32,
+    pub added_at_unix_ms: u64,
+    pub launch_overrides: LaunchOverrides,
+    pub last_session: Option<LastSession>,
+}
+
+/// The whole library file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Library {
+    pub version: u32,
+    pub games: Vec<GameEntry>,
+}
+
+/// Schema version written by this Sabrage. Not [`Default::default`]'s `0` —
+/// see the manual [`Default`] impl below.
+pub const LIBRARY_VERSION: u32 = 1;
+
+impl Default for Library {
+    fn default() -> Library {
+        Library {
+            version: LIBRARY_VERSION,
+            games: Vec::new(),
+        }
+    }
+}
+
+impl Library {
+    /// Insert `entry`, or replace the existing entry sharing its `id`.
+    /// Returns a reference to the entry now stored.
+    pub fn upsert(&mut self, entry: GameEntry) -> &GameEntry {
+        let id = entry.id;
+        if let Some(existing) = self.games.iter_mut().find(|g| g.id == id) {
+            *existing = entry;
+        } else {
+            self.games.push(entry);
+        }
+        self.games
+            .iter()
+            .find(|g| g.id == id)
+            .expect("just inserted or replaced")
+    }
+
+    /// Remove the entry with `id`. `true` iff one was found and removed.
+    pub fn remove(&mut self, id: Uuid) -> bool {
+        let before = self.games.len();
+        self.games.retain(|g| g.id != id);
+        self.games.len() != before
+    }
+
+    /// The entry with `id`, if the library has one.
+    pub fn get(&self, id: Uuid) -> Option<&GameEntry> {
+        self.games.iter().find(|g| g.id == id)
+    }
+
+    /// Attach `session` to the entry with `id` as its `last_session`.
+    /// `true` iff the entry was found (a game removed between launch and
+    /// exit is not an error — the caller just has nothing left to update).
+    pub fn record_last_session(&mut self, id: Uuid, session: LastSession) -> bool {
+        match self.games.iter_mut().find(|g| g.id == id) {
+            Some(g) => {
+                g.last_session = Some(session);
+                true
+            }
+            None => false,
+        }
+    }
+}
+
+// ── file I/O ──────────────────────────────────────────────────────────────
+
+/// `<sabrage_appsup>/library.json`.
+pub fn library_path(sabrage_appsup: &Path) -> PathBuf {
+    sabrage_appsup.join("library.json")
+}
+
+/// Load `library.json`.
+///
+/// * absent → `Ok(Library::default())` (version 1, no games) — first run;
+/// * present but unparseable → `Err`, never a silent reset (same rule as
+///   [`super::settings::load`] and [`crate::session::state::load`]).
+pub fn load(path: &Path) -> Result<Library> {
+    let text = match std::fs::read_to_string(path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Library::default()),
+        Err(e) => return Err(SabrageError::io(path, e)),
+    };
+    serde_json::from_str(&text).map_err(|e| {
+        SabrageError::io(
+            path,
+            std::io::Error::new(std::io::ErrorKind::InvalidData, e),
+        )
+    })
+}
+
+/// Write `library.json` atomically (pretty JSON plus a trailing newline).
+pub async fn save(executor: &dyn Executor, path: &Path, lib: &Library) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        executor.create_dir_all(parent).await?;
+    }
+    let mut bytes = serde_json::to_vec_pretty(lib)
+        .map_err(|e| SabrageError::io(path, std::io::Error::other(e)))?;
+    bytes.push(b'\n');
+    executor.write_atomic(path, &bytes).await
+}
+
+// ── templates + effective options ────────────────────────────────────────
+
+/// A fresh [`GameEntry`] for the Add-game wizard, seeded from `settings` and
+/// the machine's current bottle list.
+///
+/// Precedence (brief, "B — store"):
+/// * `bottle` — `settings.default_bottle`, else the first of `bottles`, else
+///   `""`;
+/// * `bs_dir` — `settings.default_bs_dir`, else `env_bs_dir`
+///   (`WINEVR_BS_DIR`, passed in rather than read here so this stays a pure
+///   function of its arguments), else [`resolve_bs_dir`]'s own default for
+///   the chosen bottle.
+pub fn new_entry_template(
+    settings: &Settings,
+    bottles: &[String],
+    env_bs_dir: Option<&str>,
+) -> GameEntry {
+    let bottle = settings
+        .default_bottle
+        .clone()
+        .or_else(|| bottles.first().cloned())
+        .unwrap_or_default();
+
+    let bs_dir = settings
+        .default_bs_dir
+        .clone()
+        .or_else(|| env_bs_dir.map(str::to_string))
+        .unwrap_or_else(|| {
+            let unvalidated = Bottle::unvalidated(&bottle);
+            resolve_bs_dir(Some(&unvalidated), None)
+                .display()
+                .to_string()
+        });
+
+    GameEntry {
+        id: Uuid::new_v4(),
+        name: "Beat Saber 1.29.4".to_string(),
+        bs_dir,
+        bottle,
+        // The contract pins this as u64 (headroom for a hypothetically huge
+        // Steam appid); Beat Saber's is 620980, well inside u32.
+        appid: contract().game.appid as u32,
+        added_at_unix_ms: crate::session::now_unix_ms(),
+        launch_overrides: LaunchOverrides::default(),
+        last_session: None,
+    }
+}
+
+/// `settings.launch ⊕ entry.launch_overrides` (an override's `Some` wins over
+/// the global default), with `bottle`/`bs_dir` taken from `entry`.
+/// `dry_run` is always `false` — a caller decides that, it is never a stored
+/// preference.
+pub fn effective_options(settings: &Settings, entry: &GameEntry) -> StageOptions {
+    let o = &entry.launch_overrides;
+    StageOptions {
+        bottle_name: Some(entry.bottle.clone()),
+        bs_dir_override: Some(PathBuf::from(&entry.bs_dir)),
+        dry_run: false,
+        verbose: o.verbose.unwrap_or(settings.launch.verbose),
+        no_audio: o.no_audio.unwrap_or(settings.launch.no_audio),
+        no_dashboard: o.no_dashboard.unwrap_or(settings.launch.no_dashboard),
+        wired: o.wired.unwrap_or(settings.launch.wired),
+    }
+}
+
+// ── validity ──────────────────────────────────────────────────────────────
+
+/// Where the installed `steam_api64.dll` stands relative to the Goldberg
+/// pin and its `.orig-steam` backup. See [`validate`]'s rule for how each
+/// variant is derived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GoldbergState {
+    /// The pinned Goldberg dll is installed and the real Steam dll is backed
+    /// up — the ordinary post-launch state.
+    Applied,
+    /// A dll is present and there is no `.orig-steam` backup: Goldberg was
+    /// never installed here (the real Steam dll, untouched).
+    Original,
+    /// A `.orig-steam` backup exists but the live dll does not match the
+    /// pin — installed once, then swapped for something else (or the pin
+    /// moved) since.
+    Modified,
+    /// No `steam_api64.dll` at all, under either search path.
+    NoDll,
+}
+
+/// Where a [`GameEntry`] stands, for the Library screen's status tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum GameStatus {
+    Ready,
+    NeedsAttention,
+    NotFound,
+    NeedsSetup,
+}
+
+/// One full snapshot of a game's install health — every fact the Library and
+/// Edit-game screens render, computed fresh on every call (never persisted:
+/// the machine can change under a stored entry at any time).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameValidity {
+    pub exe_present: bool,
+    pub detected_version: Option<String>,
+    pub version_ok: bool,
+    pub bottle_exists: bool,
+    pub bottle_template: Option<String>,
+    pub bottle_backend_dxmt: bool,
+    pub outside_drive_c: bool,
+    pub z_drive_ok: Option<bool>,
+    pub goldberg: GoldbergState,
+    pub orig_steam_present: bool,
+    pub status: GameStatus,
+    pub problems: Vec<String>,
+}
+
+/// Extract the value of a `"Template" = "…"` line from `cxbottle.conf` text,
+/// if the key is present. A display value, unlike `checks::bottle`'s
+/// `bottle_template` evaluator (which only tests equality against
+/// `win11_64`) — this returns whatever the bottle's Template key actually
+/// says, for the Library detail row.
+fn bottle_template_value(conf: &str) -> Option<String> {
+    let line = conf.lines().find(|l| l.starts_with("\"Template\""))?;
+    let rest = line.strip_prefix("\"Template\"")?.trim_start();
+    let rest = rest.strip_prefix('=')?.trim_start();
+    let rest = rest.strip_prefix('"')?;
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// Read-only probes over one `(bs_dir, bottle)` pair. Never touches the
+/// machine beyond `stat`/`read` — same contract as every `checks::*`
+/// evaluator.
+///
+/// `paths` is accepted (rather than only `bs_dir`/`bottle_name`) for the same
+/// reason `CheckCtx` carries the whole `Paths` set: callers already have one
+/// in hand, and a future rule here may need another field of it (an
+/// oxrsys-appsup probe, say) without a signature change.
+///
+/// Thin wrapper around [`validate_with_bottle`] — see that function for the
+/// actual rules and for why the split exists.
+pub fn validate(paths: &Paths, bs_dir: &Path, bottle_name: &str) -> GameValidity {
+    let _ = paths; // no current rule needs it; kept for signature symmetry — see the doc above.
+    let bottle = Bottle::unvalidated(bottle_name);
+    validate_with_bottle(bs_dir, bottle_name, &bottle)
+}
+
+/// [`validate`]'s actual logic, taking an already-resolved [`Bottle`] rather
+/// than building one from `bottle_name` itself.
+///
+/// The split exists **entirely for testability**: [`Bottle::unvalidated`]
+/// resolves against the real, unfixture-able
+/// `~/Library/Application Support/CrossOver/Bottles/<name>` (`paths::bottles_root`
+/// is `$HOME`-derived, not `Paths`-derived — see that module's doc comment),
+/// so a test cannot make `bottle_exists` true by writing a fixture bottle
+/// under a scratch temp dir the way [`crate::checks::bottle`]'s tests fake a
+/// bottle and hand it to `CheckCtx` directly. This function accepts the same kind of
+/// pre-built `Bottle` (whose `prefix` may point anywhere) so tests can do the
+/// same; [`validate`] is the only caller that actually derives one from
+/// `$HOME`.
+fn validate_with_bottle(bs_dir: &Path, bottle_name: &str, bottle: &Bottle) -> GameValidity {
+    let exe_present = bs_dir.join("Beat Saber.exe").is_file();
+    let raw_version = bs_version(bs_dir);
+    let detected_version = (raw_version != "?").then_some(raw_version);
+    let version_ok = detected_version
+        .as_deref()
+        .is_some_and(|v| v.starts_with("1.29.4"));
+
+    let bottle_exists = !bottle_name.is_empty() && bottle.exists();
+
+    let conf = if bottle_exists {
+        std::fs::read_to_string(bottle.conf_path()).unwrap_or_default()
+    } else {
+        String::new()
+    };
+    let bottle_template = bottle_template_value(&conf);
+    let bottle_backend_dxmt = conf
+        .lines()
+        .any(|l| l == "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"");
+
+    // `[[ "$BS_DIR" != "$PREFIX/drive_c/"* ]]` — same prefix test
+    // `checks::bottle::bs_dir_outside_drive_c` uses, computed unconditionally
+    // here (this module has no "bottle resolved" gate the way that check
+    // does; an unresolved bottle's unvalidated prefix is still meaningful for
+    // this string test).
+    let outside_drive_c = {
+        let glob = format!("{}/drive_c/", bottle.prefix.display());
+        !bs_dir.to_string_lossy().starts_with(&glob)
+    };
+    let z_drive_ok = outside_drive_c.then(|| bottle.z_drive().exists());
+
+    let api = steam_api_path(bs_dir);
+    let dll_present = api.is_file();
+    let orig_steam_present = orig_steam_path(&api).is_file();
+    let goldberg = if !dll_present {
+        GoldbergState::NoDll
+    } else if !orig_steam_present {
+        GoldbergState::Original
+    } else if file_sha256_matches(&api, &contract().deps.gbe_dll_sha256) {
+        GoldbergState::Applied
+    } else {
+        GoldbergState::Modified
+    };
+
+    let mut problems = Vec::new();
+    if !exe_present {
+        problems.push(format!("Beat Saber.exe not found at {}", bs_dir.display()));
+    } else if !version_ok {
+        problems.push(format!(
+            "Beat Saber version '{}' is not 1.29.4",
+            detected_version.as_deref().unwrap_or("?")
+        ));
+    }
+    if !bottle_exists {
+        problems.push(format!("CrossOver bottle '{bottle_name}' not found"));
+    } else {
+        if bottle_template.as_deref() != Some("win11_64") {
+            problems.push(format!(
+                "bottle template is not win11_64 ({})",
+                bottle_template.as_deref().unwrap_or("")
+            ));
+        }
+        if !bottle_backend_dxmt {
+            problems.push("bottle graphics backend is not dxmt (auto-fixed at launch)".to_string());
+        }
+    }
+    if z_drive_ok == Some(false) {
+        problems.push("Beat Saber is outside drive_c but the bottle has no z: drive".to_string());
+    }
+
+    let status = if !exe_present {
+        GameStatus::NotFound
+    } else if !bottle_exists {
+        GameStatus::NeedsSetup
+    } else if !version_ok || z_drive_ok == Some(false) {
+        GameStatus::NeedsAttention
+    } else {
+        GameStatus::Ready
+    };
+
+    GameValidity {
+        exe_present,
+        detected_version,
+        version_ok,
+        bottle_exists,
+        bottle_template,
+        bottle_backend_dxmt,
+        outside_drive_c,
+        z_drive_ok,
+        goldberg,
+        orig_steam_present,
+        status,
+        problems,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::executor::{DryRunExecutor, PlannedKind, RealExecutor};
+    use crate::stages::null_sink;
+    use std::fs;
+    use tokio_util::sync::CancellationToken;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sabrage-store-library-test-{name}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn real() -> RealExecutor {
+        RealExecutor::new(Uuid::nil(), null_sink(), CancellationToken::new())
+    }
+
+    fn entry(name: &str) -> GameEntry {
+        GameEntry {
+            id: Uuid::new_v4(),
+            name: name.to_string(),
+            bs_dir: "/games/bs".to_string(),
+            bottle: "Steam".to_string(),
+            appid: 620980,
+            added_at_unix_ms: 1786300214181,
+            launch_overrides: LaunchOverrides::default(),
+            last_session: None,
+        }
+    }
+
+    // ── file I/O ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn library_path_is_the_json_file_under_appsup() {
+        assert_eq!(
+            library_path(Path::new("/x/Sabrage")),
+            PathBuf::from("/x/Sabrage/library.json")
+        );
+    }
+
+    #[test]
+    fn missing_file_loads_as_default_with_version_one() {
+        let lib = load(Path::new("/nonexistent/sabrage/library.json")).unwrap();
+        assert_eq!(lib, Library::default());
+        assert_eq!(lib.version, 1);
+        assert!(lib.games.is_empty());
+    }
+
+    #[test]
+    fn a_corrupt_file_is_an_error_never_a_silent_reset() {
+        let dir = scratch("corrupt");
+        let path = dir.join("library.json");
+        fs::write(&path, b"{not json").unwrap();
+        let err = load(&path).unwrap_err();
+        assert_eq!(err.kind(), "io");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn unknown_fields_are_ignored_on_load() {
+        let dir = scratch("unknown-fields");
+        let path = dir.join("library.json");
+        fs::write(
+            &path,
+            r#"{"version":1,"games":[],"futureField":{"nested":true}}"#,
+        )
+        .unwrap();
+        let lib = load(&path).unwrap();
+        assert_eq!(lib, Library::default());
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn round_trips_camel_case_through_the_file() {
+        let dir = scratch("roundtrip");
+        let path = dir.join("nested/library.json");
+        let mut lib = Library::default();
+        let mut e = entry("Beat Saber 1.29.4");
+        e.launch_overrides.wired = Some(true);
+        e.last_session = Some(LastSession {
+            started_at_unix_ms: 1,
+            ended_at_unix_ms: 2,
+            exit_code: Some(0),
+            log_path: Some("/repo/logs/x.log".into()),
+        });
+        lib.upsert(e);
+
+        save(&real(), &path, &lib).await.unwrap();
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(text.ends_with("}\n"));
+        assert!(text.contains("\"bsDir\""));
+        assert!(text.contains("\"launchOverrides\""));
+        assert!(text.contains("\"startedAtUnixMs\""));
+        assert_eq!(load(&path).unwrap(), lib);
+
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_executor_plans_the_write_instead_of_performing_it() {
+        let dir = scratch("dry");
+        let path = dir.join("library.json");
+        let ex = DryRunExecutor::new(Uuid::nil(), null_sink(), CancellationToken::new());
+        save(&ex, &path, &Library::default()).await.unwrap();
+        assert!(!path.exists());
+        let kinds: Vec<PlannedKind> = ex.planned().iter().map(|p| p.kind).collect();
+        assert_eq!(kinds, vec![PlannedKind::CreateDir, PlannedKind::Write]);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ── Library mutators ─────────────────────────────────────────────────
+
+    #[test]
+    fn upsert_inserts_then_replaces_by_id() {
+        let mut lib = Library::default();
+        let e = entry("A");
+        let id = e.id;
+        let stored = lib.upsert(e.clone());
+        assert_eq!(stored, &e);
+        assert_eq!(lib.games.len(), 1);
+
+        let mut replacement = e.clone();
+        replacement.name = "A renamed".to_string();
+        let stored = lib.upsert(replacement.clone());
+        assert_eq!(stored.name, "A renamed");
+        assert_eq!(lib.games.len(), 1, "same id replaces, does not append");
+        assert_eq!(lib.get(id).unwrap().name, "A renamed");
+    }
+
+    #[test]
+    fn remove_reports_whether_it_found_something() {
+        let mut lib = Library::default();
+        let e = entry("A");
+        let id = e.id;
+        lib.upsert(e);
+        assert!(lib.remove(id));
+        assert!(lib.games.is_empty());
+        assert!(
+            !lib.remove(id),
+            "removing twice finds nothing the second time"
+        );
+        assert!(!lib.remove(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn get_finds_by_id_and_nothing_else() {
+        let mut lib = Library::default();
+        let e = entry("A");
+        let id = e.id;
+        lib.upsert(e);
+        assert!(lib.get(id).is_some());
+        assert!(lib.get(Uuid::new_v4()).is_none());
+    }
+
+    #[test]
+    fn record_last_session_updates_the_matching_entry_only() {
+        let mut lib = Library::default();
+        let a = entry("A");
+        let b = entry("B");
+        let (id_a, id_b) = (a.id, b.id);
+        lib.upsert(a);
+        lib.upsert(b);
+
+        let session = LastSession {
+            started_at_unix_ms: 100,
+            ended_at_unix_ms: 200,
+            exit_code: Some(0),
+            log_path: Some("/repo/logs/beatsaber-x.log".into()),
+        };
+        assert!(lib.record_last_session(id_a, session.clone()));
+        assert_eq!(lib.get(id_a).unwrap().last_session.as_ref(), Some(&session));
+        assert!(lib.get(id_b).unwrap().last_session.is_none());
+
+        assert!(!lib.record_last_session(Uuid::new_v4(), session));
+    }
+
+    // ── new_entry_template precedence ───────────────────────────────────
+
+    #[test]
+    fn template_prefers_settings_default_bottle_over_the_bottle_list() {
+        let settings = Settings {
+            default_bottle: Some("Preferred".into()),
+            ..Settings::default()
+        };
+        let e = new_entry_template(&settings, &["Other".into()], None);
+        assert_eq!(e.bottle, "Preferred");
+        assert_eq!(e.name, "Beat Saber 1.29.4");
+        assert_eq!(e.appid, 620980);
+        assert!(e.last_session.is_none());
+        assert_eq!(e.launch_overrides, LaunchOverrides::default());
+    }
+
+    #[test]
+    fn template_falls_back_to_the_first_bottle_then_empty_string() {
+        let e = new_entry_template(
+            &Settings::default(),
+            &["First".into(), "Second".into()],
+            None,
+        );
+        assert_eq!(e.bottle, "First");
+
+        let e = new_entry_template(&Settings::default(), &[], None);
+        assert_eq!(e.bottle, "");
+    }
+
+    #[test]
+    fn template_bs_dir_precedence_settings_then_env_then_resolved_default() {
+        let settings_dir = Settings {
+            default_bottle: Some("Steam".into()),
+            default_bs_dir: Some("/from/settings".into()),
+            ..Settings::default()
+        };
+        let e = new_entry_template(&settings_dir, &[], Some("/from/env"));
+        assert_eq!(e.bs_dir, "/from/settings", "settings wins over env");
+
+        let settings_no_dir = Settings {
+            default_bottle: Some("Steam".into()),
+            ..Settings::default()
+        };
+        let e = new_entry_template(&settings_no_dir, &[], Some("/from/env"));
+        assert_eq!(e.bs_dir, "/from/env", "env wins when settings has none");
+
+        let e = new_entry_template(&settings_no_dir, &[], None);
+        assert!(
+            e.bs_dir.ends_with(
+                "Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294"
+            ),
+            "falls back to resolve_bs_dir's default: {}",
+            e.bs_dir
+        );
+    }
+
+    // ── effective_options merge ──────────────────────────────────────────
+
+    #[test]
+    fn effective_options_merges_overrides_over_settings_and_takes_identity_from_the_entry() {
+        let settings = Settings {
+            launch: crate::store::settings::LaunchDefaults {
+                no_audio: false,
+                no_dashboard: true,
+                wired: false,
+                verbose: false,
+            },
+            ..Settings::default()
+        };
+        let mut e = entry("A");
+        e.launch_overrides = LaunchOverrides {
+            no_audio: Some(true), // override flips the global default
+            no_dashboard: None,   // falls through to settings (true)
+            wired: None,          // falls through to settings (false)
+            verbose: Some(true),  // override sets what settings left false
+        };
+
+        let opts = effective_options(&settings, &e);
+        assert_eq!(opts.bottle_name.as_deref(), Some("Steam"));
+        assert_eq!(opts.bs_dir_override, Some(PathBuf::from("/games/bs")));
+        assert!(!opts.dry_run);
+        assert!(opts.no_audio, "override Some(true) beats settings false");
+        assert!(opts.no_dashboard, "None falls through to settings true");
+        assert!(!opts.wired, "None falls through to settings false");
+        assert!(opts.verbose, "override Some(true) beats settings false");
+    }
+
+    // ── validate ──────────────────────────────────────────────────────────
+
+    fn fake_bottle(label: &str) -> Bottle {
+        let dir = std::env::temp_dir().join(format!(
+            "sabrage-library-test-bottle-{label}-{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Bottle {
+            name: "TestBottle".to_string(),
+            sys32: dir.join("drive_c/windows/system32"),
+            prefix: dir,
+        }
+    }
+
+    fn paths() -> Paths {
+        Paths::new("/nonexistent/sabrage/repo")
+    }
+
+    #[test]
+    fn no_bottle_no_exe_is_not_found_with_a_says_why_problem() {
+        let bs_dir = scratch("validate-notfound");
+        let v = validate(&paths(), &bs_dir, "");
+        assert!(!v.exe_present);
+        assert!(!v.bottle_exists, "empty bottle name never exists");
+        assert_eq!(v.status, GameStatus::NotFound);
+        assert!(v.problems.iter().any(|p| p.contains("Beat Saber.exe")));
+        assert_eq!(v.goldberg, GoldbergState::NoDll);
+        fs::remove_dir_all(&bs_dir).unwrap();
+    }
+
+    #[test]
+    fn exe_present_but_bottle_missing_needs_setup() {
+        let bs_dir = scratch("validate-needssetup");
+        fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
+        fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
+        let v = validate(&paths(), &bs_dir, "NoSuchBottle");
+        assert!(v.exe_present);
+        assert!(v.version_ok);
+        assert!(!v.bottle_exists);
+        assert_eq!(v.status, GameStatus::NeedsSetup);
+        assert!(v
+            .problems
+            .iter()
+            .any(|p| p.contains("CrossOver bottle 'NoSuchBottle' not found")));
+        fs::remove_dir_all(&bs_dir).unwrap();
+    }
+
+    #[test]
+    fn wrong_version_needs_attention() {
+        let bs_dir = scratch("validate-wrongversion");
+        fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
+        fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.34.2_9999999999\n").unwrap();
+        let b = fake_bottle("wrongversion");
+        fs::write(
+            b.conf_path(),
+            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+        )
+        .unwrap();
+
+        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        assert_eq!(v.detected_version.as_deref(), Some("1.34.2_9999999999"));
+        assert!(!v.version_ok);
+        assert!(v.bottle_exists);
+        assert_eq!(v.status, GameStatus::NeedsAttention);
+        assert!(v.problems.iter().any(|p| p.contains("is not 1.29.4")));
+
+        fs::remove_dir_all(&bs_dir).unwrap();
+        fs::remove_dir_all(&b.prefix).unwrap();
+    }
+
+    #[test]
+    fn outside_drive_c_without_z_drive_needs_attention() {
+        let b = fake_bottle("nozdrive");
+        fs::write(
+            b.conf_path(),
+            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+        )
+        .unwrap();
+        let bs_dir = scratch("validate-outside");
+        fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
+        fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
+
+        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        assert!(
+            v.outside_drive_c,
+            "scratch dir is not under the bottle's drive_c"
+        );
+        assert_eq!(v.z_drive_ok, Some(false));
+        assert_eq!(v.status, GameStatus::NeedsAttention);
+        assert!(v.problems.iter().any(|p| p.contains("no z: drive")));
+
+        fs::remove_dir_all(&bs_dir).unwrap();
+        fs::remove_dir_all(&b.prefix).unwrap();
+    }
+
+    #[test]
+    fn a_fully_healthy_game_is_ready_with_no_problems() {
+        let b = fake_bottle("ready");
+        fs::create_dir_all(b.prefix.join("drive_c")).unwrap();
+        fs::write(
+            b.conf_path(),
+            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+        )
+        .unwrap();
+        let bs_dir = b
+            .prefix
+            .join("drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294");
+        fs::create_dir_all(&bs_dir).unwrap();
+        fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
+        fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
+
+        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        assert!(v.exe_present && v.version_ok && v.bottle_exists && v.bottle_backend_dxmt);
+        assert!(
+            !v.outside_drive_c,
+            "install lives under the bottle's drive_c"
+        );
+        assert_eq!(
+            v.z_drive_ok, None,
+            "z: is irrelevant when not outside drive_c"
+        );
+        assert_eq!(v.bottle_template.as_deref(), Some("win11_64"));
+        assert_eq!(v.status, GameStatus::Ready);
+        assert!(v.problems.is_empty(), "{:?}", v.problems);
+
+        fs::remove_dir_all(&b.prefix).unwrap();
+    }
+
+    #[test]
+    fn bottle_template_and_backend_mismatches_surface_as_problems_without_forcing_needs_attention()
+    {
+        // A wrong template/backend does not, on its own, flip status away
+        // from Ready — only version and z: drive gate `status` per the
+        // brief's rule; template/backend still show up as problems for the
+        // detail row.
+        let b = fake_bottle("mismatch");
+        fs::create_dir_all(b.prefix.join("drive_c")).unwrap();
+        fs::write(
+            b.conf_path(),
+            "\"Template\" = \"win10_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n",
+        )
+        .unwrap();
+        let bs_dir = b.prefix.join("drive_c/bs");
+        fs::create_dir_all(&bs_dir).unwrap();
+        fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
+        fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
+
+        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        assert_eq!(v.bottle_template.as_deref(), Some("win10_64"));
+        assert!(!v.bottle_backend_dxmt);
+        assert_eq!(v.status, GameStatus::Ready);
+        assert!(v.problems.iter().any(|p| p.contains("win11_64")));
+        assert!(v.problems.iter().any(|p| p.contains("not dxmt")));
+
+        fs::remove_dir_all(&b.prefix).unwrap();
+    }
+
+    // ── Goldberg state ────────────────────────────────────────────────────
+
+    fn plugin_dir(bs_dir: &Path) -> PathBuf {
+        bs_dir.join("Beat Saber_Data/Plugins/x86_64")
+    }
+
+    #[test]
+    fn goldberg_state_covers_all_four_variants() {
+        let bs_dir = scratch("validate-goldberg");
+        let dir = plugin_dir(&bs_dir);
+        fs::create_dir_all(&dir).unwrap();
+
+        // No dll at all.
+        let v = validate(&paths(), &bs_dir, "");
+        assert_eq!(v.goldberg, GoldbergState::NoDll);
+        assert!(!v.orig_steam_present);
+
+        // A dll, no backup: never Goldberg'd.
+        fs::write(dir.join("steam_api64.dll"), b"REAL-STEAM").unwrap();
+        let v = validate(&paths(), &bs_dir, "");
+        assert_eq!(v.goldberg, GoldbergState::Original);
+        assert!(!v.orig_steam_present);
+
+        // Backup present, live dll does not match the pin: Modified.
+        fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM").unwrap();
+        fs::write(dir.join("steam_api64.dll"), b"SOME-OTHER-BYTES").unwrap();
+        let v = validate(&paths(), &bs_dir, "");
+        assert_eq!(v.goldberg, GoldbergState::Modified);
+        assert!(v.orig_steam_present);
+
+        // Backup present, live dll matches the pin: Applied.
+        let pinned = &contract().deps.gbe_dll_sha256;
+        // We cannot fabricate bytes hashing to the real pin, so this branch
+        // is instead exercised through `file_sha256_matches` directly against
+        // the repo's own pinned dll fixture path used elsewhere in this
+        // crate (`paths.gbe_dll`) when present on disk; skip gracefully
+        // otherwise (a fresh checkout without `setup` has no such file yet).
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root resolves");
+        let gbe = Paths::new(repo_root).gbe_dll;
+        if file_sha256_matches(&gbe, pinned) {
+            let bytes = std::fs::read(&gbe).unwrap();
+            std::fs::write(dir.join("steam_api64.dll"), &bytes).unwrap();
+            let v = validate(&paths(), &bs_dir, "");
+            assert_eq!(v.goldberg, GoldbergState::Applied);
+        }
+
+        fs::remove_dir_all(&bs_dir).unwrap();
+    }
+}

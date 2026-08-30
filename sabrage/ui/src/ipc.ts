@@ -4,6 +4,7 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 
 /** Mirrors `sabrage_core::checks::CheckStatus` (serde `rename_all = "snake_case"`). */
 export type CheckStatus = "pass" | "warn" | "fail" | "info" | "skipped" | "not_implemented";
@@ -18,9 +19,9 @@ export interface DoctorEvent {
   detail: string | null;
   /** Bare contract fix id (e.g. `"fix.set-graphics-backend"`), or `null` when
    * this check's remedy has none. Resolve to a `FixAction` with
-   * `contractFixIdToAction` before offering a Fix button — two contract ids
-   * (`fix.create-z-drive`, `fix.edit-protocol`) are deliberately unmodelled
-   * and resolve to `null`. */
+   * `contractFixIdToAction` before offering a Fix button — `fix.create-z-drive`
+   * is the one contract id deliberately left unmodelled and resolves to
+   * `null` (`fix.edit-protocol` gained a `FixAction` in Phase 4). */
   fix: string | null;
 }
 
@@ -31,11 +32,15 @@ export interface DoctorSummary {
   total: number;
 }
 
-/** Sidebar footer snapshot — mirrors `commands::AppState`. */
+/** Sidebar footer snapshot — mirrors `commands::AppState`. `defaultBottle`/
+ * `defaultBsDir` are Phase 4 additions (from `Settings`) so the Sidebar and
+ * Session screen can prefill without a second `getSettings()` call. */
 export interface AppState {
   repoRoot: string | null;
   bottles: string[];
   alvrVersion: string;
+  defaultBottle: string | null;
+  defaultBsDir: string | null;
 }
 
 export interface RunDoctorArgs {
@@ -99,7 +104,8 @@ export type FixAction =
   | "delete-session-json"
   | "run-setup"
   | "run-build"
-  | "run-install";
+  | "run-install"
+  | "edit-protocol";
 
 /** One `sabrage_core::StageEvent` variant — internally tagged on `kind`,
  * camelCase fields (events.rs). Forwarded to the channel verbatim by every
@@ -231,13 +237,20 @@ export const FIX_META: Record<
   "run-setup": { title: "run setup", needsAdmin: false, destructive: false, stage: "setup" },
   "run-build": { title: "run build", needsAdmin: false, destructive: false, stage: "build" },
   "run-install": { title: "run install", needsAdmin: true, destructive: false, stage: "install" },
+  "edit-protocol": {
+    title: 'set protocol = "alvr"',
+    needsAdmin: false,
+    destructive: false,
+    stage: null,
+  },
 };
 
 /** `"fix.set-graphics-backend"` -> `"set-graphics-backend"`; `null` for a
  * contract id this table does not model — mirrors
- * `FixAction::from_contract_id`'s two deliberately-deferred ids
- * (`fix.create-z-drive`, `fix.edit-protocol`). A `null` result means "render
- * no Fix button", not an error. */
+ * `FixAction::from_contract_id`. `fix.create-z-drive` is the one remaining
+ * deliberately-deferred id (`fix.edit-protocol` resolves to
+ * `"edit-protocol"` as of Phase 4). A `null` result means "render no Fix
+ * button", not an error. */
 export function contractFixIdToAction(id: string): FixAction | null {
   const bare = id.startsWith("fix.") ? id.slice(4) : id;
   return bare in FIX_META ? (bare as FixAction) : null;
@@ -389,7 +402,10 @@ export const IDLE_SESSION_STATUS: SessionStatus = {
 
 /** Mirrors `commands::LaunchOpts` (serde camelCase). Every field but the
  * bottle/bs-dir pair has no `demo.sh` counterpart at all outside `run.sh`
- * itself — see that struct's own doc comment. */
+ * itself — see that struct's own doc comment. `gameId` (Phase 4) is the
+ * library entry this launch belongs to, when it came from the Library
+ * screen's Run button — the backend uses it to record a `LastSession` after
+ * the run settles; omit it for the plain Session screen's own launches. */
 export interface LaunchOpts {
   bottle?: string | null;
   bsDir?: string | null;
@@ -398,6 +414,7 @@ export interface LaunchOpts {
   wired?: boolean | null;
   verbose?: boolean | null;
   dryRun?: boolean | null;
+  gameId?: string | null;
 }
 
 /**
@@ -426,6 +443,7 @@ export async function launch(
       wired: opts.wired ?? null,
       verbose: opts.verbose ?? null,
       dryRun: opts.dryRun ?? null,
+      gameId: opts.gameId ?? null,
     },
     onEvent: channel,
   });
@@ -612,4 +630,303 @@ export async function onMenu(cb: (which: "doctor" | "launch" | "stop") => void):
   return () => {
     for (const unlisten of unlistens) unlisten();
   };
+}
+
+// ── runtime config (Phase 4) ────────────────────────────────────────────────
+//
+// Mirrors `sabrage_core::config::runtime_toml` (via `src-tauri/src/commands.rs`).
+// Edits `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` in place —
+// the deliberate divergence from demo.sh's write-once treatment of that file
+// (design-app.md §4, "Settings write policy").
+
+/** Mirrors `config::runtime_toml::Protocol` (serde lowercase). */
+export type Protocol = "alvr" | "oxrsys";
+
+/** Mirrors `config::runtime_toml::VideoCodec` (serde lowercase). */
+export type VideoCodec = "auto" | "h265" | "h264";
+
+/** Mirrors `config::runtime_toml::EncoderProcess` (serde lowercase). */
+export type EncoderProcess = "auto" | "native" | "inproc";
+
+/** The six keys Sabrage edits in `[streaming]` — mirrors
+ * `config::runtime_toml::RuntimeConfigValues` (serde camelCase). Every field
+ * is `Option` on the Rust side: `null` here means "not present in the file"
+ * on a `RuntimeConfigView.values`/`.defaults`, or "leave this key untouched"
+ * on a `RuntimeConfigPatch`. */
+export interface RuntimeConfigValues {
+  protocol: Protocol | null;
+  bitrateMbps: number | null;
+  encoderProcess: EncoderProcess | null;
+  videoCodec: VideoCodec | null;
+  resolutionScale: number | null;
+  refreshRateHz: number | null;
+}
+
+/** One key's on-disk value the runtime would silently ignore (outside its
+ * accepted set) — mirrors `config::runtime_toml::InvalidValue`. */
+export interface InvalidValue {
+  key: string;
+  raw: string;
+  reason: string;
+}
+
+/** Mirrors `config::runtime_toml::RuntimeConfigView` — `read_runtime_config`'s
+ * return shape. */
+export interface RuntimeConfigView {
+  path: string;
+  exists: boolean;
+  values: RuntimeConfigValues;
+  /** The runtime's own compiled-in defaults, for rendering "runtime default:
+   * <x>" next to a `null` value. */
+  defaults: RuntimeConfigValues;
+  invalid: InvalidValue[];
+  /** Keys present more than once across tables (top level counts as one) —
+   * the LAST occurrence in the file is the one the runtime honors and the
+   * one reflected in `values`; render these as a warning. */
+  shadowed: string[];
+  modifiedUnixMs: number | null;
+  /** Set when `toml_edit` could not parse the file at all: `values` then
+   * comes from the line-oriented fallback reader, and `writeRuntimeConfig`
+   * refuses to touch the file until this is fixed by hand. */
+  parseError: string | null;
+}
+
+/** A patch to `oxrsys-runtime.toml`: a non-null field sets that key, `null`
+ * leaves it untouched. Same shape as `RuntimeConfigValues` on the Rust side
+ * too (`type RuntimeConfigPatch = RuntimeConfigValues`). */
+export type RuntimeConfigPatch = RuntimeConfigValues;
+
+/** Mirrors `config::runtime_toml::WriteReport` — `write_runtime_config`'s
+ * return shape. */
+export interface WriteReport {
+  createdFromTemplate: boolean;
+  /** Set whenever an existing file was overwritten — the snapshot lives
+   * under `<Sabrage appsup>/backups/`, newest `BACKUP_KEEP` (10) kept. */
+  backupPath: string | null;
+  changedKeys: string[];
+  shadowed: string[];
+  path: string;
+}
+
+/** Read the current `oxrsys-runtime.toml` state. Never rejects for a missing
+ * file (`exists: false`, every value `null`) — only a genuine IPC-layer
+ * failure (repo root unresolved) throws. */
+export async function readRuntimeConfig(): Promise<RuntimeConfigView> {
+  return invoke<RuntimeConfigView>("read_runtime_config");
+}
+
+/**
+ * Apply `patch` to `oxrsys-runtime.toml` — creates the file byte-identical to
+ * the shared template first if it doesn't exist yet, otherwise snapshots a
+ * backup and edits values in place, preserving every other byte. Rejects
+ * when the file has a `parseError` (edits are refused rather than risking an
+ * unreadable rewrite — fix the file by hand first) or on a validation/IPC
+ * failure. A patch that changes nothing writes no backup and no file.
+ */
+export async function writeRuntimeConfig(patch: RuntimeConfigPatch): Promise<WriteReport> {
+  return invoke<WriteReport>("write_runtime_config", { patch });
+}
+
+// ── settings (Phase 4) ──────────────────────────────────────────────────────
+//
+// Mirrors `sabrage_core::store::settings` (via `src-tauri/src/commands.rs`).
+// Persisted at `<Sabrage appsup>/settings.json`.
+
+/** Mirrors `store::settings::LaunchDefaults` (serde camelCase) — the four
+ * `run.sh`-only flags (see `LaunchOpts`'s doc comment), as app-wide defaults
+ * rather than one launch's overrides. */
+export interface LaunchDefaults {
+  noAudio: boolean;
+  noDashboard: boolean;
+  wired: boolean;
+  verbose: boolean;
+}
+
+/** Mirrors `store::settings::Settings` (serde camelCase). */
+export interface Settings {
+  repoRoot: string | null;
+  defaultBottle: string | null;
+  defaultBsDir: string | null;
+  launch: LaunchDefaults;
+  /** Default `true` — whether `run_doctor` is allowed to shell out to `adb`. */
+  allowAdbProbes: boolean;
+  /** Flips to `true` the first time the user confirms the Settings screen's
+   * one-time "Sabrage edits this file in place" dialog; gates that dialog,
+   * not the edit itself. */
+  runtimeConfigEditAcknowledged: boolean;
+}
+
+/** Missing `settings.json` resolves to `Settings` field defaults, not a
+ * rejection — only a corrupt file rejects (never silently reset). */
+export async function getSettings(): Promise<Settings> {
+  return invoke<Settings>("get_settings");
+}
+
+/** Persist `settings` and return it back as saved (unknown-field-stripped,
+ * same shape). */
+export async function saveSettings(settings: Settings): Promise<Settings> {
+  return invoke<Settings>("save_settings", { settings });
+}
+
+/** The Settings screen's Repository card — mirrors `commands::RepoInfo`.
+ * `hostManifestLibraryPath`/`hostManifestPointsHere` read
+ * `paths.host_xr_json` the way `checks::host` does; `pointsHere` is `null`
+ * when the manifest itself can't be read (fresh machine, no `install` yet). */
+export interface RepoInfo {
+  repoRoot: string | null;
+  source: "settings" | "env" | "executable" | "unresolved";
+  markersPresent: boolean;
+  contractSynced: boolean | null;
+  hostManifestLibraryPath: string | null;
+  hostManifestPointsHere: boolean | null;
+}
+
+export async function getRepoInfo(): Promise<RepoInfo> {
+  return invoke<RepoInfo>("get_repo_info");
+}
+
+// ── library (Phase 4) ───────────────────────────────────────────────────────
+//
+// Mirrors `sabrage_core::store::library` (via `src-tauri/src/commands.rs`).
+// Persisted at `<Sabrage appsup>/library.json`.
+
+/** Mirrors `store::library::LaunchOverrides` (serde camelCase) — per-game
+ * overrides of `Settings.launch`; `null` on a field means "use the global
+ * default", distinct from an explicit `false`. */
+export interface LaunchOverrides {
+  noAudio: boolean | null;
+  noDashboard: boolean | null;
+  wired: boolean | null;
+  verbose: boolean | null;
+}
+
+/** Mirrors `store::library::LastSession` (serde camelCase) — recorded by the
+ * `launch` command once a run it tagged with `gameId` settles. */
+export interface LastSession {
+  startedAtUnixMs: number;
+  endedAtUnixMs: number;
+  exitCode: number | null;
+  logPath: string | null;
+}
+
+/** Mirrors `store::library::GameEntry` (serde camelCase). `id` is a v4 UUID
+ * in its string form. */
+export interface GameEntry {
+  id: string;
+  name: string;
+  bsDir: string;
+  bottle: string;
+  appid: number;
+  addedAtUnixMs: number;
+  launchOverrides: LaunchOverrides;
+  lastSession: LastSession | null;
+}
+
+/** Mirrors `store::library::GoldbergState` (serde camelCase) — whether
+ * `steam_api64.dll` in `bsDir` is the Goldberg build Sabrage installs, the
+ * untouched Steam original, something else entirely, or absent. */
+export type GoldbergState = "applied" | "original" | "modified" | "noDll";
+
+/** Mirrors `store::library::GameStatus` (serde camelCase) — the Library
+ * table's status tag. */
+export type GameStatus = "ready" | "needsAttention" | "notFound" | "needsSetup";
+
+/** Read-only probes over one entry's `bsDir`/`bottle`, recomputed on every
+ * `getLibrary`/`saveGame`/`validateGame` call (never persisted) — mirrors
+ * `store::library::GameValidity`. `problems` is one human line per failing
+ * rule, in the order the UI's red lines should render them. */
+export interface GameValidity {
+  exePresent: boolean;
+  detectedVersion: string | null;
+  versionOk: boolean;
+  bottleExists: boolean;
+  bottleTemplate: string | null;
+  bottleBackendDxmt: boolean;
+  outsideDriveC: boolean;
+  /** `null` unless `outsideDriveC` — whether the bottle's `z:` drive link
+   * exists (a missing one is why "outside drive_c" games fail to launch). */
+  zDriveOk: boolean | null;
+  goldberg: GoldbergState;
+  origSteamPresent: boolean;
+  status: GameStatus;
+  problems: string[];
+}
+
+/** One `getLibrary` row: a saved entry plus its freshly computed validity —
+ * mirrors `commands::GameRow` (there is no separate persisted "row" shape;
+ * this is assembled per call). */
+export interface GameRow {
+  entry: GameEntry;
+  validity: GameValidity;
+}
+
+export async function getLibrary(): Promise<GameRow[]> {
+  return invoke<GameRow[]>("get_library");
+}
+
+/** A fresh, not-yet-saved `GameEntry` prefilled from `Settings` and the
+ * detected bottles — the Library screen's "Add game" starting point. Save it
+ * (unchanged or edited) with `saveGame` to add it to the library. */
+export async function newGameTemplate(): Promise<GameEntry> {
+  return invoke<GameEntry>("new_game_template");
+}
+
+/** Upsert `entry` into the library by `id` and return its row (the entry as
+ * saved, plus freshly computed validity). */
+export async function saveGame(entry: GameEntry): Promise<GameRow> {
+  return invoke<GameRow>("save_game", { entry });
+}
+
+/** Remove the entry named `id`. Resolves `false` when no such entry exists
+ * (already removed, stale UI state) rather than rejecting. */
+export async function removeGame(id: string): Promise<boolean> {
+  return invoke<boolean>("remove_game", { id });
+}
+
+/** Run the same read-only probes `getLibrary`/`saveGame` use, against an
+ * arbitrary `bsDir`/`bottle` pair that need not belong to a saved entry yet —
+ * the EditGame form's live (debounced) validation. */
+export async function validateGame(bsDir: string, bottle: string): Promise<GameValidity> {
+  return invoke<GameValidity>("validate_game", { bsDir, bottle });
+}
+
+/** Mirrors `store::goldberg::RevertReport`. */
+export interface RevertReport {
+  restored: boolean;
+  message: string;
+  dllPath: string;
+}
+
+/**
+ * Restore `steam_api64.dll.orig-steam` back over `steam_api64.dll` for the
+ * library entry named `gameId`. A no-op (`restored: false`, explanatory
+ * `message`) when there is no `.orig-steam` to restore from. The next launch
+ * re-applies Goldberg regardless — `message` says so
+ * (`// DIVERGENCE:` from run.sh, which never restores; see `PARITY.md`).
+ * Rejects while a session is live.
+ */
+export async function revertOriginalSteamDll(gameId: string): Promise<RevertReport> {
+  return invoke<RevertReport>("revert_original_steam_dll", { gameId });
+}
+
+// ── native dialogs ───────────────────────────────────────────────────────────
+
+/**
+ * Open a native "choose a folder" dialog (`@tauri-apps/plugin-dialog`,
+ * `dialog:allow-open` capability). Resolves `null` on cancel — the plugin's
+ * own `open()` returns `string | string[] | null` depending on options; this
+ * always asks for a single directory, so the union collapses to
+ * `string | null` here.
+ */
+export async function pickFolder(
+  title: string,
+  defaultPath?: string | null,
+): Promise<string | null> {
+  const selected = await open({
+    directory: true,
+    multiple: false,
+    title,
+    defaultPath: defaultPath ?? undefined,
+  });
+  return typeof selected === "string" ? selected : null;
 }

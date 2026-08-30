@@ -161,6 +161,17 @@ pub fn run() {
             commands::list_past_runs,
             commands::get_log_source_path,
             commands::resolve_quit,
+            commands::read_runtime_config,
+            commands::write_runtime_config,
+            commands::get_settings,
+            commands::save_settings,
+            commands::get_repo_info,
+            commands::get_library,
+            commands::new_game_template,
+            commands::save_game,
+            commands::remove_game,
+            commands::validate_game,
+            commands::revert_original_steam_dll,
         ])
         .manage(commands::RunRegistry::default())
         .manage(commands::TailRegistry::default())

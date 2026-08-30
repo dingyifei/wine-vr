@@ -39,22 +39,41 @@
 //!   `run_doctor`'s evaluators, because [`sabrage_core::logs::Tailer`] is
 //!   synchronous file I/O.
 //!
+//! Phase 4 (settings/library/config — the section above `mod tests`) adds
+//! eleven more: `read_runtime_config`/`write_runtime_config` over
+//! [`sabrage_core::config`], `get_settings`/`save_settings`/`get_repo_info`
+//! over [`sabrage_core::store::settings`], and
+//! `get_library`/`new_game_template`/`save_game`/`remove_game`/
+//! `validate_game`/`revert_original_steam_dll` over
+//! [`sabrage_core::store::library`] and [`sabrage_core::store::goldberg`].
+//! None of the eleven stream over an IPC `Channel` (no `on_event` in the
+//! brief's IPC contract table), so their mutations go through a bare
+//! [`RealExecutor`] ([`real_executor`]) rather than a [`StageCtx`] — see that
+//! section's own module note. `launch` additionally grows a `gameId` and,
+//! when one is supplied and the run actually reaches
+//! [`StageEvent::Launched`], records a [`sabrage_core::store::library::LastSession`]
+//! into `library.json` once the run settles ([`last_session_to_record`]).
+//!
 //! `ui/src/ipc.ts` hand-mirrors every serde shape here 1:1 — keep both sides in
 //! sync when either changes.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use sabrage_core::checks::{run_doctor as core_run_doctor, CheckCtx, CheckOptions, CheckStatus};
+use sabrage_core::checks::{
+    host, run_doctor as core_run_doctor, CheckCtx, CheckOptions, CheckStatus,
+};
+use sabrage_core::config as runtime_config;
 use sabrage_core::session::reconcile::Reconciled;
 use sabrage_core::session::watcher::SessionMonitor;
+use sabrage_core::store::{goldberg, library, settings};
 use sabrage_core::{
-    contract, fixes, live_session, resolve_repo_root, EventSink, FixAction, FixReport, LogBatch,
-    LogSource, PastRun, Paths, SabrageError, SessionStatus, Stage, StageCtx, StageEvent,
-    StageOptions, StageOutcome, Tailer,
+    contract, fixes, live_session, null_sink, resolve_repo_root, util, EventSink, FixAction,
+    FixReport, LogBatch, LogSource, PastRun, Paths, RealExecutor, SabrageError, SessionStatus,
+    Stage, StageCtx, StageEvent, StageOptions, StageOutcome, Tailer,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
@@ -74,9 +93,11 @@ const ALVR_VERSION: &str = "v20.14.1";
 /// `fix` is the bare contract id (`"fix.set-graphics-backend"`); the frontend
 /// maps it to a [`FixAction`] wire value itself (`ipc.ts`'s
 /// `contractFixIdToAction`, mirroring [`FixAction::from_contract_id`]) rather
-/// than have this command do it, so the two deferred contract ids
-/// (`fix.create-z-drive`, `fix.edit-protocol`) are a client-side "no button"
-/// decision instead of a silently-dropped field.
+/// than have this command do it, so the one remaining deferred contract id
+/// (`fix.create-z-drive`) is a client-side "no button" decision instead of a
+/// silently-dropped field. `fix.edit-protocol` is no longer deferred (Phase
+/// 4, `sabrage_core::fixes::FixAction::EditProtocol`): it round-trips through
+/// `from_contract_id` like every other fix and needs no special case here.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorEvent {
@@ -100,12 +121,20 @@ pub struct DoctorSummary {
 }
 
 /// Sidebar footer snapshot.
+///
+/// `default_bottle`/`default_bs_dir` (Phase 4) are `settings.json`'s stored
+/// defaults, straight through — letting the Sidebar/Session screens prefill
+/// without a second `get_settings` round trip. `None` means "nothing
+/// configured yet", same as on [`sabrage_core::store::settings::Settings`]
+/// itself.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
     pub repo_root: Option<String>,
     pub bottles: Vec<String>,
     pub alvr_version: String,
+    pub default_bottle: Option<String>,
+    pub default_bs_dir: Option<String>,
 }
 
 /// Run every doctor check in contract order, streaming each resolved row to
@@ -122,7 +151,11 @@ pub async fn run_doctor(
     bs_dir: Option<String>,
     on_event: Channel<DoctorEvent>,
 ) -> Result<DoctorSummary, String> {
-    let repo_root = match resolve_repo_root(None) {
+    // settings.repo_root plumbing (Phase 4): a persisted override — or a
+    // corrupt/missing settings file, which [`load_settings`] already
+    // degrades to `None` for, logged rather than failing doctor outright.
+    let settings = load_settings();
+    let repo_root = match resolve_repo_root(settings.repo_root.as_deref()) {
         Ok(p) => p,
         Err(err) => {
             // Surface the failure on the channel too, so a listener that only
@@ -146,6 +179,9 @@ pub async fn run_doctor(
     // WINEVR_* env is the base (parity with the CLI and demo.sh precedence);
     // explicit GUI args override.
     let mut opts = CheckOptions::from_env();
+    // settings.allow_adb_probes (Phase 4): this used to be hard-coded `true`
+    // regardless of the toggle on the Settings screen.
+    opts.allow_adb_probes = settings.allow_adb_probes;
     if let Some(b) = bottle {
         opts.bottle_name = Some(b);
     }
@@ -192,15 +228,19 @@ pub async fn run_doctor(
 }
 
 /// Sidebar footer snapshot: repo root (if resolvable), bottles present on this
-/// machine, and the pinned ALVR client version.
+/// machine, the pinned ALVR client version, and (Phase 4) `settings.json`'s
+/// default bottle/Beat Saber dir.
 #[tauri::command]
 pub fn get_app_state() -> AppState {
+    let settings = load_settings();
     AppState {
-        repo_root: resolve_repo_root(None)
+        repo_root: resolve_repo_root(settings.repo_root.as_deref())
             .ok()
             .map(|p| p.display().to_string()),
         bottles: sabrage_core::paths::list_bottles(),
         alvr_version: ALVR_VERSION.to_string(),
+        default_bottle: settings.default_bottle,
+        default_bs_dir: settings.default_bs_dir,
     }
 }
 
@@ -251,6 +291,11 @@ pub struct FixRunOpts {
 /// four flags `run.sh` reads only inside itself
 /// (`WINEVR_NO_AUDIO`/`_NO_DASHBOARD`/`_WIRED`/`_VERBOSE`), which is why they
 /// have no home on [`StageRunOpts`] — every other stage ignores them.
+///
+/// `game_id` (Phase 4) is the library entry this launch came from, if any —
+/// the Library screen's "Run through bridge" sets it, the Session screen's ad
+/// hoc launch leaves it `None`. See [`last_session_to_record`] for what it
+/// unlocks.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchOpts {
@@ -261,6 +306,7 @@ pub struct LaunchOpts {
     pub wired: Option<bool>,
     pub verbose: Option<bool>,
     pub dry_run: Option<bool>,
+    pub game_id: Option<String>,
 }
 
 /// Tracks one cancellation handle per in-flight [`run_stage`]/[`stop_session`]
@@ -316,21 +362,43 @@ fn channel_sink(channel: Channel<StageEvent>) -> EventSink {
     })
 }
 
+/// [`channel_sink`], plus a `tap` called with every event before it is
+/// forwarded — [`launch`]'s way of observing whether `StageEvent::Launched`
+/// fired for this run (Phase 4's last-session recording,
+/// [`last_session_to_record`]) without a second event type or a second
+/// subscription: `StageEvent` is already the wire shape design-core §3.1
+/// specifies (this module's own doc comment).
+fn channel_sink_tee(
+    channel: Channel<StageEvent>,
+    tap: impl Fn(&StageEvent) + Send + Sync + 'static,
+) -> EventSink {
+    Arc::new(move |ev: StageEvent| {
+        tap(&ev);
+        let _ = channel.send(ev);
+    })
+}
+
 /// Emit a well-formed `StageStarted`/`Fatal`/`StageFinished` bracket for a
 /// failure that happens *before* a [`StageCtx`] can exist (repo-root
 /// resolution). Keeps the invariant every stage's event stream relies on
 /// (`stages::run_stage`'s own doc comment): a listener that only watches
 /// events never sees a run that started and never ended.
-fn emit_early_failure(on_event: &Channel<StageEvent>, stage: Stage, err: &SabrageError) {
+///
+/// Takes the already-built [`EventSink`] rather than a raw `Channel` —
+/// [`execute_stage_with_sink`]'s failure branch runs before it knows whether
+/// its caller wrapped a plain [`channel_sink`] or [`launch`]'s tapped one, and
+/// either way the sink is called exactly like [`sabrage_core::fixes`]'s own
+/// `sink(StageEvent::…)` call sites already do.
+fn emit_early_failure(sink: &EventSink, stage: Stage, err: &SabrageError) {
     let run_id = Default::default();
-    let _ = on_event.send(StageEvent::StageStarted { run_id, stage });
-    let _ = on_event.send(StageEvent::Fatal {
+    sink(StageEvent::StageStarted { run_id, stage });
+    sink(StageEvent::Fatal {
         run_id,
         message: err.to_string(),
         remedy: err.remedy().map(|s| s.to_string()),
         fix: None,
     });
-    let _ = on_event.send(StageEvent::StageFinished {
+    sink(StageEvent::StageFinished {
         run_id,
         stage,
         ok: false,
@@ -388,21 +456,39 @@ fn launch_stage_options_from_env_and_gui(opts: &LaunchOpts) -> StageOptions {
 /// Shared body of [`execute_stage`] and [`launch`]: resolve the repo root,
 /// build a [`StageCtx`] from an already-merged [`StageOptions`], register its
 /// cancellation handle, run the stage, and unregister on the way out (success
-/// or failure alike).
+/// or failure alike). Wraps `on_event` as a plain [`channel_sink`] and hands
+/// off to [`execute_stage_with_sink`].
 async fn execute_stage_with_options(
     stage: Stage,
     stage_opts: StageOptions,
     on_event: Channel<StageEvent>,
     registry: &RunRegistry,
 ) -> Result<StageOutcome, String> {
-    let repo_root = match resolve_repo_root(None) {
+    execute_stage_with_sink(stage, stage_opts, channel_sink(on_event), registry).await
+}
+
+/// [`execute_stage_with_options`]'s body, taking an already-built
+/// [`EventSink`] rather than a raw `Channel` — the seam [`launch`] uses to
+/// pass a tapped sink ([`channel_sink_tee`]) instead of a plain forwarding
+/// one, so it can observe `StageEvent::Launched` without a second
+/// subscription.
+///
+/// settings.repo_root plumbing (Phase 4): resolves through
+/// [`resolve_repo_root_via_settings`] rather than a bare `resolve_repo_root(None)`
+/// — see that function's doc comment.
+async fn execute_stage_with_sink(
+    stage: Stage,
+    stage_opts: StageOptions,
+    sink: EventSink,
+    registry: &RunRegistry,
+) -> Result<StageOutcome, String> {
+    let repo_root = match resolve_repo_root_via_settings() {
         Ok(p) => p,
         Err(err) => {
-            emit_early_failure(&on_event, stage, &err);
+            emit_early_failure(&sink, stage, &err);
             return Err(err.to_string());
         }
     };
-    let sink = channel_sink(on_event);
     let ctx = StageCtx::new(Paths::new(repo_root), stage_opts, sink, Default::default());
     let run_id = ctx.run_id.to_string();
     let cancel_handle = ctx.cancel.clone();
@@ -499,7 +585,42 @@ pub async fn launch(
     registry: State<'_, RunRegistry>,
 ) -> Result<StageOutcome, String> {
     let stage_opts = launch_stage_options_from_env_and_gui(&opts);
-    execute_stage_with_options(Stage::Run, stage_opts, on_event, &registry).await
+
+    // Phase 4: tee the channel so a `StageEvent::Launched` for *this* run is
+    // observed, win or lose — `last_session_to_record` below is the pure
+    // decision of whether that (plus `game_id`, plus a settled outcome) adds
+    // up to something worth writing into `library.json`.
+    let launched: Arc<Mutex<Option<LaunchedInfo>>> = Arc::new(Mutex::new(None));
+    let tap_launched = launched.clone();
+    let sink = channel_sink_tee(on_event, move |ev| {
+        if let StageEvent::Launched {
+            started_at_unix_ms,
+            log_path,
+            ..
+        } = ev
+        {
+            *tap_launched.lock().expect("launched-info mutex poisoned") = Some(LaunchedInfo {
+                started_at_unix_ms: *started_at_unix_ms,
+                log_path: log_path.clone(),
+            });
+        }
+    });
+
+    let result = execute_stage_with_sink(Stage::Run, stage_opts, sink, &registry).await;
+
+    let launched_info = launched
+        .lock()
+        .expect("launched-info mutex poisoned")
+        .clone();
+    if let Some((game_id, session)) = last_session_to_record(
+        opts.game_id.as_deref(),
+        launched_info.as_ref(),
+        result.as_ref().ok(),
+    ) {
+        record_last_session(&game_id, session).await;
+    }
+
+    result
 }
 
 /// Cancel the run named `run_id` (read off that run's first `StageStarted`
@@ -572,7 +693,7 @@ async fn detach_live_session() -> Result<(), String> {
     let Some(handle) = live_session() else {
         return Ok(());
     };
-    let repo_root = resolve_repo_root(None).map_err(|e| e.to_string())?;
+    let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let paths = Paths::new(repo_root);
     sabrage_core::session::reconcile::detach(&paths, &handle)
         .await
@@ -736,7 +857,7 @@ pub async fn fix(
             "{action} is destructive and needs confirmation before it can run"
         ));
     }
-    let repo_root = resolve_repo_root(None).map_err(|e| e.to_string())?;
+    let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let mut stage_opts = stage_options_from_env_and_gui(opts.bottle, opts.bs_dir);
     stage_opts.dry_run = false;
     let sink = channel_sink(on_event);
@@ -761,7 +882,7 @@ pub struct SessionMonitorState(tauri::async_runtime::Mutex<Option<SessionMonitor
 /// same "no checkout found" condition every other command already surfaces.
 fn ensure_monitor(guard: &mut Option<SessionMonitor>) -> Result<&mut SessionMonitor, String> {
     if guard.is_none() {
-        let repo_root = resolve_repo_root(None).map_err(|e| e.to_string())?;
+        let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
         *guard = Some(SessionMonitor::new(Paths::new(repo_root)));
     }
     Ok(guard.as_mut().expect("just initialized above"))
@@ -870,7 +991,7 @@ pub struct ReconcileReport {
 /// forwarding to a channel.
 #[tauri::command]
 pub async fn reconcile_session(bottle: Option<String>) -> Result<ReconcileReport, String> {
-    let repo_root = resolve_repo_root(None).map_err(|e| e.to_string())?;
+    let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let stage_opts = stage_options_from_env_and_gui(bottle, None);
     let rows: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let sink_rows = rows.clone();
@@ -951,7 +1072,7 @@ pub fn start_log_tail(
     on_batch: Channel<LogBatch>,
     registry: State<'_, TailRegistry>,
 ) -> Result<u64, String> {
-    let repo_root = resolve_repo_root(None).map_err(|e| e.to_string())?;
+    let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let paths = Paths::new(repo_root);
     let path = sabrage_core::logs::resolve_source(&paths, &source)
         .ok_or_else(|| "no log file exists for this source yet".to_string())?;
@@ -994,7 +1115,7 @@ pub fn stop_log_tail(id: u64, registry: State<'_, TailRegistry>) -> bool {
 /// root cannot be resolved: no root means no `logs/` to list.
 #[tauri::command]
 pub fn list_past_runs() -> Vec<PastRun> {
-    match resolve_repo_root(None) {
+    match resolve_repo_root_via_settings() {
         Ok(root) => sabrage_core::logs::list_past_runs(&Paths::new(root).logs_dir()),
         Err(_) => Vec::new(),
     }
@@ -1004,9 +1125,420 @@ pub fn list_past_runs() -> Vec<PastRun> {
 /// yet (an empty `logs/` on a fresh checkout, no session ever run).
 #[tauri::command]
 pub fn get_log_source_path(source: LogSource) -> Option<String> {
-    let repo_root = resolve_repo_root(None).ok()?;
+    let repo_root = resolve_repo_root_via_settings().ok()?;
     let paths = Paths::new(repo_root);
     sabrage_core::logs::resolve_source(&paths, &source).map(|p| p.display().to_string())
+}
+
+// ── Phase 4: settings, library, runtime config ──────────────────────────────
+//
+// The eleven commands below back the Settings/Library/Edit-game screens.
+// None streams over an IPC `Channel` — the brief's IPC contract table gives
+// none of them an `on_event` parameter — so every mutation goes through a
+// bare `RealExecutor` ([`real_executor`]) rather than a `StageCtx`: there is
+// no multi-step stage here, nothing to cancel, and no live listener for a
+// single small JSON/TOML write to stream to. Every mutation still goes
+// through the `Executor` trait (the crate-wide rule), it just never needs the
+// dry-run/stage machinery layered on top of it.
+//
+// `settings.json`/`library.json`/`oxrsys-runtime.toml` all live under paths
+// derived from `$HOME` alone — [`sabrage_core::paths::sabrage_support_dir`]
+// and `Paths::oxr_appsup`/`toml_path`, never from the repo root — so
+// [`appsup_paths`] tolerates an unresolved repo root (falling back to an
+// empty one; `Paths::new` never fails and does no validation of it) rather
+// than erroring out: the Settings/Library/Config screens must keep working
+// before a wine-vr checkout is even configured. Only [`get_repo_info`] (and
+// doctor/stage execution, unchanged above) reports whether the repo root
+// itself actually resolved.
+
+/// Load `settings.json`, tolerantly.
+///
+/// [`settings::load`] already treats a *missing* file as
+/// [`settings::Settings::default`]; a file that fails to **parse** is `Err`
+/// there on purpose (design-core §4.2: never a silent reset — the one screen
+/// that exists to fix a corrupt settings file, [`get_settings`], must see the
+/// error). Every OTHER command only wants `repo_root`/`default_bottle`/
+/// `allow_adb_probes` etc. as *input*, and must not itself fail (or block a
+/// launch) over a settings file some other bug corrupted — brief: "corrupt/
+/// missing settings → None + tracing/eprintln, never a failure". This is that
+/// degrade-and-log helper; [`get_settings`] deliberately does NOT use it.
+fn load_settings() -> settings::Settings {
+    let path = settings::settings_path(&sabrage_core::paths::sabrage_support_dir());
+    match settings::load(&path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("sabrage: settings.json unreadable, using defaults ({e})");
+            settings::Settings::default()
+        }
+    }
+}
+
+/// [`resolve_repo_root`], honoring `settings.json`'s persisted override — the
+/// brief's "settings.repo_root plumbing into EVERY resolve_repo_root call in
+/// commands.rs", and every prior bare `resolve_repo_root(None)` call site
+/// above is now this. Built on [`load_settings`], so a corrupt settings file
+/// degrades to `None` (the env/executable-walk precedence tiers still apply
+/// underneath) rather than turning every command that resolves a repo root
+/// into a hard failure.
+fn resolve_repo_root_via_settings() -> std::result::Result<PathBuf, SabrageError> {
+    resolve_repo_root(load_settings().repo_root.as_deref())
+}
+
+/// A [`Paths`] set for the Phase 4 commands that only ever touch
+/// `$HOME`-derived paths (`toml_path`, `sabrage_appsup`, `oxr_appsup`) — see
+/// this section's module note for why an unresolved repo root is tolerated
+/// (an empty [`PathBuf`]) here rather than propagated as an error.
+fn appsup_paths() -> Paths {
+    Paths::new(resolve_repo_root_via_settings().unwrap_or_default())
+}
+
+/// A [`RealExecutor`] for the small, non-stage mutations this section adds —
+/// see the module note above for why no [`StageCtx`] applies. `run_id`/the
+/// cancellation token are the same `Default::default()` trick this file's
+/// "Why no `tokio_util` / `uuid` appear here" note (above,
+/// [`RunRegistry`]'s section) already relies on to reach `Uuid`/
+/// `CancellationToken` without either being a direct dependency of
+/// `sabrage-app`; the sink is [`null_sink`], since none of these eleven
+/// commands stream events.
+fn real_executor() -> RealExecutor {
+    RealExecutor::new(Default::default(), null_sink(), Default::default())
+}
+
+// ── runtime config (oxrsys-runtime.toml) ────────────────────────────────────
+
+/// The Settings screen's one read: everything [`sabrage_core::config::read`]
+/// already assembles. Never fails — an absent or unparseable file are both
+/// *states of the view*, not errors (see that function's own doc comment).
+#[tauri::command]
+pub fn read_runtime_config() -> runtime_config::RuntimeConfigView {
+    runtime_config::read(&appsup_paths().toml_path)
+}
+
+/// Patch `oxrsys-runtime.toml`'s six editable keys, creating it from the
+/// shared template first if it does not exist yet
+/// ([`runtime_config::write`]'s write-once-on-create rule).
+///
+/// Refuses **before** calling [`runtime_config::write`] when the file is one
+/// `toml_edit` cannot round-trip ([`runtime_config::RuntimeConfigView::parse_error`])
+/// — `write` would refuse on its own re-parse too (via `apply_patch`), but
+/// checking here first gives a clearer message (the fallback reader's own
+/// diagnosis) without a redundant disk read. A session being live does
+/// **not** block this (brief's IPC contract table): the runtime only reads
+/// this file at the next game start.
+#[tauri::command]
+pub async fn write_runtime_config(
+    patch: runtime_config::RuntimeConfigPatch,
+) -> Result<runtime_config::WriteReport, String> {
+    let paths = appsup_paths();
+    let view = runtime_config::read(&paths.toml_path);
+    if let Some(err) = view.parse_error {
+        return Err(format!(
+            "{} is not valid TOML ({err}) — refusing to rewrite it; edit it by hand",
+            paths.toml_path.display()
+        ));
+    }
+    runtime_config::write(
+        &real_executor(),
+        &paths.toml_path,
+        &paths.sabrage_appsup.join("backups"),
+        &patch,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+// ── settings.json ────────────────────────────────────────────────────────────
+
+/// Read `settings.json` — unlike [`load_settings`], a corrupt file is
+/// surfaced as `Err` rather than degraded to defaults: this is the one
+/// screen that exists to let the user see and fix it.
+#[tauri::command]
+pub fn get_settings() -> Result<settings::Settings, String> {
+    let path = settings::settings_path(&sabrage_core::paths::sabrage_support_dir());
+    settings::load(&path).map_err(|e| e.to_string())
+}
+
+/// Persist `settings.json`, returning it back as-saved (the brief's `Settings`
+/// return — there is nothing this side derives beyond what was sent).
+#[tauri::command]
+pub async fn save_settings(settings: settings::Settings) -> Result<settings::Settings, String> {
+    let path = settings::settings_path(&sabrage_core::paths::sabrage_support_dir());
+    settings::save(&real_executor(), &path, &settings)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(settings)
+}
+
+// ── repo info ─────────────────────────────────────────────────────────────────
+
+/// Which precedence tier of [`resolve_repo_root`] actually supplied a
+/// resolved root. `explicit_present`/`env_present` are "was that tier's input
+/// non-empty" (the explicit-override and env tiers of `resolve_repo_root`
+/// never themselves fail — only the executable-walk tier can, hence
+/// `walk_succeeded` rather than a third `bool`); factored out as a pure
+/// function of those three facts so the precedence rule is unit-testable
+/// without a real settings file, a real `SABRAGE_REPO_ROOT`, or a real
+/// executable path.
+fn classify_repo_root_source(
+    explicit_present: bool,
+    env_present: bool,
+    walk_succeeded: bool,
+) -> RepoRootSource {
+    if explicit_present {
+        RepoRootSource::Settings
+    } else if env_present {
+        RepoRootSource::Env
+    } else if walk_succeeded {
+        RepoRootSource::Executable
+    } else {
+        RepoRootSource::Unresolved
+    }
+}
+
+/// Which precedence tier of [`resolve_repo_root`] supplied
+/// [`RepoInfo::repo_root`] — see [`classify_repo_root_source`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum RepoRootSource {
+    Settings,
+    Env,
+    Executable,
+    Unresolved,
+}
+
+/// The Settings screen's "Repository" card: where the repo root came from,
+/// whether it looks like a real checkout, whether `contract/` is in sync
+/// with the generated shell mirror, and where the root-owned host OpenXR
+/// manifest currently points.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RepoInfo {
+    pub repo_root: Option<String>,
+    pub source: RepoRootSource,
+    pub markers_present: bool,
+    pub contract_synced: Option<bool>,
+    pub host_manifest_library_path: Option<String>,
+    pub host_manifest_points_here: Option<bool>,
+}
+
+#[tauri::command]
+pub fn get_repo_info() -> RepoInfo {
+    let settings = load_settings();
+    let explicit = settings.repo_root.as_deref().filter(|s| !s.is_empty());
+    let env_present = std::env::var(sabrage_core::paths::REPO_ROOT_ENV)
+        .ok()
+        .filter(|s| !s.is_empty())
+        .is_some();
+    let resolved = resolve_repo_root(explicit);
+    let source = classify_repo_root_source(explicit.is_some(), env_present, resolved.is_ok());
+    let repo_root = resolved.ok();
+
+    let markers_present = repo_root
+        .as_ref()
+        .map(|r| {
+            sabrage_core::paths::REPO_ROOT_MARKERS
+                .iter()
+                .all(|m| r.join(m).is_file())
+        })
+        .unwrap_or(false);
+
+    // meta.contract-sync's own recipe (`checks::meta`), reapplied here for
+    // explainability rather than imported (that evaluator returns a
+    // `CheckOutcome`, not a bool) — `None` when there is no root to hash.
+    let contract_synced = repo_root.as_ref().map(|root| {
+        let have = util::contract_gen_recorded_hash(root);
+        let want = util::contract_hash(root).ok();
+        matches!((&have, &want), (Some(h), Some(w)) if !h.is_empty() && h == w)
+    });
+
+    let host_json = PathBuf::from(&contract().paths.host_xr_json);
+    let host_manifest_library_path = host::host_manifest_library_path(&host_json);
+
+    let host_manifest_points_here = match (&repo_root, &host_manifest_library_path) {
+        (Some(root), Some(lp)) => {
+            let prefix = format!("{}/", root.display());
+            Some(lp.starts_with(&prefix))
+        }
+        _ => None,
+    };
+
+    RepoInfo {
+        repo_root: repo_root.map(|p| p.display().to_string()),
+        source,
+        markers_present,
+        contract_synced,
+        host_manifest_library_path,
+        host_manifest_points_here,
+    }
+}
+
+// ── library.json ─────────────────────────────────────────────────────────────
+
+/// One row of the Library screen: a stored [`library::GameEntry`] plus a
+/// fresh [`library::GameValidity`] snapshot — recomputed on every
+/// [`get_library`]/[`save_game`] call, never itself persisted, because the
+/// machine can change under a stored entry at any time (design-app §4).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GameRow {
+    pub entry: library::GameEntry,
+    pub validity: library::GameValidity,
+}
+
+fn game_row(paths: &Paths, entry: library::GameEntry) -> GameRow {
+    let validity = library::validate(paths, Path::new(&entry.bs_dir), &entry.bottle);
+    GameRow { entry, validity }
+}
+
+/// Every library entry, each with a freshly computed [`library::GameValidity`].
+#[tauri::command]
+pub fn get_library() -> Result<Vec<GameRow>, String> {
+    let paths = appsup_paths();
+    let lib_path = library::library_path(&paths.sabrage_appsup);
+    let lib = library::load(&lib_path).map_err(|e| e.to_string())?;
+    Ok(lib
+        .games
+        .into_iter()
+        .map(|entry| game_row(&paths, entry))
+        .collect())
+}
+
+/// A fresh, unsaved [`library::GameEntry`] for the Add-game wizard, seeded
+/// from `settings.json` and the bottles on this machine.
+#[tauri::command]
+pub fn new_game_template() -> library::GameEntry {
+    let settings = load_settings();
+    let bottles = sabrage_core::paths::list_bottles();
+    let env_bs_dir = std::env::var("WINEVR_BS_DIR").ok();
+    library::new_entry_template(&settings, &bottles, env_bs_dir.as_deref())
+}
+
+/// Upsert `entry` into `library.json` (by [`library::GameEntry::id`]) and
+/// return it back as the row the Library screen would now render.
+#[tauri::command]
+pub async fn save_game(entry: library::GameEntry) -> Result<GameRow, String> {
+    let paths = appsup_paths();
+    let lib_path = library::library_path(&paths.sabrage_appsup);
+    let mut lib = library::load(&lib_path).map_err(|e| e.to_string())?;
+    let saved = lib.upsert(entry).clone();
+    library::save(&real_executor(), &lib_path, &lib)
+        .await
+        .map_err(|e| e.to_string())?;
+    Ok(game_row(&paths, saved))
+}
+
+/// Remove the entry named `id` from `library.json`. `false` (never an error)
+/// when no entry with that id exists — matches [`library::Library::remove`]'s
+/// own "already gone is not a failure" contract.
+#[tauri::command]
+pub async fn remove_game(id: String) -> Result<bool, String> {
+    let target = id
+        .parse()
+        .map_err(|e| format!("{id:?} is not a valid game id: {e}"))?;
+    let paths = appsup_paths();
+    let lib_path = library::library_path(&paths.sabrage_appsup);
+    let mut lib = library::load(&lib_path).map_err(|e| e.to_string())?;
+    let removed = lib.remove(target);
+    if removed {
+        library::save(&real_executor(), &lib_path, &lib)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    Ok(removed)
+}
+
+/// Read-only install-health probes over one `(bs_dir, bottle)` pair — the
+/// Edit-game screen's inline validation, and what [`get_library`]/
+/// [`save_game`] also compute per row.
+#[tauri::command]
+pub fn validate_game(bs_dir: String, bottle: String) -> library::GameValidity {
+    library::validate(&appsup_paths(), Path::new(&bs_dir), &bottle)
+}
+
+/// Restore the real Steam `steam_api64.dll` over the entry named `game_id`'s
+/// installed Goldberg one — [`goldberg::revert_original_steam_dll`], looked
+/// up by library entry rather than a bare `bs_dir` so the Edit-game screen's
+/// button needs only the game id it already has.
+#[tauri::command]
+pub async fn revert_original_steam_dll(game_id: String) -> Result<goldberg::RevertReport, String> {
+    let target = game_id
+        .parse()
+        .map_err(|e| format!("{game_id:?} is not a valid game id: {e}"))?;
+    let paths = appsup_paths();
+    let lib_path = library::library_path(&paths.sabrage_appsup);
+    let lib = library::load(&lib_path).map_err(|e| e.to_string())?;
+    let entry = lib
+        .get(target)
+        .ok_or_else(|| format!("no game with id {game_id} in the library"))?;
+    goldberg::revert_original_steam_dll(&real_executor(), Path::new(&entry.bs_dir))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+// ── last-session recording (launch) ──────────────────────────────────────────
+
+/// What [`launch`]'s tapped sink ([`channel_sink_tee`]) captured from a
+/// `StageEvent::Launched`, if the run got that far.
+#[derive(Debug, Clone)]
+struct LaunchedInfo {
+    started_at_unix_ms: u64,
+    log_path: String,
+}
+
+/// [`launch`]'s pure decision of whether (and what) to record into
+/// `library.json` once its stage settles — factored out of the command body
+/// so the rule is unit-testable without an async runtime, a `Channel`, or a
+/// real stage run. Recording happens only when all three hold: the GUI
+/// passed a `gameId`, a `StageEvent::Launched` was actually observed for this
+/// run, and the stage settled with `Ok(outcome)` (an `Err` — repo-root
+/// resolution failing before a `StageCtx` could even exist — never reaches
+/// `Launched` in the first place, but there is then no `exit_code_equiv` to
+/// record either way).
+fn last_session_to_record(
+    game_id: Option<&str>,
+    launched: Option<&LaunchedInfo>,
+    outcome: Option<&StageOutcome>,
+) -> Option<(String, library::LastSession)> {
+    let game_id = game_id?;
+    let launched = launched?;
+    let outcome = outcome?;
+    Some((
+        game_id.to_string(),
+        library::LastSession {
+            started_at_unix_ms: launched.started_at_unix_ms,
+            ended_at_unix_ms: sabrage_core::session::now_unix_ms(),
+            exit_code: Some(outcome.exit_code_equiv),
+            log_path: Some(launched.log_path.clone()),
+        },
+    ))
+}
+
+/// Persist [`last_session_to_record`]'s decision into `library.json`.
+/// Best-effort: a game removed between launch and exit, a corrupt library
+/// file, or a failed write must not turn an otherwise-settled `launch`
+/// promise into a rejected one — logged instead, the same tolerance
+/// [`load_settings`] already applies to a corrupt settings file.
+async fn record_last_session(game_id: &str, session: library::LastSession) {
+    let Ok(target) = game_id.parse() else {
+        eprintln!("sabrage: launch carried an unparseable gameId {game_id:?}; not recording");
+        return;
+    };
+    let paths = appsup_paths();
+    let lib_path = library::library_path(&paths.sabrage_appsup);
+    let mut lib = match library::load(&lib_path) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("sabrage: library.json unreadable, not recording last session ({e})");
+            return;
+        }
+    };
+    if !lib.record_last_session(target, session) {
+        eprintln!("sabrage: game {game_id} no longer in the library; not recording last session");
+        return;
+    }
+    if let Err(e) = library::save(&real_executor(), &lib_path, &lib).await {
+        eprintln!("sabrage: failed to save library.json after launch ({e})");
+    }
 }
 
 #[cfg(test)]
@@ -1224,5 +1756,145 @@ mod tests {
         registry.forget("run");
         assert!(!registry.cancel("run"));
         assert!(!fired.load(Ordering::SeqCst));
+    }
+
+    // ── Phase 4 ───────────────────────────────────────────────────────────
+    //
+    // `sabrage-app` carries no JSON-format crate as a direct dependency
+    // (`Cargo.toml` is off-limits to this agent, and only `sabrage-core`
+    // depends on `serde_json` — see that crate's own store/config tests for
+    // the wire-format round trips), so these exercise the actual Rust-level
+    // behavior of each new payload/helper — construction, defaults, and the
+    // pure decision functions — rather than a serialized-JSON comparison.
+    // Every new `#[serde(rename_all = "camelCase")]`/`"lowercase"` attribute
+    // below follows the exact pattern already established on every sibling
+    // struct/enum in this file (`AppState`, `DoctorEvent`, `FixAction`, …).
+
+    #[test]
+    fn launch_opts_game_id_defaults_to_none_and_round_trips_through_the_struct() {
+        assert_eq!(LaunchOpts::default().game_id, None);
+        let opts = LaunchOpts {
+            game_id: Some("abc-123".to_string()),
+            ..LaunchOpts::default()
+        };
+        assert_eq!(opts.game_id.as_deref(), Some("abc-123"));
+    }
+
+    #[test]
+    fn app_state_carries_the_new_default_bottle_and_bs_dir_fields() {
+        let state = AppState {
+            repo_root: None,
+            bottles: vec![],
+            alvr_version: "v20.14.1".to_string(),
+            default_bottle: Some("Steam".to_string()),
+            default_bs_dir: None,
+        };
+        assert_eq!(state.default_bottle.as_deref(), Some("Steam"));
+        assert_eq!(state.default_bs_dir, None);
+    }
+
+    #[test]
+    fn classify_repo_root_source_follows_resolve_repo_roots_own_precedence() {
+        // Finding: `resolve_repo_root`'s explicit-override and env tiers
+        // never themselves fail (`paths.rs`'s own doc comment) — an explicit
+        // setting wins regardless of whether the walk would also have
+        // succeeded, and likewise for env over the walk.
+        assert_eq!(
+            classify_repo_root_source(true, true, true),
+            RepoRootSource::Settings
+        );
+        assert_eq!(
+            classify_repo_root_source(true, false, false),
+            RepoRootSource::Settings
+        );
+        assert_eq!(
+            classify_repo_root_source(false, true, true),
+            RepoRootSource::Env
+        );
+        assert_eq!(
+            classify_repo_root_source(false, true, false),
+            RepoRootSource::Env
+        );
+        assert_eq!(
+            classify_repo_root_source(false, false, true),
+            RepoRootSource::Executable
+        );
+        assert_eq!(
+            classify_repo_root_source(false, false, false),
+            RepoRootSource::Unresolved
+        );
+    }
+
+    #[test]
+    fn repo_root_source_variants_are_pairwise_distinct() {
+        let all = [
+            RepoRootSource::Settings,
+            RepoRootSource::Env,
+            RepoRootSource::Executable,
+            RepoRootSource::Unresolved,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn game_row_reflects_a_freshly_computed_validity_not_a_stored_one() {
+        // Exercises the private `game_row` helper directly: a `GameEntry`
+        // pointing at a bs_dir/bottle that do not exist on disk must come
+        // back `NotFound`, regardless of whatever the entry itself claims —
+        // `get_library`/`save_game`'s whole point is that validity is never
+        // trusted from the stored JSON.
+        let paths = Paths::new("/nonexistent/sabrage-commands-game-row-test");
+        let entry = library::GameEntry {
+            name: "Beat Saber 1.29.4".to_string(),
+            bs_dir: "/nonexistent/sabrage-commands-game-row-test/bs".to_string(),
+            bottle: "NoSuchBottle".to_string(),
+            ..library::GameEntry::default()
+        };
+        let row = game_row(&paths, entry.clone());
+        assert_eq!(row.entry, entry);
+        assert_eq!(row.validity.status, library::GameStatus::NotFound);
+        assert!(!row.validity.exe_present);
+    }
+
+    #[test]
+    fn last_session_to_record_needs_a_game_id_a_launched_event_and_a_settled_outcome() {
+        let launched = LaunchedInfo {
+            started_at_unix_ms: 1_000,
+            log_path: "logs/beatsaber-x.log".to_string(),
+        };
+        let outcome = StageOutcome {
+            stage: Stage::Run,
+            ok: true,
+            exit_code_equiv: 0,
+        };
+
+        assert!(
+            last_session_to_record(None, Some(&launched), Some(&outcome)).is_none(),
+            "no gameId -> nothing to record (an ad hoc Session-screen launch)"
+        );
+        assert!(
+            last_session_to_record(Some("abc"), None, Some(&outcome)).is_none(),
+            "no Launched event observed -> nothing to record (died in preflight)"
+        );
+        assert!(
+            last_session_to_record(Some("abc"), Some(&launched), None).is_none(),
+            "no settled outcome -> nothing to record (no exit_code_equiv to attach)"
+        );
+
+        let (game_id, session) =
+            last_session_to_record(Some("abc"), Some(&launched), Some(&outcome))
+                .expect("all three present");
+        assert_eq!(game_id, "abc");
+        assert_eq!(session.started_at_unix_ms, 1_000);
+        assert_eq!(session.exit_code, Some(0));
+        assert_eq!(session.log_path.as_deref(), Some("logs/beatsaber-x.log"));
+        assert!(
+            session.ended_at_unix_ms >= session.started_at_unix_ms,
+            "ended_at is \"now\", which is after the fixed started_at"
+        );
     }
 }

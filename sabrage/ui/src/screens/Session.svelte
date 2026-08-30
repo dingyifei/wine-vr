@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { getAppState, type LaunchOpts, type SessionStatus, type StageEvent } from "../ipc";
+  import { demoRunCommand } from "../lib/demo";
   import { sessionStore } from "../stores/session.svelte";
+  import { settingsStore } from "../stores/settings.svelte";
   import { stageStore } from "../stores/stage.svelte";
   import type { Screen } from "../types";
 
@@ -22,15 +24,47 @@
   let verbose = $state(false);
   let copied = $state(false);
 
+  /** Set once at mount when any field below actually got prefilled from
+   * `settings.json` (bottle/bsDir from `AppState` — Phase 4 added those two
+   * fields there specifically so this screen and the Sidebar can prefill
+   * without a second round trip — the four toggles from `settingsStore`,
+   * which this screen already needed to load anyway). Drives the small
+   * "defaults from Settings" hint; stays false on a fresh install where
+   * nothing has been set yet, so the hint doesn't appear over plain
+   * hardcoded fallbacks. */
+  let prefilledFromSettings = $state(false);
+
   function pickDefaultBottle(list: string[]): string {
     return list.includes("Steam") ? "Steam" : (list[0] ?? "");
   }
 
   onMount(async () => {
+    let appDefaultBottle: string | null = null;
+    let appDefaultBsDir: string | null = null;
     try {
-      const state = await getAppState();
+      const [state] = await Promise.all([getAppState(), settingsStore.load()]);
       bottles = state.bottles;
-      selectedBottle = pickDefaultBottle(bottles);
+      appDefaultBottle = state.defaultBottle;
+      appDefaultBsDir = state.defaultBsDir;
+      selectedBottle =
+        appDefaultBottle && bottles.includes(appDefaultBottle) ? appDefaultBottle : pickDefaultBottle(bottles);
+      bsDir = appDefaultBsDir ?? "";
+      const launch = settingsStore.settings?.launch;
+      if (launch) {
+        noAudio = launch.noAudio;
+        noDashboard = launch.noDashboard;
+        wired = launch.wired;
+        verbose = launch.verbose;
+      }
+      // `launch` is a non-null object for EVERY successfully loaded settings
+      // file, including the all-false default a fresh install gets — so it
+      // cannot stand in for "the user set something". Only a toggle that is
+      // actually on counts (each one is a demo.sh flag; off is the no-flag
+      // default this screen would show anyway).
+      const launchTouched = Boolean(
+        launch && (launch.noAudio || launch.noDashboard || launch.wired || launch.verbose),
+      );
+      prefilledFromSettings = Boolean(appDefaultBottle || appDefaultBsDir || launchTouched);
     } catch {
       bottles = [];
     } finally {
@@ -70,14 +104,11 @@
       stageStore.gate !== null,
   );
 
+  /** Delegates to `demoRunCommand` (moved out of this screen in Phase 4 so
+   * Library renders the byte-identical string for the same options) — same
+   * flag order/quoting as before. */
   function equivalentCommand(): string {
-    const parts = ["./demo.sh", "run", "--bottle", selectedBottle || "<name>"];
-    if (bsDir.trim()) parts.push("--bs-dir", `"${bsDir.trim()}"`);
-    if (noAudio) parts.push("--no-audio");
-    if (noDashboard) parts.push("--no-dashboard");
-    if (wired) parts.push("--wired");
-    if (verbose) parts.push("--verbose");
-    return parts.join(" ");
+    return demoRunCommand({ bottle: selectedBottle, bsDir, noAudio, noDashboard, wired, verbose });
   }
 
   async function copyCommand() {
@@ -284,6 +315,9 @@
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <div class="card-kicker">Launch</div>
       <h5 class="card-panel-title">Beat Saber through the bridge</h5>
+      {#if prefilledFromSettings}
+        <p class="text-muted settings-hint">Defaults from Settings — change anytime below.</p>
+      {/if}
 
       <div class="field">
         <label for="session-bottle">Bottle</label>
@@ -510,6 +544,10 @@
   }
   .card-panel-title {
     margin: 0;
+  }
+  .settings-hint {
+    font-size: 11px;
+    margin: -4px 0 2px;
   }
   .toggles {
     display: flex;

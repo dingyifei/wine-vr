@@ -1,5 +1,24 @@
 //! The user-facing configuration layer (Phase 4).
 //!
-//! Frame stub — the Phase 4 workflow's config agent owns this module:
-//! `runtime_toml.rs` (typed read + format-preserving patch + backups of
-//! `oxrsys-runtime.toml`). See `sabrage/docs/design/design-core.md` §4.1.
+//! One module today: [`runtime_toml`], the typed, format-preserving editor for
+//! `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` — the file
+//! `demo.sh` writes exactly once and then never touches again.
+//!
+//! This is the layer's boundary in one sentence: **Sabrage owns the six
+//! streaming keys' values and nothing else about that file.** Comments,
+//! ordering, spacing, unknown keys and the hand-written provenance header all
+//! survive an edit byte-for-byte, because the file is shared with a human and
+//! with a line-oriented C++ parser that is not a TOML implementation. See
+//! `sabrage/docs/design/design-core.md` §4.1 and [`runtime_toml`]'s header.
+//!
+//! Sabrage's *own* state — settings, the game library — is not configuration in
+//! this sense and lives in [`crate::store`].
+
+pub mod runtime_toml;
+
+pub use runtime_toml::{
+    apply_patch, list_backups, read, read_lines_like_the_runtime, runtime_defaults, validate,
+    write, BackupInfo, EncoderProcess, InvalidValue, Patched, Protocol, RuntimeConfigPatch,
+    RuntimeConfigValues, RuntimeConfigView, VideoCodec, WriteReport, BACKUP_KEEP, BACKUP_PREFIX,
+    EDITABLE_KEYS, TABLE,
+};

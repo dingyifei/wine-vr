@@ -45,7 +45,7 @@ fn host_manifest(ctx: &CheckCtx) -> CheckOutcome {
         );
     }
 
-    let Some(lp) = parse_library_path(host_json) else {
+    let Some(lp) = host_manifest_library_path(host_json) else {
         return CheckOutcome::fail(
             "host.manifest",
             format!(
@@ -93,7 +93,12 @@ fn host_manifest(ctx: &CheckCtx) -> CheckOutcome {
 /// manifest (install.sh's own template) never writes one, so this folds that
 /// synthetic case into "cannot parse" rather than reproducing CPython's
 /// `str()` for every JSON type. Either way the check ends up FAIL.
-fn parse_library_path(path: &Path) -> Option<String> {
+///
+/// `pub` (Phase 4): `src-tauri/src/commands.rs`'s `get_repo_info` reuses this
+/// exact parse for its `hostManifestLibraryPath`/`hostManifestPointsHere`
+/// fields, rather than a second JSON-poking copy — the brief's one named
+/// exception to "nothing else in core" for the Tauri command-layer agent.
+pub fn host_manifest_library_path(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
     value

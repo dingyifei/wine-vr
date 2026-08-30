@@ -1,0 +1,6 @@
+# Invalid TOML (an unterminated string), but the runtime's line reader still
+# resolves protocol and bitrate_mbps from it.
+[streaming]
+protocol = "alvr"
+bitrate_mbps = 80
+notes = "unterminated
