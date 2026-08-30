@@ -553,6 +553,21 @@ async fn stop_live_session_and_wait() {
 /// running. A no-op, `Ok(())`, when nothing is live.
 ///
 /// Shared by [`detach_session`] and [`resolve_quit`]'s `Keep` arm.
+/// `RunEvent::Exit` for a quit that was never asked about (AppKit
+/// `terminate:` — Dock-menu Quit, logout, AppleScript `quit` — which tao
+/// cannot intercept): if a session this process supervises is still live and
+/// no dialog answer approved this exit, apply the "keep running" answer
+/// synchronously — [`detach_live_session`] fires the handle's detach token and
+/// waits (bounded, inside `reconcile::detach`) for the supervise loop to disarm
+/// its guards and mark the record `detached`. Best-effort: an error here must
+/// not stop the process from exiting, and there is nobody left to show it to.
+pub(crate) fn detach_on_terminate(quit_approved: bool) {
+    if quit_approved || live_session().is_none() {
+        return;
+    }
+    let _ = tauri::async_runtime::block_on(detach_live_session());
+}
+
 async fn detach_live_session() -> Result<(), String> {
     let Some(handle) = live_session() else {
         return Ok(());

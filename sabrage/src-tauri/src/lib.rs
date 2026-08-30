@@ -29,7 +29,23 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
     let hide = PredefinedMenuItem::hide(handle, None)?;
     let hide_others = PredefinedMenuItem::hide_others(handle, None)?;
     let app_sep3 = PredefinedMenuItem::separator(handle)?;
-    let quit = PredefinedMenuItem::quit(handle, Some("Quit Sabrage"))?;
+    // NOT `PredefinedMenuItem::quit`: that item sends AppKit's `terminate:`
+    // selector, and tao implements no `applicationShouldTerminate:`, so the
+    // process is torn down without Tauri ever emitting `ExitRequested` — the
+    // live-session dialog can never appear on Cmd-Q (live-verified 2026-08-29:
+    // Cmd-Q killed the app mid-teardown, guards restored by their `Drop`
+    // fallbacks, the session record left saying "live"). A custom item whose
+    // handler calls `app.exit(0)` goes through `Message::RequestExit`, the one
+    // path `ExitRequested` + `prevent_exit` actually cover. Dock-menu Quit and
+    // logout still arrive as `terminate:`; those get the best-effort detach in
+    // the `RunEvent::Exit` arm below.
+    let quit = MenuItem::with_id(
+        handle,
+        "app_quit",
+        "Quit Sabrage",
+        true,
+        Some("CmdOrCtrl+Q"),
+    )?;
     let app_menu = Submenu::with_items(
         handle,
         "Sabrage",
@@ -116,7 +132,10 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
 /// `app://quit-requested`; the frontend's dialog resolves that through
 /// `commands::resolve_quit`, whose `Stop`/`Keep` arms flip `QuitApproved`
 /// before calling `app.exit(0)` themselves — which re-enters this same
-/// handler, and this time passes through untouched.
+/// handler, and this time passes through untouched. Cmd-Q reaches this path
+/// only because the Quit menu item is a custom one calling `app.exit(0)`
+/// (see `build_menu`); AppKit's own `terminate:` is handled best-effort in
+/// the `RunEvent::Exit` arm.
 pub fn run() {
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
@@ -153,6 +172,12 @@ pub fn run() {
             // Pipeline menu -> `menu://…` events; the frontend's screens are
             // the ones that know how to actually run doctor/launch/stop.
             app.on_menu_event(|app_handle, event| {
+                if event.id().as_ref() == "app_quit" {
+                    // Routed through Tauri's own exit request so the
+                    // `ExitRequested` arm below can intercept it.
+                    app_handle.exit(0);
+                    return;
+                }
                 let topic = match event.id().as_ref() {
                     "pipeline_run_doctor" => Some("menu://doctor"),
                     "pipeline_launch" => Some("menu://launch"),
@@ -200,6 +225,19 @@ pub fn run() {
                 api.prevent_close();
                 let _ = app_handle.emit("app://quit-requested", ());
             }
+        }
+        // AppKit's `terminate:` (Dock-menu Quit, logout, an AppleScript
+        // `quit`) cannot be intercepted — tao has no
+        // `applicationShouldTerminate:` — but `applicationWillTerminate` does
+        // reach here as `Exit`, synchronously, before the process dies. A
+        // session that was never asked about gets the "keep running" answer:
+        // detach (guards disarmed, record marked detached) so the game keeps
+        // streaming and the next launch offers Stop/re-attach, instead of the
+        // guards' `Drop` fallbacks yanking the audio device out from under a
+        // still-running game.
+        tauri::RunEvent::Exit => {
+            let quit_approved = app_handle.state::<commands::QuitApproved>();
+            commands::detach_on_terminate(quit_approved.0.load(Ordering::SeqCst));
         }
         _ => {}
     });
