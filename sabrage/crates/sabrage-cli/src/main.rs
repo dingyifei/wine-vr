@@ -798,10 +798,20 @@ fn report_stage_result(result: std::result::Result<StageOutcome, SabrageError>) 
 /// that the caller must propagate rather than re-emit — which makes them
 /// exactly as "already reported" as a `Fatal`, and the reason this is a
 /// predicate over the condition instead of a single-variant `matches!`.
+///
+/// [`SabrageError::Cancelled`] is here for a different reason: it is the
+/// user's own Ctrl-C (or `kill`). The run stage already printed run.sh's
+/// `-- interrupted: stopping wine` section on that path, a build stage's
+/// child simply stops, and `demo.sh` itself prints nothing after its
+/// INT/TERM trap re-raises the signal — a trailing `error: cancelled` would be
+/// the one line the shell never shows. Exit 130 remains the signal.
 fn error_already_reported_as_fatal(e: &SabrageError) -> bool {
     matches!(
         e,
-        SabrageError::Fatal { .. } | SabrageError::TccDenied { .. } | SabrageError::AdminDeclined
+        SabrageError::Fatal { .. }
+            | SabrageError::TccDenied { .. }
+            | SabrageError::AdminDeclined
+            | SabrageError::Cancelled
     )
 }
 
@@ -1574,7 +1584,10 @@ mod tests {
             assert!(error_already_reported_as_fatal(&e), "{e:?}");
         }
         // Everything else must still print its `error: {e}` tail.
-        assert!(!error_already_reported_as_fatal(&SabrageError::Cancelled));
+        // A user's own Ctrl-C: the run stage's `-- interrupted` section (or a
+        // build child simply stopping) is the report; demo.sh prints nothing
+        // after its trap re-raises either.
+        assert!(error_already_reported_as_fatal(&SabrageError::Cancelled));
         assert!(!error_already_reported_as_fatal(&SabrageError::io(
             std::path::Path::new("/x"),
             std::io::Error::from(std::io::ErrorKind::PermissionDenied),
