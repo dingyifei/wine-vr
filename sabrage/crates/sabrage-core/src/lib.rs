@@ -55,8 +55,16 @@
 //!   telemetry watcher
 //! * [`logs`] — the wine console log's name, the rotation-aware tailer, and
 //!   the past-run list
+//!
+//! Phase 4 adds the two things the GUI persists that demo.sh never had:
+//! * [`config`] — the typed, format-preserving `oxrsys-runtime.toml` editor
+//!   (the deliberate write-once override: create-if-absent from the shared
+//!   template, then in-place `toml_edit` value edits with backups)
+//! * [`store`] — Sabrage's own `~/Library/Application Support/Sabrage/`
+//!   store: `settings.json` (defaults, repo root) and `library.json` (games)
 
 pub mod checks;
+pub mod config;
 pub mod contract;
 pub mod error;
 pub mod events;
@@ -68,6 +76,7 @@ pub mod privilege;
 pub mod process;
 pub mod session;
 pub mod stages;
+pub mod store;
 pub mod tap;
 pub mod util;
 

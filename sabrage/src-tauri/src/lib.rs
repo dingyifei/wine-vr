@@ -138,6 +138,7 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
 /// the `RunEvent::Exit` arm.
 pub fn run() {
     let app = tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             // Focus the existing main window instead of spawning a second instance.
             if let Some(window) = app.get_webview_window("main") {

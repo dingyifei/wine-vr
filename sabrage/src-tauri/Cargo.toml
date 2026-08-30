@@ -15,3 +15,6 @@ tauri = { version = "2", features = [] }
 tauri-plugin-single-instance = "2"
 sabrage-core = { path = "../crates/sabrage-core" }
 serde = { version = "1", features = ["derive"] }
+# Native folder picker for the Browse… buttons (Settings paths, Edit game).
+# `dialog:allow-open` is the only capability granted (capabilities/main.json).
+tauri-plugin-dialog = "2"

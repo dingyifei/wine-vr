@@ -43,3 +43,9 @@ uuid = { version = "1.26.0", features = ["v4", "serde"] }
 # default-features = false drops `oldtime`/`wasmbind`/`serde`; `clock` brings
 # `Local::now` (and its `iana-time-zone` lookup), `std` the error types.
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# ── Phase 4 (settings + library) ─────────────────────────────────────────────
+# Format-preserving edits of the user's `oxrsys-runtime.toml` (comments,
+# unknown keys, ordering kept byte-for-byte outside the edited value) — the
+# deliberate write-once override in design-app §4 / design-core §4.1.
+toml_edit = "0.25"
