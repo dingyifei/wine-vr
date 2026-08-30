@@ -285,6 +285,80 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
+// ── the audio device to fall back to ──────────────────────────────────────────
+
+/// Substrings that mark an output device as *not a speaker*.
+///
+/// `BlackHole` is the loopback `run` routed the Mac to — restoring onto it is
+/// not a restore at all, it is the state we are escaping. `Virtual Desktop` and
+/// `Steam Streaming` are the other virtual outputs a Mac used for PCVR
+/// streaming usually carries; picking one of those leaves the user just as
+/// silent as picking BlackHole, only less obviously so.
+const VIRTUAL_OUTPUT_MARKERS: [&str; 3] = ["BlackHole", "Virtual Desktop", "Steam Streaming"];
+
+/// What a Mac with no separate speakers calls its built-in output.
+const BUILT_IN_OUTPUT: &str = "Built-in Output";
+
+/// Which device to restore the Mac's output to when the **recorded** one is
+/// gone — the AirPods that disconnected while the session was running, which
+/// makes `SwitchAudioSource -t output -s "…AirPods Pro"` exit non-zero with
+/// `Could not find an audio device named … Nothing was changed.` and leaves the
+/// Mac on `BlackHole 2ch`, silent.
+///
+/// `devices` is `SwitchAudioSource -a -t output`, in its own order. Two tiers:
+///
+/// 1. the built-in output — the first `Mac… Speakers` (MacBook Pro/Air, Mac
+///    Studio, Mac mini) or exactly `Built-in Output`. It is the one device that
+///    is always physically there, so it is always a safe landing;
+/// 2. failing that, the first device that is not one of
+///    [`VIRTUAL_OUTPUT_MARKERS`] — some real output beats no output.
+///
+/// `None` means every device on offer was virtual (or there were none): the
+/// caller must then say so and print the remedy rather than switch to
+/// something that stays silent.
+pub fn fallback_output_device(devices: &[String]) -> Option<String> {
+    devices
+        .iter()
+        .find(|d| is_built_in_output(d))
+        .or_else(|| devices.iter().find(|d| !is_virtual_output(d)))
+        .cloned()
+}
+
+/// `^Mac.* Speakers$` or exactly `Built-in Output`, without a regex crate.
+fn is_built_in_output(name: &str) -> bool {
+    name == BUILT_IN_OUTPUT || (name.starts_with("Mac") && name.ends_with(" Speakers"))
+}
+
+/// Does the name carry one of [`VIRTUAL_OUTPUT_MARKERS`]?
+fn is_virtual_output(name: &str) -> bool {
+    VIRTUAL_OUTPUT_MARKERS.iter().any(|m| name.contains(m))
+}
+
+/// `recorded output device '<prev>' is not connected — restored output -> <alt> instead`
+///
+/// The row both restore paths print when the fallback above took over.
+/// [`reconcile::restore_persisted_guards`] appends its own "previous session
+/// did not shut down cleanly" parenthetical; the guard release prints it as-is.
+pub fn audio_fallback_line(dry_run: bool, previous: &str, fallback: &str) -> String {
+    let verb = if dry_run { "would restore" } else { "restored" };
+    format!(
+        "recorded output device '{previous}' is not connected — {verb} output -> {fallback} instead"
+    )
+}
+
+/// The row printed when there is nothing to fall back to either: what failed,
+/// and the two commands that fix it by hand.
+///
+/// Naming the recorded device is the whole point — the failure this replaces
+/// left the user on `BlackHole 2ch` with no record at all of what to restore.
+pub fn audio_unrestorable_line(previous: &str) -> String {
+    format!(
+        "could not restore the audio output (recorded device '{previous}' is not connected) — \
+         restore with: SwitchAudioSource -t output -s '{previous}'   \
+         (list: SwitchAudioSource -a -t output)"
+    )
+}
+
 /// Serializes — and resets — [`RUN_PHASE`] for the tests that touch it.
 ///
 /// Unit tests share one process and the standard harness runs them on several
@@ -483,5 +557,92 @@ mod tests {
     fn now_unix_ms_is_a_plausible_wall_clock() {
         // Well past 2020, and milliseconds rather than seconds.
         assert!(now_unix_ms() > 1_600_000_000_000);
+    }
+
+    // ── the audio fallback ───────────────────────────────────────────────────
+
+    fn devices(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    #[test]
+    fn the_fallback_prefers_the_built_in_speakers() {
+        // The live list from the 2026-08-29 finding, in `SwitchAudioSource -a
+        // -t output` order: the recorded AirPods are simply not on it any more.
+        assert_eq!(
+            fallback_output_device(&devices(&[
+                "BlackHole 2ch",
+                "MacBook Pro Speakers",
+                "Steam Streaming Microphone",
+                "Steam Streaming Speakers",
+                "Virtual Desktop Mic",
+                "Virtual Desktop Speakers",
+            ])),
+            Some("MacBook Pro Speakers".to_string())
+        );
+        // Every Mac naming the pattern has to cover, built-in first even when
+        // it is listed last.
+        assert_eq!(
+            fallback_output_device(&devices(&["BlackHole 2ch", "MacBook Air Speakers"])),
+            Some("MacBook Air Speakers".to_string())
+        );
+        assert_eq!(
+            fallback_output_device(&devices(&["Mac Studio Speakers"])),
+            Some("Mac Studio Speakers".to_string())
+        );
+        assert_eq!(
+            fallback_output_device(&devices(&["Mac mini Speakers"])),
+            Some("Mac mini Speakers".to_string())
+        );
+        assert_eq!(
+            fallback_output_device(&devices(&["Steam Streaming Speakers", "Built-in Output"])),
+            Some("Built-in Output".to_string()),
+            "the built-in output outranks anything earlier in the list"
+        );
+    }
+
+    #[test]
+    fn a_real_device_beats_no_device_but_a_virtual_one_never_wins() {
+        // No built-in on the list: the first device that is not virtual.
+        assert_eq!(
+            fallback_output_device(&devices(&[
+                "BlackHole 2ch",
+                "Virtual Desktop Speakers",
+                "Studio Display Speakers",
+            ])),
+            Some("Studio Display Speakers".to_string())
+        );
+        // Only the loopback and the streaming virtuals: switching to any of
+        // them is still silence, so the caller must say so instead.
+        assert_eq!(
+            fallback_output_device(&devices(&[
+                "BlackHole 2ch",
+                "Virtual Desktop Mic",
+                "Virtual Desktop Speakers",
+            ])),
+            None
+        );
+        assert_eq!(fallback_output_device(&devices(&["BlackHole 16ch"])), None);
+        assert_eq!(fallback_output_device(&[]), None);
+    }
+
+    #[test]
+    fn the_fallback_row_texts_are_stable() {
+        assert_eq!(
+            audio_fallback_line(false, "Yifei’s AirPods Pro", "MacBook Pro Speakers"),
+            "recorded output device 'Yifei’s AirPods Pro' is not connected — restored output -> \
+             MacBook Pro Speakers instead"
+        );
+        assert_eq!(
+            audio_fallback_line(true, "Yifei’s AirPods Pro", "MacBook Pro Speakers"),
+            "recorded output device 'Yifei’s AirPods Pro' is not connected — would restore output \
+             -> MacBook Pro Speakers instead"
+        );
+        assert_eq!(
+            audio_unrestorable_line("Yifei’s AirPods Pro"),
+            "could not restore the audio output (recorded device 'Yifei’s AirPods Pro' is not \
+             connected) — restore with: SwitchAudioSource -t output -s 'Yifei’s AirPods Pro'   \
+             (list: SwitchAudioSource -a -t output)"
+        );
     }
 }

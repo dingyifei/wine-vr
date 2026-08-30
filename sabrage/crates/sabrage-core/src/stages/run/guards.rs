@@ -50,9 +50,10 @@
 //! switch the user's audio device back on an early return, which is the exact
 //! opposite of what the flag promises.
 
+use std::future::Future;
 use std::path::{Path, PathBuf};
 
-use crate::error::Result;
+use crate::error::{Result, SabrageError};
 use crate::events::{step, RunId, StageEvent};
 use crate::executor::DetachedStdio;
 use crate::paths::which;
@@ -142,6 +143,51 @@ fn audio_switched_line(previous: &str) -> String {
 /// `audio: restored output -> <dev>`
 fn audio_restored_line(previous: &str) -> String {
     format!("audio: restored output -> {previous}")
+}
+
+/// `SwitchAudioSource -t output -s <device>` through the executor, as a bool.
+///
+/// A child that cannot even be spawned counts as a failed switch rather than
+/// an error: the teardown's job is to report what the machine is left in, and
+/// [`AudioGuard::restore_output`]'s remedy row says it better than a
+/// propagated `Err` that would turn a clean quit into exit 1.
+/// [`SabrageError::Cancelled`] is the exception — it is never a switch result.
+async fn switch_output(ctx: &StageCtx, bin: &Path, device: &str) -> Result<bool> {
+    let spec = ctx
+        .child(bin.to_path_buf(), step::RUN_TEARDOWN)
+        .arg("-t")
+        .arg("output")
+        .arg("-s")
+        .arg(device);
+    match ctx.executor.run_child(&spec).await {
+        Ok(status) => Ok(status.success()),
+        Err(SabrageError::Cancelled) => Err(SabrageError::Cancelled),
+        Err(_) => Ok(false),
+    }
+}
+
+/// `SwitchAudioSource -a -t output` as one device name per line — read-only,
+/// hence [`crate::process::capture`] rather than the executor (the same
+/// exception `AudioGuard::acquire`'s two probes take).
+///
+/// An absent or failing binary yields an empty list, which simply means "no
+/// fallback": the caller then prints the remedy.
+async fn list_output_devices(ctx: &StageCtx, bin: &Path) -> Vec<String> {
+    let spec = ctx
+        .child(bin.to_path_buf(), step::RUN_TEARDOWN)
+        .arg("-a")
+        .arg("-t")
+        .arg("output")
+        .env_path(process::default_child_path());
+    match process::capture(&spec).await {
+        Ok(out) if out.status.success() => out
+            .stdout
+            .lines()
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 impl AudioGuard {
@@ -279,29 +325,91 @@ impl AudioGuard {
     /// A guard that never switched writes nothing: `prev_audio_output` is
     /// `None`, so [`SessionState::has_pending_guards`] is already false and a
     /// save would only create a state file for a run that never touched audio.
-    pub async fn release(mut self, ctx: &StageCtx, state: &mut SessionState) -> Result<()> {
+    ///
+    /// When the recorded device is **gone** — Bluetooth headphones that
+    /// disconnected mid-session — the switch back exits non-zero and the Mac
+    /// is left on `BlackHole 2ch`, i.e. silent. That is not an outcome to
+    /// swallow, so this falls back to the built-in output
+    /// ([`crate::session::fallback_output_device`]) and says so, or prints the
+    /// remedy and leaves `guards.audio_restored` **false** so the record
+    /// survives for a later restore. Either way it is rows only: a clean quit's
+    /// exit code is wine's, and a device that will not switch cannot change it.
+    pub async fn release(self, ctx: &StageCtx, state: &mut SessionState) -> Result<()> {
+        let bin = self.switch_bin.clone();
+        self.release_with(ctx, state, move || async move {
+            match bin {
+                Some(b) => list_output_devices(ctx, &b).await,
+                None => Vec::new(),
+            }
+        })
+        .await
+    }
+
+    /// [`AudioGuard::release`] with the device-list probe injected, so a test
+    /// can exercise the fallback without `SwitchAudioSource` on the machine
+    /// (the same shape `session::reconcile` uses for its probe).
+    ///
+    /// The probe is only called when the recorded switch has already failed —
+    /// a normal teardown still runs exactly one child.
+    async fn release_with<F, Fut>(
+        mut self,
+        ctx: &StageCtx,
+        state: &mut SessionState,
+        outputs: F,
+    ) -> Result<()>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Vec<String>>,
+    {
         self.released = true;
         let Some(previous) = self.previous_output.take() else {
             return Ok(());
         };
-        if let Some(bin) = self.switch_bin.clone() {
-            let restore = ctx
-                .child(bin, step::RUN_TEARDOWN)
-                .arg("-t")
-                .arg("output")
-                .arg("-s")
-                .arg(&previous);
-            // run.sh's `restore_audio` prints only when the switch succeeded.
-            if ctx.executor.run_child(&restore).await?.success() {
-                ctx.emit(StageEvent::text(
-                    ctx.run_id,
-                    Some(step::RUN_TEARDOWN),
-                    audio_restored_line(&previous),
+        let restored = match self.switch_bin.clone() {
+            Some(bin) => self.restore_output(ctx, &bin, &previous, outputs).await?,
+            // Nothing to switch with means nothing was ever switched: there is
+            // no pending work for a later process to inherit.
+            None => true,
+        };
+        state.guards.audio_restored = restored;
+        state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await
+    }
+
+    /// The recorded device, then the fallback, then the remedy. `true` when the
+    /// Mac ended up on something audible.
+    async fn restore_output<F, Fut>(
+        &self,
+        ctx: &StageCtx,
+        bin: &Path,
+        previous: &str,
+        outputs: F,
+    ) -> Result<bool>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = Vec<String>>,
+    {
+        // run.sh's `restore_audio` prints only when the switch succeeded.
+        if switch_output(ctx, bin, previous).await? {
+            ctx.emit(StageEvent::text(
+                ctx.run_id,
+                Some(step::RUN_TEARDOWN),
+                audio_restored_line(previous),
+            ));
+            return Ok(true);
+        }
+        let st = ctx.step(step::RUN_TEARDOWN);
+        if let Some(alt) = crate::session::fallback_output_device(&outputs().await) {
+            if switch_output(ctx, bin, &alt).await? {
+                st.warn(crate::session::audio_fallback_line(
+                    ctx.executor.is_dry_run(),
+                    previous,
+                    &alt,
                 ));
+                return Ok(true);
             }
         }
-        state.guards.audio_restored = true;
-        state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await
+        st.warn(crate::session::audio_unrestorable_line(previous));
+        Ok(false)
     }
 
     /// Detach: forget the guard **without** restoring. The device stays on
@@ -750,6 +858,222 @@ mod tests {
         g.dry_run = false;
         g.release(&ctx, &mut state).await.unwrap();
         assert!(seen.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A [`DryRunExecutor`] whose children come back **non-zero** whenever
+    /// `device` is one of their arguments — a `SwitchAudioSource -t output -s
+    /// "…AirPods Pro"` for headphones that are no longer connected. Same shape
+    /// as `super`'s `DenyWriteTo`; everything else delegates, so the plan still
+    /// records every attempt in order.
+    #[derive(Debug)]
+    struct FailSwitchTo {
+        inner: Arc<dyn Executor>,
+        device: std::ffi::OsString,
+    }
+
+    impl FailSwitchTo {
+        fn around(inner: Arc<dyn Executor>, device: &str) -> Arc<FailSwitchTo> {
+            Arc::new(FailSwitchTo {
+                inner,
+                device: device.into(),
+            })
+        }
+    }
+
+    impl Executor for FailSwitchTo {
+        fn with_step(&self, step: crate::events::StepId) -> Arc<dyn Executor> {
+            Arc::new(FailSwitchTo {
+                inner: self.inner.with_step(step),
+                device: self.device.clone(),
+            })
+        }
+        fn is_dry_run(&self) -> bool {
+            self.inner.is_dry_run()
+        }
+        fn planned(&self) -> Vec<crate::executor::PlannedAction> {
+            self.inner.planned()
+        }
+        fn copy_if_changed<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Copied>> {
+            self.inner.copy_if_changed(src, dst)
+        }
+        fn write_atomic<'a>(
+            &'a self,
+            path: &'a Path,
+            bytes: &'a [u8],
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.write_atomic(path, bytes)
+        }
+        fn remove_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_dir_all(p)
+        }
+        fn remove_file<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_file(p)
+        }
+        fn create_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.create_dir_all(p)
+        }
+        fn dir_copy<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.dir_copy(src, dst)
+        }
+        fn download<'a>(
+            &'a self,
+            url: &'a str,
+            dest: &'a Path,
+            sha256: &'a str,
+            label: &'a str,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Downloaded>> {
+            self.inner.download(url, dest, sha256, label)
+        }
+        fn tar_xzf<'a>(
+            &'a self,
+            archive: &'a Path,
+            into_dir: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.tar_xzf(archive, into_dir)
+        }
+        fn touch<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.touch(p)
+        }
+        fn run_child<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+        ) -> crate::executor::BoxFuture<'a, Result<std::process::ExitStatus>> {
+            let fails = spec.args.contains(&self.device);
+            Box::pin(async move {
+                let status = self.inner.run_child(spec).await?;
+                Ok(if fails {
+                    use std::os::unix::process::ExitStatusExt;
+                    std::process::ExitStatus::from_raw(1 << 8)
+                } else {
+                    status
+                })
+            })
+        }
+        fn spawn_detached<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+            stdio: DetachedStdio,
+        ) -> crate::executor::BoxFuture<'a, Result<Option<crate::executor::DetachedChild>>>
+        {
+            self.inner.spawn_detached(spec, stdio)
+        }
+    }
+
+    /// The device of the 2026-08-29 finding: recorded at launch, disconnected
+    /// before the session was torn down.
+    const AIRPODS: &str = "Yifei\u{2019}s AirPods Pro";
+
+    /// `SwitchAudioSource -a -t output` on that machine, verbatim and in order.
+    fn live_outputs() -> Vec<String> {
+        [
+            "BlackHole 2ch",
+            "MacBook Pro Speakers",
+            "Steam Streaming Microphone",
+            "Steam Streaming Speakers",
+            "Virtual Desktop Mic",
+            "Virtual Desktop Speakers",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
+    }
+
+    fn spawn_reasons(ctx: &StageCtx) -> Vec<String> {
+        ctx.executor
+            .planned()
+            .into_iter()
+            .filter(|p| p.kind == PlannedKind::Spawn)
+            .map(|p| p.reason)
+            .collect()
+    }
+
+    /// The recorded device is gone, so the switch back exits non-zero and the
+    /// Mac would stay on BlackHole — silent. Land on the built-in speakers and
+    /// say so.
+    #[tokio::test]
+    async fn a_recorded_device_that_vanished_falls_back_to_the_built_in_output() {
+        let root = scratch("audio-fallback");
+        let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
+        ctx.executor = FailSwitchTo::around(ctx.executor.clone(), AIRPODS);
+        let mut state = fresh_state();
+
+        AudioGuard::armed_for_test(&ctx, AIRPODS, "/opt/homebrew/bin/SwitchAudioSource")
+            .release_with(&ctx, &mut state, || std::future::ready(live_outputs()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(&seen.lock().unwrap()),
+            vec![format!(
+                "[warn] recorded output device '{AIRPODS}' is not connected — would restore \
+                 output -> MacBook Pro Speakers instead"
+            )],
+            "no `audio: restored output -> …`: that device is not what came back"
+        );
+        assert!(
+            state.guards.audio_restored,
+            "landing somewhere audible IS a restore"
+        );
+        assert_eq!(
+            spawn_reasons(&ctx),
+            vec![
+                format!("/opt/homebrew/bin/SwitchAudioSource -t output -s {AIRPODS}"),
+                "/opt/homebrew/bin/SwitchAudioSource -t output -s MacBook Pro Speakers".to_string(),
+            ],
+            "the recorded device is always tried first"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Nothing on the list is audible: print the remedy, leave the guard
+    /// pending so `session-state.json` survives for a later restore — and do
+    /// not fail the stage over it (run.sh's EXIT trap cannot change `exit $rc`
+    /// either).
+    #[tokio::test]
+    async fn an_unrestorable_device_prints_the_remedy_and_leaves_the_guard_pending() {
+        let root = scratch("audio-stuck");
+        let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
+        ctx.executor = FailSwitchTo::around(ctx.executor.clone(), AIRPODS);
+        let mut state = fresh_state();
+
+        AudioGuard::armed_for_test(&ctx, AIRPODS, "/opt/homebrew/bin/SwitchAudioSource")
+            .release_with(&ctx, &mut state, || {
+                // Only the loopback and the streaming virtuals are connected.
+                std::future::ready(vec![
+                    "BlackHole 2ch".to_string(),
+                    "Virtual Desktop Speakers".to_string(),
+                ])
+            })
+            .await
+            .expect("a device that will not switch is a row, never a failed stage");
+
+        assert_eq!(
+            rows(&seen.lock().unwrap()),
+            vec![format!(
+                "[warn] {}",
+                crate::session::audio_unrestorable_line(AIRPODS)
+            )]
+        );
+        assert!(
+            !state.guards.audio_restored,
+            "the guard stays pending, so the record is kept for a later restore"
+        );
+        assert_eq!(
+            spawn_reasons(&ctx),
+            vec![format!(
+                "/opt/homebrew/bin/SwitchAudioSource -t output -s {AIRPODS}"
+            )],
+            "no fallback was attempted: every device on offer is virtual"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
