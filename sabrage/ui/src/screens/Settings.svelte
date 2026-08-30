@@ -16,6 +16,7 @@
   //    instead of a form-wide save button.
   import { onMount } from "svelte";
   import {
+    suggestBsDir,
     getAppState,
     getRepoInfo,
     pickFolder,
@@ -43,6 +44,16 @@
   // ── settings.json — local mirrors, seeded once settings load, then autosaved ─
 
   let defaultBottleSel = $state("");
+  /** The path demo.sh derives for the selected bottle — shown as the empty
+   * field's placeholder so "leave empty" is a concrete path, not a promise. */
+  let derivedBsDir = $state("");
+  $effect(() => {
+    const bottle = defaultBottleSel;
+    void suggestBsDir(bottle || null, null).then(
+      (s) => (derivedBsDir = s.derived),
+      () => (derivedBsDir = ""),
+    );
+  });
   let bsDirInput = $state("");
   let routeAudioChk = $state(true);
   let openDashboardChk = $state(true);
@@ -102,7 +113,11 @@
     // with nothing on screen to explain it.
     let dir: string | null;
     try {
-      dir = await pickFolder("Choose the default Beat Saber install directory", bsDirInput || null);
+      // Start the panel in the field's own dir, else in the bottle's derived
+      // Beat Saber path (nearest existing ancestor — the bottle's drive_c on a
+      // fresh bottle), never "wherever macOS last was".
+      const suggestion = await suggestBsDir(defaultBottleSel || null, bsDirInput || null);
+      dir = await pickFolder("Choose the default Beat Saber install directory", suggestion.browseStart);
     } catch (e) {
       settingsSaveError = `Could not open the folder picker: ${e instanceof Error ? e.message : String(e)}`;
       return;
@@ -743,7 +758,7 @@
               id="settings-bsdir"
               class="input mono"
               type="text"
-              placeholder="leave empty to derive from the bottle"
+              placeholder={derivedBsDir ? `derived from the bottle: ${derivedBsDir}` : "leave empty to derive from the bottle"}
               bind:value={bsDirInput}
               onchange={onBsDirCommit}
               disabled={!settingsStore.loaded}

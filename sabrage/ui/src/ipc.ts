@@ -918,6 +918,22 @@ export async function revertOriginalSteamDll(gameId: string): Promise<RevertRepo
  * always asks for a single directory, so the union collapses to
  * `string | null` here.
  */
+/** `commands::BsDirSuggestion` — the bottle-derived Beat Saber dir (empty when
+ * no bottle) and the nearest EXISTING directory a folder picker should start
+ * in (the field's own value, else the derived path, else $HOME). */
+export interface BsDirSuggestion {
+  derived: string;
+  browseStart: string;
+}
+
+/** `suggest_bs_dir` — read-only; feeds Browse… and the empty-field placeholder. */
+export async function suggestBsDir(
+  bottle: string | null,
+  current: string | null,
+): Promise<BsDirSuggestion> {
+  return invoke<BsDirSuggestion>("suggest_bs_dir", { bottle, current });
+}
+
 export async function pickFolder(
   title: string,
   defaultPath?: string | null,

@@ -9,6 +9,7 @@
 
   import { onMount } from "svelte";
   import {
+    suggestBsDir,
     getAppState,
     newGameTemplate,
     pickFolder,
@@ -131,7 +132,10 @@
       // `open()` rejects (it does not resolve null) when the dialog capability
       // is missing or the panel fails, so an unhandled rejection here would
       // leave Browse… looking like a dead button.
-      const picked = await pickFolder("Choose the Beat Saber install directory", entry.bsDir || null);
+      // Start in the field's own dir, else the bottle's derived Beat Saber
+      // path (nearest existing ancestor), never wherever macOS last was.
+      const suggestion = await suggestBsDir(entry.bottle || null, entry.bsDir || null);
+      const picked = await pickFolder("Choose the Beat Saber install directory", suggestion.browseStart);
       if (picked) entry.bsDir = picked;
     } catch (e) {
       validateError = e instanceof Error ? e.message : String(e);

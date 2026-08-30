@@ -1358,6 +1358,70 @@ pub struct RepoInfo {
     pub host_manifest_points_here: Option<bool>,
 }
 
+/// Where a Browse… folder picker should start for a Beat Saber dir field, and
+/// the path demo.sh would derive for the bottle when the field is left empty.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BsDirSuggestion {
+    /// lib.sh's `${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/<leaf>}`
+    /// for `bottle`; empty when no bottle is named (the shell's bottle-less
+    /// fallback is a quirk, not a suggestion).
+    pub derived: String,
+    /// The nearest **existing** directory at or above `current` (when given),
+    /// else at or above `derived`, else `$HOME` — an NSOpenPanel handed a
+    /// path that does not exist just opens wherever it last was, which is
+    /// how "Browse… doesn't start in the bottle" looked to the user.
+    pub browse_start: String,
+}
+
+/// First ancestor-or-self of `p` that is a directory, if any.
+fn nearest_existing_dir(p: &Path) -> Option<PathBuf> {
+    p.ancestors().find(|a| a.is_dir()).map(Path::to_path_buf)
+}
+
+/// Pure body of [`suggest_bs_dir`]; `exists` is injected so the precedence is
+/// testable without real directories.
+fn suggest_bs_dir_with(
+    bottle: Option<&str>,
+    current: Option<&str>,
+    home: &Path,
+    exists: impl Fn(&Path) -> Option<PathBuf>,
+) -> BsDirSuggestion {
+    let derived = bottle
+        .filter(|b| !b.is_empty())
+        .map(|b| {
+            sabrage_core::paths::resolve_bs_dir(Some(&sabrage_core::Bottle::unvalidated(b)), None)
+                .display()
+                .to_string()
+        })
+        .unwrap_or_default();
+    let candidates = [
+        current.filter(|c| !c.trim().is_empty()),
+        Some(derived.as_str()).filter(|d| !d.is_empty()),
+    ];
+    let browse_start = candidates
+        .into_iter()
+        .flatten()
+        .find_map(|c| exists(Path::new(c)))
+        .unwrap_or_else(|| home.to_path_buf());
+    BsDirSuggestion {
+        derived,
+        browse_start: browse_start.display().to_string(),
+    }
+}
+
+/// Settings' and Edit-game's Browse… start directory + the empty-field
+/// placeholder for a Beat Saber dir field. Read-only.
+#[tauri::command]
+pub fn suggest_bs_dir(bottle: Option<String>, current: Option<String>) -> BsDirSuggestion {
+    suggest_bs_dir_with(
+        bottle.as_deref(),
+        current.as_deref(),
+        &sabrage_core::paths::home_dir(),
+        nearest_existing_dir,
+    )
+}
+
 #[tauri::command]
 pub fn get_repo_info() -> RepoInfo {
     let settings = load_settings();
@@ -1591,6 +1655,44 @@ mod tests {
     /// [`launch_stage_options_layers_the_launch_flags_with_gui_precedence`]
     /// below holds it too.
     static WINEVR_BOTTLE_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn browse_start_prefers_the_field_then_the_bottle_derived_dir_then_home() {
+        let home = Path::new("/Users/me");
+        let existing = |p: &Path| -> Option<PathBuf> {
+            // Only /Volumes/Games and the bottle's drive_c "exist".
+            p.ancestors()
+                .find(|a| {
+                    *a == Path::new("/Volumes/Games")
+                        || a.to_string_lossy().ends_with("/Bottles/Steam/drive_c")
+                })
+                .map(Path::to_path_buf)
+        };
+        // Field set → its nearest existing ancestor wins even with a bottle.
+        let s = suggest_bs_dir_with(
+            Some("Steam"),
+            Some("/Volumes/Games/Beat Saber 1294"),
+            home,
+            existing,
+        );
+        assert_eq!(s.browse_start, "/Volumes/Games");
+        assert!(s.derived.ends_with(
+            "/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294"
+        ));
+        // Empty field → the bottle-derived dir's nearest existing ancestor.
+        let s = suggest_bs_dir_with(Some("Steam"), Some("   "), home, existing);
+        assert!(
+            s.browse_start.ends_with("/Bottles/Steam/drive_c"),
+            "{}",
+            s.browse_start
+        );
+        // No bottle, nothing existing → $HOME, and no derived path at all.
+        let s = suggest_bs_dir_with(None, None, home, |_| None);
+        assert_eq!(s.derived, "");
+        assert_eq!(s.browse_start, "/Users/me");
+        let s = suggest_bs_dir_with(Some(""), Some(""), home, |_| None);
+        assert_eq!(s.derived, "");
+    }
 
     #[test]
     fn settings_defaults_fill_only_what_env_and_gui_left_unset() {

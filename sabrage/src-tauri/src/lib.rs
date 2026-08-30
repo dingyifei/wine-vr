@@ -166,6 +166,7 @@ pub fn run() {
             commands::get_settings,
             commands::save_settings,
             commands::get_repo_info,
+            commands::suggest_bs_dir,
             commands::get_library,
             commands::new_game_template,
             commands::save_game,
