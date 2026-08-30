@@ -28,6 +28,9 @@ function createDoctorStore() {
   let hasRun = $state(false);
   let bottles = $state<string[]>([]);
   let bottlesLoaded = $state(false);
+  /** `settings.json`'s `defaultBottle` as reported by `get_app_state` (Phase 4)
+   * — the Doctor screen's first choice before its hardcoded "Steam" fallback. */
+  let defaultBottle = $state<string | null>(null);
 
   /** The one row (if any) standing in for "currently running". */
   function runningSlug(): string | null {
@@ -40,8 +43,10 @@ function createDoctorStore() {
     try {
       const state = await getAppState();
       bottles = state.bottles;
+      defaultBottle = state.defaultBottle;
     } catch {
       bottles = [];
+      defaultBottle = null;
     } finally {
       bottlesLoaded = true;
     }
@@ -93,6 +98,9 @@ function createDoctorStore() {
     },
     get bottles() {
       return bottles;
+    },
+    get defaultBottle() {
+      return defaultBottle;
     },
     get bottlesLoaded() {
       return bottlesLoaded;

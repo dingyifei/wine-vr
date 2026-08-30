@@ -176,12 +176,25 @@ pub async fn run_doctor(
         }
     };
 
-    // WINEVR_* env is the base (parity with the CLI and demo.sh precedence);
-    // explicit GUI args override.
+    // Precedence, highest first: explicit GUI args > `WINEVR_*` env (parity
+    // with the CLI and demo.sh) > the persisted `settings.json` defaults
+    // (Phase 4 — a Finder-launched .app has no environment at all, so without
+    // this tier the Doctor screen could never find a Beat Saber dir the user
+    // had set on the Settings screen).
     let mut opts = CheckOptions::from_env();
     // settings.allow_adb_probes (Phase 4): this used to be hard-coded `true`
     // regardless of the toggle on the Settings screen.
     opts.allow_adb_probes = settings.allow_adb_probes;
+    if opts.bottle_name.is_none() {
+        opts.bottle_name = settings.default_bottle.clone().filter(|s| !s.is_empty());
+    }
+    if opts.bs_dir_override.is_none() {
+        opts.bs_dir_override = settings
+            .default_bs_dir
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
+    }
     if let Some(b) = bottle {
         opts.bottle_name = Some(b);
     }
@@ -421,12 +434,36 @@ fn emit_early_failure(sink: &EventSink, stage: Stage, err: &SabrageError) {
 /// `WINEVR_BOTTLE` set in Sabrage's own environment — the CLI's `cmd_stage`
 /// never had this bug (it already called `StageOptions::from_env()` first).
 fn stage_options_from_env_and_gui(bottle: Option<String>, bs_dir: Option<String>) -> StageOptions {
-    let mut opts = StageOptions::from_env();
+    let mut opts = fill_stage_options_from_settings(StageOptions::from_env(), &load_settings());
     if let Some(b) = bottle {
         opts.bottle_name = Some(b);
     }
     if let Some(d) = bs_dir {
         opts.bs_dir_override = Some(PathBuf::from(d));
+    }
+    opts
+}
+
+/// The lowest precedence tier of [`stage_options_from_env_and_gui`] (and of
+/// [`run_doctor`]'s `CheckOptions`): `settings.json`'s `default_bottle` /
+/// `default_bs_dir` fill a bottle or Beat Saber dir that neither the
+/// environment nor the caller supplied. Phase 4 — a Finder-launched .app has
+/// no `WINEVR_*` environment, so this tier is what makes the Settings
+/// screen's "Paths" card actually reach setup/build/install/doctor/stop.
+/// Pure (settings passed in) so it is testable without touching `$HOME`.
+fn fill_stage_options_from_settings(
+    mut opts: StageOptions,
+    settings: &settings::Settings,
+) -> StageOptions {
+    if opts.bottle_name.is_none() {
+        opts.bottle_name = settings.default_bottle.clone().filter(|s| !s.is_empty());
+    }
+    if opts.bs_dir_override.is_none() {
+        opts.bs_dir_override = settings
+            .default_bs_dir
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .map(PathBuf::from);
     }
     opts
 }
@@ -1554,6 +1591,38 @@ mod tests {
     /// [`launch_stage_options_layers_the_launch_flags_with_gui_precedence`]
     /// below holds it too.
     static WINEVR_BOTTLE_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn settings_defaults_fill_only_what_env_and_gui_left_unset() {
+        let settings = settings::Settings {
+            default_bottle: Some("Steam".to_string()),
+            default_bs_dir: Some("/Volumes/Games/Beat Saber 1294".to_string()),
+            ..settings::Settings::default()
+        };
+        // Nothing set anywhere else → both defaults apply.
+        let filled = fill_stage_options_from_settings(StageOptions::default(), &settings);
+        assert_eq!(filled.bottle_name.as_deref(), Some("Steam"));
+        assert_eq!(
+            filled.bs_dir_override.as_deref(),
+            Some(Path::new("/Volumes/Games/Beat Saber 1294"))
+        );
+        // An env/GUI-supplied value is never overridden by a default.
+        let preset = StageOptions {
+            bottle_name: Some("VR".to_string()),
+            bs_dir_override: Some(PathBuf::from("/elsewhere")),
+            ..StageOptions::default()
+        };
+        let kept = fill_stage_options_from_settings(preset.clone(), &settings);
+        assert_eq!(kept, preset);
+        // Empty strings in settings.json count as unset, not as "" paths.
+        let blank = settings::Settings {
+            default_bottle: Some(String::new()),
+            default_bs_dir: Some(String::new()),
+            ..settings::Settings::default()
+        };
+        let untouched = fill_stage_options_from_settings(StageOptions::default(), &blank);
+        assert_eq!(untouched, StageOptions::default());
+    }
 
     #[test]
     fn stage_options_from_env_and_gui_honours_winevr_bottle_when_the_gui_passes_none() {

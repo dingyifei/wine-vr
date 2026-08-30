@@ -17,13 +17,14 @@
   let fixError = $state<FixError | null>(null);
   let confirmFix = $state<{ slug: string; action: FixAction } | null>(null);
 
-  function pickDefaultBottle(bottles: string[]): string {
+  function pickDefaultBottle(bottles: string[], preferred: string | null): string {
+    if (preferred && bottles.includes(preferred)) return preferred;
     return bottles.includes("Steam") ? "Steam" : (bottles[0] ?? "");
   }
 
   onMount(async () => {
     await doctorStore.loadBottles();
-    selectedBottle = pickDefaultBottle(doctorStore.bottles);
+    selectedBottle = pickDefaultBottle(doctorStore.bottles, doctorStore.defaultBottle);
     void runChecks();
   });
 
