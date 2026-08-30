@@ -56,6 +56,11 @@ pub struct RuntimeStatus {
 ///
 /// Three seconds: comfortably above the observed write cadence, low enough
 /// that a killed runtime stops looking alive within one status poll.
+/// The `state` value oxrsys writes while a client is connected and frames are
+/// flowing (`RuntimeStatus::SetStreaming`); the only state with a per-second
+/// heartbeat, hence the only one whose staleness means anything.
+pub const RUNTIME_STATE_STREAMING: &str = "streaming";
+
 pub const RUNTIME_STATUS_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// How long a fresh launch gets before [`SessionMonitor::snapshot`] will even
@@ -329,8 +334,22 @@ impl SessionMonitor {
                 }
             }
         }
-        // ── Stalled: Running, past the startup grace, stale too long ────────
-        if status.phase == SessionPhase::Running {
+        // ── Stalled: Running + streaming, past the startup grace, stale too long
+        //
+        // oxrsys writes `runtime_status.json` on state changes (`SetIdle` /
+        // `SetStreaming`) and then once per second *only while streaming*
+        // (`SetStreamingStats`, StreamingServer.cpp) — there is no idle
+        // heartbeat. So staleness means "the stream's heartbeat stopped" only
+        // when the file's last state is `streaming`; an `idle` runtime waiting
+        // for the headset is legitimately stale for as long as the user takes
+        // to put it on, and must never read as Stalled (live-verified
+        // 2026-08-29: a fresh launch flipped to Stalled 13 s in, before the
+        // Quest had connected).
+        let runtime_streaming = self
+            .runtime_status
+            .as_ref()
+            .is_some_and(|rs| rs.state == RUNTIME_STATE_STREAMING);
+        if status.phase == SessionPhase::Running && runtime_streaming {
             let started = status.started_at_unix_ms.unwrap_or(now);
             let past_startup_grace =
                 now.saturating_sub(started) > SESSION_STARTUP_GRACE.as_millis() as u64;
@@ -1183,12 +1202,22 @@ mod tests {
                 assert_eq!(s.runtime_state.as_deref(), Some("streaming"));
             }
 
-            // Stalled: past the startup grace, stale for longer than the
-            // stall grace (simulated directly — no real 30s+10s sleep).
+            // Stalled: past the startup grace, the *streaming* heartbeat stale
+            // for longer than the stall grace (simulated directly — no real
+            // 30s+10s sleep). The file's last state must be `streaming`: that
+            // is the only state oxrsys heartbeats.
             {
                 let dir = scratch("live-stalled");
                 let paths = fixture_paths(&dir);
                 std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+                std::fs::write(
+                    paths.oxr_appsup.join("runtime_status.json"),
+                    format!(
+                        r#"{{"state":"streaming","updated_at_unix_ms":{}}}"#,
+                        now - 20_000
+                    ),
+                )
+                .unwrap();
                 let run_id = Uuid::new_v4();
                 set_live_session(LiveSessionHandle {
                     run_id,
@@ -1208,6 +1237,45 @@ mod tests {
 
                 assert_eq!(s.phase, SessionPhase::Stalled);
                 assert!(!s.runtime_fresh);
+            }
+
+            // Idle runtime waiting for the headset: the file was written once
+            // (`SetIdle`) and is now arbitrarily stale, past every grace —
+            // oxrsys has no idle heartbeat, so this is Running, never Stalled
+            // (live-verified 2026-08-29: the pre-fix rule flipped a fresh
+            // launch to Stalled 13 s in, before the Quest had connected).
+            {
+                let dir = scratch("live-idle-waiting");
+                let paths = fixture_paths(&dir);
+                std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+                std::fs::write(
+                    paths.oxr_appsup.join("runtime_status.json"),
+                    format!(
+                        r#"{{"state":"idle","updated_at_unix_ms":{}}}"#,
+                        now - 120_000
+                    ),
+                )
+                .unwrap();
+                let run_id = Uuid::new_v4();
+                set_live_session(LiveSessionHandle {
+                    run_id,
+                    bottle: "Steam".into(),
+                    identity: ProcInfo::observe(std::process::id()).unwrap(),
+                    log_path: PathBuf::from("/repo/logs/x.log"),
+                    started_at_unix_ms: now - 120_000,
+                    cancel: CancellationToken::new(),
+                    detach: CancellationToken::new(),
+                });
+
+                let mut m = SessionMonitor::new(paths);
+                m.ever_fresh = true;
+                m.last_fresh_unix_ms = Some(now - 100_000);
+                let s = m.snapshot().await;
+                clear_live_session(run_id);
+
+                assert_eq!(s.phase, SessionPhase::Running);
+                assert!(!s.runtime_fresh);
+                assert_eq!(s.runtime_state.as_deref(), Some("idle"));
             }
 
             // Same staleness, but still inside the startup grace window: must
