@@ -203,7 +203,9 @@ fn version_stamp_at(b: &[u8], i: usize) -> Option<usize> {
 ///
 /// install.sh:
 /// ```zsh
-/// WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB}"
+/// OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
+/// OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
+/// WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB_JSON}"
 /// ```
 /// `$(<file)` strips the template's trailing newline, so the returned string has
 /// **no** trailing newline — it is the *comparison* form, the exact bytes
@@ -212,9 +214,40 @@ fn version_stamp_at(b: &[u8], i: usize) -> Option<usize> {
 ///
 /// This is the single most drift-sensitive artifact in the pipeline: one extra
 /// byte and the two front-ends thrash each other with sudo prompts.
+///
+/// The path lands **inside a JSON string literal**, so it goes through
+/// [`json_escape_string`] first — install.sh escapes `$OXR_DYLIB` the same way
+/// before its own `//@OXR_DYLIB@/` substitution, and an ordinary path (no `\`,
+/// no `"`) renders byte-identically to the unescaped form, so no artifact on
+/// any existing machine changes.
 pub fn render_host_manifest(dylib_path: &Path) -> String {
-    strip_trailing_newlines(crate::contract::HOST_MANIFEST_TEMPLATE)
-        .replace(HOST_MANIFEST_PLACEHOLDER, &dylib_path.to_string_lossy())
+    strip_trailing_newlines(crate::contract::HOST_MANIFEST_TEMPLATE).replace(
+        HOST_MANIFEST_PLACEHOLDER,
+        &json_escape_string(&dylib_path.to_string_lossy()),
+    )
+}
+
+/// Escape `s` for embedding in a JSON string literal, byte-for-byte the way
+/// install.sh does it:
+///
+/// ```zsh
+/// OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
+/// OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
+/// ```
+///
+/// i.e. backslash first (so the escapes it introduces are not re-escaped), then
+/// the double quote — and **nothing else**. A checkout path containing either
+/// character would otherwise produce invalid or misdirected JSON in the
+/// root-owned host manifest, which breaks OpenXR until another privileged
+/// install repairs it.
+///
+/// Deliberately *not* a full JSON encoder: control characters (a literal
+/// newline or tab in a path) stay unescaped because the zsh side leaves them
+/// unescaped too, and artifact-byte parity between the two front-ends outranks
+/// being correct for a path no checkout has ever had. Widening this must land
+/// on both sides in the same commit.
+pub fn json_escape_string(s: &str) -> String {
+    s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
 /// The bytes written to `/usr/local/share/openxr/1/active_runtime.x86_64.json`:
@@ -297,6 +330,23 @@ pub fn contract_marker_bytes(sha: &str) -> String {
 
 // ── contract sync ─────────────────────────────────────────────────────────────
 
+/// The `meta.contract-sync` hash over contract bytes already in memory —
+/// `cat <parts…> | shasum -a 256`, in the order given.
+///
+/// The one place the recipe is spelled out for in-memory inputs, so the
+/// compiled-in identity ([`crate::contract::COMPILED_CONTRACT_SHA256`]) and the
+/// on-disk recompute ([`contract_hash`], which streams the same three files off
+/// `repo_root`) cannot drift apart in *how* they hash — only in *what* they
+/// hash, which is exactly the skew the two are meant to expose.
+pub fn contract_sha256_from(parts: &[&str]) -> String {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    for part in parts {
+        h.update(part.as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
 /// The `meta.contract-sync` hash, recomputed from the contract files **on disk**
 /// under `repo_root`.
 ///
@@ -375,6 +425,47 @@ mod tests {
             host_manifest_file_bytes(Path::new("/repo/ext/oxrsys/build-x64/runtime/lib.dylib")),
             format!("{want}\n")
         );
+    }
+
+    /// A path inside a JSON string literal must be escaped, and an ordinary
+    /// path must still render byte-identically to the unescaped form (the
+    /// golden every deployed host manifest was written with).
+    #[test]
+    fn host_manifest_json_escapes_the_dylib_path() {
+        let plain = Path::new("/repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib");
+        assert_eq!(
+            render_host_manifest(plain),
+            strip_trailing_newlines(crate::contract::HOST_MANIFEST_TEMPLATE)
+                .replace(HOST_MANIFEST_PLACEHOLDER, &plain.to_string_lossy()),
+            "ordinary paths must render exactly as they did before escaping existed"
+        );
+
+        for raw in [
+            "/Users/me/my \"vr\" repo/ext/oxrsys/build-x64/runtime/lib.dylib",
+            "/Users/me/a\\b/ext/oxrsys/build-x64/runtime/lib.dylib",
+            "/Users/me/\"\\\"/lib.dylib",
+        ] {
+            let rendered = render_host_manifest(Path::new(raw));
+            let parsed: serde_json::Value =
+                serde_json::from_str(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e}"));
+            assert_eq!(
+                parsed["runtime"]["library_path"].as_str(),
+                Some(raw),
+                "the decoded library_path must be the path we were given"
+            );
+        }
+    }
+
+    #[test]
+    fn json_escape_string_is_install_shs_two_substitutions() {
+        assert_eq!(json_escape_string("/plain/path"), "/plain/path");
+        assert_eq!(json_escape_string(r#"a"b"#), r#"a\"b"#);
+        assert_eq!(json_escape_string(r"a\b"), r"a\\b");
+        // Backslash first: the escape it introduces is not re-escaped.
+        assert_eq!(json_escape_string(r#"\""#), r#"\\\""#);
+        // Deliberately NOT a full JSON encoder — the zsh side escapes exactly
+        // these two characters and nothing else.
+        assert_eq!(json_escape_string("a\nb"), "a\nb");
     }
 
     #[test]

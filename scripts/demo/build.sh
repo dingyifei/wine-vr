@@ -16,6 +16,7 @@ rustup target list --installed 2>/dev/null | grep -q x86_64-apple-darwin || \
 info "building oxrsys (build-x64: Ninja, Debug, x86_64, ALVR on)..."
 cmake -S "$OXRSYS" -B "$OXR_BUILD" -G Ninja \
   -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOXRSYS_ENABLE_ALVR=ON \
+  -DOXRSYS_BUILD_ENCODER_HELPER=OFF \
   >/dev/null
 cmake --build "$OXR_BUILD" -j8
 ok "oxrsys built"

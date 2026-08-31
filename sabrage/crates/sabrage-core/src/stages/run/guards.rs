@@ -278,12 +278,34 @@ impl AudioGuard {
         )
         .await?;
         // `$(…)` capture semantics: trailing newlines stripped, nothing else.
-        let previous = crate::util::strip_trailing_newlines(&current.stdout).to_string();
+        let reading = crate::util::strip_trailing_newlines(&current.stdout).to_string();
+
+        // A device carried forward from an earlier session whose restore never
+        // finished (`run` seeds it from the kept record — see
+        // `stages::run::unfinished_audio_restore`) outranks the current
+        // reading, because in exactly that case the reading IS `BlackHole 2ch`:
+        // recording it would pin the loopback as the device to "restore" and
+        // lose the real one for good. Sabrage-only — run.sh has no record to
+        // carry anything forward from.
+        let carried = state.prev_audio_output.is_some() && !state.guards.audio_restored;
+        let previous = match state.prev_audio_output.clone() {
+            Some(pending) if carried => pending,
+            _ => reading,
+        };
 
         // Write BEFORE the mutation: a crash in the window that follows must
         // still leave a machine-readable record of the device to restore.
         state.prev_audio_output = Some(previous.clone());
         state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await?;
+
+        // Arm the guard BEFORE the switch, not after it. `run_child` can report
+        // `Cancelled` for a child that already applied the CoreAudio change
+        // (`process::spawn_streamed_inner`'s select has no pre-spawn check and
+        // signals a child that may have finished), and the `?` below would then
+        // drop a guard holding `previous_output: None` — the Mac left on
+        // BlackHole with the `Drop` fallback disabled. Armed here, the early
+        // return restores instead.
+        guard.previous_output = Some(previous.clone());
 
         let switch = ctx
             .child(bin, step::RUN_AUDIO)
@@ -292,7 +314,6 @@ impl AudioGuard {
             .arg("-s")
             .arg(BLACKHOLE_DEVICE);
         if ctx.executor.run_child(&switch).await?.success() {
-            guard.previous_output = Some(previous.clone());
             ctx.emit(StageEvent::text(
                 ctx.run_id,
                 Some(step::RUN_AUDIO),
@@ -314,8 +335,14 @@ impl AudioGuard {
             st.warn(format!(
                 "could not switch output to {BLACKHOLE_DEVICE} — audio stays on the Mac"
             ));
-            state.prev_audio_output = None;
-            state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await?;
+            guard.previous_output = None;
+            // …but never clear a device this run only inherited: that record is
+            // an EARLIER session's unfinished restore, and this launch failing
+            // to switch is no reason to forget it.
+            if !carried {
+                state.prev_audio_output = None;
+                state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await?;
+            }
         }
         Ok(guard)
     }
@@ -1044,6 +1071,10 @@ mod tests {
         let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
         ctx.executor = FailSwitchTo::around(ctx.executor.clone(), AIRPODS);
         let mut state = fresh_state();
+        // What `acquire` recorded before it switched: the record and the guard
+        // name the same device, which is what makes the pending flag below
+        // mean anything to `teardown`.
+        state.prev_audio_output = Some(AIRPODS.to_string());
 
         AudioGuard::armed_for_test(&ctx, AIRPODS, "/opt/homebrew/bin/SwitchAudioSource")
             .release_with(&ctx, &mut state, || {
@@ -1066,6 +1097,10 @@ mod tests {
         assert!(
             !state.guards.audio_restored,
             "the guard stays pending, so the record is kept for a later restore"
+        );
+        assert!(
+            super::super::teardown_pending(&state),
+            "…and `teardown` has to agree: this is the state that keeps the file"
         );
         assert_eq!(
             spawn_reasons(&ctx),

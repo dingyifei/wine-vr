@@ -71,7 +71,9 @@ struct Contract {
 #[derive(Debug, Deserialize)]
 struct Deps {
     url: String,
+    gbe_dll_asset: String,
     gbe_dll_sha256: String,
+    dxmt_tgz_asset: String,
     dxmt_tgz_sha256: String,
 }
 
@@ -80,7 +82,6 @@ struct Game {
     appid: u64,
     depot: u64,
     manifest: String,
-    #[allow(dead_code)]
     bs_dir_leaf: String,
 }
 
@@ -187,13 +188,16 @@ pub fn generate_from(
 
 # ---- pinned dependency sources -----------------------------------------------
 DEPS_URL=\"{deps_url}\"
+DXMT_TGZ_ASSET=\"{dxmt_asset}\"
 DXMT_TGZ_SHA256=\"{dxmt_sha}\"
+GBE_DLL_ASSET=\"{gbe_asset}\"
 GBE_DLL_SHA256=\"{gbe_sha}\"
 
 # ---- Beat Saber depot pin ------------------------------------------------------
 BS_APPID={appid}
 BS_DEPOT={depot}
 BS_MANIFEST={manifest}
+BS_DIR_LEAF=\"{bs_dir_leaf}\"
 
 # ---- host OpenXR loader registration -------------------------------------------
 HOST_XR_JSON=\"{host_xr_json}\"
@@ -207,11 +211,14 @@ LEGACY_REVERSE_PORTS=({legacy_ports})   # 9947 deliberately absent
 ",
         hash = hash,
         deps_url = c.deps.url,
+        dxmt_asset = c.deps.dxmt_tgz_asset,
         dxmt_sha = c.deps.dxmt_tgz_sha256,
+        gbe_asset = c.deps.gbe_dll_asset,
         gbe_sha = c.deps.gbe_dll_sha256,
         appid = c.game.appid,
         depot = c.game.depot,
         manifest = c.game.manifest,
+        bs_dir_leaf = c.game.bs_dir_leaf,
         host_xr_json = c.paths.host_xr_json,
         dxmt_files = dxmt_files,
         wired_ports = wired_ports,
@@ -330,6 +337,105 @@ mod tests {
         let g = generate();
         assert!(g.ends_with(")   # 9947 deliberately absent\n"));
         assert!(!g.ends_with("\n\n"));
+    }
+
+    /// The generated file minus its `# contract-sha256:` header line.
+    ///
+    /// The header changes for *any* contract edit, so comparing whole files
+    /// cannot tell "the shell actually got the new value" from "only the
+    /// tripwire hash moved". Every assertion about a field reaching the shell
+    /// has to look at the body.
+    fn body(generated: &str) -> String {
+        generated
+            .lines()
+            .filter(|l| !l.starts_with("# contract-sha256: "))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Every contract scalar the zsh side consumes must be *emitted*, not
+    /// hard-coded in lib.sh/setup.sh: mutate it in `pipeline.toml` and a body
+    /// line has to change. A field that only moves the header hash is a field
+    /// the shell never receives — `--regen` + `--check` + `meta.contract-sync`
+    /// would all report "in sync" while the two front-ends used different
+    /// values (that is exactly how `gbe_dll_asset`, `dxmt_tgz_asset` and
+    /// `bs_dir_leaf` were silently shell-hard-coded before Phase 1's review).
+    #[test]
+    fn every_shell_consumed_contract_field_changes_a_body_line() {
+        let base = generate();
+        for (field, from, to) in [
+            (
+                "deps.url",
+                r#"url = "https://github.com/dingyifei/wine-vr/releases/download/deps-v1""#,
+                r#"url = "https://github.com/dingyifei/wine-vr/releases/download/deps-v9""#,
+            ),
+            (
+                "deps.gbe_dll_asset",
+                r#"gbe_dll_asset = "gbe-steam_api64-regular-x64.dll""#,
+                r#"gbe_dll_asset = "gbe-steam_api64-other-x64.dll""#,
+            ),
+            (
+                "deps.gbe_dll_sha256",
+                r#"gbe_dll_sha256 = "cc5a2c9cb93fdbde7dadb825138ab7f694e3f8c310cdd675f733eaa784cbcc3e""#,
+                r#"gbe_dll_sha256 = "0000000000000000000000000000000000000000000000000000000000000000""#,
+            ),
+            (
+                "deps.dxmt_tgz_asset",
+                r#"dxmt_tgz_asset = "dxmt-artifacts-monofunc.tar.gz""#,
+                r#"dxmt_tgz_asset = "dxmt-artifacts-other.tar.gz""#,
+            ),
+            (
+                "deps.dxmt_tgz_sha256",
+                r#"dxmt_tgz_sha256 = "487e57e86e9866c922f8d8e42a50cb0818697b927739b6741fae8f4447e2df96""#,
+                r#"dxmt_tgz_sha256 = "1111111111111111111111111111111111111111111111111111111111111111""#,
+            ),
+            ("game.appid", "appid = 620980", "appid = 620999"),
+            ("game.depot", "depot = 620981", "depot = 620999"),
+            (
+                "game.manifest",
+                r#"manifest = "6291266771922375922""#,
+                r#"manifest = "1234567890123456789""#,
+            ),
+            (
+                "game.bs_dir_leaf",
+                r#"bs_dir_leaf = "Beat Saber 1294""#,
+                r#"bs_dir_leaf = "Beat Saber 1295""#,
+            ),
+            (
+                "paths.host_xr_json",
+                r#"host_xr_json = "/usr/local/share/openxr/1/active_runtime.x86_64.json""#,
+                r#"host_xr_json = "/opt/openxr/1/active_runtime.x86_64.json""#,
+            ),
+            (
+                "ports.stream",
+                "stream = [9943, 9944]",
+                "stream = [9955, 9956]",
+            ),
+            (
+                "ports.legacy_reverse",
+                "legacy_reverse = [9944, 9945, 9946, 9948]",
+                "legacy_reverse = [9944, 9945]",
+            ),
+            (
+                "dxmt.files",
+                r#""x86_64-windows/dxgi.dll","#,
+                r#""x86_64-windows/dxgi2.dll","#,
+            ),
+        ] {
+            let mutated = PIPELINE_TOML.replace(from, to);
+            assert_ne!(
+                mutated, PIPELINE_TOML,
+                "{field}: the test's own mutation no longer matches pipeline.toml"
+            );
+            let generated = generate_from(&mutated, RUNTIME_TOML_TEMPLATE, HOST_MANIFEST_TEMPLATE)
+                .expect("mutated contract still parses");
+            assert_ne!(
+                body(&generated),
+                body(&base),
+                "{field} changed but no line of contract.gen.sh's body did — the shell \
+                 hard-codes this value instead of sourcing it"
+            );
+        }
     }
 
     #[test]

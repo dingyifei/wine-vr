@@ -55,7 +55,11 @@ files = [
 slug = "meta.contract-sync"
 group = "meta"
 shell_gate = "none"
-native_gate = "none"
+# Native launch refuses to mutate on a stale contract: a binary built from another
+# checkout's contract (compiled hash ≠ this checkout's) or an un-regenerated
+# contract.gen.sh both fail this check. The shell has no compiled contract and
+# doctor.sh only reports it (sabrage/PARITY.md, "Contract identity").
+native_gate = "block"
 
 [[check]]
 slug = "sys.arch"

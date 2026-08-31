@@ -34,11 +34,16 @@
 //! would always read false after a planned-but-not-executed mutation. Rather
 //! than report those as failures a dry run could not itself have caused, each
 //! such check is skipped (never `die`s) when
-//! [`crate::executor::Executor::is_dry_run`] is true; the check still runs for
-//! real when the precondition already happens to hold (a dry run over an
-//! already-set-up checkout still reports truthfully), and the accompanying `ok`
-//! row is still emitted, matching [`crate::executor::DryRunExecutor`]'s own
-//! convention of optimistically reporting success for a planned mutation.
+//! [`crate::executor::Executor::is_dry_run`] is true. The check still runs for
+//! real when the postcondition already happens to hold — a dry run over an
+//! already-set-up checkout reports the same `ok` rows a real run would — and
+//! only then. When the postcondition is currently **false**, the row swaps to
+//! a future-tense `info` ("would initialize submodules …", "would extract
+//! ext/dxmt-artifacts …") instead of the `ok`: a preview may say what it
+//! plans to do, but it may not claim a checkout state that does not exist
+//! (`sabrage setup --dry-run` over a fresh clone used to print three green
+//! completed-state rows). This is the same verb swap `build.rs` applies to its
+//! own staged-copy outcome, and PARITY.md's "would …" dry-run language row.
 
 use std::path::Path;
 
@@ -48,6 +53,23 @@ use crate::events::step;
 use crate::process::{self, ChildSpec};
 use crate::stages::{require_bottle, StageCtx};
 use crate::util;
+
+// ── dry-run "would …" rows (no shell counterpart; see the module doc) ────────
+
+/// Replaces `ok "submodules ready"` under `--dry-run` when the submodules are
+/// not in fact checked out yet.
+const SUBMODULES_WOULD_INIT_INFO: &str =
+    "would initialize submodules (nothing was fetched under --dry-run)";
+
+/// Replaces the patch-set `ok` row under `--dry-run` when the grep does not
+/// (yet) find `is_streaming_nonblocking`.
+const PATCHSET_WOULD_CHECKOUT_INFO: &str = "would check out the ALVR oxrsys patch set \
+     (branch oxrsys-v20.14.1; nothing was fetched under --dry-run)";
+
+/// Replaces the extraction `ok` row under `--dry-run` when `ext/dxmt-artifacts`
+/// is not (yet) complete on disk.
+const DXMT_WOULD_EXTRACT_INFO: &str =
+    "would extract ext/dxmt-artifacts and write the provenance marker";
 
 /// Execute the stage.
 pub async fn run(ctx: &StageCtx) -> Result<()> {
@@ -109,8 +131,12 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
     .await?;
 
     let openvr_header = ctx.paths.alvr.join("openvr/headers/openvr_driver.h");
-    if openvr_header.is_file() || ctx.executor.is_dry_run() {
+    if openvr_header.is_file() {
         st.ok("submodules ready");
+    } else if ctx.executor.is_dry_run() {
+        // The postcondition is false *because* the dry run planned the fetch
+        // instead of performing it — say what would happen, never claim it did.
+        st.info(SUBMODULES_WOULD_INIT_INFO);
     } else {
         return Err(st.fatal(
             "ALVR openvr submodule did not materialize — check network/auth and re-run setup",
@@ -123,8 +149,11 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
     let patchset_present = std::fs::read(&connection_rs)
         .map(|bytes| String::from_utf8_lossy(&bytes).contains("is_streaming_nonblocking"))
         .unwrap_or(false);
-    if patchset_present || ctx.executor.is_dry_run() {
+    if patchset_present {
         st.ok("ALVR checkout carries the oxrsys patch set (branch oxrsys-v20.14.1)");
+        Ok(())
+    } else if ctx.executor.is_dry_run() {
+        st.info(PATCHSET_WOULD_CHECKOUT_INFO);
         Ok(())
     } else {
         Err(st.fatal(
@@ -195,13 +224,20 @@ async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
         }
     }
 
-    if util::dxmt_files_ok(&ctx.paths) || exec.is_dry_run() {
+    let extracted_ok = util::dxmt_files_ok(&ctx.paths);
+    if extracted_ok || exec.is_dry_run() {
+        // The marker write stays planned either way, so the dry-run plan still
+        // records it; only the row's tense follows the postcondition.
         let marker_path = ctx.paths.dxmt_art.join(".sha256");
         let marker_bytes = util::contract_marker_bytes(&deps.dxmt_tgz_sha256);
         exec.write_atomic(&marker_path, marker_bytes.as_bytes())
             .await?;
-        ctx.step(step::SETUP_PINNED)
-            .ok("extracted ext/dxmt-artifacts (provenance marker written)");
+        let st = ctx.step(step::SETUP_PINNED);
+        if extracted_ok {
+            st.ok("extracted ext/dxmt-artifacts (provenance marker written)");
+        } else {
+            st.info(DXMT_WOULD_EXTRACT_INFO);
+        }
         Ok(())
     } else {
         Err(ctx.step(step::SETUP_PINNED).fatal(
@@ -650,6 +686,101 @@ mod tests {
         );
         assert!(!plan.iter().any(|a| a.kind == PlannedKind::Extract));
         assert!(!plan.iter().any(|a| a.kind == PlannedKind::RemoveDir));
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
+    // ── dry-run honesty: no green completed-state rows for planned work ──────
+
+    /// Make `fixture` look like a checkout whose submodules are initialized and
+    /// whose ALVR branch carries the oxrsys patch set.
+    fn fake_submodule_checkout(paths: &Paths) {
+        let header = paths.alvr.join("openvr/headers/openvr_driver.h");
+        std::fs::create_dir_all(header.parent().unwrap()).unwrap();
+        std::fs::write(&header, b"// stub").unwrap();
+        let connection = paths.alvr.join("alvr/server_core/src/connection.rs");
+        std::fs::create_dir_all(connection.parent().unwrap()).unwrap();
+        std::fs::write(&connection, b"fn is_streaming_nonblocking() {}\n").unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_over_a_fresh_checkout_never_claims_completed_state() {
+        let fixture = scratch("dry-run-honesty-fresh");
+        let paths = fixture_paths(&fixture);
+        let (ctx, seen) = ctx_with_paths(
+            paths.clone(),
+            StageOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        run(&ctx).await.unwrap();
+
+        let rows = lines(&seen);
+        for claim in [
+            "submodules ready",
+            "ALVR checkout carries the oxrsys patch set (branch oxrsys-v20.14.1)",
+            "extracted ext/dxmt-artifacts (provenance marker written)",
+        ] {
+            assert!(
+                !rows
+                    .iter()
+                    .any(|(sev, t)| *sev == Severity::Ok && t == claim),
+                "a dry run claimed {claim:?} over a checkout that has none of it: {rows:?}"
+            );
+        }
+        for planned in [
+            SUBMODULES_WOULD_INIT_INFO,
+            PATCHSET_WOULD_CHECKOUT_INFO,
+            DXMT_WOULD_EXTRACT_INFO,
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|(sev, t)| *sev == Severity::Info && t == planned),
+                "missing the future-tense row {planned:?}: {rows:?}"
+            );
+        }
+        // The marker write is still *planned* — only the row's tense changed.
+        assert!(ctx.executor.planned().iter().any(|a| {
+            a.kind == PlannedKind::Write
+                && a.dst.as_deref() == Some(paths.dxmt_art.join(".sha256").as_path())
+        }));
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
+    #[tokio::test]
+    async fn a_dry_run_over_an_already_set_up_checkout_still_reports_the_ok_rows() {
+        let fixture = scratch("dry-run-honesty-ready");
+        let paths = fixture_paths(&fixture);
+        fake_submodule_checkout(&paths);
+        // Every extracted file present but the provenance marker absent: the
+        // stage plans the fetch/extract and then finds the set complete, which
+        // is the one shape where the extraction `ok` row is truthful.
+        for f in &contract().dxmt.files {
+            let p = paths.dxmt_art.join(f);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"stub").unwrap();
+        }
+        let (ctx, seen) = ctx_with_paths(
+            paths.clone(),
+            StageOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        run(&ctx).await.unwrap();
+
+        let rows = lines(&seen);
+        for claim in [
+            "submodules ready",
+            "ALVR checkout carries the oxrsys patch set (branch oxrsys-v20.14.1)",
+            "extracted ext/dxmt-artifacts (provenance marker written)",
+        ] {
+            assert!(
+                rows.iter()
+                    .any(|(sev, t)| *sev == Severity::Ok && t == claim),
+                "a truthful postcondition lost its ok row {claim:?}: {rows:?}"
+            );
+        }
         std::fs::remove_dir_all(&fixture).ok();
     }
 

@@ -124,6 +124,48 @@ impl SabrageError {
         }
     }
 
+    /// Has this error's prose already reached the user as a `Fatal` row?
+    ///
+    /// The rule a front-end needs when an operation fails: print (or show) the
+    /// error, *unless* the layer that raised it already said the same thing in
+    /// the event stream. Three variants are contracts to exactly that effect —
+    /// [`crate::stages::StageCtx::fatal`] emits the row and returns
+    /// [`SabrageError::Fatal`]; `privilege::upgrade_write_error` emits the App
+    /// Management explanation and returns [`SabrageError::TccDenied`];
+    /// `privilege::elevate_osascript` emits the declined-authorization row and
+    /// returns [`SabrageError::AdminDeclined`] — and all three document that
+    /// the caller must propagate rather than re-emit.
+    ///
+    /// [`SabrageError::Cancelled`] is included for a different reason: it is
+    /// the user's own Stop or Ctrl-C. `run` already printed run.sh's
+    /// `-- interrupted: stopping wine` section, a build stage's child simply
+    /// stops, and `demo.sh` prints nothing after its INT trap re-raises the
+    /// signal — a trailing `error: cancelled` would be the one line the shell
+    /// never shows. The exit code (130) still carries the fact.
+    ///
+    /// Lives here rather than in either front-end because both need it: the
+    /// CLI decides whether to print a final `error:` line, the GUI whether to
+    /// surface a second banner over the `Fatal` row already in the run log.
+    pub fn already_reported(&self) -> bool {
+        matches!(
+            self,
+            SabrageError::Fatal { .. }
+                | SabrageError::TccDenied { .. }
+                | SabrageError::AdminDeclined
+                | SabrageError::Cancelled
+        )
+    }
+
+    /// This error as the flat, serializable shape a front-end renders.
+    pub fn payload(&self) -> ErrorPayload {
+        ErrorPayload {
+            kind: self.kind(),
+            message: self.to_string(),
+            remedy: self.remedy().map(str::to_string),
+            already_reported: self.already_reported(),
+        }
+    }
+
     /// The remedy line, when this error carries one.
     pub fn remedy(&self) -> Option<&str> {
         match self {
@@ -148,5 +190,91 @@ impl SabrageError {
             SabrageError::ChildFailed { tail, .. } => tail,
             _ => &[],
         }
+    }
+}
+
+/// One error, flattened for a front-end: the machine-readable discriminant, the
+/// prose, the remedy, and whether the user has already been told.
+///
+/// The GUI must never parse message text ([`SabrageError::kind`]'s whole
+/// reason), and both front-ends need the same four fields — the CLI for its
+/// `--json` output and its final `error:` line, the GUI for the failure banner
+/// it puts over a run log. camelCase because `ui/src/ipc.ts` mirrors these
+/// types by hand, like every other serialized shape in this crate.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ErrorPayload {
+    /// [`SabrageError::kind`].
+    pub kind: &'static str,
+    /// The `Display` text — `die()`-verbatim where the shell has a counterpart.
+    pub message: String,
+    /// [`SabrageError::remedy`], the one-line fix.
+    pub remedy: Option<String>,
+    /// [`SabrageError::already_reported`]: true when the prose is already in
+    /// the event stream as a `Fatal` row, so rendering it again would double
+    /// it up.
+    pub already_reported: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn already_reported_covers_the_variants_that_emit_their_own_row() {
+        for e in [
+            SabrageError::fatal("no bottle", "create it"),
+            SabrageError::TccDenied {
+                path: PathBuf::from("/Applications/CrossOver.app"),
+            },
+            SabrageError::AdminDeclined,
+            SabrageError::Cancelled,
+        ] {
+            assert!(e.already_reported(), "{e:?}");
+        }
+        for e in [
+            SabrageError::InvalidInput("--nope".into()),
+            SabrageError::io(
+                "/x",
+                std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+            ),
+            SabrageError::ChildFailed {
+                argv0: "cmake".into(),
+                status: 2,
+                tail: Vec::new(),
+            },
+            SabrageError::Download {
+                url: "https://h/x".into(),
+                detail: None,
+            },
+            SabrageError::HashMismatch {
+                label: "DXMT".into(),
+                got: "abc".into(),
+            },
+        ] {
+            assert!(!e.already_reported(), "{e:?}");
+        }
+    }
+
+    #[test]
+    fn payload_carries_kind_message_remedy_and_the_reported_flag() {
+        let p = SabrageError::fatal("bottle 'Steam' not found", "create it in the CrossOver UI")
+            .payload();
+        assert_eq!(p.kind, "fatal");
+        assert_eq!(p.message, "bottle 'Steam' not found");
+        assert_eq!(p.remedy.as_deref(), Some("create it in the CrossOver UI"));
+        assert!(p.already_reported);
+
+        let io = SabrageError::io("/x", std::io::Error::from(std::io::ErrorKind::NotFound));
+        let p = io.payload();
+        assert_eq!(p.kind, "io");
+        assert_eq!(p.message, io.to_string());
+        assert_eq!(p.remedy, None);
+        assert!(!p.already_reported);
+
+        // camelCase on the wire: `ui/src/ipc.ts` mirrors this by hand.
+        let j = serde_json::to_value(&p).unwrap();
+        assert_eq!(j["kind"], "io");
+        assert_eq!(j["alreadyReported"], false);
     }
 }

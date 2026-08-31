@@ -1,0 +1,19 @@
+# Every editable key assigned twice: a value the runtime accepts, then one it
+# does not. Config.cpp assigns only inside each key's whitelist and its catch
+# block "ignore[s] malformed values and keep[s] the last valid/default setting",
+# so the junk assignment is skipped and the earlier value stays in force.
+[streaming]
+protocol = "alvr"
+bitrate_mbps = 80
+encoder_process = "native"
+video_codec = "h265"
+resolution_scale = 0.9
+refresh_rate_hz = 90
+
+[stale]
+protocol = "bogus"
+bitrate_mbps = 9001
+encoder_process = 'native'
+video_codec = "vp9"
+resolution_scale = 4.0
+refresh_rate_hz = 75

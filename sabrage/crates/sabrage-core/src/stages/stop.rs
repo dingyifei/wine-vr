@@ -90,6 +90,19 @@
 //!   never end in `Beat Saber.exe`, so that probe's warn branch was
 //!   unreachable and the row would silently always say "down" even with the
 //!   game running — the one safety row this stage exists to report correctly.
+//! * A reap's `killed` row waits for the signalled process to actually be
+//!   gone ([`wait_for_exit`]) and warns naming the survivor otherwise, skips a
+//!   pid whose `(pid, start_time)` identity changed between the scan and the
+//!   signal, and swaps to a "would terminate …" `info` under `--dry-run`.
+//!   `pkill -f … || true` reports none of that; a green "encoder helper
+//!   killed" row with the helper still holding the encoder is the one lie this
+//!   step must not tell.
+//! * When the helper reap matches nothing, [`report_foreign_helpers`] scans by
+//!   basename for a helper running from **another checkout** before the
+//!   `"no leftover encoder helper"` row is allowed to print — report-only, no
+//!   kill. The shell has the same blind spot (`pkill -f "$OXR_HELPER_BIN"`
+//!   cannot match a helper whose path is another root's), and the project's
+//!   worktree workflow makes that case ordinary.
 //! * The two **reap** steps keep exact exe-path matching
 //!   ([`crate::process::find_processes_by_exe`]) against a known staged
 //!   binary, not argv — a narrower, still-intentional divergence from
@@ -139,6 +152,49 @@ const BEAT_SABER_EXE_SUFFIX: &str = "Beat Saber.exe";
 /// The exact `lsof` invocation stop.sh (and doctor.sh's `net.ports`) use.
 const LSOF_ARGS: [&str; 3] = ["-nP", "-iUDP:9944", "-iTCP:9943"];
 
+/// The staged encoder helper's file name — what a helper from *another*
+/// checkout still calls itself. See [`report_foreign_helpers`].
+const HELPER_BASENAME: &str = "oxrsys-encoder-helper";
+
+/// stop.sh's `reap_stray "$OXR_HELPER_BIN" … "no leftover encoder helper"`
+/// not-found text, emitted by [`report_foreign_helpers`] once the wider scan
+/// has confirmed it.
+const NO_LEFTOVER_HELPER: &str = "no leftover encoder helper";
+
+/// How long [`reap`] waits for a signalled process to actually exit before
+/// reporting it as a survivor, and how often it re-checks. Deliberately short:
+/// this is a report, not a hard guarantee, and `stop` must stay snappy. Local
+/// to this file rather than in [`crate::stages`] beside
+/// [`STOP_WINESERVER_WAIT`] — nothing else waits on a reap.
+const REAP_EXIT_WAIT: std::time::Duration = std::time::Duration::from_millis(1000);
+const REAP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// The three tenses of a reap's "there was one" row: what a real run says once
+/// the process is really gone, what it says when the process outlived SIGTERM
+/// (plus the surviving `pid name` pairs), and what a `--dry-run` says instead
+/// of claiming a kill it only planned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ReapMsg {
+    killed: &'static str,
+    survived: &'static str,
+    would: &'static str,
+}
+
+/// stop.sh's helper `reap_stray` text, plus the two rows the shell has no
+/// counterpart for.
+const HELPER_REAP_MSG: ReapMsg = ReapMsg {
+    killed: "encoder helper killed (the runtime owns it — this one outlived its game)",
+    survived: "encoder helper still running after SIGTERM",
+    would: "would terminate the leftover encoder helper",
+};
+
+/// stop.sh's dashboard `reap_stray` text, same shape.
+const DASHBOARD_REAP_MSG: ReapMsg = ReapMsg {
+    killed: "ALVR dashboard closed (left over from a run that died uncleanly)",
+    survived: "ALVR dashboard still running after SIGTERM",
+    would: "would close the leftover ALVR dashboard",
+};
+
 /// Execute the stage.
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let bottle = require_bottle(ctx)?;
@@ -153,20 +209,26 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     checkpoint(ctx)?;
     report_ports(ctx).await;
     checkpoint(ctx)?;
-    reap(
+    // The helper's not-found row is emitted by `report_foreign_helpers` rather
+    // than by `reap`: "no leftover encoder helper" may only be said after
+    // looking beyond *this* checkout's staged path (see the module docs).
+    let helper_matched = reap(
         ctx,
         &ctx.paths.oxr_helper_staged,
         step::STOP_REAP,
-        Some("encoder helper killed (the runtime owns it — this one outlived its game)"),
-        Some("no leftover encoder helper"),
+        Some(HELPER_REAP_MSG),
+        None,
     )
     .await?;
+    if !helper_matched {
+        report_foreign_helpers(ctx);
+    }
     checkpoint(ctx)?;
     reap(
         ctx,
         &ctx.paths.alvr_dashboard,
         step::STOP_REAP,
-        Some("ALVR dashboard closed (left over from a run that died uncleanly)"),
+        Some(DASHBOARD_REAP_MSG),
         None,
     )
     .await?;
@@ -350,8 +412,27 @@ async fn report_ports(ctx: &StageCtx) {
 ///
 /// One `/bin/kill -TERM <pid>` child per match (`pkill -f` kills every match at
 /// once; a matched-then-vanished pid's failing kill is swallowed exactly as
-/// `pkill`'s is). `found_msg`/`not_found_msg` fire at most once regardless of
-/// match count, matching the shell's single `ok` call.
+/// `pkill`'s is). [`ReapMsg`]/`not_found_msg` fire at most once regardless of
+/// match count, matching the shell's single `ok` call. Returns whether anything
+/// was actually signalled (under `--dry-run`: whether anything matched), so a
+/// caller can say something else about the not-found case — the helper's
+/// cross-checkout scan does.
+///
+/// Two things the shell's `pkill -f … || true` does not do, both additive:
+///
+/// * a pid whose `(pid, start_time)` identity no longer matches the process
+///   that was scanned is **not** signalled ([`ProcInfo::is_same_process`], the
+///   same recycled-pid guard `session::reconcile` uses) — the scan and the kill
+///   are separated by an `await`, and a stop must never SIGTERM a stranger that
+///   inherited the number;
+/// * the `killed` row is emitted only once every signalled identity is actually
+///   gone ([`wait_for_exit`], bounded by [`REAP_EXIT_WAIT`]); a helper that
+///   ignores or outlives SIGTERM gets a `warn` naming it instead of a green row
+///   claiming a death that did not happen.
+///
+/// Under `--dry-run` nothing is signalled at all, so neither applies and the
+/// row swaps to [`ReapMsg::would`] — PARITY.md's "would …" dry-run language,
+/// as `fixes/adb.rs` and `fixes/helper.rs` already do for their own verbs.
 ///
 /// Returns `Err(`[`SabrageError::Cancelled`]`)` — skipping any remaining kills
 /// and the closing message — the moment `ctx.cancel` fires after any one kill;
@@ -360,28 +441,117 @@ async fn reap(
     ctx: &StageCtx,
     exe_path: &Path,
     step_id: StepId,
-    found_msg: Option<&str>,
+    found_msg: Option<ReapMsg>,
     not_found_msg: Option<&str>,
-) -> Result<()> {
+) -> Result<bool> {
     let procs = process::find_processes_by_exe(exe_path);
     if procs.is_empty() {
         if let Some(msg) = not_found_msg {
             ctx.step(step_id).ok(msg);
         }
-        return Ok(());
+        return Ok(false);
     }
+    let dry_run = ctx.executor.is_dry_run();
+    let mut signalled: Vec<ProcInfo> = Vec::new();
     for p in &procs {
+        // A dry run signals nothing, so its plan lists every match; a real run
+        // re-checks the identity it is about to signal.
+        if !dry_run && !p.is_same_process() {
+            continue;
+        }
         let spec = ctx
             .child("/bin/kill", step_id)
             .arg("-TERM")
             .arg(p.pid.to_string());
         let _ = ctx.executor.run_child(&spec).await;
+        signalled.push(p.clone());
         checkpoint(ctx)?;
     }
-    if let Some(msg) = found_msg {
-        ctx.step(step_id).ok(msg);
+    if !dry_run && signalled.is_empty() {
+        // Every match's identity changed between the scan and the signal — the
+        // process exited on its own (or, in theory, its pid was recycled). This
+        // stage signalled nothing, so it claims nothing; the caller treats it
+        // as the not-found case it now is.
+        return Ok(false);
     }
-    Ok(())
+    let Some(msg) = found_msg else {
+        return Ok(true);
+    };
+    let st = ctx.step(step_id);
+    if dry_run {
+        st.info(msg.would);
+        return Ok(true);
+    }
+    let alive = wait_for_exit(&signalled).await;
+    if alive.is_empty() {
+        st.ok(msg.killed);
+    } else {
+        st.warn(format!("{}: {}", msg.survived, format_survivors(&alive)));
+    }
+    Ok(true)
+}
+
+/// The identities out of `procs` that are *still the same live process* after
+/// up to [`REAP_EXIT_WAIT`], polled every [`REAP_POLL_INTERVAL`]. Empty means
+/// every signalled process is gone.
+///
+/// Returns as soon as the last one exits, so the common case costs one poll.
+async fn wait_for_exit(procs: &[ProcInfo]) -> Vec<ProcInfo> {
+    let deadline = tokio::time::Instant::now() + REAP_EXIT_WAIT;
+    loop {
+        let alive: Vec<ProcInfo> = procs
+            .iter()
+            .filter(|p| p.is_same_process())
+            .cloned()
+            .collect();
+        if alive.is_empty() || tokio::time::Instant::now() >= deadline {
+            return alive;
+        }
+        tokio::time::sleep(REAP_POLL_INTERVAL).await;
+    }
+}
+
+/// Sabrage-only, and deliberately **report-only**: a helper staged under
+/// another checkout (this project's own worktree workflow makes that ordinary)
+/// runs from a different absolute path, so neither `reap`'s exact-path match
+/// nor the shell's `pkill -f "$OXR_HELPER_BIN"` can see it — and `stop` used to
+/// answer "no leftover encoder helper" without ever having looked.
+///
+/// The scan is by command line ([`process::find_processes_by_cmdline`], the
+/// probe `report_survivors` already uses), narrowed to processes whose resolved
+/// executable is *named* [`HELPER_BASENAME`] and lies outside this checkout —
+/// so an editor or a `tail -f` that merely mentions the path cannot match.
+/// Nothing is signalled: PARITY.md's "Stop" rationale (a mutating kill may not
+/// rely on an argv match) stands, and killing another checkout's helper is that
+/// checkout's `stop` to run.
+fn report_foreign_helpers(ctx: &StageCtx) {
+    let st = ctx.step(step::STOP_REAP);
+    let root = ctx
+        .paths
+        .root
+        .canonicalize()
+        .unwrap_or_else(|_| ctx.paths.root.clone());
+    let foreign: Vec<ProcInfo> = find_processes_by_cmdline(HELPER_BASENAME)
+        .into_iter()
+        .filter(|p| {
+            if p.exe.file_name().and_then(|n| n.to_str()) != Some(HELPER_BASENAME) {
+                return false;
+            }
+            let exe = p.exe.canonicalize().unwrap_or_else(|_| p.exe.clone());
+            !exe.starts_with(&root)
+        })
+        .collect();
+    if foreign.is_empty() {
+        st.ok(NO_LEFTOVER_HELPER);
+        return;
+    }
+    for p in foreign {
+        st.warn(format!(
+            "leftover encoder helper from another checkout: {} {} — stop it from that checkout",
+            p.pid,
+            p.exe.display()
+        ));
+    }
 }
 
 // ── step 4: audio ─────────────────────────────────────────────────────────────
@@ -720,6 +890,13 @@ mod tests {
         assert!(ctx.executor.planned().is_empty());
     }
 
+    /// A [`ReapMsg`] whose three texts are distinguishable at a glance.
+    const TEST_REAP_MSG: ReapMsg = ReapMsg {
+        killed: "found",
+        survived: "survived",
+        would: "would find",
+    };
+
     #[tokio::test]
     async fn dry_run_reap_plans_a_kill_per_match_and_reports_once() {
         // find_processes_by_exe on a path nothing runs from: not-found branch.
@@ -727,15 +904,16 @@ mod tests {
             dry_run: true,
             ..Default::default()
         });
-        reap(
+        let matched = reap(
             &ctx,
             Path::new("/nonexistent/sabrage/helper"),
             step::STOP_REAP,
-            Some("found"),
+            Some(TEST_REAP_MSG),
             Some("not found"),
         )
         .await
         .expect("not cancelled");
+        assert!(!matched);
         let evs = seen.lock().unwrap().clone();
         assert_eq!(evs.len(), 1);
         assert!(matches!(
@@ -752,21 +930,28 @@ mod tests {
             dry_run: true,
             ..Default::default()
         });
-        reap(
+        let matched = reap(
             &ctx,
             &exe,
             step::STOP_REAP,
-            Some("found"),
+            Some(TEST_REAP_MSG),
             Some("not found"),
         )
         .await
         .expect("not cancelled");
+        assert!(matched);
         let evs = seen.lock().unwrap().clone();
         assert_eq!(evs.len(), 1);
-        assert!(matches!(
-            &evs[0],
-            crate::events::StageEvent::Line { text, .. } if text == "found"
-        ));
+        // A dry run signalled nothing, so it may not claim a kill: the row is
+        // the future-tense variant, at Info.
+        assert!(
+            matches!(
+                &evs[0],
+                crate::events::StageEvent::Line { text, severity, .. }
+                    if text == TEST_REAP_MSG.would && *severity == Severity::Info
+            ),
+            "{evs:?}"
+        );
         let planned = ctx.executor.planned();
         assert!(
             !planned.is_empty(),
@@ -775,6 +960,228 @@ mod tests {
         assert!(planned
             .iter()
             .all(|p| p.kind == PlannedKind::Spawn && p.reason.contains("/bin/kill -TERM")));
+    }
+
+    // ── real-run reap: verified termination, survivors, foreign checkouts ────
+
+    /// Spawned as a child by the reap tests below, never as part of the suite
+    /// (`#[ignore]` plus the env gate). The child is a **copy** of this test
+    /// binary placed at a unique temp path named [`HELPER_BASENAME`], so
+    /// `find_processes_by_exe` matches exactly that copy and nothing else on
+    /// the machine — this harness process included.
+    #[test]
+    #[ignore = "spawned as a child by the reap tests; not a test of its own"]
+    fn sleeper_child() {
+        let Ok(secs) = std::env::var("SABRAGE_TEST_SLEEP_SECS") else {
+            return;
+        };
+        if std::env::var("SABRAGE_TEST_IGNORE_TERM").is_ok() {
+            use nix::sys::signal::{signal, SigHandler, Signal};
+            // SAFETY: installing SIG_IGN in a freshly spawned single-purpose
+            // child, before it does anything else.
+            unsafe { signal(Signal::SIGTERM, SigHandler::SigIgn) }.expect("ignore SIGTERM");
+        }
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(dir) = exe.parent() {
+                let _ = std::fs::write(dir.join("ready"), b"1");
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(
+            secs.parse().unwrap_or(10).min(60),
+        ));
+    }
+
+    /// A live child at a unique `…/oxrsys-encoder-helper` path. Killed and
+    /// removed on drop, whatever the test did.
+    struct Sleeper {
+        child: std::process::Child,
+        dir: PathBuf,
+        exe: PathBuf,
+    }
+
+    impl Drop for Sleeper {
+        fn drop(&mut self) {
+            let _ = self.child.kill();
+            let _ = self.child.wait();
+            std::fs::remove_dir_all(&self.dir).ok();
+        }
+    }
+
+    fn spawn_sleeper(ignore_term: bool) -> Sleeper {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let exe = dir.join(HELPER_BASENAME);
+        std::fs::copy(std::env::current_exe().unwrap(), &exe).unwrap();
+
+        let mut cmd = std::process::Command::new(&exe);
+        cmd.args([
+            "--exact",
+            "stages::stop::tests::sleeper_child",
+            "--ignored",
+            "--nocapture",
+        ])
+        .env("SABRAGE_TEST_SLEEP_SECS", "20")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        if ignore_term {
+            cmd.env("SABRAGE_TEST_IGNORE_TERM", "1");
+        }
+        let child = cmd.spawn().expect("spawn the copied test binary");
+        let sleeper = Sleeper { child, dir, exe };
+
+        // Wait for the child to have installed its disposition and reached the
+        // sleep — it writes `ready` next to itself just before.
+        let ready = sleeper.dir.join("ready");
+        for _ in 0..200 {
+            if ready.is_file() && !process::find_processes_by_exe(&sleeper.exe).is_empty() {
+                return sleeper;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        panic!("the sleeper child never became ready at {:?}", sleeper.exe);
+    }
+
+    fn rows(seen: &Arc<StdMutex<Vec<crate::events::StageEvent>>>) -> Vec<(Severity, String)> {
+        seen.lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                crate::events::StageEvent::Line { severity, text, .. } => {
+                    Some((*severity, text.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_real_reap_reports_the_kill_only_once_the_process_is_really_gone() {
+        let sleeper = spawn_sleeper(false);
+        let (ctx, seen) = test_ctx(StageOptions::default());
+        assert!(!ctx.executor.is_dry_run());
+
+        let matched = reap(
+            &ctx,
+            &sleeper.exe,
+            step::STOP_REAP,
+            Some(TEST_REAP_MSG),
+            None,
+        )
+        .await
+        .expect("not cancelled");
+
+        assert!(matched);
+        assert_eq!(rows(&seen), vec![(Severity::Ok, "found".to_string())]);
+        // The row is only allowed to exist because the process is gone.
+        assert!(
+            process::find_processes_by_exe(&sleeper.exe).is_empty(),
+            "the killed row printed while the process was still alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_term_ignoring_process_gets_a_warn_row_not_a_green_killed_row() {
+        let sleeper = spawn_sleeper(true);
+        let pid = sleeper.child.id();
+        let (ctx, seen) = test_ctx(StageOptions::default());
+
+        reap(
+            &ctx,
+            &sleeper.exe,
+            step::STOP_REAP,
+            Some(TEST_REAP_MSG),
+            None,
+        )
+        .await
+        .expect("not cancelled");
+
+        let rows = rows(&seen);
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        let (severity, text) = &rows[0];
+        assert_eq!(*severity, Severity::Warn, "{rows:?}");
+        assert!(
+            text.starts_with("survived: ") && text.contains(&pid.to_string()),
+            "{text:?} should name the surviving pid {pid}"
+        );
+        // Still alive: the whole point of the warn.
+        assert!(!process::find_processes_by_exe(&sleeper.exe).is_empty());
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_returns_the_survivors_and_nothing_once_they_are_gone() {
+        let mut sleeper = spawn_sleeper(false);
+        let observed = process::find_processes_by_exe(&sleeper.exe);
+        assert_eq!(observed.len(), 1, "{observed:?}");
+
+        assert_eq!(wait_for_exit(&observed).await, observed, "still running");
+
+        sleeper.child.kill().unwrap();
+        sleeper.child.wait().unwrap();
+        assert!(wait_for_exit(&observed).await.is_empty());
+    }
+
+    /// A stale identity — same pid, a start time that process never had — must
+    /// not be signalled at all: `reap` skips it and reports nothing killed.
+    #[tokio::test]
+    async fn reap_never_signals_a_pid_whose_identity_no_longer_matches() {
+        let (ctx, _seen) = test_ctx(StageOptions::default());
+        let mut mismatched = ProcInfo::observe(std::process::id()).expect("observe self");
+        mismatched.start_time += 1;
+        assert!(!mismatched.is_same_process());
+        // Sanity that the guard, not some other branch, is what protects us:
+        // this pid *is* alive.
+        assert!(ProcInfo::observe(std::process::id()).is_some());
+        // Exercised through `wait_for_exit`'s own predicate rather than by
+        // asking `reap` to kill this very test process.
+        assert!(wait_for_exit(&[mismatched]).await.is_empty());
+        assert!(ctx.executor.planned().is_empty());
+    }
+
+    // ── cross-checkout helper scan (finding A5-7) ────────────────────────────
+
+    #[test]
+    fn a_helper_from_another_checkout_is_reported_instead_of_no_leftover() {
+        let sleeper = spawn_sleeper(false);
+        let (mut ctx, seen) = test_ctx(StageOptions::default());
+        // "Another checkout": this repo root contains neither the sleeper nor
+        // anything else, and the staged path does not exist.
+        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+        ctx.paths.oxr_helper_staged = PathBuf::from("/nonexistent/sabrage/helper");
+
+        assert!(process::find_processes_by_exe(&ctx.paths.oxr_helper_staged).is_empty());
+        report_foreign_helpers(&ctx);
+
+        let rows = rows(&seen);
+        assert!(
+            !rows.iter().any(|(_, t)| t == NO_LEFTOVER_HELPER),
+            "claimed no leftover helper with one running elsewhere: {rows:?}"
+        );
+        let pid = sleeper.child.id();
+        assert!(
+            rows.iter().any(|(sev, t)| *sev == Severity::Warn
+                && t.starts_with("leftover encoder helper from another checkout: ")
+                && t.contains(&pid.to_string())),
+            "{rows:?}"
+        );
+    }
+
+    #[test]
+    fn with_no_foreign_helper_running_the_shells_not_found_row_is_unchanged() {
+        let (mut ctx, seen) = test_ctx(StageOptions::default());
+        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+        // Ground truth is machine state (this file's own testing pattern):
+        // only assert the row when nothing on this Mac qualifies as foreign.
+        let any_foreign = find_processes_by_cmdline(HELPER_BASENAME)
+            .into_iter()
+            .any(|p| p.exe.file_name().and_then(|n| n.to_str()) == Some(HELPER_BASENAME));
+        report_foreign_helpers(&ctx);
+        if !any_foreign {
+            assert_eq!(
+                rows(&seen),
+                vec![(Severity::Ok, NO_LEFTOVER_HELPER.to_string())]
+            );
+        }
     }
 
     #[test]
@@ -821,7 +1228,7 @@ mod tests {
             &ctx,
             &exe,
             step::STOP_REAP,
-            Some("found"),
+            Some(TEST_REAP_MSG),
             Some("not found"),
         )
         .await

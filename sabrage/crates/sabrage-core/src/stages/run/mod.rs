@@ -129,19 +129,39 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     // outlives its launch. See [`RunPhaseScope`].
     let mut phase = RunPhaseScope::new(ctx.run_id, &bottle.name);
 
-    // ── Preflight (run.sh:8-91) ──────────────────────────────────────────────
+    // ── Reconcile ────────────────────────────────────────────────────────────
+    // Sabrage-only, and deliberately *before* anything permanent — the
+    // preflight's two auto-fixes (the `cxbottle.conf` backend line, the helper
+    // restage) included, which is why this runs ABOVE `preflight::run` and not
+    // between it and Prepare: PARITY.md promises that a launch refused for a
+    // live session changed nothing, and an auto-fix that rewrites the bottle
+    // config of a *running* game is exactly the mutation that promise is
+    // about. A stale record's guards are restored here (reconcile emits its
+    // own rows) so this launch starts from a clean machine; a live one refuses
+    // rather than taking the running game's wineserver down under it.
     phase.publish(SessionPhase::Preflight);
-    let facts = preflight::run(ctx).await?;
+    let reconciled = session::reconcile::reconcile(ctx).await?;
+    if let Reconciled::Live { state } = &reconciled {
+        return Err(already_running(ctx, &bottle, state));
+    }
+    // A record that survived reconciliation still names an output device
+    // nobody could switch back to. Carry it forward instead of letting this
+    // launch's own `SwitchAudioSource -c` overwrite it — by now that reads
+    // `BlackHole 2ch`, and recording *that* is how the real device is lost for
+    // good (`AudioGuard::acquire` explains the other half).
+    let carried = match &reconciled {
+        Reconciled::Dead { state, .. } | Reconciled::IdentityMismatch { state, .. } => {
+            unfinished_audio_restore(state)
+        }
+        // `NoSession`, `Busy` (nothing was touched, so nothing is ours to
+        // carry), and `Live` — which never reaches here, the launch having
+        // already refused.
+        _ => None,
+    };
     checkpoint(ctx)?;
 
-    // ── Reconcile ────────────────────────────────────────────────────────────
-    // Sabrage-only, and deliberately *before* the first launch action: a stale
-    // record's guards are restored (reconcile emits its own rows) so this
-    // launch starts from a clean machine, and a *live* one refuses rather than
-    // taking the running game's wineserver down under it.
-    if let Reconciled::Live { state } = session::reconcile::reconcile(ctx).await? {
-        return Err(already_running(ctx, &bottle, &state));
-    }
+    // ── Preflight (run.sh:8-91) ──────────────────────────────────────────────
+    let facts = preflight::run(ctx).await?;
     checkpoint(ctx)?;
 
     // ── Prepare (run.sh:93-152) ──────────────────────────────────────────────
@@ -154,6 +174,7 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
         PathBuf::new(),
         session::now_unix_ms(),
     );
+    sess.prev_audio_output = carried;
 
     let forwards = actions::adb_forward_hygiene(ctx).await?;
     if !forwards.is_empty() {
@@ -209,6 +230,29 @@ fn checkpoint(ctx: &StageCtx) -> Result<()> {
         return Err(SabrageError::Cancelled);
     }
     Ok(())
+}
+
+/// The output device a reconciled record still has pending, if any.
+///
+/// [`session::reconcile::finish_record`](crate::session::reconcile) keeps
+/// `session-state.json` when a guard could not be released — the recorded
+/// device had disconnected, so nothing switched back and the Mac is still on
+/// `BlackHole 2ch`. The next launch used to start from a bare
+/// [`SessionState::new`] and overwrite that record with the current reading
+/// (the loopback), losing the only note of what to restore. Carrying the name
+/// forward is what makes the retry the kept record was kept for actually
+/// happen.
+///
+/// A `Dead` / `IdentityMismatch` record whose restore succeeded has
+/// `audio_restored` set and carries nothing; only the kept ones do.
+fn unfinished_audio_restore(state: &SessionState) -> Option<String> {
+    // The kept-record condition, asked of the state rather than of the
+    // outcome enum: a restore that succeeded sets the flag, and that record is
+    // already gone.
+    if state.guards.audio_restored {
+        return None;
+    }
+    state.prev_audio_output.clone()
 }
 
 // ── the published run phase ───────────────────────────────────────────────────
@@ -294,15 +338,29 @@ struct Guards {
 impl Guards {
     /// `stop_dashboard; stop_helper; restore_audio` — run.sh's EXIT/INT/TERM
     /// trap body, in that order.
+    ///
+    /// Every guard is attempted, and the first error is *reported* rather than
+    /// short-circuited: the shell's trap body is three unconditional commands,
+    /// and a `?` on the dashboard's `session-state.json` write would otherwise
+    /// leave the audio device on BlackHole — the one mutation the user can
+    /// actually hear.
     async fn release(&mut self, ctx: &StageCtx, sess: &mut SessionState) -> Result<()> {
+        let mut failure: Option<SabrageError> = None;
         if let Some(d) = self.dashboard.take() {
-            d.release(ctx, sess).await?;
+            if let Err(e) = d.release(ctx, sess).await {
+                failure.get_or_insert(e);
+            }
         }
         reap_helper(ctx).await;
         if let Some(a) = self.audio.take() {
-            a.release(ctx, sess).await?;
+            if let Err(e) = a.release(ctx, sess).await {
+                failure.get_or_insert(e);
+            }
         }
-        Ok(())
+        match failure {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Detach: forget both guards without undoing either.
@@ -423,23 +481,33 @@ async fn guarded(
 
     // run.sh:266 — `wait $WINE_PID`.
     let mut proc = child.child;
+    // `biased` on purpose: an unbiased `select!` picks at random among ready
+    // branches, and Stop losing that coin toss to a Detach the user fired a
+    // moment earlier disarms the guards and leaves the game running while
+    // `stop_session` watches the live slot empty and reports success. Stop is
+    // terminal here — the cancel branch is checked first, and the detach arm
+    // re-checks the token below, so a Stop that fired at ANY point wins.
     let how = tokio::select! {
+        biased;
+        _ = ctx.cancel.cancelled() => Supervised::Cancelled,
         status = proc.wait() => Supervised::Exited(
             status.map(process::exit_code_of).unwrap_or(1),
         ),
-        _ = ctx.cancel.cancelled() => Supervised::Cancelled,
         _ = detach.cancelled() => Supervised::Detached,
+    };
+    let cancelled = |identity: ProcInfo, proc: tokio::process::Child| Reason::Cancelled {
+        child: Some(DetachedChild {
+            identity,
+            child: proc,
+        }),
     };
     Ok(match how {
         Supervised::Exited(rc) => Reason::Normal { rc, log },
-        Supervised::Cancelled => Reason::Cancelled {
-            child: Some(DetachedChild {
-                identity,
-                child: proc,
-            }),
-        },
+        Supervised::Cancelled => cancelled(identity, proc),
         // Dropping the handle does not touch the process: `spawn_detached` sets
-        // `kill_on_drop(false)` precisely so this is a clean walk-away.
+        // `kill_on_drop(false)` precisely so this is a clean walk-away — unless
+        // a Stop is already in flight, in which case this is that Stop.
+        Supervised::Detached if ctx.cancel.is_cancelled() => cancelled(identity, proc),
         Supervised::Detached => Reason::Detached { log },
     })
 }
@@ -514,9 +582,23 @@ async fn teardown(
             // Leak the guards on purpose: the dashboard stays open, the audio
             // device stays on BlackHole, and `session-state.json` keeps
             // describing both so a later reconcile can finish the job.
-            held.disarm();
+            //
+            // The record goes down FIRST. Disarming is what makes the guards
+            // unrecoverable by this process, and doing it before the write
+            // meant a failed write left the device on BlackHole with nothing
+            // on disk naming it — the exact state `session-state.json` exists
+            // to prevent. A write that fails therefore keeps the guards armed:
+            // `run` drops them on the way out and each `Drop` fallback undoes
+            // what it can, which is a worse detach but a recoverable machine.
             sess.detached = true;
-            state::save(&*tctx.executor, state_path, sess).await?;
+            match state::save(&*tctx.executor, state_path, sess).await {
+                Ok(()) => held.disarm(),
+                Err(e) => tctx.step(step::RUN_TEARDOWN).warn(format!(
+                    "could not record the detached session in {} ({e}) — the guards will be \
+                     released instead of left in place",
+                    state_path.display()
+                )),
+            }
             // The row that closes the Supervise phase — `step::RUN_SUPERVISE`
             // is attributed to exactly this: detach is the one way supervision
             // ends without a teardown, and the announcement belongs to the
@@ -574,9 +656,9 @@ async fn teardown(
                      the guards came off, but a later Sabrage may still see this session on disk"
                 ));
             }
-            if let Err(e) = clear_state(&tctx, state_path).await {
+            if let Err(e) = finish_record(&tctx, state_path, sess).await {
                 tctx.step(step::RUN_TEARDOWN).warn(format!(
-                    "could not remove {} ({e}) — a later Sabrage may offer to reconcile a \
+                    "could not update {} ({e}) — a later Sabrage may offer to reconcile a \
                      session that has already exited",
                     state_path.display()
                 ));
@@ -594,13 +676,31 @@ async fn teardown(
             ));
             tctx.section("interrupted: stopping wine");
             stop_wine(&tctx, bottle).await;
-            held.release(&tctx, sess).await?;
+            // Best effort, exactly as the `Normal` arm above is (#202): the
+            // shell's INT trap runs every one of its commands and only then
+            // re-signals itself, so a `?` here — which could only come from the
+            // `session-state.json` write — must not skip the reap, the record
+            // or the live handle. Leaking the handle is the expensive one: the
+            // next `stop_session` would spend its whole 30 s timeout on an
+            // already-fired token.
+            if let Err(e) = held.release(&tctx, sess).await {
+                tctx.step(step::RUN_TEARDOWN).warn(format!(
+                    "could not save the session record while releasing the guards ({e}) — \
+                     the guards came off, but a later Sabrage may still see this session on disk"
+                ));
+            }
             if let Some(mut c) = child {
                 // The game dies with its wineserver; reap it rather than
                 // leaving a zombie behind.
                 let _ = tokio::time::timeout(WINE_EXIT_WAIT, c.child.wait()).await;
             }
-            clear_state(&tctx, state_path).await?;
+            if let Err(e) = finish_record(&tctx, state_path, sess).await {
+                tctx.step(step::RUN_TEARDOWN).warn(format!(
+                    "could not update {} ({e}) — a later Sabrage may offer to reconcile a \
+                     session that has already been stopped",
+                    state_path.display()
+                ));
+            }
             session::clear_live_session(ctx.run_id);
             // The shell resignals itself so the process exits 130; the same
             // number, reached through `SabrageError::Cancelled::exit_code`.
@@ -608,15 +708,17 @@ async fn teardown(
         }
 
         Reason::DryRun => {
-            held.release(&tctx, sess).await?;
+            // Nothing ran, so nothing here can fail in a way worth an exit
+            // code — but the live handle must be cleared either way.
+            let released = held.release(&tctx, sess).await;
             session::clear_live_session(ctx.run_id);
-            Ok(0)
+            released.map(|()| 0)
         }
 
         Reason::Failed(e) => {
             // Best effort: a second failure here must not mask the first.
             let _ = held.release(&tctx, sess).await;
-            let _ = clear_state(&tctx, state_path).await;
+            let _ = finish_record(&tctx, state_path, sess).await;
             session::clear_live_session(ctx.run_id);
             Err(e)
         }
@@ -725,6 +827,42 @@ async fn clear_state(ctx: &StageCtx, path: &Path) -> Result<()> {
     } else {
         Ok(())
     }
+}
+
+/// Is a guard *this teardown was responsible for* still pending?
+///
+/// Deliberately **not** [`SessionState::has_pending_guards`]: that one also
+/// counts `wired_forwards`, which `run` records as it creates them and never
+/// removes (the permanent-vs-guarded boundary — run.sh's traps do not clear
+/// them either), so it would keep a stale record after every single `--wired`
+/// launch. The audio device and the dashboard are what the traps cover, and
+/// they are what this asks about.
+fn teardown_pending(sess: &SessionState) -> bool {
+    (sess.prev_audio_output.is_some() && !sess.guards.audio_restored)
+        || (sess.dashboard.is_some() && !sess.guards.dashboard_closed)
+}
+
+/// The info row emitted instead of clearing a record whose guards are not all
+/// released. Sabrage-only, and the mirror of `session::reconcile`'s own
+/// `previous session record kept for a later restore`.
+const RECORD_KEPT_LINE: &str = "session record kept for a later restore (a guard is still pending)";
+
+/// Clear `session-state.json` — or keep it, when a guard is still pending.
+///
+/// The teardown counterpart of `session::reconcile::finish_record`, and the
+/// same guarantee PARITY.md states for `AudioGuard::release`: "the record is
+/// only cleared once every guard that was recorded is released". A recorded
+/// output device that could not be switched back (disconnected Bluetooth
+/// headphones) leaves `audio_restored` false on purpose — clearing the record
+/// anyway left the Mac on `BlackHole 2ch` with nothing on disk saying what to
+/// restore, which is the exact failure the fallback was written to prevent.
+async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Result<()> {
+    if !teardown_pending(sess) {
+        return clear_state(ctx, path).await;
+    }
+    state::save(&*ctx.executor, path, sess).await?;
+    ctx.step(step::RUN_TEARDOWN).info(RECORD_KEPT_LINE);
+    Ok(())
 }
 
 // ── verbatim text ─────────────────────────────────────────────────────────────
@@ -1213,6 +1351,318 @@ mod tests {
         );
         drop(phase);
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A8-1: the record is only cleared once every guard that was recorded is
+    /// released (PARITY.md). An output device that could not be switched back
+    /// leaves `audio_restored` false — deleting the record then leaves the Mac
+    /// on `BlackHole 2ch` with nothing on disk naming what to restore.
+    #[tokio::test]
+    async fn a_teardown_with_an_unrestorable_guard_keeps_the_record() {
+        let root = scratch("teardown-keeps-record");
+        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let mut held = Guards::default();
+        let mut sess = fresh(&root);
+        // The shape `AudioGuard::release` leaves behind when every switch
+        // failed: a recorded device, and the flag still false.
+        sess.prev_audio_output = Some("Yifei\u{2019}s AirPods Pro".into());
+        assert!(teardown_pending(&sess));
+        let log = root.join("l.log");
+
+        let _g = session::lock_session_globals();
+        let mut phase = RunPhaseScope::new(ctx.run_id, "Steam");
+        let rc = teardown(
+            &ctx,
+            &bottle(&root),
+            &mut held,
+            &mut sess,
+            &ctx.paths.session_state_path(),
+            Ok(Reason::Normal { rc: 0, log }),
+            &mut phase,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(rc, 0, "a kept record cannot change wine's status");
+        let kinds: Vec<PlannedKind> = ctx.executor.planned().iter().map(|p| p.kind).collect();
+        assert!(
+            !kinds.contains(&PlannedKind::RemoveFile),
+            "the record must survive the pending guard: {kinds:?}"
+        );
+        assert!(kinds.contains(&PlannedKind::Write), "…and be re-saved");
+        assert!(
+            rows(&seen.lock().unwrap()).contains(&format!("[info] {RECORD_KEPT_LINE}")),
+            "the user is told why the record is still there"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// The counter-test that keeps the gate honest: `run` records the `--wired`
+    /// forwards it creates and never removes them (permanent-vs-guarded), so
+    /// `has_pending_guards()` would keep the record after EVERY wired run.
+    /// Only the guards teardown actually releases may hold the record back.
+    #[tokio::test]
+    async fn a_wired_run_whose_guards_came_off_still_clears_the_record() {
+        let root = scratch("teardown-wired-clears");
+        let (ctx, _) = dry_ctx(&root, StageOptions::default());
+        let mut held = Guards::default();
+        let mut sess = fresh(&root);
+        sess.wired_forwards = vec![crate::session::state::WiredForward {
+            serial: "1WMHH000".into(),
+            port: 9943,
+        }];
+        sess.prev_audio_output = Some("MacBook Pro Speakers".into());
+        sess.guards.audio_restored = true;
+        assert!(
+            sess.has_pending_guards(),
+            "the forwards are still on the phone — and that is not teardown's business"
+        );
+        assert!(!teardown_pending(&sess));
+        // The record has to exist for a removal to be planned at all.
+        std::fs::create_dir_all(&ctx.paths.sabrage_appsup).unwrap();
+        std::fs::write(ctx.paths.session_state_path(), b"{}\n").unwrap();
+
+        let _g = session::lock_session_globals();
+        let mut phase = RunPhaseScope::new(ctx.run_id, "Steam");
+        teardown(
+            &ctx,
+            &bottle(&root),
+            &mut held,
+            &mut sess,
+            &ctx.paths.session_state_path(),
+            Ok(Reason::Normal {
+                rc: 0,
+                log: root.join("l.log"),
+            }),
+            &mut phase,
+        )
+        .await
+        .unwrap();
+
+        let kinds: Vec<PlannedKind> = ctx.executor.planned().iter().map(|p| p.kind).collect();
+        assert!(
+            kinds.contains(&PlannedKind::RemoveFile),
+            "nothing teardown owns is pending: the record goes: {kinds:?}"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A8-2 / A11-1: the INT path is best-effort exactly like the normal one.
+    /// A failed `session-state.json` write must not skip the reap, the record
+    /// or — above all — `clear_live_session`: a leaked handle turns every later
+    /// `stop_session` into a guaranteed 30 s timeout on an already-fired token.
+    #[tokio::test]
+    async fn a_cancelled_teardown_survives_a_failed_state_save() {
+        let root = scratch("teardown-cancel-save-fails");
+        let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let state_path = ctx.paths.session_state_path();
+        ctx.executor = DenyWriteTo::around(ctx.executor.clone(), &state_path);
+        ctx.paths.wineserver = Some(PathBuf::from("/cx/bin/wineserver"));
+
+        let mut held = Guards {
+            audio: Some(AudioGuard::armed_for_test(
+                &ctx,
+                "MacBook Pro Speakers",
+                "/opt/homebrew/bin/SwitchAudioSource",
+            )),
+            dashboard: None,
+        };
+        let mut sess = fresh(&root);
+
+        let _g = session::lock_session_globals();
+        session::set_live_session(LiveSessionHandle {
+            run_id: ctx.run_id,
+            bottle: "Steam".into(),
+            identity: ProcInfo::observe(std::process::id()).unwrap(),
+            log_path: root.join("l.log"),
+            started_at_unix_ms: 1786300214181,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        });
+        let mut phase = RunPhaseScope::new(ctx.run_id, "Steam");
+
+        let err = teardown(
+            &ctx,
+            &bottle(&root),
+            &mut held,
+            &mut sess,
+            &state_path,
+            Err(SabrageError::Cancelled),
+            &mut phase,
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(err.exit_code(), 130, "still the shell's 130");
+        let printed = rows(&seen.lock().unwrap());
+        assert!(
+            printed.contains(&"audio: restored output -> MacBook Pro Speakers".to_string()),
+            "the device came back even though the record could not be written: {printed:?}"
+        );
+        assert!(
+            printed
+                .iter()
+                .any(|r| r.starts_with("[warn] could not save the session record")),
+            "the save failure is announced: {printed:?}"
+        );
+        assert!(
+            session::live_session().is_none(),
+            "the live handle must be cleared even when the save failed"
+        );
+        assert!(held.audio.is_none(), "the guard was released, not leaked");
+        drop(phase);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A8-2: detach persists FIRST and disarms second. A write that fails
+    /// leaves the guards armed — `run` drops them and each `Drop` fallback
+    /// undoes what it can — rather than a machine on BlackHole with nothing on
+    /// disk naming the device.
+    #[tokio::test]
+    async fn a_detach_that_cannot_write_its_record_keeps_the_guards_armed() {
+        let root = scratch("teardown-detach-save-fails");
+        let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let state_path = ctx.paths.session_state_path();
+        ctx.executor = DenyWriteTo::around(ctx.executor.clone(), &state_path);
+
+        let mut held = Guards {
+            audio: Some(AudioGuard::armed_for_test(
+                &ctx,
+                "MacBook Pro Speakers",
+                "/opt/homebrew/bin/SwitchAudioSource",
+            )),
+            dashboard: None,
+        };
+        let mut sess = fresh(&root);
+
+        let _g = session::lock_session_globals();
+        session::set_live_session(LiveSessionHandle {
+            run_id: ctx.run_id,
+            bottle: "Steam".into(),
+            identity: ProcInfo::observe(std::process::id()).unwrap(),
+            log_path: root.join("l.log"),
+            started_at_unix_ms: 1786300214181,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        });
+        let mut phase = RunPhaseScope::new(ctx.run_id, "Steam");
+
+        let rc = teardown(
+            &ctx,
+            &bottle(&root),
+            &mut held,
+            &mut sess,
+            &state_path,
+            Ok(Reason::Detached {
+                log: root.join("l.log"),
+            }),
+            &mut phase,
+        )
+        .await
+        .expect("detach still succeeds — the session keeps running");
+
+        assert_eq!(rc, 0);
+        assert!(
+            sess.detached,
+            "the flag is set before the write is attempted"
+        );
+        assert!(
+            held.audio.is_some(),
+            "a record that could not be written must not leave the guards unrecoverable"
+        );
+        let printed = rows(&seen.lock().unwrap());
+        assert!(
+            printed
+                .iter()
+                .any(|r| r.starts_with("[warn] could not record the detached session in ")),
+            "{printed:?}"
+        );
+        assert!(
+            session::live_session().is_none(),
+            "the live handle is cleared on every teardown arm"
+        );
+        drop(phase);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A9-2: only an *unfinished* restore is carried into the next launch.
+    #[test]
+    fn only_an_unfinished_restore_is_carried_into_the_next_launch() {
+        let root = scratch("carried-audio");
+        let mut unfinished = fresh(&root);
+        unfinished.prev_audio_output = Some("Yifei\u{2019}s AirPods Pro".into());
+        assert_eq!(
+            unfinished_audio_restore(&unfinished),
+            Some("Yifei\u{2019}s AirPods Pro".to_string()),
+            "the device the kept record was kept FOR"
+        );
+
+        let mut done = unfinished.clone();
+        done.guards.audio_restored = true;
+        assert_eq!(
+            unfinished_audio_restore(&done),
+            None,
+            "a completed restore carries nothing"
+        );
+
+        assert_eq!(
+            unfinished_audio_restore(&fresh(&root)),
+            None,
+            "and a session that never touched audio carries nothing either"
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A7-1: PARITY.md promises a launch refused for a live session changed
+    /// nothing. Reconciliation therefore runs BEFORE `preflight::run`, whose
+    /// two auto-fixes (the `cxbottle.conf` backend line, the helper restage)
+    /// are permanent and never unwound.
+    #[tokio::test]
+    async fn a_live_session_refuses_before_the_preflight_runs_a_single_check() {
+        let _g = session::lock_session_globals();
+        session::publish_run_phase(None);
+
+        let root = scratch("run-live-refusal");
+        let (mut ctx, seen) = dry_ctx(
+            &root,
+            StageOptions {
+                bottle_name: Some("Steam".to_string()),
+                bs_dir_override: Some(root.join("BeatSaber")),
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        ctx.bottle = Some(bottle(&root));
+
+        // A record whose wine identity is *this* process: alive, same start
+        // time — `classify` says Live.
+        let mut recorded = fresh(&root);
+        recorded.wine = Some(ProcInfo::observe(std::process::id()).unwrap());
+        std::fs::create_dir_all(&ctx.paths.sabrage_appsup).unwrap();
+        std::fs::write(
+            ctx.paths.session_state_path(),
+            serde_json::to_vec_pretty(&recorded).unwrap(),
+        )
+        .unwrap();
+
+        let err = run(&ctx, None).await.unwrap_err();
+        assert!(
+            err.to_string().starts_with("a session is already running"),
+            "{err}"
+        );
+        let evs = seen.lock().unwrap().clone();
+        assert!(
+            !evs.iter().any(|e| matches!(e, StageEvent::Check { .. })),
+            "not one preflight check ran: {:?}",
+            rows(&evs)
+        );
+        assert!(
+            ctx.executor.planned().is_empty(),
+            "and nothing permanent was even planned: {:?}",
+            ctx.executor.planned()
+        );
+        assert!(session::run_phase().is_none(), "the slot is emptied");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

@@ -48,7 +48,10 @@ fi
 print -r -- "-- host OpenXR registration ($HOST_XR_JSON)"
 # Byte-shared with sabrage-core: both sides render contract/active_runtime.x86_64.json.template
 # ($(<…) strips the template's trailing newline, matching the historical inline string).
-WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB}"
+# The path is substituted into a JSON string: escape `\` and `"` (no-op for ordinary paths).
+OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
+OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
+WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB_JSON}"
 if [ -f "$HOST_XR_JSON" ] && [ "$(cat "$HOST_XR_JSON")" = "$WANT" ]; then
   info "host registration already current"
 else

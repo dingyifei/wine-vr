@@ -4,7 +4,8 @@
 #
 # Usage:
 #   scripts/dev/parity.sh [--bottle <name>] [--live=off]
-#       Tier 1: cargo test -p sabrage-parity -p sabrage-contract-gen (always).
+#       Tier 1: cargo test -p sabrage-parity -p sabrage-contract-gen -p sabrage-core (always;
+#               CI runs only the first two — see TIER1_PKGS below).
 #       Tier 2: live doctor diff (zsh doctor vs `sabrage doctor`) — runs only when
 #       a bottle is known (--bottle, else $WINEVR_BOTTLE) and --live=off is absent.
 #
@@ -66,14 +67,21 @@ require_cargo() {
 
 # ---- tier 1 -------------------------------------------------------------------
 
+# sabrage-core is included locally: its frozen-text unit tests pin the native half
+# of the launch/preflight strings, and Cargo never runs a dev-dependency's tests
+# when only the parity crate is selected. CI (.github/workflows/parity.yml) runs
+# on ubuntu and keeps the two hermetic crates only — sabrage-core's suite probes
+# macOS tools (lipo, SwitchAudioSource, CrossOver paths).
+TIER1_PKGS=(-p sabrage-parity -p sabrage-contract-gen -p sabrage-core)
+
 run_tier1() { # [skip_fingerprint: 0|1]
   local skip="${1:-0}"
   if [ "$skip" = 1 ]; then
-    say "== tier 1: cargo test -p sabrage-parity -p sabrage-contract-gen (PARITY_SKIP_FINGERPRINT=1) =="
-    ( cd "$SABRAGE" && PARITY_SKIP_FINGERPRINT=1 cargo test -p sabrage-parity -p sabrage-contract-gen )
+    say "== tier 1: cargo test ${TIER1_PKGS[*]} (PARITY_SKIP_FINGERPRINT=1) =="
+    ( cd "$SABRAGE" && PARITY_SKIP_FINGERPRINT=1 cargo test "${TIER1_PKGS[@]}" )
   else
-    say "== tier 1: cargo test -p sabrage-parity -p sabrage-contract-gen =="
-    ( cd "$SABRAGE" && cargo test -p sabrage-parity -p sabrage-contract-gen )
+    say "== tier 1: cargo test ${TIER1_PKGS[*]} =="
+    ( cd "$SABRAGE" && cargo test "${TIER1_PKGS[@]}" )
   fi
 }
 

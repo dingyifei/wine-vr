@@ -243,6 +243,29 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// rename, so a reader never sees a half-written file.
     fn write_atomic<'a>(&'a self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, Result<()>>;
 
+    /// Create `path` with `bytes` **only if it does not exist**: `Ok(true)`
+    /// when this call created it, `Ok(false)` when something else got there
+    /// first (and the file was left untouched).
+    ///
+    /// The write-once documents — `oxrsys-runtime.toml` above all — are
+    /// created through this rather than through [`Executor::write_atomic`],
+    /// because `exists()`-then-`write_atomic` is a race whose loser silently
+    /// replaces a hand-edited config that never got backed up. `O_EXCL` makes
+    /// "did I create it?" the kernel's answer instead of a stale observation.
+    ///
+    /// The default implementation is the racy check-then-write, kept only so a
+    /// decorating [`Executor`] (the test doubles) inherits sane behaviour; both
+    /// executors in this module override it.
+    fn create_new<'a>(&'a self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            if path.exists() {
+                return Ok(false);
+            }
+            self.write_atomic(path, bytes).await?;
+            Ok(true)
+        })
+    }
+
     /// `rm -rf path`. A missing path is success.
     fn remove_dir_all<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>>;
 
@@ -409,11 +432,23 @@ impl Executor for RealExecutor {
         Box::pin(async move {
             self.guard()?;
             if crate::util::cmp_files(src, dst) {
-                return Ok(Copied::Unchanged);
+                // Bytes match — but a staged file that lost its execute bit is
+                // *not* installed, and rebuilding cannot repair it because the
+                // bytes never change (checks/build.rs requires the bit;
+                // fixes/helper.rs restages through this primitive). Repair the
+                // mode and report it as work done. DIVERGENCE from lib.sh's
+                // `cmp -s`-only `install_if_changed` — PARITY.md, "Install".
+                return match (mode_of(src), mode_of(dst)) {
+                    (Some(want), Some(have)) if want != have => {
+                        tokio::fs::set_permissions(dst, permissions(want))
+                            .await
+                            .map_err(|e| SabrageError::io(dst, e))?;
+                        Ok(Copied::Copied)
+                    }
+                    _ => Ok(Copied::Unchanged),
+                };
             }
-            tokio::fs::copy(src, dst)
-                .await
-                .map_err(|e| SabrageError::io(dst, e))?;
+            copy_atomic(src, dst).await?;
             Ok(Copied::Copied)
         })
     }
@@ -422,6 +457,13 @@ impl Executor for RealExecutor {
         Box::pin(async move {
             self.guard()?;
             write_atomic_real(path, bytes).await
+        })
+    }
+
+    fn create_new<'a>(&'a self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            self.guard()?;
+            create_new_real(path, bytes).await
         })
     }
 
@@ -671,19 +713,157 @@ fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-async fn write_atomic_real(path: &Path, bytes: &[u8]) -> Result<()> {
+/// The permission bits of `p`, when it exists.
+fn mode_of(p: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o7777)
+}
+
+fn permissions(mode: u32) -> std::fs::Permissions {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::Permissions::from_mode(mode)
+}
+
+/// A unique temp name beside `path`, for the write-then-rename dance.
+fn sibling_tmp(path: &Path) -> PathBuf {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let tmp = dir.join(format!(".sabrage-{}.tmp", uuid::Uuid::new_v4().as_simple()));
-    tokio::fs::write(&tmp, bytes)
-        .await
-        .map_err(|e| SabrageError::io(&tmp, e))?;
-    match tokio::fs::rename(&tmp, path).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            Err(SabrageError::io(path, e))
+    dir.join(format!(".sabrage-{}.tmp", uuid::Uuid::new_v4().as_simple()))
+}
+
+/// `cp src dst`, via a sibling temp file and a rename.
+///
+/// The destination is never truncated: `std::fs::copy` opens the destination
+/// `create|truncate`, so a failure *after* that (ENOSPC, an unreadable source,
+/// this process being killed mid-copy) leaves a damaged file behind — and the
+/// destinations here are CrossOver's global DXMT overlay and `wineopenxr`,
+/// where one damaged file breaks every bottle (install.rs names ENOSPC among
+/// the expected failures). Either the old bytes stay or the new ones land.
+///
+/// Every failure is reported against `dst`, not against the temp: that is the
+/// path the caller prints, and the path `privilege::classify_write_error`
+/// reasons about when it decides whether a `PermissionDenied` is App
+/// Management (TCC).
+///
+/// The one case this loses to plain `cp`: a destination *directory* that
+/// forbids creating files while the existing destination file is writable. No
+/// install target is shaped that way (the DXMT overlay, `lib/wine`, and the
+/// bottle's `system32` are all user-owned directories), and a half-written
+/// global dylib is the worse failure by a distance.
+async fn copy_atomic(src: &Path, dst: &Path) -> Result<()> {
+    let tmp = sibling_tmp(dst);
+    let result = async {
+        tokio::fs::copy(src, &tmp)
+            .await
+            .map_err(|e| SabrageError::io(dst, e))?;
+        // `fs::copy` already carries the source's mode over; make it explicit
+        // so the execute bit is part of the contract rather than a side effect.
+        if let Some(mode) = mode_of(src) {
+            tokio::fs::set_permissions(&tmp, permissions(mode))
+                .await
+                .map_err(|e| SabrageError::io(dst, e))?;
         }
+        tokio::fs::rename(&tmp, dst)
+            .await
+            .map_err(|e| SabrageError::io(dst, e))
     }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
+    result
+}
+
+/// Write `bytes` to `path` through a sibling temp file and a rename.
+///
+/// Durable, not merely atomic: the temp is `fsync`ed before the rename and the
+/// containing directory after it, because the caller ordering that matters
+/// most here is persist-before-mutate — `run`'s audio guard saves the recovery
+/// record and *then* switches the Mac's output device (paths.rs,
+/// `session_state_path`). Without the syncs a power loss can lose the record
+/// while the device switch survives, which is the one state that file exists to
+/// prevent.
+///
+/// Mode: an existing destination keeps its bits; a fresh file lands at 0644
+/// regardless of this process's umask (the temp is created 0600 so no reader
+/// can ever see it wider than the final file).
+async fn write_atomic_real(path: &Path, bytes: &[u8]) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let tmp = sibling_tmp(path);
+    let mode = mode_of(path).unwrap_or(0o644);
+    let result = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+            .await
+            .map_err(|e| SabrageError::io(&tmp, e))?;
+        file.write_all(bytes)
+            .await
+            .map_err(|e| SabrageError::io(&tmp, e))?;
+        file.sync_all()
+            .await
+            .map_err(|e| SabrageError::io(&tmp, e))?;
+        drop(file);
+        tokio::fs::set_permissions(&tmp, permissions(mode))
+            .await
+            .map_err(|e| SabrageError::io(&tmp, e))?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(|e| SabrageError::io(path, e))
+    }
+    .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return result;
+    }
+    // Best effort: some filesystems refuse `fsync` on a directory fd, and a
+    // failure here costs durability, not correctness.
+    if let Ok(dir) = tokio::fs::File::open(path.parent().unwrap_or_else(|| Path::new("."))).await {
+        let _ = dir.sync_all().await;
+    }
+    Ok(())
+}
+
+/// `O_EXCL` create with contents: `Ok(true)` when this call created the file,
+/// `Ok(false)` when it already existed (and nothing was written).
+async fn create_new_real(path: &Path, bytes: &[u8]) -> Result<bool> {
+    use tokio::io::AsyncWriteExt;
+
+    let mut file = match tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)
+        .await
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(e) => return Err(SabrageError::io(path, e)),
+    };
+    let written = async {
+        file.write_all(bytes)
+            .await
+            .map_err(|e| SabrageError::io(path, e))?;
+        file.sync_all()
+            .await
+            .map_err(|e| SabrageError::io(path, e))?;
+        // Explicit, so the mode does not depend on this process's umask (the
+        // GUI inherits Finder's, the CLI a login shell's).
+        tokio::fs::set_permissions(path, permissions(0o644))
+            .await
+            .map_err(|e| SabrageError::io(path, e))
+    }
+    .await;
+    if written.is_err() {
+        // We created it, so we own the cleanup: leaving a truncated file
+        // behind would make the next caller take the "already exists" branch.
+        let _ = tokio::fs::remove_file(path).await;
+    }
+    written.map(|()| true)
 }
 
 // ── dry run ───────────────────────────────────────────────────────────────────
@@ -759,6 +939,19 @@ impl Executor for DryRunExecutor {
             // Real compare: the plan must distinguish "would install" from
             // "would skip (unchanged)".
             if crate::util::cmp_files(src, dst) {
+                // Same mode repair the real executor performs — the plan has to
+                // show it, or a dry run reports a restage it would not do.
+                if let (Some(want), Some(have)) = (mode_of(src), mode_of(dst)) {
+                    if want != have {
+                        self.record(
+                            PlannedKind::Copy,
+                            Some(src),
+                            Some(dst),
+                            &format!("bytes match, mode {have:04o} differs from source {want:04o}"),
+                        );
+                        return Ok(Copied::Copied);
+                    }
+                }
                 self.record(
                     PlannedKind::Skip,
                     Some(src),
@@ -787,6 +980,24 @@ impl Executor for DryRunExecutor {
                 &format!("{} bytes", bytes.len()),
             );
             Ok(())
+        })
+    }
+
+    fn create_new<'a>(&'a self, path: &'a Path, bytes: &'a [u8]) -> BoxFuture<'a, Result<bool>> {
+        Box::pin(async move {
+            // Real existence probe, like every other dry-run predicate: the
+            // plan must say which branch the caller would take.
+            if path.exists() {
+                self.record(PlannedKind::Skip, None, Some(path), "already exists");
+                return Ok(false);
+            }
+            self.record(
+                PlannedKind::Write,
+                None,
+                Some(path),
+                &format!("{} bytes", bytes.len()),
+            );
+            Ok(true)
         })
     }
 
@@ -966,6 +1177,149 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    fn mode_bits(p: &Path) -> u32 {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(p).unwrap().permissions().mode() & 0o7777
+    }
+
+    /// The destination is never truncated by a copy that then fails: install's
+    /// destinations are CrossOver's *global* DXMT and wineopenxr files, where a
+    /// half-written file breaks every bottle.
+    #[tokio::test]
+    async fn a_failed_copy_leaves_the_previous_destination_intact() {
+        let dir = scratch("copy-fail");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let src = dir.join("src.dylib");
+        let dst = dir.join("dst.dylib");
+        std::fs::write(&src, b"new bytes").unwrap();
+        std::fs::write(&dst, b"the last good overlay").unwrap();
+        // An unreadable source: the copy fails after the compare said "differs".
+        std::fs::set_permissions(&src, permissions(0o000)).unwrap();
+
+        let err = ex.copy_if_changed(&src, &dst).await.unwrap_err();
+        assert_eq!(err.kind(), "io");
+        match &err {
+            SabrageError::Io { path, .. } => assert_eq!(path, &dst, "error names the destination"),
+            other => panic!("expected Io, got {other:?}"),
+        }
+        assert_eq!(std::fs::read(&dst).unwrap(), b"the last good overlay");
+        let strays: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".sabrage-"))
+            .collect();
+        assert!(strays.is_empty(), "temp files left: {strays:?}");
+
+        std::fs::set_permissions(&src, permissions(0o644)).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A staged helper whose bytes match but whose execute bit is gone is not
+    /// installed — and rebuilding cannot repair it, because the bytes never
+    /// change. The copy primitive repairs the mode and reports work done.
+    #[tokio::test]
+    async fn a_byte_identical_destination_with_a_lost_execute_bit_is_repaired() {
+        let dir = scratch("copy-mode");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let src = dir.join("oxrsys-encoder-helper");
+        let dst = dir.join("staged-helper");
+        std::fs::write(&src, b"helper").unwrap();
+        std::fs::set_permissions(&src, permissions(0o755)).unwrap();
+
+        // Fresh copy carries the execute bit over.
+        assert_eq!(
+            ex.copy_if_changed(&src, &dst).await.unwrap(),
+            Copied::Copied
+        );
+        assert_eq!(mode_bits(&dst), 0o755);
+        assert_eq!(
+            ex.copy_if_changed(&src, &dst).await.unwrap(),
+            Copied::Unchanged
+        );
+
+        // Bytes still equal, mode drifted: repaired, and reported as Copied.
+        std::fs::set_permissions(&dst, permissions(0o644)).unwrap();
+        assert_eq!(
+            ex.copy_if_changed(&src, &dst).await.unwrap(),
+            Copied::Copied
+        );
+        assert_eq!(mode_bits(&dst), 0o755);
+        assert_eq!(std::fs::read(&dst).unwrap(), b"helper");
+
+        // The dry run plans that repair instead of calling it a skip.
+        std::fs::set_permissions(&dst, permissions(0o644)).unwrap();
+        let (run_id, sink, cancel) = sinks();
+        let dry = DryRunExecutor::new(run_id, sink, cancel);
+        assert_eq!(
+            dry.copy_if_changed(&src, &dst).await.unwrap(),
+            Copied::Copied
+        );
+        assert_eq!(mode_bits(&dst), 0o644, "dry run changed the mode");
+        assert_eq!(dry.planned()[0].kind, PlannedKind::Copy);
+        assert!(dry.planned()[0].reason.contains("mode"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `O_EXCL`, so "the file was absent" is the kernel's answer rather than a
+    /// stale `exists()`: the loser of a race must not replace a hand-edited
+    /// `oxrsys-runtime.toml` that never got backed up.
+    #[tokio::test]
+    async fn create_new_never_clobbers_an_existing_file() {
+        let dir = scratch("create-new");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let f = dir.join("oxrsys-runtime.toml");
+
+        assert!(ex.create_new(&f, b"template").await.unwrap());
+        assert_eq!(std::fs::read(&f).unwrap(), b"template");
+        assert_eq!(mode_bits(&f), 0o644);
+
+        std::fs::write(&f, b"hand edited").unwrap();
+        assert!(!ex.create_new(&f, b"template").await.unwrap());
+        assert_eq!(std::fs::read(&f).unwrap(), b"hand edited");
+
+        // The dry run probes for real and writes nothing, either branch.
+        let (run_id, sink, cancel) = sinks();
+        let dry = DryRunExecutor::new(run_id, sink, cancel);
+        let absent = dir.join("absent.toml");
+        assert!(dry.create_new(&absent, b"template").await.unwrap());
+        assert!(!absent.exists(), "dry run created the file");
+        assert!(!dry.create_new(&f, b"template").await.unwrap());
+        assert_eq!(std::fs::read(&f).unwrap(), b"hand edited");
+        let plan = dry.planned();
+        assert_eq!(plan[0].kind, PlannedKind::Write);
+        assert_eq!(plan[0].reason, "8 bytes");
+        assert_eq!(plan[1].kind, PlannedKind::Skip);
+        assert_eq!(plan[1].reason, "already exists");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An atomic write replaces a file; it must not silently widen it.
+    #[tokio::test]
+    async fn write_atomic_keeps_an_existing_files_mode() {
+        let dir = scratch("atomic-mode");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+
+        let fresh = dir.join("new.json");
+        ex.write_atomic(&fresh, b"{}").await.unwrap();
+        assert_eq!(mode_bits(&fresh), 0o644);
+
+        let tight = dir.join("session-state.json");
+        std::fs::write(&tight, b"old").unwrap();
+        std::fs::set_permissions(&tight, permissions(0o600)).unwrap();
+        ex.write_atomic(&tight, b"new").await.unwrap();
+        assert_eq!(std::fs::read(&tight).unwrap(), b"new");
+        assert_eq!(mode_bits(&tight), 0o600, "replacement widened the file");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn write_atomic_replaces_and_leaves_no_temp_files() {
         let dir = scratch("atomic");
@@ -1088,6 +1442,7 @@ mod tests {
         for e in [
             ex.copy_if_changed(&src, &dst).await.err(),
             ex.write_atomic(&out, b"bytes").await.err(),
+            ex.create_new(&out, b"bytes").await.err(),
             ex.create_dir_all(&sub).await.err(),
             ex.remove_dir_all(&dir).await.err(),
             ex.remove_file(&victim).await.err(),
@@ -1102,6 +1457,75 @@ mod tests {
         assert!(!dst.exists() && !out.exists() && !sub.exists());
         assert!(victim.is_file() && dir.is_dir());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The invariant the whole trait exists for: under `--dry-run` **nothing**
+    /// on disk changes, whichever primitive a stage reaches for. Probes still
+    /// run (that is what makes the plan truthful), but they are reads.
+    #[tokio::test]
+    async fn a_dry_run_mutates_nothing_at_all() {
+        let dir = scratch("dry-nothing");
+        let (run_id, sink, cancel) = sinks();
+        let ex = DryRunExecutor::new(run_id, sink, cancel);
+
+        let src = dir.join("src");
+        let existing = dir.join("existing");
+        std::fs::write(&src, b"payload").unwrap();
+        std::fs::write(&existing, b"keep me").unwrap();
+        let sub = dir.join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        let before = snapshot(&dir);
+
+        let absent = dir.join("absent");
+        ex.copy_if_changed(&src, &absent).await.unwrap();
+        ex.write_atomic(&existing, b"clobbered").await.unwrap();
+        ex.create_new(&absent, b"new").await.unwrap();
+        ex.create_dir_all(&dir.join("deep/deeper")).await.unwrap();
+        ex.remove_file(&existing).await.unwrap();
+        ex.remove_dir_all(&sub).await.unwrap();
+        ex.dir_copy(&sub, &dir.join("sub-copy")).await.unwrap();
+        ex.touch(&absent).await.unwrap();
+        ex.tar_xzf(&src, &dir).await.unwrap();
+        ex.download("https://h/x.tgz", &absent, "deadbeef", "X")
+            .await
+            .unwrap();
+        ex.run_child(&ChildSpec::new("/bin/rm", step::BUILD_TOOLS, run_id).arg(&existing))
+            .await
+            .unwrap();
+        ex.spawn_detached(
+            &ChildSpec::new("/bin/echo", step::BUILD_TOOLS, run_id),
+            DetachedStdio::LogFile(dir.join("run.log")),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(snapshot(&dir), before, "a dry run touched the filesystem");
+        assert_eq!(ex.planned().len(), 12, "every call recorded one action");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every path under `dir`, with each file's bytes — the "nothing changed"
+    /// witness.
+    fn snapshot(dir: &Path) -> Vec<(PathBuf, Option<Vec<u8>>)> {
+        fn walk(dir: &Path, out: &mut Vec<(PathBuf, Option<Vec<u8>>)>) {
+            let mut entries: Vec<_> = std::fs::read_dir(dir)
+                .unwrap()
+                .filter_map(|e| e.ok())
+                .map(|e| e.path())
+                .collect();
+            entries.sort();
+            for p in entries {
+                if p.is_dir() {
+                    out.push((p.clone(), None));
+                    walk(&p, out);
+                } else {
+                    out.push((p.clone(), Some(std::fs::read(&p).unwrap())));
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(dir, &mut out);
+        out
     }
 
     #[test]

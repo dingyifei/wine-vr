@@ -9,9 +9,11 @@
 //! Implementation notes for the fixes agent:
 //! * source is [`crate::paths::Paths::oxr_helper_built`], destination is
 //!   [`crate::paths::Paths::oxr_helper_staged`];
-//! * copy with the executor's `copy_if_changed` (cmp-bytes semantics — an
-//!   already-current helper reports `unchanged`, and the fix reports
-//!   [`FixReport::unchanged`]);
+//! * an already-arm64 staged helper is a silent [`FixReport::unchanged`];
+//!   otherwise copy with the executor's `copy_if_changed`, which repairs a
+//!   mode-only difference as well as differing bytes — a staged copy with the
+//!   right bytes and no execute bit is not "unchanged", and nothing else can
+//!   repair it (a rebuild produces the same bytes);
 //! * verify the SOURCE is arm64 first ([`crate::util::helper_is_arm64`], where
 //!   `arm64e` alone must NOT satisfy) and refuse rather than stage a wrong-arch
 //!   binary that would shadow a good one.
@@ -58,25 +60,26 @@ use crate::util::helper_is_arm64;
 /// this fix.
 const STEP: StepId = "fix.restage-helper";
 
-/// Same algorithm as `checks::config`'s (private) `parse_protocol`, for the
-/// `encoder_process` key instead of `protocol`:
-/// `awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML"`.
-/// Duplicated rather than shared because that parser is private to a module
-/// this fix does not own (file-ownership split, design-core §9).
+/// `$ENCODER_PROC`, read with **the runtime's own semantics** rather than the
+/// shell's `awk` recipe.
+///
+/// `ext/oxrsys/runtime/src/Config.cpp` is table-blind and last-assignment-wins
+/// (see [`crate::config::runtime_toml`]'s header), so a file with
+/// `encoder_process = "inproc"` early and `encoder_process = "native"` later
+/// runs the *helper* path — and this die text has to name the value the runtime
+/// will actually use, not the first one in the file. A value the runtime would
+/// ignore reads as absent here for the same reason: the runtime falls back to
+/// its default, so `${ENCODER_PROC:-auto}` is the honest answer.
+///
+/// Shared with the reader the Settings screen uses, rather than a third copy of
+/// the same rules.
 fn parse_encoder_process(toml_text: &str) -> String {
-    for line in toml_text.lines() {
-        let after_leading_ws = line.trim_start();
-        let Some(rest) = after_leading_ws.strip_prefix("encoder_process") else {
-            continue;
-        };
-        if !rest.trim_start().starts_with('=') {
-            continue;
-        }
-        let mut fields = line.split('"');
-        let _before_first_quote = fields.next();
-        return fields.next().unwrap_or("").to_string();
-    }
-    String::new()
+    let (values, _invalid, _shadowed) =
+        crate::config::runtime_toml::read_lines_like_the_runtime(toml_text);
+    values
+        .encoder_process
+        .map(|e| e.as_str().to_string())
+        .unwrap_or_default()
 }
 
 /// `${ENCODER_PROC:-auto}` — empty (missing key, missing file, unquoted value)
@@ -132,14 +135,16 @@ pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixRepor
 
     let dry_run = ctx.executor.is_dry_run();
     let executor = ctx.executor_for(step::BUILD_HELPER);
+
     let copied = executor.copy_if_changed(&built, &staged).await?;
     match copied {
-        // `install_if_changed`'s "unchanged" branch is trustworthy even in a
-        // dry run (the executor's dry-run `copy_if_changed` still does the
-        // real byte compare) — this can only actually happen here if the
-        // staged copy became arm64-but-not-executable between the two probes
-        // above and this one, but the row is reproduced regardless, matching
-        // `install_if_changed` unconditionally.
+        // Bytes already match AND the mode already matches. Reaching this at
+        // all means the destination changed between the arm64 probe above and
+        // the copy — `copy_if_changed` repairs a mode-only difference itself
+        // and reports it as `Copied` (a staged helper that lost its execute bit
+        // is not "unchanged": nothing else can repair it, since a rebuild
+        // produces the same bytes). The row is `install_if_changed`'s,
+        // reproduced regardless.
         Copied::Unchanged => sink(StageEvent::info(
             ctx.run_id,
             Some(step::BUILD_HELPER),
@@ -162,7 +167,8 @@ pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixRepor
     // A dry run never actually wrote the file, so re-validating it here would
     // always (wrongly) look like a failed restage. Skip the check and the
     // "restaged" claim accordingly; the executor's plan already records what
-    // would have happened.
+    // would have happened — including a mode-only repair, which the dry-run
+    // executor records as a `Copy` for exactly this reason.
     if dry_run {
         let description = "encoder helper would be restaged (arm64)".to_string();
         sink(StageEvent::ok(ctx.run_id, Some(STEP), description.clone()));
@@ -197,7 +203,7 @@ mod tests {
     // ── parse_encoder_process / encoder_process_or_default ──────────────────
 
     #[test]
-    fn parse_encoder_process_matches_the_awk_recipe() {
+    fn parse_encoder_process_follows_the_runtime_semantics() {
         assert_eq!(
             parse_encoder_process("encoder_process = \"native\"\n"),
             "native"
@@ -211,12 +217,26 @@ mod tests {
             ""
         );
         assert_eq!(parse_encoder_process("encoder_process_extra = \"x\"\n"), "");
-        assert_eq!(parse_encoder_process("encoder_process=native\n"), "");
         assert_eq!(
             parse_encoder_process("protocol = \"alvr\"\nencoder_process = \"inproc\"\n"),
             "inproc"
         );
         assert_eq!(parse_encoder_process(""), "");
+
+        // The runtime is table-blind and last-assignment-wins, so a shadowed
+        // earlier line is NOT the value the launched runtime uses. The `awk`
+        // recipe this used to copy took the first one.
+        assert_eq!(
+            parse_encoder_process(
+                "encoder_process = \"inproc\"\n[streaming]\nencoder_process = \"native\"\n"
+            ),
+            "native"
+        );
+        // The runtime strips one layer of quotes and accepts the bare word…
+        assert_eq!(parse_encoder_process("encoder_process=native\n"), "native");
+        // …and silently ignores a value outside the accepted set, keeping its
+        // compiled-in default — which `encoder_process_or_default` then reports.
+        assert_eq!(parse_encoder_process("encoder_process = \"bogus\"\n"), "");
     }
 
     #[test]
@@ -344,6 +364,116 @@ mod tests {
             !ctx.paths.oxr_helper_staged.exists(),
             "dry run must never write"
         );
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// Byte-identical, but the staged copy lost its execute bit: the byte
+    /// compare behind `copy_if_changed` cannot see that and used to report
+    /// `Unchanged`, leaving the mode unrepaired and the re-validation failing
+    /// on every retry — a state neither this fix nor `./demo.sh build` could
+    /// get out of.
+    #[tokio::test]
+    async fn a_byte_identical_but_non_executable_staged_helper_is_repaired() {
+        if !arm64_available() {
+            return;
+        }
+        let root = scratch("mode-repair");
+        let (ctx, seen) = ctx_for(&root, false);
+        write_thin_arm64_stub(&ctx.paths.oxr_helper_built);
+        std::fs::create_dir_all(ctx.paths.oxr_helper_staged.parent().unwrap()).unwrap();
+        std::fs::copy(&ctx.paths.oxr_helper_built, &ctx.paths.oxr_helper_staged).unwrap();
+        let mut perms = std::fs::metadata(&ctx.paths.oxr_helper_staged)
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&ctx.paths.oxr_helper_staged, perms).unwrap();
+        assert!(!helper_is_arm64(&ctx.paths.oxr_helper_staged));
+
+        let report = restage_helper(&ctx, &ctx.sink.clone()).await.unwrap();
+        assert!(report.changed);
+        assert_eq!(report.description, "encoder helper restaged (arm64)");
+        assert!(
+            helper_is_arm64(&ctx.paths.oxr_helper_staged),
+            "the execute bit must be repaired, not compared away"
+        );
+        assert_eq!(
+            std::fs::metadata(&ctx.paths.oxr_helper_staged)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111,
+            std::fs::metadata(&ctx.paths.oxr_helper_built)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o111
+        );
+
+        let evs = seen.lock().unwrap();
+        let texts: Vec<&str> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StageEvent::Line { text, .. } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            texts.iter().any(|t| t.starts_with("installed: ")),
+            "a repair is an install, not an `unchanged:` row: {texts:?}"
+        );
+        assert!(!texts.iter().any(|t| t.starts_with("unchanged: ")));
+
+        drop(evs);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The same state under a dry run: the file is untouched, the removal is
+    /// planned rather than performed, and the report says a restage *would*
+    /// happen — which is now true, where before it was a claim the real apply
+    /// could not honour.
+    #[tokio::test]
+    async fn a_dry_run_plans_the_mode_repair_without_performing_it() {
+        if !arm64_available() {
+            return;
+        }
+        let root = scratch("mode-repair-dry");
+        let (ctx, _seen) = ctx_for(&root, true);
+        write_thin_arm64_stub(&ctx.paths.oxr_helper_built);
+        std::fs::create_dir_all(ctx.paths.oxr_helper_staged.parent().unwrap()).unwrap();
+        std::fs::copy(&ctx.paths.oxr_helper_built, &ctx.paths.oxr_helper_staged).unwrap();
+        let mut perms = std::fs::metadata(&ctx.paths.oxr_helper_staged)
+            .unwrap()
+            .permissions();
+        perms.set_mode(0o644);
+        std::fs::set_permissions(&ctx.paths.oxr_helper_staged, perms).unwrap();
+
+        let report = restage_helper(&ctx, &ctx.sink.clone()).await.unwrap();
+        assert!(report.changed);
+        assert_eq!(
+            report.description,
+            "encoder helper would be restaged (arm64)"
+        );
+        assert_eq!(
+            std::fs::metadata(&ctx.paths.oxr_helper_staged)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644,
+            "a dry run must not repair anything"
+        );
+        let planned = ctx.executor.planned();
+        assert!(
+            planned
+                .iter()
+                .any(|p| p.kind == crate::executor::PlannedKind::Copy
+                    && p.dst.as_deref() == Some(ctx.paths.oxr_helper_staged.as_path())),
+            "the mode repair must appear in the plan as work, not as a skip: {planned:?}"
+        );
+        assert!(!planned
+            .iter()
+            .any(|p| p.kind == crate::executor::PlannedKind::Skip));
 
         std::fs::remove_dir_all(&root).ok();
     }

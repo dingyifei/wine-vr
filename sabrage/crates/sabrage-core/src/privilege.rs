@@ -46,7 +46,14 @@
 //!   is a swap race;
 //! * its name is randomized (`host-manifest-<uuid>.json`) and it is created
 //!   `O_CREAT|O_EXCL` with mode `0600`, so an attacker cannot pre-create it;
-//! * it is removed on every exit path ([`StagedTemp`]'s `Drop`);
+//! * it is removed on every exit path ([`StagedTemp`]'s `Drop`) — with one
+//!   deliberate exception: a **cancellation** defuses that `Drop`
+//!   ([`StagedTemp::defuse`]) and leaves the file, because the elevated
+//!   descendant runs as root and cannot be reliably killed or even observed by
+//!   us; unlinking the source out from under a privileged `install` still in
+//!   flight would turn a cancelled run into a corrupt one. The next privileged
+//!   write sweeps anything older than [`STAGING_SWEEP_AGE`]
+//!   ([`sweep_stale_staging`]);
 //! * every argv element of the elevated command is single-quoted for `/bin/sh`
 //!   ([`shell_quote`]) and the whole command is then escaped for the AppleScript
 //!   string literal ([`applescript_escape`]) — two independent layers, both
@@ -78,6 +85,7 @@ use std::io::{IsTerminal, Write};
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -98,11 +106,31 @@ const INSTALL: &str = "/usr/bin/install";
 pub const APP_MANAGEMENT_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles";
 
-/// What [`StageEvent::NeedsAdmin`] says before the prompt appears (design-core
-/// §5.4). The point is that the user can predict the dialog *and* knows it will
-/// not come back on every install.
+/// What [`StageEvent::NeedsAdmin`] says before the **osascript** prompt appears
+/// (design-core §5.4). The point is that the user can predict the dialog *and*
+/// knows it will not come back on every install.
 pub const NEEDS_ADMIN_REASON: &str =
     "this writes the host OpenXR registration — one password, only when the repo path changes";
+
+/// The same announcement for the [`AdminMethod::Sudo`] path, which prompts on
+/// the **controlling terminal**, not in a macOS dialog.
+///
+/// A GUI started from a shell (`npm run tauri dev`, the documented dev
+/// workflow) inherits that terminal, so `detect()` picks `sudo` and the
+/// password prompt appears in a window that is very likely *behind* the one the
+/// user is looking at — the stage then looks hung. Saying where the prompt is
+/// is the whole point of announcing it, so the announcement names the mechanism
+/// [`AdminMethod::detect`] actually picked rather than one of the two.
+pub const NEEDS_ADMIN_REASON_SUDO: &str = "sudo is waiting for your password in the terminal that launched Sabrage — this writes the host OpenXR registration, only when the repo path changes";
+
+/// The announcement for `method`: [`NEEDS_ADMIN_REASON`] for the dialog,
+/// [`NEEDS_ADMIN_REASON_SUDO`] for the terminal.
+pub fn needs_admin_reason(method: AdminMethod) -> &'static str {
+    match method {
+        AdminMethod::Osascript => NEEDS_ADMIN_REASON,
+        AdminMethod::Sudo => NEEDS_ADMIN_REASON_SUDO,
+    }
+}
 
 /// The `--dry-run` stand-in for the prompt. A dry run must never emit
 /// [`StageEvent::NeedsAdmin`]: the GUI renders that as "macOS will ask for your
@@ -119,6 +147,29 @@ const USER_CANCELLED_MARKER: &str = "-128";
 /// run. Indices line up with [`elevation_argv`]'s `Sudo` output.
 const SUDO_DIE: [&str; 2] = ["sudo mkdir failed", "sudo write failed"];
 
+/// How long a cancellation waits for the elevated child to actually exit before
+/// giving up on it.
+///
+/// Bounded on purpose: once `sudo` (or osascript's authorization) has exec'd,
+/// the child's real uid is 0 and an unprivileged parent's `kill(2)` comes back
+/// `EPERM`, so "wait for the child we just signalled" can be an unbounded wait
+/// on a process that will never notice. Waiting *some* bounded time still reaps
+/// the ordinary case (authorization not yet granted — the child is still ours).
+const CANCEL_REAP_GRACE: Duration = Duration::from_millis(500);
+
+/// How old a leftover `host-manifest-*.json` must be before
+/// [`sweep_stale_staging`] removes it. Comfortably longer than any elevated
+/// `install` can take, so a *concurrent* sabrage's staging file is never pulled
+/// out from under it.
+const STAGING_SWEEP_AGE: Duration = Duration::from_secs(3600);
+
+/// What a cancelled elevation reports about the staging file it deliberately
+/// left behind.
+const CANCELLED_MID_ELEVATION_WARN: &str =
+    "cancelled while the elevated write may still be running — leaving the staging file in \
+     place (removing it could corrupt a privileged write already in flight); the next install \
+     sweeps it";
+
 // ── types ─────────────────────────────────────────────────────────────────────
 
 /// Outcome of the one privileged write.
@@ -128,6 +179,11 @@ pub enum PrivilegedWrite {
     Skipped,
     /// The manifest was written (one authorization prompt).
     Written,
+    /// `--dry-run`: the staging write and the elevated argv were *planned*
+    /// (recorded through the executor), nothing was prompted for and nothing
+    /// was written. A separate variant because the caller renders it — the row
+    /// a preview prints must not be the row a completed install prints.
+    Planned,
 }
 
 /// How to ask for administrator rights.
@@ -371,18 +427,38 @@ pub async fn write_host_manifest_privileged(
         return plan_privileged_write(ctx, method, &content, dest).await;
     }
 
+    // The announcement names the mechanism `detect()` actually picked: the
+    // dialog and the terminal prompt are in completely different places, and a
+    // GUI launched from a shell takes the terminal one.
     ctx.emit(StageEvent::NeedsAdmin {
         run_id: ctx.run_id,
         step: step::INSTALL_HOST_MANIFEST.into(),
-        reason: NEEDS_ADMIN_REASON.to_string(),
+        reason: needs_admin_reason(method).to_string(),
     });
 
-    // Dropped — and so deleted — on every exit path below.
-    let staged = StagedTemp::create(&sabrage_temp_dir(), &content)?;
+    // Anything a previous cancellation deliberately left behind (see below).
+    sweep_stale_staging(&sabrage_temp_dir());
+
+    // Dropped — and so deleted — on every exit path below, except the
+    // cancellation arm, which defuses it.
+    let mut staged = StagedTemp::create(&sabrage_temp_dir(), &content)?;
     let argv = elevation_argv(method, &staged.path, dest);
-    match method {
-        AdminMethod::Osascript => elevate_osascript(ctx, &argv[0]).await?,
-        AdminMethod::Sudo => elevate_sudo(ctx, &argv).await?,
+    let elevated = match method {
+        AdminMethod::Osascript => elevate_osascript(ctx, &argv[0]).await,
+        AdminMethod::Sudo => elevate_sudo(ctx, &argv).await,
+    };
+    if let Err(e) = elevated {
+        // A cancelled elevation is the one case where we do **not** know the
+        // privileged command is over: it runs as root, so our kill can come
+        // back EPERM, and osascript's elevated `/bin/sh` is not even in our
+        // process tree. Deleting the staging file here could hand a still-live
+        // `install` an ENOENT half-way through the pipeline's only root write.
+        if matches!(e, SabrageError::Cancelled) {
+            staged.defuse();
+            ctx.step(step::INSTALL_HOST_MANIFEST)
+                .warn(CANCELLED_MID_ELEVATION_WARN);
+        }
+        return Err(e);
     }
     verify_written(ctx, dest, &content)?;
     Ok(PrivilegedWrite::Written)
@@ -391,9 +467,10 @@ pub async fn write_host_manifest_privileged(
 /// The `--dry-run` half of [`write_host_manifest_privileged`]: record the
 /// staging write and the elevated argv through the executor, mutate nothing.
 ///
-/// Reported as [`PrivilegedWrite::Written`] for the same reason
-/// [`crate::executor::Copied::Copied`] is: the plan describes what *would*
-/// happen, and "would prompt and write" is the honest answer here.
+/// Reported as [`PrivilegedWrite::Planned`], never `Written`: the caller turns
+/// the outcome into a row in the run log, and a preview that prints the same
+/// `ok "host registration written"` a real install prints is indistinguishable
+/// from completed work in the event log.
 async fn plan_privileged_write(
     ctx: &StageCtx,
     method: AdminMethod,
@@ -411,7 +488,7 @@ async fn plan_privileged_write(
             .args(argv[1..].iter().cloned());
         exec.run_child(&spec).await?;
     }
-    Ok(PrivilegedWrite::Written)
+    Ok(PrivilegedWrite::Planned)
 }
 
 /// One `osascript -e 'do shell script … with administrator privileges'`.
@@ -518,11 +595,22 @@ async fn run_capturing(
     let child = cmd
         .spawn()
         .map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))?;
+    let wait = child.wait_with_output();
+    tokio::pin!(wait);
     tokio::select! {
-        out = child.wait_with_output() => {
+        out = &mut wait => {
             out.map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))
         }
-        _ = cancel.cancelled() => Err(SabrageError::Cancelled),
+        _ = cancel.cancelled() => {
+            // Give the child a bounded moment to finish before the future (and
+            // with it the child, `kill_on_drop`) is dropped: returning the
+            // instant Stop is pressed would let the caller tear the staging
+            // file down under a privileged `install` that is already running.
+            // Bounded because the elevated half is root-owned and may outlive
+            // us regardless — see CANCEL_REAP_GRACE.
+            let _ = tokio::time::timeout(CANCEL_REAP_GRACE, &mut wait).await;
+            Err(SabrageError::Cancelled)
+        }
     }
 }
 
@@ -542,7 +630,14 @@ async fn run_inheriting(argv: &[OsString], cancel: &CancellationToken) -> Result
             status.map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))
         }
         _ = cancel.cancelled() => {
+            // Signal, then *reap* — bounded. Without the wait this returned
+            // while the child (and, past the password prompt, its root-owned
+            // `mkdir`/`install`) was still running, and the caller's staging
+            // file was unlinked underneath it. The kill itself is best-effort
+            // for the same reason: after `sudo` execs, its real uid is 0 and
+            // this process cannot signal it at all.
             let _ = child.start_kill();
+            let _ = tokio::time::timeout(CANCEL_REAP_GRACE, child.wait()).await;
             Err(SabrageError::Cancelled)
         }
     }
@@ -550,10 +645,14 @@ async fn run_inheriting(argv: &[OsString], cancel: &CancellationToken) -> Result
 
 // ── staging ───────────────────────────────────────────────────────────────────
 
-/// A `0600` file that deletes itself when dropped.
+/// A `0600` file that deletes itself when dropped — unless it has been
+/// [`defuse`](StagedTemp::defuse)d.
 #[derive(Debug)]
 struct StagedTemp {
     path: PathBuf,
+    /// False once [`StagedTemp::defuse`] has run: `Drop` then leaves the file
+    /// alone.
+    armed: bool,
 }
 
 impl StagedTemp {
@@ -575,17 +674,58 @@ impl StagedTemp {
             .mode(0o600)
             .open(&path)
             .map_err(|e| SabrageError::io(&path, e))?;
-        let staged = StagedTemp { path };
+        let staged = StagedTemp { path, armed: true };
         file.write_all(content.as_bytes())
             .and_then(|()| file.sync_all())
             .map_err(|e| SabrageError::io(&staged.path, e))?;
         Ok(staged)
     }
+
+    /// Keep the file: `Drop` will not unlink it.
+    ///
+    /// Used on exactly one path — a cancelled elevation, where the privileged
+    /// command may still be reading this file. [`sweep_stale_staging`] is what
+    /// collects it later.
+    fn defuse(&mut self) {
+        self.armed = false;
+    }
 }
 
 impl Drop for StagedTemp {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
+        if self.armed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// Remove staging files a previous run left behind (see
+/// [`StagedTemp::defuse`]), oldest-first safe: only files older than
+/// [`STAGING_SWEEP_AGE`] go, so a *concurrent* sabrage's live staging file is
+/// never taken out from under its own elevated write.
+///
+/// Best effort throughout — a staging file we cannot remove is a stale `0600`
+/// file in our own `0700` directory, not a reason to fail an install.
+fn sweep_stale_staging(dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let now = std::time::SystemTime::now();
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !(name.starts_with("host-manifest-") && name.ends_with(".json")) {
+            continue;
+        }
+        let stale = entry
+            .metadata()
+            .ok()
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| now.duration_since(t).ok())
+            .is_some_and(|age| age >= STAGING_SWEEP_AGE);
+        if stale {
+            let _ = std::fs::remove_file(entry.path());
+        }
     }
 }
 
@@ -654,6 +794,46 @@ pub fn upgrade_write_error(ctx: &StageCtx, err: SabrageError) -> SabrageError {
         fix: None,
     });
     SabrageError::TccDenied { path }
+}
+
+/// [`upgrade_write_error`] for a failure that arrives as a **child's** exit
+/// status rather than an `io::Error` — install layer 1's `cp -R` of the stock
+/// DXMT tree, the first write the pipeline makes into `CrossOver.app` and so
+/// the most likely place to meet App Management.
+///
+/// There is no errno to classify, only the child's output tail, so the test is
+/// "destination inside a `.app` **and** the tail says permission denied". Same
+/// contract as [`upgrade_write_error`] in every other respect: the prose is
+/// emitted here, once, as a [`StageEvent::Fatal`], and the caller propagates
+/// the returned [`SabrageError::TccDenied`] instead of re-emitting. Anything
+/// else passes through untouched — a `ChildFailed` already explains itself.
+pub fn upgrade_child_write_error(ctx: &StageCtx, err: SabrageError, dest: &Path) -> SabrageError {
+    let SabrageError::ChildFailed { tail, .. } = &err else {
+        return err;
+    };
+    if !is_inside_app_bundle(dest) || !tail_is_permission_denied(tail) {
+        return err;
+    }
+    ctx.emit(StageEvent::Fatal {
+        run_id: ctx.run_id,
+        message: app_management_message(dest),
+        remedy: Some(app_management_remedy(ctx.opts.bottle_name.as_deref())),
+        fix: None,
+    });
+    SabrageError::TccDenied {
+        path: dest.to_path_buf(),
+    }
+}
+
+/// True when a failed child's output tail reads like a refused write — `cp`'s
+/// own `Permission denied` / `Operation not permitted` (the two spellings macOS
+/// produces for `EACCES` and `EPERM`, and a sandbox refusal arrives as one of
+/// them).
+pub fn tail_is_permission_denied(tail: &[String]) -> bool {
+    tail.iter().any(|line| {
+        let line = line.to_lowercase();
+        line.contains("permission denied") || line.contains("operation not permitted")
+    })
 }
 
 /// The hypothesis, phrased as one.
@@ -1054,7 +1234,10 @@ mod tests {
             write_host_manifest_privileged(&ctx, &dylib, &dest)
                 .await
                 .unwrap(),
-            PrivilegedWrite::Written
+            // Planned, never Written: the caller renders this, and a preview
+            // that prints the completed-install row is indistinguishable from
+            // a completed install in the event log.
+            PrivilegedWrite::Planned
         );
 
         // Nothing happened on disk.
@@ -1109,6 +1292,179 @@ mod tests {
             );
         }
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── cancellation: reap the child, keep the staging file ──────────────────
+
+    /// The cancel arm must not return while the child it just signalled is
+    /// still running: the caller's next act is to drop the staging file, and a
+    /// privileged `install` reading it would get an ENOENT half-way through the
+    /// pipeline's only root write. `sleep` + `touch` is the observable form —
+    /// if the wait were missing, the marker could appear after the call
+    /// returned.
+    #[tokio::test]
+    async fn a_cancelled_child_is_reaped_before_the_call_returns() {
+        let dir = scratch("cancel-reap");
+        let marker = dir.join("marker");
+        let argv = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(format!(
+                "sleep 0.4; touch {}",
+                shell_quote(&marker.to_string_lossy())
+            )),
+        ];
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        let err = run_inheriting(&argv, &cancel).await.unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        // Reaped, not merely signalled: the child is gone *now*, so the work it
+        // would have done cannot land after this point.
+        assert!(!marker.exists(), "the child was killed before it wrote");
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(
+            !marker.exists(),
+            "a signalled-but-unreaped child would have finished by now"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The staging file is deleted on every exit path *except* cancellation,
+    /// where the elevated (root) write may still be reading it.
+    #[test]
+    fn a_defused_staging_file_outlives_its_drop() {
+        let dir = scratch("defuse");
+        let path;
+        {
+            let mut staged = StagedTemp::create(&dir, "x").unwrap();
+            path = staged.path.clone();
+            staged.defuse();
+        }
+        assert!(
+            path.exists(),
+            "a cancelled elevation must not pull the file out from under root"
+        );
+
+        // …and the next privileged write is what collects it — but only once it
+        // is old enough that no concurrent run can still be using it.
+        sweep_stale_staging(&dir);
+        assert!(path.exists(), "a fresh staging file is never swept");
+        let old = std::time::SystemTime::now() - STAGING_SWEEP_AGE - Duration::from_secs(60);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(old))
+            .unwrap();
+        let bystander = dir.join("session.json");
+        std::fs::write(&bystander, "keep me").unwrap();
+        sweep_stale_staging(&dir);
+        assert!(!path.exists(), "a stale staging file is swept");
+        assert!(bystander.exists(), "only host-manifest-*.json is swept");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the announced mechanism ──────────────────────────────────────────────
+
+    #[test]
+    fn the_announcement_names_the_method_detect_actually_picked() {
+        assert_eq!(
+            needs_admin_reason(AdminMethod::Osascript),
+            NEEDS_ADMIN_REASON
+        );
+        assert_eq!(
+            needs_admin_reason(AdminMethod::Sudo),
+            NEEDS_ADMIN_REASON_SUDO
+        );
+        // The sudo path prompts on a terminal that may well be *behind* the
+        // window the user is looking at (`npm run tauri dev`), so the row has
+        // to say where to look.
+        assert!(
+            needs_admin_reason(AdminMethod::Sudo).contains("terminal that launched Sabrage"),
+            "{}",
+            NEEDS_ADMIN_REASON_SUDO
+        );
+        assert!(!needs_admin_reason(AdminMethod::Osascript).contains("terminal"));
+        // Both still say what the password buys, which is the other half of
+        // design-core §5.4's promise.
+        for method in [AdminMethod::Osascript, AdminMethod::Sudo] {
+            assert!(
+                needs_admin_reason(method).contains("host OpenXR registration")
+                    && needs_admin_reason(method).contains("repo path changes"),
+                "{}",
+                needs_admin_reason(method)
+            );
+        }
+    }
+
+    // ── cp -R refusals (install layer 1) ─────────────────────────────────────
+
+    #[test]
+    fn a_refused_cp_into_a_bundle_is_upgraded_like_a_refused_write() {
+        let (ctx, seen) = ctx_with(StageOptions {
+            bottle_name: Some("BS".into()),
+            ..Default::default()
+        });
+        let backup = PathBuf::from(
+            "/Applications/CrossOver.app/Contents/SharedSupport/CrossOver/lib/dxmt.stock-backup",
+        );
+        let refused = || SabrageError::ChildFailed {
+            argv0: "cp".into(),
+            status: 1,
+            tail: vec![format!("cp: {}: Permission denied", backup.display())],
+        };
+
+        let upgraded = upgrade_child_write_error(&ctx, refused(), &backup);
+        assert_eq!(upgraded.kind(), "tcc_denied");
+        assert!(matches!(&upgraded, SabrageError::TccDenied { path } if path == &backup));
+        let evs = seen.lock().unwrap().clone();
+        assert_eq!(evs.len(), 1, "the prose is emitted once, here: {evs:?}");
+        let StageEvent::Fatal {
+            message, remedy, ..
+        } = &evs[0]
+        else {
+            panic!("expected Fatal, got {:?}", evs[0]);
+        };
+        assert_eq!(message, &app_management_message(&backup));
+        assert_eq!(
+            remedy.as_deref(),
+            Some(app_management_remedy(Some("BS")).as_str())
+        );
+
+        // A destination outside a bundle, a tail that is not a refusal, and a
+        // non-child error all pass through untouched and emit nothing more.
+        let outside = PathBuf::from("/usr/local/share/openxr/1");
+        assert_eq!(
+            upgrade_child_write_error(&ctx, refused(), &outside).kind(),
+            "child_failed"
+        );
+        let full = SabrageError::ChildFailed {
+            argv0: "cp".into(),
+            status: 1,
+            tail: vec!["cp: no space left on device".into()],
+        };
+        assert_eq!(
+            upgrade_child_write_error(&ctx, full, &backup).kind(),
+            "child_failed"
+        );
+        assert_eq!(
+            upgrade_child_write_error(&ctx, SabrageError::Cancelled, &backup).kind(),
+            "cancelled"
+        );
+        assert_eq!(seen.lock().unwrap().len(), 1, "no further events");
+    }
+
+    #[test]
+    fn a_permission_tail_is_recognised_in_either_spelling() {
+        assert!(tail_is_permission_denied(&[
+            "cp: /x: Permission denied".into()
+        ]));
+        assert!(tail_is_permission_denied(&[
+            "cp: /x: Operation not permitted".into()
+        ]));
+        assert!(!tail_is_permission_denied(&["cp: /x: No such file".into()]));
+        assert!(!tail_is_permission_denied(&[]));
     }
 
     #[test]

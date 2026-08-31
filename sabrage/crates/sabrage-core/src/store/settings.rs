@@ -11,14 +11,22 @@
 //!
 //! Every field carries `#[serde(default)]` (via the struct-level attribute on
 //! [`Settings`] and [`LaunchDefaults`]), so an older file — or a hand-trimmed
-//! one — still loads: an unrecognized field is silently ignored, a missing one
-//! falls back to its default. A file that fails to *parse* at all is a hard
-//! [`crate::error::SabrageError`], never a silent reset — a corrupt
-//! `settings.json` should be visible, not quietly replaced.
+//! one — still loads: a missing field falls back to its default. A file that
+//! fails to *parse* at all is a hard [`crate::error::SabrageError`], never a
+//! silent reset — a corrupt `settings.json` should be visible, not quietly
+//! replaced.
+//!
+//! Fields this binary does **not** know are not ignored either: they are
+//! captured into [`Settings::extra`] and written back out verbatim by the next
+//! [`save`]. Without that, running an older Sabrage once — and touching one
+//! toggle, which autosaves the whole object — would silently delete everything
+//! a newer build had written. [`SETTINGS_VERSION`] rides along for the case a
+//! future change cannot be expressed as "unknown keys, preserved".
 
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use serde_json::{Map, Value};
 
 use crate::error::{Result, SabrageError};
 use crate::executor::Executor;
@@ -38,6 +46,10 @@ pub struct LaunchDefaults {
     pub verbose: bool,
 }
 
+/// Schema version written by this Sabrage into `settings.json`. Bump it only
+/// for a change [`Settings::extra`]'s verbatim round-trip cannot absorb.
+pub const SETTINGS_VERSION: u32 = 1;
+
 /// Sabrage's global preferences.
 ///
 /// `repo_root`/`default_bottle`/`default_bs_dir` are `None` until the user has
@@ -45,9 +57,13 @@ pub struct LaunchDefaults {
 /// configured yet", and every reader (`resolve_repo_root`,
 /// `library::new_entry_template`) already has its own fallback chain for that
 /// case.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
+    /// [`SETTINGS_VERSION`] at write time. A file without one (every file
+    /// written before this field existed) reads as the current version — its
+    /// shape *is* the current shape.
+    pub version: u32,
     /// Persisted override for [`crate::paths::resolve_repo_root`]'s first
     /// precedence tier.
     pub repo_root: Option<String>,
@@ -72,17 +88,32 @@ pub struct Settings {
     /// deployed settings file (this field is new) must still show the panel
     /// once.
     pub runtime_config_edit_acknowledged: bool,
+    /// Every top-level key this binary does not have a field for, kept exactly
+    /// as read and written straight back out.
+    ///
+    /// This is the whole downgrade-safety story: the UI autosaves a complete
+    /// `Settings` object on every control change, so anything not represented
+    /// here would be deleted the first time an older build touched one toggle.
+    /// Flattened, so the keys sit at the top level of the JSON where they were
+    /// found; skipped when empty, so an ordinary file's bytes are unchanged.
+    ///
+    /// (This is also why [`Settings`] is no longer `Eq`: [`Value`] is only
+    /// `PartialEq` — `f64` has no total equality.)
+    #[serde(flatten, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 impl Default for Settings {
     fn default() -> Settings {
         Settings {
+            version: SETTINGS_VERSION,
             repo_root: None,
             default_bottle: None,
             default_bs_dir: None,
             launch: LaunchDefaults::default(),
             allow_adb_probes: true,
             runtime_config_edit_acknowledged: false,
+            extra: Map::new(),
         }
     }
 }
@@ -190,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn unknown_fields_are_ignored_on_load() {
+    fn unknown_fields_load_into_extra_instead_of_failing() {
         let dir = scratch("unknown-fields");
         let path = dir.join("settings.json");
         std::fs::write(
@@ -200,6 +231,65 @@ mod tests {
         .unwrap();
         let s = load(&path).unwrap();
         assert_eq!(s.repo_root.as_deref(), Some("/repo"));
+        assert_eq!(s.extra.len(), 2, "{:?}", s.extra);
+        assert_eq!(s.extra["anotherOne"], serde_json::json!(42));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn unknown_fields_survive_a_load_save_round_trip() {
+        // The downgrade case: an older binary loads a newer file, the user
+        // flips one toggle, and the whole object is autosaved back.
+        let dir = scratch("downgrade");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"repoRoot":"/repo","futureSetting":{"nested":true},"futureFlag":false}"#,
+        )
+        .unwrap();
+
+        let mut s = load(&path).unwrap();
+        s.allow_adb_probes = false; // the one control the old build knows
+        save(&real(), &path, &s).await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"futureSetting\""), "{text}");
+        assert!(text.contains("\"futureFlag\""), "{text}");
+        let reread = load(&path).unwrap();
+        assert!(!reread.allow_adb_probes);
+        assert_eq!(reread.extra, s.extra);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_without_a_version_reads_as_the_current_one() {
+        let s: Settings = serde_json::from_str(r#"{"repoRoot":"/repo"}"#).unwrap();
+        assert_eq!(s.version, SETTINGS_VERSION);
+        assert!(s.extra.is_empty());
+    }
+
+    #[tokio::test]
+    async fn an_ordinary_settings_file_carries_no_extra_keys() {
+        let dir = scratch("no-extra");
+        let path = dir.join("settings.json");
+        save(&real(), &path, &Settings::default()).await.unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
+        assert_eq!(
+            keys,
+            vec![
+                "version",
+                "repoRoot",
+                "defaultBottle",
+                "defaultBsDir",
+                "launch",
+                "allowAdbProbes",
+                "runtimeConfigEditAcknowledged"
+            ],
+            "an empty `extra` must add nothing to the file"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -219,6 +309,7 @@ mod tests {
             },
             allow_adb_probes: false,
             runtime_config_edit_acknowledged: true,
+            ..Settings::default()
         };
         assert_eq!(
             load(&path).unwrap(),

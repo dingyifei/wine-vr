@@ -13,13 +13,21 @@
 //! The consumer is not a TOML library. `ext/oxrsys/runtime/src/Config.cpp` is a
 //! line-oriented reader (verified 2026-08-30):
 //!
-//! * `#` starts a comment (quote-aware) and the rest of the line is discarded;
+//! * `#` starts a comment and the rest of the line is discarded, unless a `"`
+//!   opened a string first. **Only `"` toggles string context**
+//!   (`StripTomlComment`) — `'` is an ordinary character and there is no escape
+//!   handling anywhere in that parser;
 //! * blank lines and `[table]` headers are skipped — **tables are ignored
 //!   entirely**, so a key counts wherever it sits;
 //! * the line is split on its first `=`, both halves trimmed;
-//! * a later assignment overwrites an earlier one — **last wins**;
-//! * a value outside the accepted set is *silently ignored* and the compiled-in
-//!   default stays.
+//! * a string value loses **one pair of double quotes** and nothing else
+//!   (`ParseString`): `'alvr'` stays `'alvr'` and matches no accepted value;
+//! * a later *accepted* assignment overwrites an earlier one — **last valid
+//!   wins**;
+//! * a value outside the accepted set is *silently ignored* and whatever the
+//!   previous accepted assignment (or the compiled-in default) left behind
+//!   stays — Config.cpp's "Ignore malformed values and keep the last
+//!   valid/default setting".
 //!
 //! Three consequences shape this module:
 //!
@@ -35,13 +43,25 @@
 //!    copy carries a four-line provenance header about a Catch2 run that once
 //!    clobbered it — so a reformat would destroy real user notes.
 //!
-//! # Two readers
+//! # One reader, one editor
 //!
-//! [`read`] parses with `toml_edit` and, when that fails, falls back to
-//! [`read_lines_like_the_runtime`] — the runtime's own semantics — so the GUI
-//! can still show what the runtime *would* use in a file neither the GUI nor
-//! `toml_edit` can round-trip. In that state [`RuntimeConfigView::parse_error`]
-//! is set and writes are refused: never rewrite a file you cannot round-trip.
+//! **Values always come from [`read_lines_like_the_runtime`]** — the port of
+//! `ParseConfigToml` — because the only question the Settings screen ever asks
+//! is "what will the runtime use?". `toml_edit` answers a different question
+//! (what does a TOML *implementation* see), and the two genuinely disagree:
+//! `protocol = 'alvr'` is a valid TOML string and a value the runtime throws
+//! away; a `"""…"""` block is one string to `toml_edit` and a run of live
+//! assignments to the runtime. Showing the TOML answer is how the GUI ends up
+//! reporting ALVR for a file that streams over the legacy path.
+//!
+//! `toml_edit` is kept for the other half of the job: deciding whether the file
+//! can be *rewritten* safely, and doing the rewrite.
+//! [`RuntimeConfigView::parse_error`] carries that verdict — it is set when
+//! `toml_edit` cannot parse the file at all, and also when the physical lines
+//! and the parsed document disagree about where an editable key lives (the
+//! multiline-string case above), because an edit would then land on a line the
+//! runtime does not read. Writes are refused in both states: never rewrite a
+//! file you cannot round-trip.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -302,24 +322,55 @@ pub fn read(path: &Path) -> RuntimeConfigView {
         }
     };
 
-    match text.parse::<DocumentMut>() {
-        Ok(doc) => {
-            let (values, invalid, shadowed) = harvest(&doc);
-            view.values = values;
-            view.invalid = invalid;
-            view.shadowed = shadowed;
-        }
-        Err(e) => {
-            // The runtime does not care that the file is invalid TOML — it
-            // reads lines. Show what it would use, and refuse to write.
-            view.parse_error = Some(e.to_string());
-            let (values, invalid, shadowed) = read_lines_like_the_runtime(&text);
-            view.values = values;
-            view.invalid = invalid;
-            view.shadowed = shadowed;
+    view.fill_from(&text);
+    view
+}
+
+impl RuntimeConfigView {
+    /// Everything a view derives from the file's bytes: what the runtime would
+    /// use (always the line reader) and whether Sabrage may rewrite the file.
+    fn fill_from(&mut self, text: &str) {
+        let (values, invalid, shadowed) = read_lines_like_the_runtime(text);
+        self.values = values;
+        self.invalid = invalid;
+        self.shadowed = shadowed;
+        self.parse_error = round_trip_error(text);
+    }
+}
+
+/// Why this file must not be rewritten, if it must not be — the value
+/// [`RuntimeConfigView::parse_error`] carries and [`write`] refuses on.
+///
+/// Two reasons, both meaning "an edit would not land where the runtime looks":
+///
+/// 1. `toml_edit` cannot parse it at all, so [`apply_patch`] has no document;
+/// 2. it parses, but the physical lines carry an assignment of an editable key
+///    that the document does not — a `"""…"""` (or `'''…'''`) block whose
+///    content looks like `protocol = "oxrsys"`. The runtime reads that line;
+///    `toml_edit` sees string content, so an edit would rewrite some *other*
+///    line and the runtime would keep obeying the one inside the string.
+fn round_trip_error(text: &str) -> Option<String> {
+    let body = strip_bom(text);
+    let doc = match body.parse::<DocumentMut>() {
+        Ok(doc) => doc,
+        Err(e) => return Some(e.to_string()),
+    };
+    let seen: Vec<(&str, &str)> = raw_assignments(text).collect();
+    for key in EDITABLE_KEYS {
+        let physical = seen.iter().filter(|(k, _)| *k == key).count();
+        if physical > occurrences_of(doc.as_table(), key).len() {
+            return Some(format!(
+                "'{key}' is assigned on a physical line that TOML reads as string content (a \
+                 multiline string): the runtime honours that line and an edit here could not \
+                 reach it — edit this file by hand"
+            ));
         }
     }
-    view
+    None
+}
+
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
 }
 
 /// Millisecond mtime, for "the file changed under us" checks in the UI.
@@ -331,102 +382,207 @@ fn modified_unix_ms(path: &Path) -> Option<u64> {
         .map(|d| d.as_millis() as u64)
 }
 
-/// Pull the six keys out of a parsed document with the runtime's resolution
-/// rules: every table counts, the last assignment wins.
-fn harvest(doc: &DocumentMut) -> (RuntimeConfigValues, Vec<InvalidValue>, Vec<String>) {
-    let mut values = RuntimeConfigValues::default();
-    let mut invalid = Vec::new();
-    let mut shadowed = Vec::new();
+// ── the six settings, once ───────────────────────────────────────────────────
 
-    for key in EDITABLE_KEYS {
-        let occurrences = occurrences_of(doc.as_table(), key);
-        if occurrences.len() > 1 {
-            shadowed.push(key.to_string());
-        }
-        let Some(last) = occurrences.last() else {
-            continue;
-        };
-        let Some(value) = value_at(doc.as_table(), &last.path, key) else {
-            continue;
-        };
-        match interpret(key, value) {
-            Ok(()) => {}
-            Err(bad) => {
-                invalid.push(bad);
-                continue;
-            }
-        }
-        assign(&mut values, key, value);
-    }
-    (values, invalid, shadowed)
+/// One accepted assignment of one editable key.
+///
+/// Parsing into this instead of validating a `&str` in one place and
+/// re-deriving it in another is what keeps [`read_lines_like_the_runtime`],
+/// [`validate`] and [`apply_patch`] from drifting: a value that produced a
+/// `Setting` is by construction one the runtime accepts, and each key's
+/// accepted set is spelled out exactly once, in [`accepted`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Setting {
+    Protocol(Protocol),
+    VideoCodec(VideoCodec),
+    EncoderProcess(EncoderProcess),
+    Bitrate(u32),
+    Refresh(u32),
+    Scale(f64),
 }
 
-/// Type-check one `toml_edit` value against the runtime's accepted set,
-/// producing the [`InvalidValue`] the UI shows when it does not fit.
-fn interpret(key: &str, value: &Value) -> std::result::Result<(), InvalidValue> {
-    let raw = value_repr(value);
+/// What the runtime accepts for one key, phrased for the UI. One string per
+/// key, in one place — every [`InvalidValue::reason`] comes from here.
+fn accepted(key: &str) -> String {
     match key {
-        "protocol" => match value.as_str().and_then(Protocol::parse) {
-            Some(_) => Ok(()),
-            None => Err(InvalidValue::new(
-                key,
-                raw,
-                "expected \"alvr\" or \"oxrsys\"",
-            )),
-        },
-        "video_codec" => match value.as_str().and_then(VideoCodec::parse) {
-            Some(_) => Ok(()),
-            None => Err(InvalidValue::new(
-                key,
-                raw,
-                "expected \"auto\", \"h265\" or \"h264\"",
-            )),
-        },
-        "encoder_process" => match value.as_str().and_then(EncoderProcess::parse) {
-            Some(_) => Ok(()),
-            None => Err(InvalidValue::new(
-                key,
-                raw,
-                "expected \"auto\", \"native\" or \"inproc\"",
-            )),
-        },
-        "bitrate_mbps" => match value.as_integer() {
-            Some(n) if in_bitrate_range(n) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, bitrate_reason())),
-        },
-        "refresh_rate_hz" => match value.as_integer() {
-            Some(n) if REFRESH_RATES.iter().any(|r| i64::from(*r) == n) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, refresh_reason())),
-        },
-        "resolution_scale" => match as_scale(value) {
-            Some(f) if in_scale_range(f) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, scale_reason())),
-        },
-        _ => Ok(()),
+        "protocol" => "expected \"alvr\" or \"oxrsys\"".to_string(),
+        "video_codec" => "expected \"auto\", \"h265\" or \"h264\"".to_string(),
+        "encoder_process" => "expected \"auto\", \"native\" or \"inproc\"".to_string(),
+        "bitrate_mbps" => format!(
+            "expected an integer {}..={}",
+            BITRATE_RANGE.0, BITRATE_RANGE.1
+        ),
+        "refresh_rate_hz" => format!(
+            "expected one of {}",
+            REFRESH_RATES
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+        "resolution_scale" => format!(
+            "expected a number {}..={}",
+            RESOLUTION_SCALE_RANGE.0, RESOLUTION_SCALE_RANGE.1
+        ),
+        _ => String::new(),
     }
 }
 
-/// Store an already-validated value.
-fn assign(values: &mut RuntimeConfigValues, key: &str, value: &Value) {
-    match key {
-        "protocol" => values.protocol = value.as_str().and_then(Protocol::parse),
-        "video_codec" => values.video_codec = value.as_str().and_then(VideoCodec::parse),
-        "encoder_process" => {
-            values.encoder_process = value.as_str().and_then(EncoderProcess::parse)
+impl Setting {
+    /// Which key this is an assignment of.
+    fn key(self) -> &'static str {
+        match self {
+            Setting::Protocol(_) => "protocol",
+            Setting::VideoCodec(_) => "video_codec",
+            Setting::EncoderProcess(_) => "encoder_process",
+            Setting::Bitrate(_) => "bitrate_mbps",
+            Setting::Refresh(_) => "refresh_rate_hz",
+            Setting::Scale(_) => "resolution_scale",
         }
-        "bitrate_mbps" => values.bitrate_mbps = value.as_integer().map(|n| n as u32),
-        "refresh_rate_hz" => values.refresh_rate_hz = value.as_integer().map(|n| n as u32),
-        "resolution_scale" => values.resolution_scale = as_scale(value),
-        _ => {}
+    }
+
+    /// Read one raw line value the way `ParseConfigToml` does: one pair of
+    /// **double** quotes comes off, `std::stoi`/`std::stof` become Rust's
+    /// numeric parses, and the accepted set is checked.
+    ///
+    /// `Ok(None)` means "not one of the six" — the runtime knows plenty of
+    /// other keys and Sabrage passes them through untouched.
+    fn read_raw(key: &str, raw: &str) -> std::result::Result<Option<Setting>, InvalidValue> {
+        let s = unquote(raw);
+        let parsed = match key {
+            "protocol" => Protocol::parse(s).map(Setting::Protocol),
+            "video_codec" => VideoCodec::parse(s).map(Setting::VideoCodec),
+            "encoder_process" => EncoderProcess::parse(s).map(Setting::EncoderProcess),
+            "bitrate_mbps" => stoi(s)
+                .filter(|n| in_bitrate_range(*n))
+                .map(|n| Setting::Bitrate(n as u32)),
+            "refresh_rate_hz" => stoi(s)
+                .filter(|n| REFRESH_RATES.iter().any(|r| i64::from(*r) == *n))
+                .map(|n| Setting::Refresh(n as u32)),
+            "resolution_scale" => stof(s).filter(|f| in_scale_range(*f)).map(Setting::Scale),
+            _ => return Ok(None),
+        };
+        parsed
+            .map(Some)
+            .ok_or_else(|| InvalidValue::new(key, raw, accepted(key)))
+    }
+
+    /// This key's value in a patch, if the patch sets it. Unvalidated: the
+    /// enums cannot be wrong, the three numbers can, and [`validate`] is where
+    /// that is decided.
+    fn from_patch(key: &str, patch: &RuntimeConfigPatch) -> Option<Setting> {
+        match key {
+            "protocol" => patch.protocol.map(Setting::Protocol),
+            "video_codec" => patch.video_codec.map(Setting::VideoCodec),
+            "encoder_process" => patch.encoder_process.map(Setting::EncoderProcess),
+            "bitrate_mbps" => patch.bitrate_mbps.map(Setting::Bitrate),
+            "refresh_rate_hz" => patch.refresh_rate_hz.map(Setting::Refresh),
+            "resolution_scale" => patch.resolution_scale.map(Setting::Scale),
+            _ => None,
+        }
+    }
+
+    /// The complaint to show when a patch carries a value the runtime would
+    /// ignore, or `None` when it would not.
+    fn out_of_range(self) -> Option<InvalidValue> {
+        let bad = |raw: String| Some(InvalidValue::new(self.key(), raw, accepted(self.key())));
+        match self {
+            Setting::Bitrate(n) if !in_bitrate_range(i64::from(n)) => bad(n.to_string()),
+            Setting::Refresh(hz) if !REFRESH_RATES.contains(&hz) => bad(hz.to_string()),
+            Setting::Scale(f) if !in_scale_range(f) => bad(format!("{f}")),
+            _ => None,
+        }
+    }
+
+    /// Store an accepted assignment. Later calls win, which is the runtime's
+    /// last-valid-wins rule expressed as a fold.
+    fn apply(self, values: &mut RuntimeConfigValues) {
+        match self {
+            Setting::Protocol(p) => values.protocol = Some(p),
+            Setting::VideoCodec(c) => values.video_codec = Some(c),
+            Setting::EncoderProcess(e) => values.encoder_process = Some(e),
+            Setting::Bitrate(n) => values.bitrate_mbps = Some(n),
+            Setting::Refresh(hz) => values.refresh_rate_hz = Some(hz),
+            Setting::Scale(f) => values.resolution_scale = Some(f),
+        }
+    }
+
+    /// The canonical spelling Sabrage writes: integers bare (`80`), floats
+    /// always with a fractional part (`1.0`, never `1` — `resolution_scale` is
+    /// a float key and a bare `1` reads as an integer to a stricter parser),
+    /// strings as basic (double-quoted) strings, which is the only string form
+    /// the runtime unquotes.
+    fn to_value(self) -> Value {
+        match self {
+            Setting::Protocol(p) => string_value(p.as_str()),
+            Setting::VideoCodec(c) => string_value(c.as_str()),
+            Setting::EncoderProcess(e) => string_value(e.as_str()),
+            Setting::Bitrate(n) => Value::Integer(Formatted::new(i64::from(n))),
+            Setting::Refresh(hz) => Value::Integer(Formatted::new(i64::from(hz))),
+            Setting::Scale(f) => Value::Float(Formatted::new(f)),
+        }
     }
 }
 
-/// `resolution_scale` is a float key, but `1` parses as a TOML integer and the
-/// runtime's `std::stod` accepts it, so accept both here too.
-fn as_scale(value: &Value) -> Option<f64> {
-    value
-        .as_float()
-        .or_else(|| value.as_integer().map(|n| n as f64))
+/// `std::stoi`, whose prefix rule Rust's `parse` does not share: an optional
+/// sign and the run of decimal digits after it, with everything past that
+/// ignored, and a throw (→ `None`) when there are no leading digits at all.
+///
+/// So `80 # old` never reaches here (the comment is already stripped), `80abc`
+/// is 80, TOML's `1_0` is **1**, and `0x50` is `0` — base 10 stops at the `x`,
+/// which is why a hex-spelled bitrate reads as out of range rather than as 80.
+/// Being stricter than this looks safer and is not: it makes Sabrage report a
+/// value the runtime is not using.
+fn stoi(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    if i == start {
+        return None;
+    }
+    s[..i].parse::<i64>().ok()
+}
+
+/// `std::stof`, same prefix rule: optional sign, digits, optional fraction,
+/// optional exponent — `0.9 (was 0.75)` is 0.9, `abc` throws.
+///
+/// The exotic spellings `strtof` also takes (`0x1p3`, `inf`, `nan`) are left
+/// out: `in_scale_range` rejects every one of them anyway.
+fn stof(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let mut i = usize::from(matches!(b.first(), Some(b'+' | b'-')));
+    let int_start = i;
+    while i < b.len() && b[i].is_ascii_digit() {
+        i += 1;
+    }
+    let mut digits = i - int_start;
+    if b.get(i) == Some(&b'.') {
+        i += 1;
+        while i < b.len() && b[i].is_ascii_digit() {
+            digits += 1;
+            i += 1;
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    if b.get(i).is_some_and(|c| c.eq_ignore_ascii_case(&b'e')) {
+        let mut j = i + 1;
+        if matches!(b.get(j), Some(b'+' | b'-')) {
+            j += 1;
+        }
+        let exp_start = j;
+        while j < b.len() && b[j].is_ascii_digit() {
+            j += 1;
+        }
+        if j > exp_start {
+            i = j;
+        }
+    }
+    s[..i].parse::<f64>().ok()
 }
 
 fn in_bitrate_range(n: i64) -> bool {
@@ -437,147 +593,117 @@ fn in_scale_range(f: f64) -> bool {
     f.is_finite() && f >= RESOLUTION_SCALE_RANGE.0 && f <= RESOLUTION_SCALE_RANGE.1
 }
 
-fn bitrate_reason() -> String {
-    format!(
-        "expected an integer {}..={}",
-        BITRATE_RANGE.0, BITRATE_RANGE.1
-    )
-}
+// ── the reader (the runtime's own semantics) ─────────────────────────────────
 
-fn refresh_reason() -> String {
-    format!(
-        "expected one of {}",
-        REFRESH_RATES
-            .iter()
-            .map(u32::to_string)
-            .collect::<Vec<_>>()
-            .join(", ")
-    )
-}
-
-fn scale_reason() -> String {
-    format!(
-        "expected a number {}..={}",
-        RESOLUTION_SCALE_RANGE.0, RESOLUTION_SCALE_RANGE.1
-    )
-}
-
-// ── the fallback reader (the runtime's own semantics) ────────────────────────
-
-/// `ext/oxrsys/runtime/src/Config.cpp`, ported: strip the quote-aware `#`
-/// comment, skip blanks and `[table]` headers, split on the first `=`, trim,
-/// last assignment wins.
+/// Every `key = value` the runtime's line reader sees, in physical order.
 ///
-/// Used only when `toml_edit` cannot parse the file. It is deliberately *not*
-/// the primary reader: it cannot round-trip, so nothing built on it may write.
+/// `ext/oxrsys/runtime/src/Config.cpp`'s `ParseConfigToml` loop, ported: strip
+/// the `"`-aware `#` comment, skip blanks and `[table]` headers, split on the
+/// first `=`, trim both halves. Tables are not tracked because the runtime does
+/// not track them — a key counts wherever it sits.
+fn raw_assignments(text: &str) -> impl Iterator<Item = (&str, &str)> {
+    text.lines().filter_map(|line| {
+        let line = strip_comment(line).trim();
+        if line.is_empty() || line.starts_with('[') {
+            return None;
+        }
+        let (k, v) = line.split_once('=')?;
+        Some((k.trim(), v.trim()))
+    })
+}
+
+/// What the runtime would use, read the way the runtime reads it.
+///
+/// This is the **primary** reader (see the module header): every value the GUI
+/// shows comes from here, whether or not `toml_edit` can also parse the file.
+///
+/// Folds each key's occurrences in physical order and keeps the last one the
+/// runtime would *accept* — Config.cpp assigns only inside its whitelist and
+/// its `catch` block "ignore[s] malformed values and keep[s] the last
+/// valid/default setting", so a valid assignment followed by a junk one still
+/// leaves the valid value in force. Every rejected occurrence is reported in
+/// `invalid`; a key assigned more than once is reported in `shadowed`.
 pub fn read_lines_like_the_runtime(
     text: &str,
 ) -> (RuntimeConfigValues, Vec<InvalidValue>, Vec<String>) {
-    let mut seen: Vec<(String, String)> = Vec::new();
-    for line in text.lines() {
-        let line = strip_comment(line);
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('[') {
-            continue;
-        }
-        let Some((k, v)) = line.split_once('=') else {
-            continue;
-        };
-        seen.push((k.trim().to_string(), v.trim().to_string()));
-    }
+    let seen: Vec<(&str, &str)> = raw_assignments(text).collect();
 
     let mut values = RuntimeConfigValues::default();
     let mut invalid = Vec::new();
     let mut shadowed = Vec::new();
     for key in EDITABLE_KEYS {
-        let hits: Vec<&String> = seen
-            .iter()
-            .filter(|(k, _)| k == key)
-            .map(|(_, v)| v)
-            .collect();
-        if hits.len() > 1 {
-            shadowed.push(key.to_string());
+        let hits = seen.iter().filter(|(k, _)| *k == key).map(|(_, v)| *v);
+        let mut count = 0usize;
+        for raw in hits {
+            count += 1;
+            match Setting::read_raw(key, raw) {
+                Ok(Some(setting)) => setting.apply(&mut values),
+                Ok(None) => {}
+                Err(bad) => {
+                    if !invalid.contains(&bad) {
+                        invalid.push(bad);
+                    }
+                }
+            }
         }
-        let Some(raw) = hits.last() else { continue };
-        match interpret_raw(key, raw) {
-            Ok(()) => assign_raw(&mut values, key, raw),
-            Err(bad) => invalid.push(bad),
+        if count > 1 {
+            shadowed.push(key.to_string());
         }
     }
     (values, invalid, shadowed)
 }
 
-/// The runtime's comment stripper: `#` ends the line unless it is inside a
-/// quoted string. Both quote flavours, with backslash escapes in basic strings.
+/// The value the runtime would end up with for **any** key, as a plain string,
+/// with no accepted-set filtering.
+///
+/// The runtime's own rule for the keys Sabrage does not model: last assignment
+/// in the file wins, whatever table it sits in, with one pair of double quotes
+/// removed. `None` means the key is never assigned, so the caller's own default
+/// applies (`${…:-auto}` in the shell).
+///
+/// This exists so the doctor checks, the helper fixes and the run preflight
+/// stop each carrying their own approximation of `ParseConfigToml` — those
+/// hand-rolled `awk`/split parsers are first-match-wins and quote-blind, which
+/// is a different file than the one the runtime reads. Deliberately free of
+/// `toml_edit`: it answers what the runtime does, not what TOML says.
+pub fn effective_string(text: &str, key: &str) -> Option<String> {
+    raw_assignments(text)
+        .filter(|(k, _)| *k == key)
+        .map(|(_, v)| unquote(v).to_string())
+        .last()
+}
+
+/// The runtime's comment stripper (`StripTomlComment`): `#` ends the line
+/// unless a `"` opened a string first.
+///
+/// Only `"` toggles, and there is no escape handling — both deliberately, to
+/// match Config.cpp byte for byte. A `'` is an ordinary character there, so
+/// `x = 'a # b'` really does lose everything from the `#`, and a `\"` inside a
+/// basic string really does close it.
 fn strip_comment(line: &str) -> &str {
-    let bytes = line.as_bytes();
-    let mut in_basic = false;
-    let mut in_literal = false;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' if in_basic => i += 1,
-            b'"' if !in_literal => in_basic = !in_basic,
-            b'\'' if !in_basic => in_literal = !in_literal,
-            b'#' if !in_basic && !in_literal => return &line[..i],
+    let mut in_string = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_string = !in_string,
+            '#' if !in_string => return &line[..i],
             _ => {}
         }
-        i += 1;
     }
     line
 }
 
-/// Strip one layer of matching quotes, the way the runtime does before
-/// comparing a string value.
+/// Strip one layer of **double** quotes, the way the runtime's `ParseString`
+/// does before comparing a string value.
+///
+/// Double quotes only, and no escape processing: `'alvr'` keeps its quotes and
+/// therefore matches nothing in the runtime's whitelist, which is why Sabrage
+/// reports that spelling invalid and rewrites it as `"alvr"`.
 fn unquote(raw: &str) -> &str {
     let b = raw.as_bytes();
-    if b.len() >= 2
-        && ((b[0] == b'"' && b[b.len() - 1] == b'"') || (b[0] == b'\'' && b[b.len() - 1] == b'\''))
-    {
+    if b.len() >= 2 && b[0] == b'"' && b[b.len() - 1] == b'"' {
         &raw[1..raw.len() - 1]
     } else {
         raw
-    }
-}
-
-fn interpret_raw(key: &str, raw: &str) -> std::result::Result<(), InvalidValue> {
-    let s = unquote(raw);
-    match key {
-        "protocol" => Protocol::parse(s)
-            .map(|_| ())
-            .ok_or_else(|| InvalidValue::new(key, raw, "expected \"alvr\" or \"oxrsys\"")),
-        "video_codec" => VideoCodec::parse(s)
-            .map(|_| ())
-            .ok_or_else(|| InvalidValue::new(key, raw, "expected \"auto\", \"h265\" or \"h264\"")),
-        "encoder_process" => EncoderProcess::parse(s).map(|_| ()).ok_or_else(|| {
-            InvalidValue::new(key, raw, "expected \"auto\", \"native\" or \"inproc\"")
-        }),
-        "bitrate_mbps" => match s.parse::<i64>() {
-            Ok(n) if in_bitrate_range(n) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, bitrate_reason())),
-        },
-        "refresh_rate_hz" => match s.parse::<i64>() {
-            Ok(n) if REFRESH_RATES.iter().any(|r| i64::from(*r) == n) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, refresh_reason())),
-        },
-        "resolution_scale" => match s.parse::<f64>() {
-            Ok(f) if in_scale_range(f) => Ok(()),
-            _ => Err(InvalidValue::new(key, raw, scale_reason())),
-        },
-        _ => Ok(()),
-    }
-}
-
-fn assign_raw(values: &mut RuntimeConfigValues, key: &str, raw: &str) {
-    let s = unquote(raw);
-    match key {
-        "protocol" => values.protocol = Protocol::parse(s),
-        "video_codec" => values.video_codec = VideoCodec::parse(s),
-        "encoder_process" => values.encoder_process = EncoderProcess::parse(s),
-        "bitrate_mbps" => values.bitrate_mbps = s.parse::<u32>().ok(),
-        "refresh_rate_hz" => values.refresh_rate_hz = s.parse::<u32>().ok(),
-        "resolution_scale" => values.resolution_scale = s.parse::<f64>().ok(),
-        _ => {}
     }
 }
 
@@ -590,35 +716,11 @@ fn assign_raw(values: &mut RuntimeConfigValues, key: &str, raw: &str) {
 /// refusing — the file would look edited and the runtime would keep its
 /// default.
 pub fn validate(patch: &RuntimeConfigPatch) -> Vec<InvalidValue> {
-    let mut out = Vec::new();
-    if let Some(n) = patch.bitrate_mbps {
-        if !in_bitrate_range(i64::from(n)) {
-            out.push(InvalidValue::new(
-                "bitrate_mbps",
-                n.to_string(),
-                bitrate_reason(),
-            ));
-        }
-    }
-    if let Some(hz) = patch.refresh_rate_hz {
-        if !REFRESH_RATES.contains(&hz) {
-            out.push(InvalidValue::new(
-                "refresh_rate_hz",
-                hz.to_string(),
-                refresh_reason(),
-            ));
-        }
-    }
-    if let Some(f) = patch.resolution_scale {
-        if !in_scale_range(f) {
-            out.push(InvalidValue::new(
-                "resolution_scale",
-                format!("{f}"),
-                scale_reason(),
-            ));
-        }
-    }
-    out
+    EDITABLE_KEYS
+        .iter()
+        .filter_map(|key| Setting::from_patch(key, patch))
+        .filter_map(Setting::out_of_range)
+        .collect()
 }
 
 // ── occurrence walk ──────────────────────────────────────────────────────────
@@ -700,17 +802,6 @@ fn walk(table: &Table, order: isize, path: &mut Vec<Seg>, key: &str, out: &mut V
     }
 }
 
-fn table_at<'a>(root: &'a Table, path: &[Seg]) -> Option<&'a Table> {
-    let mut cur = root;
-    for seg in path {
-        cur = match seg {
-            Seg::Table(name) => cur.get(name)?.as_table()?,
-            Seg::ArrayOfTables(name, i) => cur.get(name)?.as_array_of_tables()?.get(*i)?,
-        };
-    }
-    Some(cur)
-}
-
 fn table_at_mut<'a>(root: &'a mut Table, path: &[Seg]) -> Option<&'a mut Table> {
     let mut cur = root;
     for seg in path {
@@ -722,10 +813,6 @@ fn table_at_mut<'a>(root: &'a mut Table, path: &[Seg]) -> Option<&'a mut Table> 
         };
     }
     Some(cur)
-}
-
-fn value_at<'a>(root: &'a Table, path: &[Seg], key: &str) -> Option<&'a Value> {
-    table_at(root, path)?.get(key)?.as_value()
 }
 
 // ── apply_patch ──────────────────────────────────────────────────────────────
@@ -748,7 +835,8 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
         )));
     }
 
-    let mut doc: DocumentMut = text.parse().map_err(|e| {
+    let shape = ByteShape::of(text);
+    let mut doc: DocumentMut = strip_bom(text).parse().map_err(|e| {
         SabrageError::InvalidInput(format!(
             "oxrsys-runtime.toml is not valid TOML, refusing to rewrite it: {e}"
         ))
@@ -790,10 +878,14 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
     // come back different from its input, and [`write`] would back the file up
     // and rewrite it whole while reporting `changed_keys: []`. "Nothing
     // changed" means no key changed, never "the re-render happens to match".
+    //
+    // A *real* edit goes through the same re-render, so those three
+    // normalisations have to be undone explicitly ([`ByteShape`]) — Sabrage
+    // owns six values, not the file's line endings.
     let text = if changed_keys.is_empty() {
         text.to_string()
     } else {
-        doc.to_string()
+        shape.restore(doc.to_string())
     };
 
     Ok(Patched {
@@ -803,26 +895,64 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
     })
 }
 
-/// The patch's value for one key, rendered as a `toml_edit` value with the
-/// canonical spelling: integers bare (`80`), floats always with a fractional
-/// part (`1.0`, never `1` — `resolution_scale` is a float key and a bare `1`
-/// reads as an integer to a stricter parser), strings as basic strings.
-fn patch_value(key: &str, patch: &RuntimeConfigPatch) -> Option<Value> {
-    match key {
-        "protocol" => patch.protocol.map(|p| string_value(p.as_str())),
-        "bitrate_mbps" => patch
-            .bitrate_mbps
-            .map(|n| Value::Integer(Formatted::new(i64::from(n)))),
-        "encoder_process" => patch.encoder_process.map(|e| string_value(e.as_str())),
-        "video_codec" => patch.video_codec.map(|c| string_value(c.as_str())),
-        "resolution_scale" => patch
-            .resolution_scale
-            .map(|f| Value::Float(Formatted::new(f))),
-        "refresh_rate_hz" => patch
-            .refresh_rate_hz
-            .map(|n| Value::Integer(Formatted::new(i64::from(n)))),
-        _ => None,
+/// The three bytes-level properties `toml_edit`'s renderer does not preserve.
+///
+/// `DocumentMut::to_string()` always emits LF, never a BOM, and always a final
+/// newline. Sabrage's contract is narrower than that (`config`'s module header:
+/// *the six streaming keys' values and nothing else*), so a one-value edit must
+/// not silently convert a CRLF file, strip the BOM an editor put there, or add
+/// a trailing newline the user did not have. Captured before parsing, restored
+/// after rendering.
+///
+/// Mixed line endings are the one shape not preserved: there is no "the file's"
+/// ending to restore, and any choice reformats something. Such a file is
+/// rendered LF, which is what it already was for most of its lines.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ByteShape {
+    bom: bool,
+    crlf: bool,
+    final_newline: bool,
+}
+
+impl ByteShape {
+    fn of(text: &str) -> ByteShape {
+        let body = strip_bom(text);
+        let breaks = body.matches('\n').count();
+        ByteShape {
+            bom: body.len() != text.len(),
+            crlf: breaks > 0 && body.matches("\r\n").count() == breaks,
+            // An empty document has no line ending to preserve; whatever the
+            // renderer emits for it is the whole file.
+            final_newline: body.is_empty() || body.ends_with('\n'),
+        }
     }
+
+    fn restore(self, rendered: String) -> String {
+        let mut out = if self.crlf {
+            rendered.replace("\r\n", "\n").replace('\n', "\r\n")
+        } else {
+            rendered
+        };
+        // Only ever *remove* a line ending the input did not have; if the
+        // renderer did not add one, there is nothing to undo.
+        if !self.final_newline {
+            if out.ends_with("\r\n") {
+                out.truncate(out.len() - 2);
+            } else if out.ends_with('\n') {
+                out.truncate(out.len() - 1);
+            }
+        }
+        if self.bom {
+            out.insert(0, '\u{feff}');
+        }
+        out
+    }
+}
+
+/// The patch's value for one key as a `toml_edit` value in Sabrage's canonical
+/// spelling — see [`Setting::to_value`].
+fn patch_value(key: &str, patch: &RuntimeConfigPatch) -> Option<Value> {
+    Setting::from_patch(key, patch).map(Setting::to_value)
 }
 
 /// A value's own text, with its decor (the `=` spacing and any trailing
@@ -890,27 +1020,17 @@ fn edit_in_place(table: &mut Table, key: &str, new: Value) -> bool {
 /// Whether the runtime would read the same value out of both, i.e. whether
 /// rewriting the line would be a pure reformat.
 ///
-/// Textual equality alone is too strict for strings: the runtime strips one
-/// matching pair of quotes of either flavour ([`unquote`]), so `'alvr'` and
-/// `"alvr"` are one value to it, while [`patch_value`] always builds a basic
-/// string. Without this, re-saving a value a hand-maintained file spells with
-/// literal quotes would count as a change and burn a backup on a rewrite the
-/// runtime cannot observe.
-///
-/// Numbers stay on textual comparison on purpose: `0x50` and `80` are the same
-/// integer to `toml_edit` and *not* to the runtime, which parses the raw line
-/// text — a number spelled in a form it would misread must still be rewritten.
-/// So must a multi-line or escaped string, whose one-layer unquote does not
-/// yield the wanted text.
+/// Textual equality of the value's own bytes, and nothing looser. It is the
+/// runtime, not `toml_edit`, that has to agree with us: `0x50` and `80` are the
+/// same integer to `toml_edit` and *not* to the runtime, which parses the raw
+/// line text; a `'alvr'` literal string is a valid TOML value the runtime does
+/// **not** unquote (its `ParseString` takes double quotes only), so it is junk
+/// there and must be rewritten as `"alvr"`; and a multiline or escaped string
+/// does not survive its one-layer unquote either. Every spelling the runtime
+/// would misread is therefore a change, which is exactly what makes saving one
+/// fix it.
 fn same_to_the_runtime(old: &Value, new: &Value) -> bool {
-    let old_repr = value_repr(old);
-    if old_repr == value_repr(new) {
-        return true;
-    }
-    matches!(
-        (old.as_str(), new.as_str()),
-        (Some(_), Some(wanted)) if unquote(&old_repr) == wanted
-    )
+    value_repr(old) == value_repr(new)
 }
 
 fn decor_str(raw: Option<&toml_edit::RawString>) -> std::borrow::Cow<'_, str> {
@@ -996,6 +1116,16 @@ fn insert_into_streaming(doc: &mut DocumentMut, key: &str, new: Value) -> Result
 ///
 /// Every mutation goes through `executor`, so a [`crate::DryRunExecutor`] plans
 /// the create, the backup, the prune and the write without touching disk.
+///
+/// Two refusals guard the replacement, both because the file has other owners:
+///
+/// * a **live session** ([`blocking_session`]) — the runtime re-reads this file
+///   every 250 ms and rebuilds the encoder when the values it keys on move, so
+///   a save mid-stream is a live reconfiguration, not a next-launch setting;
+/// * a **concurrent edit** ([`still_safe_to_replace`]) — the bytes on disk must
+///   still be the ones the patch was computed against, or the backup would
+///   describe a state that no longer exists and the replacement would drop
+///   somebody else's work.
 pub async fn write(
     executor: &dyn Executor,
     toml_path: &Path,
@@ -1014,13 +1144,27 @@ pub async fn write(
         )));
     }
 
-    let exists = toml_path.is_file();
-    let base = if exists {
-        std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?
-    } else {
+    let session_state = session_state_beside(backups_dir);
+    if let Some(bottle) = blocking_session(&session_state) {
+        return Err(live_session_refusal(toml_path, &bottle));
+    }
+
+    // The existence probe and the create are two syscalls apart, so the absent
+    // branch is a TOCTOU by construction: `Executor::write_atomic` is a rename
+    // over the destination and there is no no-clobber create to reach for. The
+    // window is narrowed as far as it can be from here — probed again after the
+    // awaited `create_dir_all`, and every path guarded by the compare-and-swap
+    // below — but only an `O_EXCL` create on the executor closes it.
+    let mut exists = toml_path.is_file();
+    if !exists {
         if let Some(parent) = toml_path.parent() {
             executor.create_dir_all(parent).await?;
         }
+        exists = toml_path.is_file();
+    }
+    let base = if exists {
+        std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?
+    } else {
         let template = crate::util::toml_template();
         executor
             .write_atomic(toml_path, template.as_bytes())
@@ -1050,6 +1194,8 @@ pub async fn write(
         return Ok(report);
     }
 
+    still_safe_to_replace(executor, toml_path, &session_state, &base)?;
+
     if exists {
         let backup = next_backup_path(backups_dir, unix_secs());
         // The prune list is computed BEFORE the new backup is written: a real
@@ -1067,10 +1213,96 @@ pub async fn write(
         report.backup_path = Some(backup.display().to_string());
     }
 
+    // Again, immediately before the replacement: the backup write and the prune
+    // above are the widest part of the window a concurrent editor can land in,
+    // and the backup we just took describes `base`, not whatever is there now.
+    still_safe_to_replace(executor, toml_path, &session_state, &base)?;
+
     executor
         .write_atomic(toml_path, patched.text.as_bytes())
         .await?;
     Ok(report)
+}
+
+/// The bottle of a session that must be stopped before this file may be
+/// rewritten, or `None` when nothing is streaming.
+///
+/// Two sources, because either alone leaves a hole:
+///
+/// * [`crate::session::live_session`] — this process's own supervised launch;
+/// * `session-state.json` — a launch owned by **another** front-end (the
+///   `sabrage` CLI, or a Sabrage the user told to detach). The record counts
+///   only while the wine process it names is still that same process
+///   ([`crate::process::ProcInfo::is_same_process`], the recycled-pid guard),
+///   so a crashed session's leftover file never wedges the Settings screen.
+///
+/// Why this exists at all: the runtime does **not** read `oxrsys-runtime.toml`
+/// once at game start. `Config::GetValues()` refreshes it whenever the mtime
+/// moved, at most every 250 ms, and `AlvrStreamingBackend::EnsureEncoder` reads
+/// `encoder_process`/`video_codec` per frame and retires the encoder when the
+/// identity drifts — so a Settings save mid-stream rebuilds the encoder, and
+/// selecting `native` with no staged helper drops frames for the rest of the
+/// session.
+pub fn blocking_session(session_state_path: &Path) -> Option<String> {
+    if let Some(live) = crate::session::live_session() {
+        return Some(live.bottle);
+    }
+    let state = crate::session::state::load(session_state_path)
+        .ok()
+        .flatten()?;
+    let wine = state.wine.as_ref()?;
+    (wine.pid != 0 && wine.is_same_process()).then(|| state.bottle.clone())
+}
+
+fn live_session_refusal(toml_path: &Path, bottle: &str) -> SabrageError {
+    SabrageError::InvalidInput(format!(
+        "refusing to edit {} while a session is live (bottle '{bottle}') — the runtime re-reads          this file every 250 ms and rebuilds the encoder when encoder_process or video_codec          changes, so saving mid-stream drops frames; stop the session first: ./demo.sh stop          --bottle {bottle}",
+        toml_path.display()
+    ))
+}
+
+/// Where `session-state.json` sits, given the backups directory.
+///
+/// `backups_dir` is always `<sabrage_appsup>/backups` ([`crate::paths::Paths`]),
+/// so its parent is the directory that record lives in. Deriving it rather than
+/// adding a fifth parameter keeps [`write`]'s callers unchanged and — the part
+/// that matters — keeps the guard hermetic under test: a test that points
+/// `backups_dir` at a temp dir gets a temp session path with it, never the
+/// developer's real running session.
+fn session_state_beside(backups_dir: &Path) -> PathBuf {
+    backups_dir
+        .parent()
+        .unwrap_or(backups_dir)
+        .join("session-state.json")
+}
+
+/// Compare-and-swap: refuse unless the file is still the bytes `base` was read
+/// from, and still nothing is streaming.
+///
+/// A dry run is exempt from the byte check: it planned the create instead of
+/// performing it, so on the absent path there is deliberately nothing on disk
+/// to compare against.
+fn still_safe_to_replace(
+    executor: &dyn Executor,
+    toml_path: &Path,
+    session_state_path: &Path,
+    base: &str,
+) -> Result<()> {
+    if let Some(bottle) = blocking_session(session_state_path) {
+        return Err(live_session_refusal(toml_path, &bottle));
+    }
+    if executor.is_dry_run() {
+        return Ok(());
+    }
+    let now = std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?;
+    if now != base {
+        return Err(SabrageError::InvalidInput(format!(
+            "{} changed on disk while Sabrage was editing it — nothing was written; reload \
+             Settings and try again",
+            toml_path.display()
+        )));
+    }
+    Ok(())
 }
 
 fn unix_secs() -> u64 {
@@ -1149,15 +1381,16 @@ const EDIT_PROTOCOL_STEP: StepId = "fix.edit-protocol";
 /// it inherits the backup, the create-from-template branch and the dry-run
 /// plan.
 pub async fn edit_protocol(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
-    if let Some(live) = crate::session::live_session() {
+    // [`write`] refuses on its own too; this runs first so the refusal arrives as
+    // a fix's `fatal` with its remedy attached rather than a bare InvalidInput.
+    if let Some(bottle) = blocking_session(&ctx.paths.session_state_path()) {
         return Err(ctx.fatal(
             format!(
-                "refusing to edit {} while a session is live (bottle '{}') — the runtime reads \
-                 this file once at game start",
+                "refusing to edit {} while a session is live (bottle '{bottle}') — the runtime \
+                 re-reads this file while it streams",
                 ctx.paths.toml_path.display(),
-                live.bottle
             ),
-            Some("./demo.sh stop --bottle <name>".to_string()),
+            Some(format!("./demo.sh stop --bottle {bottle}")),
         ));
     }
 
@@ -1364,12 +1597,25 @@ mod tests {
         assert!(out.changed_keys.is_empty(), "{:?}", out.changed_keys);
     }
 
-    /// A value the file spells with literal quotes is already the value the
-    /// runtime reads (its unquote takes either flavour), so re-saving it is a
-    /// pure reformat and must not count as a change.
+    /// A value the file spells with **literal** quotes is a value the runtime
+    /// throws away: `ParseString` strips a pair of double quotes and nothing
+    /// else, so `'alvr'` fails the whitelist and `streamingProtocol` keeps its
+    /// `oxrsys` default. It reads as invalid, and re-saving it is a real change
+    /// that rewrites the line in the spelling the runtime does read.
+    ///
+    /// (Before 2026-08-30 both `unquote` and `same_to_the_runtime` accepted
+    /// either quote flavour, so Settings showed ALVR with no warning and Save
+    /// reported success while leaving the dead line on disk.)
     #[test]
-    fn a_literal_quoted_string_is_not_a_change() {
+    fn a_literal_quoted_string_is_invalid_and_gets_rewritten() {
         let text = "[streaming]\nprotocol = 'alvr'\n";
+        let view = read_text(text);
+        assert_eq!(view.values.protocol, None, "the runtime keeps its default");
+        assert_eq!(view.invalid.len(), 1, "{:?}", view.invalid);
+        assert_eq!(view.invalid[0].key, "protocol");
+        assert_eq!(view.invalid[0].raw, "'alvr'");
+        assert!(view.parse_error.is_none(), "it is still valid TOML");
+
         let out = apply_patch(
             text,
             &RuntimeConfigPatch {
@@ -1378,9 +1624,9 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(out.text, text);
-        assert!(out.changed_keys.is_empty(), "{:?}", out.changed_keys);
-        // A different value still rewrites, and in the canonical spelling.
+        assert_eq!(out.text, "[streaming]\nprotocol = \"alvr\"\n");
+        assert_eq!(out.changed_keys, vec!["protocol".to_string()]);
+        // A different value likewise rewrites, in the canonical spelling.
         let out = apply_patch(
             text,
             &RuntimeConfigPatch {
@@ -1437,19 +1683,22 @@ mod tests {
         assert!(err.contains("quoted key"), "{err}");
     }
 
+    /// `read`, minus the file. Goes through the same `fill_from` the real
+    /// reader does, so these tests exercise the shipped resolution rules and
+    /// not a second copy of them.
     fn read_text(text: &str) -> RuntimeConfigView {
-        let doc: DocumentMut = text.parse().unwrap();
-        let (values, invalid, shadowed) = harvest(&doc);
-        RuntimeConfigView {
+        let mut view = RuntimeConfigView {
             path: String::new(),
             exists: true,
-            values,
+            values: RuntimeConfigValues::default(),
             defaults: runtime_defaults(),
-            invalid,
-            shadowed,
+            invalid: Vec::new(),
+            shadowed: Vec::new(),
             modified_unix_ms: None,
             parse_error: None,
-        }
+        };
+        view.fill_from(text);
+        view
     }
 
     // ── rule 4/6: the golden one-line edit ───────────────────────────────────
@@ -1544,7 +1793,7 @@ mod tests {
     #[test]
     fn a_missing_streaming_table_is_created_at_the_end_with_one_blank_line() {
         let text = "# a hand-written file\nabr_mode = \"off\"\n";
-        let out = apply_patch(&text, &patch_bitrate(60)).unwrap();
+        let out = apply_patch(text, &patch_bitrate(60)).unwrap();
         assert_eq!(
             out.text,
             "# a hand-written file\nabr_mode = \"off\"\n\n[streaming]\nbitrate_mbps = 60\n"
@@ -1787,12 +2036,204 @@ mod tests {
         );
     }
 
+    /// `StripTomlComment` verbatim: only `"` toggles string context, and there
+    /// is no escape handling — so a `'` protects nothing and a `\\"` closes the
+    /// string it appears in. Being *more* clever than Config.cpp here is how
+    /// Sabrage ends up reading a different file than the runtime does.
     #[test]
-    fn the_comment_stripper_is_quote_aware() {
+    fn the_comment_stripper_matches_config_cpp() {
         assert_eq!(strip_comment("a = \"x # y\" # tail"), "a = \"x # y\" ");
-        assert_eq!(strip_comment("a = 'x # y'"), "a = 'x # y'");
         assert_eq!(strip_comment("# whole line"), "");
         assert_eq!(strip_comment("a = 1"), "a = 1");
+        // A literal-quoted string does NOT protect its '#'.
+        assert_eq!(strip_comment("a = 'x # y'"), "a = 'x ");
+        // No escape handling: the backslash is an ordinary byte, so the '\\"'
+        // closes the string and the '#' after it starts a comment.
+        assert_eq!(strip_comment("a = \"x\\\" # y\""), "a = \"x\\\" ");
+    }
+
+    /// The runtime's `catch` block keeps "the last valid/default setting", so a
+    /// good assignment followed by a junk one leaves the good value in force.
+    /// Reading only the last occurrence reported the key as absent and fell
+    /// back to the compiled-in default — for `protocol` that is `oxrsys`, i.e.
+    /// a false legacy-backend warning on a file that streams over ALVR.
+    #[test]
+    fn a_later_invalid_assignment_does_not_erase_an_earlier_valid_one() {
+        let text = fixture("oxrsys-runtime.shadowed-invalid-last.toml");
+        let view = read_text(&text);
+
+        assert_eq!(view.values.protocol, Some(Protocol::Alvr));
+        assert_eq!(view.values.bitrate_mbps, Some(80));
+        assert_eq!(view.values.encoder_process, Some(EncoderProcess::Native));
+        assert_eq!(view.values.video_codec, Some(VideoCodec::H265));
+        assert_eq!(view.values.resolution_scale, Some(0.9));
+        assert_eq!(view.values.refresh_rate_hz, Some(90));
+
+        // Every rejected line is still reported — the user must see the dead
+        // assignment, just not have it override the live one.
+        let mut named: Vec<&str> = view.invalid.iter().map(|i| i.key.as_str()).collect();
+        named.sort_unstable();
+        let mut expected = EDITABLE_KEYS.to_vec();
+        expected.sort_unstable();
+        assert_eq!(named, expected, "{:?}", view.invalid);
+        assert!(view
+            .invalid
+            .iter()
+            .any(|i| i.key == "protocol" && i.raw == "\"bogus\""));
+        assert!(
+            view.invalid
+                .iter()
+                .any(|i| i.key == "encoder_process" && i.raw == "'native'"),
+            "a literal-quoted value is junk to the runtime too: {:?}",
+            view.invalid
+        );
+
+        let mut shadowed = view.shadowed.clone();
+        shadowed.sort_unstable();
+        assert_eq!(shadowed, expected);
+
+        // The edit still lands on the LAST physical occurrence: that is the one
+        // the runtime reaches last, so it has to be the one that wins.
+        let out = apply_patch(&text, &patch_bitrate(60)).unwrap();
+        assert_eq!(out.changed_keys, vec!["bitrate_mbps".to_string()]);
+        let diff = diff_lines(&text, &out.text);
+        assert_eq!(diff.len(), 1, "{diff:?}");
+        assert_eq!(diff[0].0, "bitrate_mbps = 9001");
+        assert_eq!(diff[0].1, "bitrate_mbps = 60");
+    }
+
+    /// A table-driven differential against `ParseConfigToml`'s documented
+    /// semantics: single quotes are not quotes, `#` is only protected by `"`,
+    /// `std::stoi`-unfriendly spellings are junk, and tables never matter.
+    #[test]
+    fn the_line_reader_agrees_with_parse_config_toml() {
+        // (source, effective protocol, effective bitrate)
+        let cases: &[(&str, Option<Protocol>, Option<u32>)] = &[
+            // ParseString takes double quotes only.
+            ("protocol = 'alvr'\n", None, None),
+            ("protocol = \"alvr\"\n", Some(Protocol::Alvr), None),
+            // Bare (unquoted) values pass straight through the whitelist.
+            ("protocol = alvr\n", Some(Protocol::Alvr), None),
+            // No escape handling: the value keeps its inner backslash and quote.
+            ("protocol = \"al\\\"vr\"\n", None, None),
+            // Tables are ignored entirely; last accepted wins.
+            (
+                "[a]\nprotocol = \"oxrsys\"\n[b]\nprotocol = \"alvr\"\n",
+                Some(Protocol::Alvr),
+                None,
+            ),
+            // A '#' inside a basic string survives; one after it does not.
+            (
+                "protocol = \"alvr\" # was oxrsys\n",
+                Some(Protocol::Alvr),
+                None,
+            ),
+            // std::stoi is base 10: it reads "0x50" as 0, which is below the
+            // minimum bitrate, so the runtime keeps its default.
+            ("bitrate_mbps = 0x50\n", None, None),
+            ("bitrate_mbps = 80\n", None, Some(80)),
+            // TOML's numeric underscores mean nothing to std::stoi: it takes
+            // the leading digits and stops, so this really is 1, not 10.
+            ("bitrate_mbps = 1_0\n", None, Some(1)),
+            // …and trailing junk after a valid number is likewise ignored.
+            ("bitrate_mbps = 80 mbps\n", None, Some(80)),
+            // Arrays and inline tables are values no editable key accepts.
+            ("bitrate_mbps = [80]\n", None, None),
+            ("protocol = { a = \"alvr\" }\n", None, None),
+            // A dotted key is a different key text after the split.
+            ("streaming.protocol = \"alvr\"\n", None, None),
+            // So is a quoted one.
+            ("\"protocol\" = \"alvr\"\n", None, None),
+        ];
+        for (text, protocol, bitrate) in cases {
+            let (values, _, _) = read_lines_like_the_runtime(text);
+            assert_eq!(values.protocol, *protocol, "protocol of {text:?}");
+            assert_eq!(values.bitrate_mbps, *bitrate, "bitrate of {text:?}");
+        }
+    }
+
+    /// A multiline string is one value to TOML and a run of live assignments to
+    /// the runtime. `read` must show the runtime's answer, and `write` must
+    /// refuse: there is no line `apply_patch` could edit that would beat the
+    /// one inside the string.
+    #[test]
+    fn a_key_inside_a_multiline_string_reads_live_and_refuses_the_write() {
+        let text =
+            "[streaming]\nprotocol = \"alvr\"\nnote = \"\"\"\nprotocol = \"oxrsys\"\n\"\"\"\n";
+        assert!(
+            text.parse::<DocumentMut>().is_ok(),
+            "fixture must be valid TOML"
+        );
+        let view = read_text(text);
+        assert_eq!(
+            view.values.protocol,
+            Some(Protocol::Oxrsys),
+            "the runtime reads the physical line inside the string"
+        );
+        let err = view.parse_error.expect("must refuse to rewrite this file");
+        assert!(err.contains("protocol"), "{err}");
+        assert!(err.contains("multiline string"), "{err}");
+    }
+
+    // ── effective_string (the one reader the other modules share) ────────────
+
+    #[test]
+    fn effective_string_is_last_wins_table_blind_and_double_quote_only() {
+        assert_eq!(
+            effective_string(
+                "[a]\nencoder_process = \"inproc\"\n[b]\nencoder_process = \"native\"\n",
+                "encoder_process"
+            ),
+            Some("native".to_string()),
+            "last assignment wins, whatever table it sits in"
+        );
+        assert_eq!(
+            effective_string("[streaming]\nprotocol = \"alvr\" # keep\n", "protocol"),
+            Some("alvr".to_string()),
+            "a same-line comment is not part of the value"
+        );
+        assert_eq!(
+            effective_string("protocol = 'alvr'\n", "protocol"),
+            Some("'alvr'".to_string()),
+            "literal quotes stay on, so the caller's whitelist rejects them"
+        );
+        assert_eq!(effective_string("[streaming]\n", "protocol"), None);
+        assert_eq!(
+            effective_string("# protocol = \"alvr\"\n", "protocol"),
+            None,
+            "a commented line is not an assignment"
+        );
+    }
+
+    // ── rule 6, continued: an edit owns six values, not the file's bytes ─────
+
+    /// `toml_edit`'s renderer normalises CRLF to LF, drops a BOM and appends a
+    /// final newline. A no-op patch already avoided that by returning the input
+    /// bytes; a *real* edit went through the renderer and rewrote every line of
+    /// a CRLF file to change one value.
+    #[test]
+    fn a_real_edit_preserves_crlf_a_bom_and_a_missing_final_newline() {
+        let lf =
+            "[streaming]\nprotocol = \"alvr\"\nbitrate_mbps = 42\n# note\nrefresh_rate_hz = 72\n";
+        for (label, text) in [
+            ("lf", lf.to_string()),
+            ("crlf", lf.replace('\n', "\r\n")),
+            ("bom", format!("\u{feff}{lf}")),
+            ("no-final-newline", lf.trim_end_matches('\n').to_string()),
+            ("bom+crlf", format!("\u{feff}{}", lf.replace('\n', "\r\n"))),
+        ] {
+            let out = apply_patch(&text, &patch_bitrate(60)).unwrap();
+            assert_eq!(
+                out.changed_keys,
+                vec!["bitrate_mbps".to_string()],
+                "{label}"
+            );
+            assert_eq!(
+                out.text,
+                text.replace("bitrate_mbps = 42", "bitrate_mbps = 60"),
+                "{label}: only the edited value may differ"
+            );
+        }
     }
 
     // ── write ────────────────────────────────────────────────────────────────
@@ -2083,6 +2524,148 @@ mod tests {
             .unwrap_err();
         assert!(err.to_string().contains("bitrate_mbps"), "{err}");
         assert!(!path.exists(), "not even the template create happens");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the live-session guard ───────────────────────────────────────────────
+
+    /// A `session-state.json` naming a wine process that is still alive. The
+    /// pid is this test process, which is exactly what makes `is_same_process`
+    /// true without launching anything.
+    fn write_live_session(dir: &Path, bottle: &str, owner_pid: u32) {
+        let mut state = crate::session::state::SessionState::new(
+            uuid::Uuid::new_v4(),
+            bottle,
+            dir.join("bs"),
+            dir.join("run.log"),
+            0,
+        );
+        state.owner_pid = owner_pid;
+        state.wine = crate::process::ProcInfo::observe(std::process::id());
+        assert!(state.wine.is_some(), "the test process must be observable");
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(
+            dir.join("session-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// The runtime polls this file every 250 ms and rebuilds the encoder when
+    /// `encoder_process`/`video_codec` drift, so a Settings save mid-stream is
+    /// not "next launch" — it is a live reconfiguration. `write` refuses, and
+    /// the file is left untouched down to its mtime.
+    #[tokio::test]
+    async fn write_refuses_while_a_session_is_live_and_touches_nothing() {
+        let dir = scratch("live-guard");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        std::fs::write(&path, deployed()).unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        // `backups_dir` is `<sabrage_appsup>/backups`, so the record goes beside it.
+        write_live_session(&dir, "beatsaber", std::process::id());
+
+        let err = write(&real(), &path, &backups, &patch_bitrate(60))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("beatsaber"), "{err}");
+        assert!(err.contains("./demo.sh stop"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), deployed());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().modified().unwrap(),
+            before
+        );
+        assert!(!backups.exists(), "no backup churn from a refused write");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The guard has to be about the *machine*, not this process: a session the
+    /// `sabrage` CLI (or a detached Sabrage) owns has no in-process handle here,
+    /// and its encoder is just as rebuildable.
+    #[tokio::test]
+    async fn the_live_guard_fires_for_a_session_owned_by_another_process() {
+        let dir = scratch("live-guard-other");
+        let path = dir.join("oxrsys-runtime.toml");
+        std::fs::write(&path, deployed()).unwrap();
+        assert!(
+            crate::session::live_session().is_none(),
+            "no in-process handle in this test"
+        );
+        write_live_session(&dir, "otherbottle", std::process::id().wrapping_add(1));
+
+        let err = write(&real(), &path, &dir.join("backups"), &patch_bitrate(60))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("otherbottle"), "{err}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A crashed session leaves the record behind. It names a dead pid, so it
+    /// must not wedge the Settings screen forever.
+    #[tokio::test]
+    async fn a_stale_session_record_does_not_block_a_write() {
+        let dir = scratch("live-guard-stale");
+        let path = dir.join("oxrsys-runtime.toml");
+        std::fs::write(&path, deployed()).unwrap();
+        let mut state = crate::session::state::SessionState::new(
+            uuid::Uuid::new_v4(),
+            "beatsaber",
+            dir.join("bs"),
+            dir.join("run.log"),
+            0,
+        );
+        // A pid that cannot be running, with a start time nothing can match.
+        state.wine = Some(crate::process::ProcInfo {
+            pid: 0xffff_fffe,
+            start_time: 1,
+            exe: PathBuf::from("/nope"),
+        });
+        std::fs::write(
+            dir.join("session-state.json"),
+            serde_json::to_vec(&state).unwrap(),
+        )
+        .unwrap();
+
+        let report = write(&real(), &path, &dir.join("backups"), &patch_bitrate(60))
+            .await
+            .unwrap();
+        assert_eq!(report.changed_keys, vec!["bitrate_mbps".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ── the compare-and-swap ─────────────────────────────────────────────────
+
+    /// `write` reads, patches in memory, backs up and only then replaces. If
+    /// anything moved the file in between — the `sabrage` CLI, `setup.sh`, a
+    /// human with an editor — the replacement would drop their work and the
+    /// backup would describe bytes that no longer existed.
+    #[test]
+    fn the_replacement_refuses_when_the_file_changed_underneath() {
+        let dir = scratch("cas");
+        let path = dir.join("oxrsys-runtime.toml");
+        let session = dir.join("session-state.json");
+        std::fs::write(&path, deployed()).unwrap();
+
+        still_safe_to_replace(&real(), &path, &session, &deployed())
+            .expect("unchanged file must pass");
+
+        std::fs::write(&path, "protocol = \"alvr\"\n").unwrap();
+        let err = still_safe_to_replace(&real(), &path, &session, &deployed())
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("changed on disk"), "{err}");
+        assert!(err.contains("nothing was written"), "{err}");
+        assert!(
+            err.contains(&path.display().to_string()),
+            "the message must name the file: {err}"
+        );
+
+        // A dry run planned the write instead of performing it, so there is
+        // deliberately nothing on disk for it to compare against.
+        still_safe_to_replace(&dry(), &path, &session, &deployed())
+            .expect("a dry run is exempt from the byte check");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

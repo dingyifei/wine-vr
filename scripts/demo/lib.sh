@@ -96,7 +96,7 @@ require_bottle() {
   [ -f "$PREFIX/cxbottle.conf" ] || die "bottle '$WINEVR_BOTTLE' not found at $PREFIX — create it in CrossOver (win11_64) first"
   # Beat Saber location: --bs-dir/WINEVR_BS_DIR override, else the bottle's
   # standard Steam library path.
-  BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294}"
+  BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/$BS_DIR_LEAF}"
   DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
 }
 

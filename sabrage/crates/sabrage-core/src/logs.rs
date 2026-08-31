@@ -27,11 +27,15 @@
 //!
 //! # Tailing
 //!
-//! [`Tailer`] is rotation-aware — inode change **or** a size that shrank means
-//! the file was replaced or truncated, and the tailer reopens from the start
-//! and says so ([`LogBatch::rotated`]). A partial final line is buffered until
-//! its newline arrives, so a half-written line never reaches the UI as a
-//! complete one. Splitting reuses [`crate::process::ChunkSplitter`] — the same
+//! [`Tailer`] is rotation-aware — an inode change, a size that shrank, or a
+//! prefix that no longer matches the bytes last read from it (an in-place
+//! `truncate(true)` that grew back past the cursor between two polls, which is
+//! how ALVR rewrites `session_log.txt`) all mean the file was replaced, and the
+//! tailer reopens from the start and says so ([`LogBatch::rotated`]). One poll
+//! reads a bounded number of bytes ([`POLL_BYTE_BUDGET`]), so a large existing
+//! log is drained across polls rather than materialised in one. A partial
+//! final line is buffered until its newline arrives, so a half-written line
+//! never reaches the UI as a complete one. Splitting reuses [`crate::process::ChunkSplitter`] — the same
 //! `\n`/`\r`/`\r\n`-tolerant state machine `spawn_streamed` already uses for
 //! wine/build-tool output — rather than a second hand-rolled copy of the same
 //! rule.
@@ -153,13 +157,14 @@ pub fn resolve_source(paths: &Paths, source: &LogSource) -> Option<PathBuf> {
 pub struct LogBatch {
     /// Complete lines only, without their newlines.
     pub lines: Vec<String>,
-    /// The file was replaced (new inode) or truncated: `lines` restarts from
-    /// the beginning of the new file. The UI clears its buffer on this.
+    /// The file was replaced (new inode), truncated, or rewritten in place:
+    /// `lines` restarts from the beginning of the new file. The UI clears its
+    /// buffer on this.
     pub rotated: bool,
-    /// This batch hit [`MAX_LINES_PER_POLL`]: the remaining lines are already
-    /// buffered internally (never dropped) and arrive on a later
-    /// [`Tailer::poll`] call — the file is producing faster than the caller is
-    /// polling.
+    /// This batch hit [`MAX_LINES_PER_POLL`] or [`POLL_BYTE_BUDGET`]: the rest
+    /// is still queued internally (never dropped) or still unread in the file,
+    /// and arrives on a later [`Tailer::poll`] call — the file is producing
+    /// faster than the caller is polling.
     pub truncated: bool,
     /// The file these lines came from, for the pane header.
     pub path: String,
@@ -175,19 +180,58 @@ const MAX_LINES_PER_POLL: usize = 2000;
 /// never turn "open a log pane" into "read the whole file".
 const TAIL_PRELOAD_CAP_BYTES: u64 = 256 * 1024;
 
+/// Bound on the bytes ONE [`Tailer::poll`] reads, whatever has accumulated in
+/// the file since the last one.
+///
+/// [`MAX_LINES_PER_POLL`] caps what a poll *delivers*, not what it reads: the
+/// old loop did one `read_to_end` from the cursor and split every byte of it
+/// into `pending` before that cap was ever applied, so opening a large
+/// `--verbose` wine console log (or an `oxrsys-runtime.log` at its 5 MiB
+/// rotation size) from offset 0 materialised the whole file as `String`s in a
+/// single call. The cursor and the splitter both survive to the next poll, and
+/// the poller runs every 250 ms, so a backlog is drained across polls instead.
+const POLL_BYTE_BUDGET: usize = 1024 * 1024;
+
+/// One `read` of the loop above. Small enough that the line cap is noticed
+/// promptly, large enough that a 1 MiB budget is 16 syscalls.
+const READ_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Bound on the splitter's unterminated-line buffer.
+///
+/// A file with no delimiter at all (a binary blob written over a log path)
+/// would otherwise grow that buffer without limit across polls, since the byte
+/// budget above bounds only one poll. Past this, the partial is flushed as a
+/// line of its own — a synthetic break is a better failure than unbounded
+/// memory.
+const MAX_UNTERMINATED_LINE_BYTES: usize = 1024 * 1024;
+
+/// How many bytes immediately before the cursor are remembered to detect a
+/// same-inode rewrite (see [`Tailer::poll`]).
+const CONTINUITY_SIGNATURE_BYTES: usize = 64;
+
 /// A rotation-aware line tailer.
 ///
 /// One per open log pane. Not `Clone`: it owns a file handle and a byte cursor.
 pub struct Tailer {
     path: PathBuf,
-    file: Option<std::fs::File>,
+    /// The open file and its device+inode, or `None` when the path does not
+    /// exist (yet). Kept as one field because the two are only ever meaningful
+    /// together: the identity describes *this* handle, and a `Some` handle
+    /// whose identity was missing would have no way to detect rotation.
+    open: Option<(std::fs::File, (u64, u64))>,
     offset: u64,
-    /// Device+inode of the open file, for rotation detection. Always `Some`
-    /// exactly when `file` is `Some` — the two are maintained together.
-    identity: Option<(u64, u64)>,
+    /// The last [`CONTINUITY_SIGNATURE_BYTES`] bytes read, i.e. the bytes
+    /// immediately *before* `offset`. Re-read at the next poll to catch a
+    /// truncate-and-regrow that left the inode alone and grew back past the
+    /// cursor before we looked (ALVR opens `session_log.txt` with
+    /// `.truncate(true)`, keeping the inode).
+    signature: Vec<u8>,
     /// `\n`/`\r`/`\r\n`-tolerant splitter; its internal buffer *is* the
     /// "partial final line" the doc below promises never shows up early.
     splitter: ChunkSplitter,
+    /// Bytes fed to `splitter` since it last emitted a line — the counter
+    /// behind [`MAX_UNTERMINATED_LINE_BYTES`].
+    unterminated: usize,
     /// Lines already split out of the file but not yet handed to a caller —
     /// either the `from_end` preload, or the overflow from a batch that hit
     /// [`MAX_LINES_PER_POLL`].
@@ -195,28 +239,45 @@ pub struct Tailer {
 }
 
 /// `(dev, ino)` — the pair that changes when a path starts naming a different
-/// file (rename+recreate, or `logrotate`'s copy step), even though a
-/// same-inode truncate-in-place leaves it unchanged (caught separately by
-/// `len < offset`).
+/// file (rename+recreate, or `logrotate`'s copy step). A same-inode
+/// truncate-in-place leaves it unchanged; that case is caught by `len <
+/// offset`, or — when the file grew back past the cursor between two polls —
+/// by the continuity signature.
 fn file_identity(meta: &std::fs::Metadata) -> (u64, u64) {
     use std::os::unix::fs::MetadataExt;
     (meta.dev(), meta.ino())
 }
 
+/// Remember the last [`CONTINUITY_SIGNATURE_BYTES`] bytes of what has been
+/// read so far, given the bytes just consumed.
+fn update_signature(signature: &mut Vec<u8>, chunk: &[u8]) {
+    if chunk.len() >= CONTINUITY_SIGNATURE_BYTES {
+        signature.clear();
+        signature.extend_from_slice(&chunk[chunk.len() - CONTINUITY_SIGNATURE_BYTES..]);
+        return;
+    }
+    signature.extend_from_slice(chunk);
+    if signature.len() > CONTINUITY_SIGNATURE_BYTES {
+        let excess = signature.len() - CONTINUITY_SIGNATURE_BYTES;
+        signature.drain(0..excess);
+    }
+}
+
 impl Tailer {
     /// Open `path` for tailing.
     ///
-    /// A path that does not exist yet is not an error: `file`/`identity` stay
-    /// `None`, and the first [`poll`](Tailer::poll) that finds the file has
-    /// since appeared treats that as a fresh open (`rotated: true`) — the log
-    /// pane for a session that has not launched yet, or `alvr/session_log.txt`
+    /// A path that does not exist yet is not an error: `open` stays `None`,
+    /// and the first [`poll`](Tailer::poll) that finds the file has since
+    /// appeared treats that as a fresh open (`rotated: true`) — the log pane
+    /// for a session that has not launched yet, or `alvr/session_log.txt`
     /// before ALVR has written a byte, are both normal states, not errors.
     ///
     /// `from_end` starts at EOF with the last `tail_lines` lines pre-loaded —
     /// mandatory for `alvr/session_log.txt`, which is unbounded (design-core
-    /// §7). `from_end == false` reads the whole file first (nothing is
-    /// preloaded; the first [`poll`](Tailer::poll) simply starts at offset 0),
-    /// which is what a past run's log wants.
+    /// §7). `from_end == false` reads the whole file (nothing is preloaded;
+    /// the first [`poll`](Tailer::poll) simply starts at offset 0, and
+    /// [`POLL_BYTE_BUDGET`] spreads a large one over several polls), which is
+    /// what a past run's log wants.
     pub fn open(path: &Path, from_end: bool, tail_lines: usize) -> Result<Tailer> {
         let mut file = match std::fs::File::open(path) {
             Ok(f) => Some(f),
@@ -225,13 +286,14 @@ impl Tailer {
         };
 
         let mut offset = 0u64;
-        let mut identity = None;
+        let mut open = None;
+        let mut signature = Vec::new();
         let mut splitter = ChunkSplitter::new();
         let mut pending = VecDeque::new();
 
         if let Some(f) = file.as_mut() {
             let meta = f.metadata().map_err(|e| SabrageError::io(path, e))?;
-            identity = Some(file_identity(&meta));
+            let identity = file_identity(&meta);
             let len = meta.len();
 
             if from_end {
@@ -262,33 +324,45 @@ impl Tailer {
                     // completes it, exactly like an ordinary mid-stream
                     // partial.
                 }
+                signature = read_signature(f, offset).map_err(|e| SabrageError::io(path, e))?;
             }
+            open = Some((file.take().expect("checked above"), identity));
         }
 
         Ok(Tailer {
             path: path.to_path_buf(),
-            file,
+            open,
             offset,
-            identity,
+            signature,
             splitter,
+            unterminated: 0,
             pending,
         })
     }
 
     /// Read whatever has arrived since the last poll.
     ///
-    /// Detects rotation (inode change) and truncation (size < offset) first;
-    /// either reopens from the start with [`LogBatch::rotated`] set. A file
-    /// that has vanished yields an empty batch rather than an error — the next
-    /// poll picks it up when it comes back.
+    /// Detects rotation first — a new inode, a size below the cursor, or a
+    /// rewritten prefix (the bytes before the cursor no longer match the
+    /// [`Tailer::signature`] read from them, which is what an in-place
+    /// `truncate(true)` that grew back past the cursor between two polls looks
+    /// like) — and any of the three reopens from the start with
+    /// [`LogBatch::rotated`] set. A file that has vanished yields an empty
+    /// batch rather than an error — the next poll picks it up when it comes
+    /// back.
+    ///
+    /// One call reads at most [`POLL_BYTE_BUDGET`] bytes and stops early once
+    /// [`MAX_LINES_PER_POLL`] lines are queued: the cursor and the splitter
+    /// survive to the next call, so a large backlog is drained across polls
+    /// instead of materialised in one.
     pub fn poll(&mut self) -> Result<LogBatch> {
         let path_str = self.path.display().to_string();
 
         let meta = match std::fs::metadata(&self.path) {
             Ok(m) => m,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                self.file = None;
-                self.identity = None;
+                self.open = None;
+                self.signature.clear();
                 let (lines, truncated) = self.drain_capped();
                 return Ok(LogBatch {
                     lines,
@@ -302,14 +376,27 @@ impl Tailer {
 
         let current_id = file_identity(&meta);
         let len = meta.len();
-        // `self.identity` is `None` exactly when there is no open file yet —
+        // `self.open` is `None` exactly when there is no open file yet —
         // either this is the first time the path has ever existed, or it
         // vanished on a previous poll and has just reappeared. Either way
         // that is a fresh open, not a continuation.
-        let rotated = match self.identity {
+        let mut rotated = match &self.open {
             None => true,
-            Some(id) => id != current_id || len < self.offset,
+            Some((_, id)) => *id != current_id || len < self.offset,
         };
+        if !rotated {
+            // Same inode, and long enough to contain everything we have read —
+            // but the writer may still have truncated it and written a *new*
+            // session past our cursor since the last poll. The bytes we last
+            // read are the cheapest possible witness.
+            let path = &self.path;
+            let offset = self.offset;
+            let signature = &self.signature;
+            if let Some((f, _)) = self.open.as_mut() {
+                let seen = read_signature(f, offset).map_err(|e| SabrageError::io(path, e))?;
+                rotated = seen != *signature;
+            }
+        }
 
         if rotated {
             let file =
@@ -326,12 +413,14 @@ impl Tailer {
             // deliver them now, under `rotated: true` so the UI still clears
             // its buffer, and pick up the reopened file's own content on the
             // next `poll()`.
-            if !self.pending.is_empty() {
+            let backlog = !self.pending.is_empty();
+            self.open = Some((file, current_id));
+            self.offset = 0;
+            self.signature.clear();
+            self.splitter = ChunkSplitter::new();
+            self.unterminated = 0;
+            if backlog {
                 let (lines, truncated) = self.drain_capped();
-                self.file = Some(file);
-                self.identity = Some(current_id);
-                self.offset = 0;
-                self.splitter = ChunkSplitter::new();
                 return Ok(LogBatch {
                     lines,
                     rotated: true,
@@ -339,34 +428,61 @@ impl Tailer {
                     path: path_str,
                 });
             }
-
-            self.file = Some(file);
-            self.identity = Some(current_id);
-            self.offset = 0;
-            self.splitter = ChunkSplitter::new();
         }
 
-        let file = self
-            .file
-            .as_mut()
-            .expect("identity is Some here: either just (re)opened above, or already open");
-        file.seek(SeekFrom::Start(self.offset))
-            .map_err(|e| SabrageError::io(&self.path, e))?;
-        let mut buf = Vec::new();
-        file.read_to_end(&mut buf)
-            .map_err(|e| SabrageError::io(&self.path, e))?;
-        self.offset += buf.len() as u64;
-
         let Tailer {
-            splitter, pending, ..
+            open,
+            offset,
+            signature,
+            splitter,
+            unterminated,
+            pending,
+            path,
         } = self;
-        splitter.push(&buf, &mut |l| pending.push_back(l));
+        let (file, _) = open
+            .as_mut()
+            .expect("open is Some here: either just (re)opened above, or already open");
+        file.seek(SeekFrom::Start(*offset))
+            .map_err(|e| SabrageError::io(&*path, e))?;
+
+        let mut buf = vec![0u8; READ_CHUNK_BYTES];
+        let mut consumed = 0usize;
+        while consumed < POLL_BYTE_BUDGET && pending.len() < MAX_LINES_PER_POLL {
+            let want = READ_CHUNK_BYTES.min(POLL_BYTE_BUDGET - consumed);
+            let n = file
+                .read(&mut buf[..want])
+                .map_err(|e| SabrageError::io(&*path, e))?;
+            if n == 0 {
+                break;
+            }
+            consumed += n;
+            let chunk = &buf[..n];
+            update_signature(signature, chunk);
+            let mut produced = 0usize;
+            splitter.push(chunk, &mut |l| {
+                produced += 1;
+                pending.push_back(l);
+            });
+            if produced == 0 {
+                *unterminated += n;
+            } else {
+                *unterminated = 0;
+            }
+            if *unterminated >= MAX_UNTERMINATED_LINE_BYTES {
+                // One line has outgrown the bound: break it here rather than
+                // let the splitter's buffer keep growing across polls.
+                splitter.finish(&mut |l| pending.push_back(l));
+                *unterminated = 0;
+            }
+        }
+        *offset += consumed as u64;
+        let budget_hit = consumed >= POLL_BYTE_BUDGET;
 
         let (lines, truncated) = self.drain_capped();
         Ok(LogBatch {
             lines,
             rotated,
-            truncated,
+            truncated: truncated || budget_hit,
             path: path_str,
         })
     }
@@ -383,6 +499,26 @@ impl Tailer {
         }
         let truncated = !self.pending.is_empty();
         (lines, truncated)
+    }
+}
+
+/// The [`CONTINUITY_SIGNATURE_BYTES`] bytes immediately before `offset`, or
+/// fewer at the start of a file. Empty at offset 0 — there is nothing before
+/// it that a rewrite could change.
+fn read_signature(f: &mut std::fs::File, offset: u64) -> std::io::Result<Vec<u8>> {
+    let want = offset.min(CONTINUITY_SIGNATURE_BYTES as u64) as usize;
+    if want == 0 {
+        return Ok(Vec::new());
+    }
+    f.seek(SeekFrom::Start(offset - want as u64))?;
+    let mut buf = vec![0u8; want];
+    match f.read_exact(&mut buf) {
+        Ok(()) => Ok(buf),
+        // The file shrank under us between the metadata call and this read;
+        // an unreadable signature is a mismatch, which is exactly the
+        // "reopen from the start" answer.
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(Vec::new()),
+        Err(e) => Err(e),
     }
 }
 
@@ -877,6 +1013,144 @@ mod tests {
         assert!(!b2.truncated);
         assert_eq!(b2.lines[0], "l2000");
         assert_eq!(*b2.lines.last().unwrap(), "l2499");
+    }
+
+    /// A poll must not read the whole file: `MAX_LINES_PER_POLL` caps what is
+    /// *delivered*, `POLL_BYTE_BUDGET` caps what is *read*. A file far larger
+    /// than the budget is drained over several polls, in order and complete.
+    #[test]
+    fn one_poll_reads_at_most_the_byte_budget_and_still_delivers_every_line() {
+        let dir = scratch("byte-budget");
+        let path = dir.join("a.log");
+        // ~3 MiB of 128-byte lines: three budgets' worth.
+        let line = "x".repeat(127);
+        let count = (3 * POLL_BYTE_BUDGET) / 128;
+        let content: String = (0..count).map(|_| format!("{line}\n")).collect();
+        std::fs::write(&path, content.as_bytes()).unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert!(
+            t.offset <= POLL_BYTE_BUDGET as u64,
+            "one poll read {} bytes of a {size}-byte file",
+            t.offset
+        );
+        assert!(b1.truncated, "the caller is told there is more to come");
+        assert_eq!(b1.lines.len(), MAX_LINES_PER_POLL);
+
+        // Every line still arrives, in order, across as many polls as it takes.
+        let mut delivered = b1.lines.len();
+        for _ in 0..1000 {
+            if delivered == count {
+                break;
+            }
+            let b = t.poll().unwrap();
+            assert!(b.lines.iter().all(|l| *l == line));
+            delivered += b.lines.len();
+        }
+        assert_eq!(delivered, count, "nothing was dropped");
+        assert_eq!(t.offset, size, "and the whole file was eventually read");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A file with no delimiter at all must not grow the splitter's buffer
+    /// without limit: past `MAX_UNTERMINATED_LINE_BYTES` the partial is broken
+    /// into a line of its own.
+    #[test]
+    fn a_single_line_with_no_newline_is_broken_at_the_bound() {
+        let dir = scratch("no-newline");
+        let path = dir.join("a.log");
+        std::fs::write(&path, vec![b'z'; 2 * MAX_UNTERMINATED_LINE_BYTES + 4096]).unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let mut lines = 0usize;
+        for _ in 0..16 {
+            lines += t.poll().unwrap().lines.len();
+        }
+        assert!(
+            lines >= 2,
+            "the unterminated run must have been broken, not buffered whole"
+        );
+        assert!(
+            t.unterminated < MAX_UNTERMINATED_LINE_BYTES,
+            "the counter is reset by each forced break"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A8-7: ALVR opens `session_log.txt` with `.truncate(true)`, so a new
+    /// session keeps the inode. If it writes back past our cursor before the
+    /// next poll, neither the inode check nor `len < offset` sees anything —
+    /// only the bytes before the cursor say the file is not the one we were
+    /// reading.
+    #[test]
+    fn truncate_and_regrow_past_the_cursor_between_polls_reports_rotation() {
+        for regrow in ["equal", "larger"] {
+            let dir = scratch(&format!("rewrite-{regrow}"));
+            let path = dir.join("a.log");
+            let old: String = (1..=10)
+                .map(|n| format!("OLD session line {n}\n"))
+                .collect();
+            std::fs::write(&path, old.as_bytes()).unwrap();
+
+            // Opened from the end: the cursor sits at EOF, exactly where a
+            // live pane on `session_log.txt` sits.
+            let mut t = Tailer::open(&path, true, 5).unwrap();
+            let _ = t.poll().unwrap();
+
+            let new: String = match regrow {
+                "equal" => (1..=10)
+                    .map(|n| format!("NEW session line {n}\n"))
+                    .collect(),
+                _ => (1..=30)
+                    .map(|n| format!("NEW session line {n}\n"))
+                    .collect(),
+            };
+            // In place, same inode — `OpenOptions::truncate`, not remove+create.
+            {
+                use std::io::Write;
+                let mut f = std::fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(true)
+                    .open(&path)
+                    .unwrap();
+                f.write_all(new.as_bytes()).unwrap();
+            }
+
+            let b = t.poll().unwrap();
+            assert!(b.rotated, "{regrow}: the rewrite must be reported");
+            assert_eq!(
+                b.lines.first().map(String::as_str),
+                Some("NEW session line 1"),
+                "{regrow}: the new session's FIRST line must not be skipped"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// The signature check must not cry rotation on an ordinary append — the
+    /// bytes before the cursor are unchanged, which is the whole point.
+    #[test]
+    fn an_ordinary_append_is_never_mistaken_for_a_rewrite() {
+        let dir = scratch("append-not-rotation");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"one\n").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        assert_eq!(t.poll().unwrap().lines, vec!["one"]);
+        for n in 2..=20 {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "line{n}").unwrap();
+            let b = t.poll().unwrap();
+            assert!(!b.rotated, "append {n} must not read as a rotation");
+            assert_eq!(b.lines, vec![format!("line{n}")]);
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// F14 (finding 14): a backlog queued in `pending` from *before* the path

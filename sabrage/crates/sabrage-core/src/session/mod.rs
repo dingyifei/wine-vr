@@ -78,6 +78,18 @@ pub enum SessionPhase {
     /// Still running, no longer supervised by this process. Guards were left
     /// in place deliberately — see this module's header.
     Detached,
+    /// A session **nothing in Sabrage started**: no live handle, no
+    /// `session-state.json`, but `runtime_status.json` is fresh and the
+    /// process it names is alive. That is a `demo.sh run` in another terminal,
+    /// which is a supported way to run this pipeline — reporting it as
+    /// [`SessionPhase::Idle`] ("No session running") invites a second launch
+    /// over a live game.
+    ///
+    /// Derived conservatively and never from file freshness alone
+    /// ([`watcher::SessionMonitor::snapshot`]); it carries the runtime's pid
+    /// and nothing else, because nothing else about that session is knowable
+    /// from here.
+    External,
 }
 
 /// The encoder configuration one session actually negotiated.
@@ -272,6 +284,185 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
     }
 }
 
+// ── one answer to "is a session live?" ────────────────────────────────────────
+
+/// Why a mutating operation must not start right now, or `None` when nothing on
+/// this machine looks like a live session.
+///
+/// Five signals, cheapest first, and deliberately **not** just the in-process
+/// [`live_session`] slot: the session a Settings save or a Doctor button would
+/// break may have been launched by the other front-end, by an earlier run of
+/// this process, or by `./demo.sh run`, none of which publish anything here.
+///
+/// 1. this process's own live-session handle;
+/// 2. the run stage's published phase — a launch that has not spawned yet;
+/// 3. `session-state.json`, when its recorded wine identity is still
+///    [`reconcile::Classification::Live`] (or
+///    [`reconcile::Classification::Unverifiable`], which is alive as far as
+///    anyone can tell) — the other front-end, or a session that outlived the
+///    process that started it;
+/// 4. the same record's `owner_pid`, for the window *before* that front-end's
+///    launch has spawned anything ([`state::has_live_foreign_owner`]);
+/// 5. a **fresh** `runtime_status.json` — the only one of the five a
+///    `./demo.sh run` session produces.
+///
+/// A live CrossOver `wineserver` is deliberately *not* a signal: it is alive for
+/// any CrossOver app the user has open, and blocking `build` on that would be
+/// wrong. The two fixes whose file a CrossOver process really can clobber keep
+/// their own narrower wineserver probes.
+pub fn live_session_reason(paths: &crate::paths::Paths) -> Option<String> {
+    session_reason(
+        &paths.session_state_path(),
+        &paths.oxr_appsup.join("runtime_status.json"),
+    )
+}
+
+/// [`live_session_reason`] against two explicit paths — what tests use, so no
+/// test can consult the developer's own machine.
+fn session_reason(
+    state_path: &std::path::Path,
+    runtime_status_path: &std::path::Path,
+) -> Option<String> {
+    if let Some(h) = live_session() {
+        return Some(format!(
+            "this Sabrage process is supervising a session for bottle '{}' (wine pid {})",
+            h.bottle, h.identity.pid
+        ));
+    }
+
+    if let Some(info) = run_phase() {
+        if matches!(
+            info.phase,
+            SessionPhase::Preflight
+                | SessionPhase::Launching
+                | SessionPhase::Running
+                | SessionPhase::Stalled
+                | SessionPhase::Stopping
+        ) {
+            return Some(format!(
+                "a launch for bottle '{}' is in progress ({:?})",
+                info.bottle, info.phase
+            ));
+        }
+    }
+
+    if let Ok(Some(s)) = state::load(state_path) {
+        if matches!(
+            reconcile::classify(&s),
+            reconcile::Classification::Live | reconcile::Classification::Unverifiable
+        ) {
+            let pid = s.wine.as_ref().map(|w| w.pid).unwrap_or(0);
+            return Some(format!(
+                "a session for bottle '{}' is still running (wine pid {pid})",
+                s.bottle
+            ));
+        }
+        if state::has_live_foreign_owner(&s) {
+            return Some(format!(
+                "Sabrage process {} is running a session for bottle '{}'",
+                s.owner_pid, s.bottle
+            ));
+        }
+    }
+
+    if let Ok(text) = std::fs::read_to_string(runtime_status_path) {
+        if let Some(rs) = watcher::parse_runtime_status(&text) {
+            if watcher::is_fresh(rs.updated_at_unix_ms, now_unix_ms()) {
+                return Some(format!(
+                    "the oxrsys runtime is reporting a live session (state '{}')",
+                    rs.state
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// Refuse `action` while any session is live — the single policy every "not
+/// while the game is running" caller shares, over [`live_session_reason`]'s
+/// five signals.
+///
+/// The error carries `stop.sh`'s own remedy, so a GUI caller renders the same
+/// row the config and doctor refusals already render.
+///
+/// This form reads the machine's real support directories: both paths it needs
+/// are derived from `$HOME`, so the empty repo root below is never consulted.
+/// Anything that already has a [`crate::paths::Paths`] — and every test — must
+/// call [`ensure_idle_in`] instead, or it will consult the developer's own
+/// session.
+pub fn ensure_idle(action: &str) -> std::result::Result<(), crate::error::SabrageError> {
+    ensure_idle_in(&crate::paths::Paths::new(PathBuf::new()), action)
+}
+
+/// [`ensure_idle`] scoped to one [`crate::paths::Paths`].
+pub fn ensure_idle_in(
+    paths: &crate::paths::Paths,
+    action: &str,
+) -> std::result::Result<(), crate::error::SabrageError> {
+    ensure_idle_at(
+        &paths.session_state_path(),
+        &paths.oxr_appsup.join("runtime_status.json"),
+        action,
+    )
+}
+
+/// [`ensure_idle`] against explicit paths.
+fn ensure_idle_at(
+    state_path: &std::path::Path,
+    runtime_status_path: &std::path::Path,
+    action: &str,
+) -> std::result::Result<(), crate::error::SabrageError> {
+    match session_reason(state_path, runtime_status_path) {
+        None => Ok(()),
+        Some(reason) => Err(crate::error::SabrageError::fatal(
+            format!(
+                "refusing to {action} while a session is live — {reason}; stop the session first"
+            ),
+            "./demo.sh stop --bottle <name>",
+        )),
+    }
+}
+
+/// What stopping *this* session means — decided once, from the status every
+/// caller already has in view.
+///
+/// The three answers are not interchangeable: firing the operation-locked
+/// `stop` stage during `Preflight`/`Launching` blocks on the very launch it is
+/// trying to stop (`run` holds [`crate::stages::OPERATION_LOCK`] until the
+/// wine child is up), and running the stage over a session this process
+/// supervises tears it down from outside instead of through its own INT path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StopPlan {
+    /// A launch of ours that has not published its handle yet: fire that run's
+    /// cancellation token (no lock needed).
+    CancelRun(RunId),
+    /// A session this process supervises: fire [`LiveSessionHandle::cancel`]
+    /// and wait for the slot to empty.
+    FireLiveToken,
+    /// Anything else — a session on disk, an external one, or none at all:
+    /// run the bottle-scoped `stop` stage, exactly `stop.sh`'s situation.
+    RunStopStage,
+}
+
+/// Which of [`StopPlan`]'s three answers `status` calls for. Pure.
+pub fn stop_plan(status: &SessionStatus) -> StopPlan {
+    match status.phase {
+        SessionPhase::Preflight | SessionPhase::Launching => match status.run_id {
+            // Without a run id there is nothing to cancel; the stage is the
+            // only remaining lever, lock and all.
+            Some(id) => StopPlan::CancelRun(id),
+            None => StopPlan::RunStopStage,
+        },
+        SessionPhase::Running | SessionPhase::Stalled | SessionPhase::Stopping
+            if status.owned_by_this_process && !status.detached =>
+        {
+            StopPlan::FireLiveToken
+        }
+        _ => StopPlan::RunStopStage,
+    }
+}
+
 /// Wall-clock milliseconds since the Unix epoch.
 ///
 /// The clock for `started_at_unix_ms` and for comparing against
@@ -337,8 +528,8 @@ fn is_virtual_output(name: &str) -> bool {
 /// `recorded output device '<prev>' is not connected — restored output -> <alt> instead`
 ///
 /// The row both restore paths print when the fallback above took over.
-/// [`reconcile::restore_persisted_guards`] appends its own "previous session
-/// did not shut down cleanly" parenthetical; the guard release prints it as-is.
+/// [`reconcile`]'s recovery pass appends its own "previous session did not
+/// shut down cleanly" parenthetical; the guard release prints it as-is.
 pub fn audio_fallback_line(dry_run: bool, previous: &str, fallback: &str) -> String {
     let verb = if dry_run { "would restore" } else { "restored" };
     format!(
@@ -476,8 +667,209 @@ mod tests {
             (SessionPhase::Stopping, "stopping"),
             (SessionPhase::Exited, "exited"),
             (SessionPhase::Detached, "detached"),
+            (SessionPhase::External, "external"),
         ] {
             assert_eq!(serde_json::to_value(phase).unwrap(), word);
+        }
+    }
+
+    // ── the one liveness policy ──────────────────────────────────────────────
+
+    fn state_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "sabrage-session-policy-{tag}-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn ensure_idle_refuses_for_every_source_that_can_know_about_a_session() {
+        let _g = lock_session_globals();
+        let dir = state_dir("ensure-idle");
+        let path = dir.join("session-state.json");
+        // Inside the fixture: no test may read the developer's own machine.
+        let status = dir.join("runtime_status.json");
+
+        // Nothing anywhere.
+        assert!(ensure_idle_at(&path, &status, "edit the runtime config").is_ok());
+
+        // 1: a session this process supervises.
+        let run = Uuid::new_v4();
+        set_live_session(handle(run));
+        let err = ensure_idle_at(&path, &status, "edit the runtime config").unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refusing to edit the runtime config while a session is live — this Sabrage process \
+             is supervising a session for bottle 'Steam' (wine pid 4242); stop the session first"
+        );
+        assert_eq!(
+            err.remedy(),
+            Some("./demo.sh stop --bottle <name>"),
+            "the GUI renders the same remedy the config fixer already renders"
+        );
+        clear_live_session(run);
+        assert!(ensure_idle_at(&path, &status, "x").is_ok());
+
+        // 2: our own launch, before it publishes a handle.
+        for phase in [
+            SessionPhase::Preflight,
+            SessionPhase::Launching,
+            SessionPhase::Stopping,
+        ] {
+            publish_run_phase(Some(RunPhaseInfo {
+                phase,
+                run_id: run,
+                bottle: "Steam".into(),
+                exit_code: None,
+            }));
+            assert!(
+                ensure_idle_at(&path, &status, "x").is_err(),
+                "{phase:?} is a live session"
+            );
+        }
+        publish_run_phase(Some(RunPhaseInfo {
+            phase: SessionPhase::Exited,
+            run_id: run,
+            bottle: "Steam".into(),
+            exit_code: Some(0),
+        }));
+        assert!(
+            ensure_idle_at(&path, &status, "x").is_ok(),
+            "a finished launch is not a live session"
+        );
+        publish_run_phase(None);
+
+        // 3: a record on disk whose wine child is this very process.
+        let me = ProcInfo::observe(std::process::id()).unwrap();
+        let mut s = state::SessionState::new(Uuid::new_v4(), "Bottled", "/g", "/l", 1);
+        s.wine = Some(me);
+        std::fs::write(&path, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+        let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
+        assert!(err.to_string().contains("bottle 'Bottled'"), "{err}");
+
+        // 4: the *other* front-end's launch, before it has spawned anything —
+        // no wine identity to classify, only `owner_pid` knows.
+        let foreign = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .expect("/bin/sleep is on every macOS");
+        let mut theirs = state::SessionState::new(Uuid::new_v4(), "Theirs", "/g", "/l", 1);
+        theirs.owner_pid = foreign.id();
+        std::fs::write(&path, serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
+        let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains(&format!("Sabrage process {} is running", foreign.id())),
+            "{err}"
+        );
+        let mut foreign = foreign;
+        let _ = foreign.kill();
+        let _ = foreign.wait();
+        std::fs::remove_file(&path).unwrap();
+
+        // 5: a `demo.sh run` session — nothing of ours anywhere, but the
+        // runtime is reporting in right now.
+        std::fs::write(
+            &status,
+            format!(
+                r#"{{"state":"streaming","updated_at_unix_ms":{}}}"#,
+                now_unix_ms()
+            ),
+        )
+        .unwrap();
+        let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
+        assert!(
+            err.to_string().contains("the oxrsys runtime is reporting"),
+            "{err}"
+        );
+        // …and a stale one is not a session.
+        std::fs::write(
+            &status,
+            format!(
+                r#"{{"state":"streaming","updated_at_unix_ms":{}}}"#,
+                now_unix_ms() - 600_000
+            ),
+        )
+        .unwrap();
+        assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
+        std::fs::remove_file(&status).unwrap();
+
+        // Back to the on-disk record for the last case.
+        std::fs::write(&path, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+
+        // …and a record whose wine child is long gone is not a session.
+        s.wine = Some(ProcInfo {
+            pid: u32::MAX - 1,
+            start_time: 1,
+            exe: PathBuf::new(),
+        });
+        std::fs::write(&path, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
+        assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn stop_plan_decides_from_the_status_alone() {
+        let run = Uuid::new_v4();
+        let with = |phase, owned, detached, run_id| SessionStatus {
+            phase,
+            run_id,
+            owned_by_this_process: owned,
+            detached,
+            ..SessionStatus::default()
+        };
+
+        // A launch of ours that has not published a handle: cancel the run —
+        // the stop stage would block on the lock that launch is holding.
+        for phase in [SessionPhase::Preflight, SessionPhase::Launching] {
+            assert_eq!(
+                stop_plan(&with(phase, true, false, Some(run))),
+                StopPlan::CancelRun(run)
+            );
+            assert_eq!(
+                stop_plan(&with(phase, true, false, None)),
+                StopPlan::RunStopStage,
+                "nothing to cancel without a run id"
+            );
+        }
+
+        // A session we supervise: its own INT path.
+        for phase in [
+            SessionPhase::Running,
+            SessionPhase::Stalled,
+            SessionPhase::Stopping,
+        ] {
+            assert_eq!(
+                stop_plan(&with(phase, true, false, Some(run))),
+                StopPlan::FireLiveToken
+            );
+            assert_eq!(
+                stop_plan(&with(phase, false, false, Some(run))),
+                StopPlan::RunStopStage,
+                "somebody else's session is stopped by the stage, as stop.sh does"
+            );
+        }
+
+        // Detached, external, exited, idle: the bottle-scoped stage.
+        for phase in [
+            SessionPhase::Detached,
+            SessionPhase::External,
+            SessionPhase::Exited,
+            SessionPhase::Idle,
+        ] {
+            assert_eq!(
+                stop_plan(&with(
+                    phase,
+                    true,
+                    phase == SessionPhase::Detached,
+                    Some(run)
+                )),
+                StopPlan::RunStopStage
+            );
         }
     }
 

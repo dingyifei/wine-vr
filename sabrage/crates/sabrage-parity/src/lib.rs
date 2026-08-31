@@ -54,6 +54,87 @@ mod tests {
             );
         }
 
+        /// Executable shell lines only: full-line comments (the header prose in
+        /// demo.sh/lib.sh that *documents* the default install leaf) are not
+        /// hard-coded values.
+        fn executable_lines(text: &str) -> String {
+            text.lines()
+                .filter(|l| !l.trim_start().starts_with('#'))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// A contract scalar the shell hard-codes is a scalar the two
+        /// front-ends can silently disagree about: editing it in
+        /// `pipeline.toml` and regenerating moves only the generated file's
+        /// `# contract-sha256:` header, so `--check`, `--regen` and doctor's
+        /// `meta.contract-sync` all report "in sync" while native setup fetches
+        /// one asset and setup.sh fetches another (or the two resolve BS_DIR to
+        /// different directories).
+        ///
+        /// `sabrage-contract-gen` emits these three; the shell must source
+        /// them. `sabrage-core` already reads them from the contract
+        /// (`stages::setup`, `paths::resolve_bs_dir`).
+        #[test]
+        fn the_shell_sources_the_emitted_asset_and_install_leaf_scalars() {
+            let root = repo_root();
+            let generated = sabrage_contract_gen::generate();
+            for var in ["GBE_DLL_ASSET", "DXMT_TGZ_ASSET", "BS_DIR_LEAF"] {
+                assert!(
+                    generated.contains(&format!("\n{var}=")),
+                    "contract.gen.sh must emit {var} for the shell to source"
+                );
+            }
+
+            let read = |rel: &str| {
+                std::fs::read_to_string(root.join(rel)).unwrap_or_else(|e| panic!("{rel}: {e}"))
+            };
+            let setup = executable_lines(&read("scripts/demo/setup.sh"));
+            let lib = executable_lines(&read("scripts/demo/lib.sh"));
+            let doctor = executable_lines(&read("scripts/demo/doctor.sh"));
+
+            for (name, text, var) in [
+                ("setup.sh", &setup, "GBE_DLL_ASSET"),
+                ("setup.sh", &setup, "DXMT_TGZ_ASSET"),
+                ("lib.sh", &lib, "BS_DIR_LEAF"),
+                ("doctor.sh", &doctor, "BS_DIR_LEAF"),
+            ] {
+                assert!(
+                    text.contains(var),
+                    "{name} must use ${var} (sourced from contract.gen.sh) instead of a literal"
+                );
+            }
+
+            for (name, text, literal) in [
+                (
+                    "setup.sh",
+                    &setup,
+                    sabrage_core::contract().deps.gbe_dll_asset.as_str(),
+                ),
+                (
+                    "setup.sh",
+                    &setup,
+                    sabrage_core::contract().deps.dxmt_tgz_asset.as_str(),
+                ),
+                (
+                    "lib.sh",
+                    &lib,
+                    sabrage_core::contract().game.bs_dir_leaf.as_str(),
+                ),
+                (
+                    "doctor.sh",
+                    &doctor,
+                    sabrage_core::contract().game.bs_dir_leaf.as_str(),
+                ),
+            ] {
+                assert!(
+                    !text.contains(literal),
+                    "{name} hard-codes the contract value {literal:?} — source the generated \
+                     variable instead, so changing contract/pipeline.toml changes both sides"
+                );
+            }
+        }
+
         #[test]
         fn check_reports_in_sync_against_the_live_checkout() {
             let report = sabrage_contract_gen::check(&repo_root())
@@ -222,7 +303,33 @@ mod tests {
             out
         }
 
+        /// The executable part of a shell line: everything before the first
+        /// **comment** `#` — one that starts a word (line start, or after
+        /// whitespace) and is not inside a single- or double-quoted string.
+        ///
+        /// Without this the scanner credits a commented-out `chk` line as a
+        /// live emission, which is precisely how a deleted check keeps its
+        /// coverage. `${_f#$ROOT/}`, `$#` and a `#` inside a quoted message are
+        /// not comments and must survive.
+        fn strip_comment(line: &str) -> &str {
+            let mut in_single = false;
+            let mut in_double = false;
+            let mut prev_ws = true;
+            for (i, c) in line.char_indices() {
+                match c {
+                    '\'' if !in_double => in_single = !in_single,
+                    '"' if !in_single => in_double = !in_double,
+                    '#' if !in_single && !in_double && prev_ws => return &line[..i],
+                    _ => {}
+                }
+                prev_ws = c == ' ' || c == '\t';
+            }
+            line
+        }
+
         /// `# 0.` / `# 9b.` / `# 16b.` … doctor.sh's own section numbering.
+        /// Read from the RAW line: section headers are comments, and
+        /// [`strip_comment`] would eat them.
         fn section_header(line: &str) -> Option<String> {
             let re = Regex::new(r"^#\s+(\d+[a-z]?)\.").unwrap();
             re.captures(line.trim_start()).map(|c| c[1].to_string())
@@ -233,58 +340,136 @@ mod tests {
             re.is_match(s)
         }
 
-        /// slug -> the set of doctor.sh sections it was found emitted from.
-        fn scan_doctor_slugs(text: &str) -> BTreeMap<String, BTreeSet<String>> {
+        /// What one scan of doctor.sh found.
+        pub(super) struct Scan {
+            /// slug -> the set of doctor.sh sections it was emitted from.
+            pub by_slug: BTreeMap<String, BTreeSet<String>>,
+            /// Slugs in **first-emission order** — the contract calls its own
+            /// order load-bearing ("Order = doctor.sh order"), so a set
+            /// comparison alone cannot prove the two agree.
+            pub order: Vec<String>,
+            /// `slug:value` loop headers whose body emits nothing: the header
+            /// still names slugs, but no `chk`/`tap` call consumes the loop
+            /// variable, so those slugs are NOT covered.
+            pub header_only_loops: Vec<String>,
+        }
+
+        fn record(scan: &mut Scan, slug: &str, section: &str) {
+            let sections = scan.by_slug.entry(slug.to_string()).or_default();
+            if sections.is_empty() {
+                scan.order.push(slug.to_string());
+            }
+            sections.insert(section.to_string());
+        }
+
+        /// Does the loop body starting at `rest` actually emit for `var`?
+        ///
+        /// Both halves are required: the `${_x%%:*}` slug extraction (directly
+        /// in the `chk` argument, or via the intermediate `_slug=` assignment
+        /// section 10 uses) **and** at least one `chk`/`tap` call. Deleting the
+        /// body's `chk` lines while keeping the `slug:value` header — the
+        /// realistic way a check evaporates — then reads as uncovered.
+        fn loop_body_emits(rest: &[String], var: &str, call_re: &Regex) -> bool {
+            let prefix = format!("${{{var}%%:*}}");
+            let mut saw_extraction = false;
+            let mut saw_call = false;
+            let mut depth = 0usize;
+            for line in rest {
+                let logical = strip_comment(line);
+                let trimmed = logical.trim();
+                if trimmed == "done" {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    continue;
+                }
+                if trimmed.ends_with("; do") || trimmed == "do" {
+                    depth += 1;
+                }
+                if logical.contains(&prefix) {
+                    saw_extraction = true;
+                }
+                if call_re.is_match(logical) {
+                    saw_call = true;
+                }
+            }
+            saw_extraction && saw_call
+        }
+
+        pub(super) fn scan_doctor_slugs(text: &str) -> Scan {
             let chk_re =
                 Regex::new(r"\bchk\s+(?:ok|warn|fail|info)\s+([a-z][a-z0-9._-]*)\b").unwrap();
             let tap_re =
                 Regex::new(r"\btap\s+([a-z][a-z0-9._-]*)\s+(?:ok|warn|fail|info|skipped)\b")
                     .unwrap();
             // `for _x in <list>; do` — the loop headers in sections 4/6/9/10.
-            let loop_re = Regex::new(r"\bfor\s+_\w+\s+in\s+(.+?)\s*;\s*do\b").unwrap();
+            let loop_re = Regex::new(r"\bfor\s+(_\w+)\s+in\s+(.+?)\s*;\s*do\b").unwrap();
+            // Any chk/tap invocation, slug-shaped argument or not: inside a
+            // loop the argument is `${_t%%:*}` / `"$_slug"`, which the two
+            // slug-extracting regexes above deliberately do not match.
+            let call_re = Regex::new(r"\b(?:chk|tap)\s").unwrap();
 
-            let mut by_slug: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+            let lines = logical_lines(text);
+            let mut scan = Scan {
+                by_slug: BTreeMap::new(),
+                order: Vec::new(),
+                header_only_loops: Vec::new(),
+            };
             let mut current_section: Option<String> = None;
 
-            for logical in logical_lines(text) {
-                if let Some(sec) = section_header(&logical) {
+            for (i, raw) in lines.iter().enumerate() {
+                if let Some(sec) = section_header(raw) {
                     current_section = Some(sec);
                 }
+                let logical = strip_comment(raw);
                 let Some(section) = current_section.clone() else {
                     continue; // nothing before "# 0." emits a slug
                 };
 
-                for cap in chk_re.captures_iter(&logical) {
-                    by_slug
-                        .entry(cap[1].to_string())
-                        .or_default()
-                        .insert(section.clone());
+                for cap in chk_re.captures_iter(logical) {
+                    record(&mut scan, &cap[1], &section);
                 }
-                for cap in tap_re.captures_iter(&logical) {
-                    by_slug
-                        .entry(cap[1].to_string())
-                        .or_default()
-                        .insert(section.clone());
+                for cap in tap_re.captures_iter(logical) {
+                    record(&mut scan, &cap[1], &section);
                 }
-                for cap in loop_re.captures_iter(&logical) {
+                for cap in loop_re.captures_iter(logical) {
+                    let var = cap[1].to_string();
                     // Each whitespace-delimited word is `slug:value`; take
                     // only the part before the FIRST colon (values like
                     // overlay's `"$DXMT_ART/…/d3d11.dll:$CX/…/d3d11.dll"`
                     // contain further colons that must not be mistaken for a
                     // second slug).
-                    for word in cap[1].split_whitespace() {
-                        if let Some((slug, _rest)) = word.split_once(':') {
-                            if is_slug_shaped(slug) {
-                                by_slug
-                                    .entry(slug.to_string())
-                                    .or_default()
-                                    .insert(section.clone());
-                            }
+                    let slugs: Vec<String> = cap[2]
+                        .split_whitespace()
+                        .filter_map(|w| w.split_once(':').map(|(slug, _)| slug))
+                        .filter(|slug| is_slug_shaped(slug))
+                        .map(str::to_string)
+                        .collect();
+                    if slugs.is_empty() {
+                        continue;
+                    }
+                    if loop_body_emits(&lines[i + 1..], &var, &call_re) {
+                        for slug in slugs {
+                            record(&mut scan, &slug, &section);
                         }
+                    } else {
+                        scan.header_only_loops
+                            .push(format!("for {var} in {}", slugs.join(" ")));
                     }
                 }
             }
-            by_slug
+            scan
+        }
+
+        /// The contract's doctor-row slugs, in contract order.
+        fn contract_row_slugs() -> Vec<String> {
+            sabrage_core::contract()
+                .checks
+                .iter()
+                .filter(|c| c.group != "run-only")
+                .map(|c| c.slug.clone())
+                .collect()
         }
 
         #[test]
@@ -293,9 +478,17 @@ mod tests {
             let text = std::fs::read_to_string(root.join("scripts/demo/doctor.sh"))
                 .expect("scripts/demo/doctor.sh reads");
 
-            let found = scan_doctor_slugs(&text);
+            let scan = scan_doctor_slugs(&text);
 
-            let cross_section: Vec<String> = found
+            assert!(
+                scan.header_only_loops.is_empty(),
+                "doctor.sh loop header(s) name slugs but the loop body emits no \
+                 chk/tap for them: {:?}",
+                scan.header_only_loops
+            );
+
+            let cross_section: Vec<String> = scan
+                .by_slug
                 .iter()
                 .filter(|(_, sections)| sections.len() > 1)
                 .map(|(slug, sections)| {
@@ -312,13 +505,9 @@ mod tests {
                 cross_section.join("; ")
             );
 
-            let found_slugs: BTreeSet<String> = found.keys().cloned().collect();
-            let contract_slugs: BTreeSet<String> = sabrage_core::contract()
-                .checks
-                .iter()
-                .filter(|c| c.group != "run-only")
-                .map(|c| c.slug.clone())
-                .collect();
+            let found_slugs: BTreeSet<String> = scan.by_slug.keys().cloned().collect();
+            let contract_order = contract_row_slugs();
+            let contract_slugs: BTreeSet<String> = contract_order.iter().cloned().collect();
 
             let missing: Vec<&String> = contract_slugs.difference(&found_slugs).collect();
             assert!(
@@ -334,6 +523,84 @@ mod tests {
                 "doctor.sh emits slug(s) the contract does not declare: {unknown:?} \
                  (add a [[check]] to contract/pipeline.toml, or fix the typo)"
             );
+
+            // The contract calls its own order load-bearing (pipeline.toml:
+            // "Order = doctor.sh order"), and tier 2 compares two tap channels
+            // as unordered maps — so this is the only gate on it.
+            assert_eq!(
+                scan.order, contract_order,
+                "doctor.sh's first-emission order must equal the contract's check order"
+            );
+        }
+
+        // ── the scanner's own behaviour, on inline fixtures ──────────────────
+
+        fn slugs_of(fixture: &str) -> Vec<String> {
+            scan_doctor_slugs(fixture).order
+        }
+
+        #[test]
+        fn a_commented_out_chk_line_contributes_no_slug() {
+            let live = "# 5. rust\nchk ok rust.x64-target \"ok\"\n";
+            let commented = "# 5. rust\n#chk ok rust.x64-target \"ok\"\n";
+            let indented = "# 5. rust\n  # chk ok rust.x64-target \"ok\"\n";
+            assert_eq!(slugs_of(live), vec!["rust.x64-target".to_string()]);
+            assert!(slugs_of(commented).is_empty());
+            assert!(slugs_of(indented).is_empty());
+        }
+
+        #[test]
+        fn a_trailing_comment_does_not_hide_the_call_before_it() {
+            let fixture = "# 5. rust\nchk ok rust.x64-target \"ok\"  # trailing note\n";
+            assert_eq!(slugs_of(fixture), vec!["rust.x64-target".to_string()]);
+        }
+
+        #[test]
+        fn a_hash_inside_a_parameter_expansion_or_a_string_is_not_a_comment() {
+            let fixture =
+                "# 9. build\nchk ok build.oxr-dylib \"built: ${_f#$ROOT/} # not a comment\"\n";
+            assert_eq!(slugs_of(fixture), vec!["build.oxr-dylib".to_string()]);
+        }
+
+        #[test]
+        fn a_loop_header_whose_body_emits_nothing_covers_no_slug() {
+            let covered = "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  \
+                           chk ok ${_t%%:*} \"${_t#*:}\"\ndone\n";
+            let gutted = "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  \
+                          command -v ${_t#*:} >/dev/null\ndone\n";
+            assert_eq!(
+                slugs_of(covered),
+                vec!["tool.cmake".to_string(), "tool.ninja".to_string()]
+            );
+            let scan = scan_doctor_slugs(gutted);
+            assert!(scan.order.is_empty(), "{:?}", scan.order);
+            assert_eq!(scan.header_only_loops.len(), 1);
+        }
+
+        #[test]
+        fn a_loop_that_extracts_the_slug_into_a_variable_still_counts() {
+            // Section 10's shape: `_slug="${_o%%:*}"` then `chk ok "$_slug" …`.
+            let fixture = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
+                           _slug=\"${_o%%:*}\"\n  chk ok \"$_slug\" \"current\"\ndone\n";
+            assert_eq!(slugs_of(fixture), vec!["overlay.woxr-dll".to_string()]);
+        }
+
+        #[test]
+        fn the_scan_records_first_emission_order_not_a_set() {
+            let fixture = "# 0. meta\nchk ok meta.contract-sync \"a\"\n# 1. system\n\
+                           chk ok sys.arch \"b\"\ntap sys.arch ok\nchk ok sys.macos27 \"c\"\n";
+            assert_eq!(
+                slugs_of(fixture),
+                vec![
+                    "meta.contract-sync".to_string(),
+                    "sys.arch".to_string(),
+                    "sys.macos27".to_string(),
+                ],
+                "a re-emitted slug keeps its first position, and order is preserved"
+            );
+            let swapped = "# 0. meta\nchk ok sys.arch \"b\"\n# 1. system\n\
+                           chk ok meta.contract-sync \"a\"\n";
+            assert_ne!(slugs_of(swapped), slugs_of(fixture));
         }
     }
 
@@ -342,6 +609,8 @@ mod tests {
     mod run_sh_tags {
         use super::repo_root;
         use regex::Regex;
+        use sabrage_core::Gate;
+        use std::collections::BTreeMap;
 
         /// `require_bottle()` (lib.sh) enforces `bottle.named` and
         /// `bottle.exists` by calling `die()` unconditionally at the top of
@@ -356,9 +625,19 @@ mod tests {
         /// mismatch.
         const REQUIRE_BOTTLE_BLOCKS: [&str; 2] = ["bottle.named", "bottle.exists"];
 
+        /// The three preflight tag kinds and the `shell_gate` each one claims.
+        /// `none` has no tag by construction: an untagged check is not in the
+        /// launch preflight at all.
+        const TAG_GATES: [(&str, Gate); 3] = [
+            ("preflight:", Gate::Block),
+            ("preflight-warn:", Gate::Warn),
+            ("preflight-autofix:", Gate::Autofix),
+        ];
+
         /// All slugs on `# <tag> <slug> [<slug> …]` lines, in file order
         /// (multiple slugs on one line, as `cfg.protocol.supported
-        /// cfg.protocol.legacy-oxrsys` does, expand to multiple entries).
+        /// cfg.protocol.legacy-oxrsys` did before the gates split them, expand
+        /// to multiple entries).
         fn extract_tagged(text: &str, tag: &str) -> Vec<String> {
             let re = Regex::new(&format!(r"(?m)^#\s*{}\s+(.+)$", regex::escape(tag))).unwrap();
             re.captures_iter(text)
@@ -370,52 +649,168 @@ mod tests {
                 .collect()
         }
 
+        /// slug -> the gate its tag claims, for every tagged (or documented
+        /// untagged) preflight in run.sh.
+        ///
+        /// Merging the three tag kinds into one "is gating at all" bag — which
+        /// this test used to do — cannot tell `warn` from `block` in either
+        /// direction: turning `game.version`'s `warn` into a `die` left the tag
+        /// and the whole comparison unchanged. The map is the fix.
+        fn tag_gate_map(text: &str) -> (BTreeMap<String, Gate>, Vec<String>) {
+            let mut map: BTreeMap<String, Gate> = BTreeMap::new();
+            let mut conflicts: Vec<String> = Vec::new();
+            for (tag, gate) in TAG_GATES {
+                for slug in extract_tagged(text, tag) {
+                    if let Some(prev) = map.insert(slug.clone(), gate) {
+                        if prev != gate {
+                            conflicts.push(format!(
+                                "{slug} is tagged both {} and {}",
+                                prev.as_str(),
+                                gate.as_str()
+                            ));
+                        }
+                    }
+                }
+            }
+            for slug in REQUIRE_BOTTLE_BLOCKS {
+                if let Some(prev) = map.insert(slug.to_string(), Gate::Block) {
+                    conflicts.push(format!(
+                        "{slug} carries a {} tag as well as the documented require_bottle block",
+                        prev.as_str()
+                    ));
+                }
+            }
+            (map, conflicts)
+        }
+
+        /// The contract's shell-side launch preflight: slug -> gate, `none`
+        /// excluded (an untagged, non-gating check).
+        fn contract_shell_gates() -> BTreeMap<String, Gate> {
+            sabrage_core::contract()
+                .checks
+                .iter()
+                .filter(|c| c.shell_gate != Gate::None)
+                .map(|c| (c.slug.clone(), c.shell_gate))
+                .collect()
+        }
+
         #[test]
-        fn preflight_and_autofix_tags_match_the_contracts_shell_gates() {
+        fn preflight_tags_match_the_contracts_shell_gates_gate_for_gate() {
             let root = repo_root();
             let text = std::fs::read_to_string(root.join("scripts/demo/run.sh"))
                 .expect("scripts/demo/run.sh reads");
 
-            let mut preflight = extract_tagged(&text, "preflight:");
-            let autofix = extract_tagged(&text, "preflight-autofix:");
-
-            preflight.extend(autofix.iter().cloned());
-            preflight.extend(REQUIRE_BOTTLE_BLOCKS.iter().map(|s| s.to_string()));
-            preflight.sort();
-            preflight.dedup();
-
-            let mut gating: Vec<String> = sabrage_core::contract()
-                .checks
-                .iter()
-                .filter(|c| c.shell_gate != sabrage_core::Gate::None)
-                .map(|c| c.slug.clone())
-                .collect();
-            gating.sort();
-
-            assert_eq!(
-                preflight, gating,
-                "run.sh's `# preflight:` + `# preflight-autofix:` tags, plus the documented \
-                 require_bottle exception ({REQUIRE_BOTTLE_BLOCKS:?}), must exactly equal the \
-                 contract slugs with shell_gate != none"
+            let (tagged, conflicts) = tag_gate_map(&text);
+            assert!(
+                conflicts.is_empty(),
+                "contradictory run.sh tags: {conflicts:?}"
             );
 
-            let mut autofix_sorted = autofix;
-            autofix_sorted.sort();
-            autofix_sorted.dedup();
-
-            let mut autofix_gate: Vec<String> = sabrage_core::contract()
-                .checks
-                .iter()
-                .filter(|c| c.shell_gate == sabrage_core::Gate::Autofix)
-                .map(|c| c.slug.clone())
-                .collect();
-            autofix_gate.sort();
-
+            let want = contract_shell_gates();
             assert_eq!(
-                autofix_sorted, autofix_gate,
-                "run.sh's `# preflight-autofix:` tags must exactly equal the contract slugs \
-                 with shell_gate = autofix"
+                tagged, want,
+                "run.sh's `# preflight:` (block) / `# preflight-warn:` (warn) / \
+                 `# preflight-autofix:` (autofix) tags, plus the documented require_bottle \
+                 exception ({REQUIRE_BOTTLE_BLOCKS:?}), must equal the contract's shell_gate \
+                 map slug-for-slug AND gate-for-gate"
             );
+            // Cardinality, stated separately so a same-size swap still reads
+            // as one obvious failure above rather than as a length mismatch.
+            assert_eq!(tagged.len(), want.len());
+        }
+
+        /// A tag is a comment: nothing binds `# preflight-warn: game.version`
+        /// to the `warn` two lines below it. This ties each tag *group* to the
+        /// verb its block actually uses, which is what makes the map above
+        /// evidence about behaviour rather than about comments.
+        ///
+        /// A "block" is the run of lines from a tag group (consecutive
+        /// `# preflight*:` lines) to the next tag group, or to end of file.
+        /// `autofix` groups are exempt: their blocks legitimately contain both
+        /// verbs (the fix's own failure path dies).
+        #[test]
+        fn each_preflight_tag_group_uses_the_verb_its_gate_claims() {
+            let root = repo_root();
+            let text = std::fs::read_to_string(root.join("scripts/demo/run.sh"))
+                .expect("scripts/demo/run.sh reads");
+            let die_re = Regex::new(r"\bdie\b").unwrap();
+            let warn_re = Regex::new(r"\bwarn\b").unwrap();
+            for group in tag_groups(&text) {
+                let has_die = die_re.is_match(&group.body);
+                let has_warn = warn_re.is_match(&group.body);
+                if group.gates.contains(&Gate::Autofix) {
+                    continue;
+                }
+                if group.gates.contains(&Gate::Block) {
+                    assert!(
+                        has_die,
+                        "block-tagged {:?} but its run.sh block never calls die:\n{}",
+                        group.slugs, group.body
+                    );
+                }
+                if group.gates.contains(&Gate::Warn) {
+                    assert!(
+                        has_warn,
+                        "warn-tagged {:?} but its run.sh block never calls warn:\n{}",
+                        group.slugs, group.body
+                    );
+                    if !group.gates.contains(&Gate::Block) {
+                        assert!(
+                            !has_die,
+                            "warn-only {:?} but its run.sh block calls die — the contract says \
+                             the launch continues:\n{}",
+                            group.slugs, group.body
+                        );
+                    }
+                }
+            }
+        }
+
+        struct TagGroup {
+            slugs: Vec<String>,
+            gates: Vec<Gate>,
+            body: String,
+        }
+
+        /// Consecutive `# preflight*:` tag lines and the run.sh lines they
+        /// govern (up to the next tag group, or EOF).
+        fn tag_groups(text: &str) -> Vec<TagGroup> {
+            let tag_re =
+                Regex::new(r"^#\s*(preflight:|preflight-warn:|preflight-autofix:)\s+(.+)$")
+                    .unwrap();
+            let lines: Vec<&str> = text.lines().collect();
+            let mut groups: Vec<TagGroup> = Vec::new();
+            let mut i = 0usize;
+            while i < lines.len() {
+                let Some(cap) = tag_re.captures(lines[i].trim_start()) else {
+                    i += 1;
+                    continue;
+                };
+                let mut slugs: Vec<String> = Vec::new();
+                let mut gates: Vec<Gate> = Vec::new();
+                let mut cap = Some(cap);
+                while let Some(c) = cap {
+                    let gate = TAG_GATES
+                        .iter()
+                        .find(|(t, _)| *t == &c[1])
+                        .map(|(_, g)| *g)
+                        .expect("the regex only matches the three known tags");
+                    gates.push(gate);
+                    slugs.extend(c[2].split_whitespace().map(str::to_string));
+                    i += 1;
+                    cap = lines.get(i).and_then(|l| tag_re.captures(l.trim_start()));
+                }
+                let start = i;
+                while i < lines.len() && tag_re.captures(lines[i].trim_start()).is_none() {
+                    i += 1;
+                }
+                groups.push(TagGroup {
+                    slugs,
+                    gates,
+                    body: lines[start..i].join("\n"),
+                });
+            }
+            groups
         }
 
         #[test]
@@ -436,6 +831,54 @@ mod tests {
                 "run.sh's `# launch-action:` tags, in file order, must exactly equal the \
                  contract's [[launch_action]] id order"
             );
+        }
+
+        // ── the tag scan's own behaviour, on inline fixtures ─────────────────
+
+        #[test]
+        fn the_scan_separates_block_warn_and_autofix() {
+            let fixture = "# preflight: a.block\n[ -f x ] || die \"gone\"\n\
+                           # preflight-warn: b.warn\ncase $v in x) : ;; *) warn \"odd\" ;; esac\n\
+                           # preflight-autofix: c.fix\nfix_it || die \"could not fix\"\n";
+            let (map, conflicts) = tag_gate_map(fixture);
+            assert!(conflicts.is_empty());
+            assert_eq!(map.get("a.block"), Some(&Gate::Block));
+            assert_eq!(map.get("b.warn"), Some(&Gate::Warn));
+            assert_eq!(map.get("c.fix"), Some(&Gate::Autofix));
+        }
+
+        #[test]
+        fn a_warn_tagged_block_that_dies_is_rejected() {
+            let honest = "# preflight-warn: b.warn\ncase $v in x) : ;; *) warn \"odd\" ;; esac\n";
+            let lying = "# preflight-warn: b.warn\ncase $v in x) : ;; *) die \"odd\" ;; esac\n";
+            let die_re = Regex::new(r"\bdie\b").unwrap();
+            let warn_re = Regex::new(r"\bwarn\b").unwrap();
+
+            let g = &tag_groups(honest)[0];
+            assert!(warn_re.is_match(&g.body) && !die_re.is_match(&g.body));
+
+            let g = &tag_groups(lying)[0];
+            assert!(
+                die_re.is_match(&g.body),
+                "the warn->die mutation must be visible in the group's body"
+            );
+        }
+
+        #[test]
+        fn a_block_tagged_group_that_only_warns_is_rejected() {
+            let lying = "# preflight: a.block\ncase $v in x) : ;; *) warn \"odd\" ;; esac\n";
+            let g = &tag_groups(lying)[0];
+            assert!(!Regex::new(r"\bdie\b").unwrap().is_match(&g.body));
+        }
+
+        #[test]
+        fn consecutive_tags_share_one_block() {
+            let fixture = "# preflight: a.block\n# preflight-warn: b.warn\n\
+                           case $v in a) : ;; b) warn \"legacy\" ;; *) die \"invalid\" ;; esac\n";
+            let groups = tag_groups(fixture);
+            assert_eq!(groups.len(), 1);
+            assert_eq!(groups[0].slugs, vec!["a.block", "b.warn"]);
+            assert_eq!(groups[0].gates, vec![Gate::Block, Gate::Warn]);
         }
     }
 
@@ -466,6 +909,38 @@ mod tests {
                 sabrage_core::util::host_manifest_file_bytes(dylib),
                 format!("{expected}\n")
             );
+        }
+
+        /// The dylib path lands inside a JSON string literal, so both
+        /// front-ends escape it (`util::json_escape_string` here,
+        /// `${OXR_DYLIB//\\/\\\\}` + `${.../\"/\\\"}` in install.sh) before the
+        /// `@OXR_DYLIB@` substitution. The golden above proves an ordinary
+        /// path is unchanged by that; this one proves a path containing `"` or
+        /// `\` still produces JSON whose decoded `library_path` is the path we
+        /// asked for, rather than the invalid/misdirected manifest a raw
+        /// replace writes into a root-owned file.
+        #[test]
+        fn render_host_manifest_json_escapes_the_dylib_path() {
+            for raw in [
+                "/Users/me/my \"vr\" repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib",
+                "/Users/me/a\\b/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib",
+                "/Users/me/\"\\\"/liboxrsys-runtime.dylib",
+            ] {
+                let path = Path::new(raw);
+                for rendered in [
+                    sabrage_core::util::render_host_manifest(path),
+                    sabrage_core::util::host_manifest_file_bytes(path),
+                    sabrage_core::privilege::host_manifest_bytes(path),
+                ] {
+                    let parsed: serde_json::Value = serde_json::from_str(&rendered)
+                        .unwrap_or_else(|e| panic!("not valid JSON: {rendered}: {e}"));
+                    assert_eq!(
+                        parsed["runtime"]["library_path"].as_str(),
+                        Some(raw),
+                        "the decoded library_path must be the dylib path itself"
+                    );
+                }
+            }
         }
 
         /// The bytes install layer 4 actually **writes** — not merely the ones
@@ -857,6 +1332,197 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
         }
 
+        // ── steam_appid.txt bytes, as they land on disk ──────────────────────
+
+        /// A synchronous [`Executor`] that really writes, into the test's own
+        /// scratch tree.
+        ///
+        /// The plan a dry run records carries no content — `write_atomic`
+        /// becomes `PlannedAction { reason: "<n> bytes" }` and the bytes are
+        /// dropped — so the golden above can only pin the payload's *length*:
+        /// `b"999999"` and `b"62098\n"` both record `"6 bytes"`. Reading the
+        /// file back is the only way to pin the bytes, and
+        /// [`sabrage_core::executor::RealExecutor`] cannot be driven from this
+        /// crate (its primitives are `tokio::fs`, and sabrage-parity has no
+        /// async runtime — adding one is a `Cargo.toml` edit outside this
+        /// crate's ownership). `std::fs` behind the same trait gives the real
+        /// on-disk bytes with no dependency at all; every primitive the run
+        /// stage does not use panics rather than pretending to succeed.
+        #[derive(Debug)]
+        struct SyncFsExecutor;
+
+        impl sabrage_core::executor::Executor for SyncFsExecutor {
+            fn with_step(
+                &self,
+                _step: sabrage_core::events::StepId,
+            ) -> std::sync::Arc<dyn sabrage_core::executor::Executor> {
+                std::sync::Arc::new(SyncFsExecutor)
+            }
+
+            fn copy_if_changed<'a>(
+                &'a self,
+                src: &'a Path,
+                dst: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<
+                'a,
+                sabrage_core::Result<sabrage_core::executor::Copied>,
+            > {
+                Box::pin(async move {
+                    if sabrage_core::util::cmp_files(src, dst) {
+                        return Ok(sabrage_core::executor::Copied::Unchanged);
+                    }
+                    std::fs::copy(src, dst).expect("scratch copy succeeds");
+                    Ok(sabrage_core::executor::Copied::Copied)
+                })
+            }
+
+            fn write_atomic<'a>(
+                &'a self,
+                path: &'a Path,
+                bytes: &'a [u8],
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                Box::pin(async move {
+                    std::fs::write(path, bytes).expect("scratch write succeeds");
+                    Ok(())
+                })
+            }
+
+            fn remove_dir_all<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                Box::pin(async move {
+                    std::fs::remove_dir_all(path).ok();
+                    Ok(())
+                })
+            }
+
+            fn remove_file<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                Box::pin(async move {
+                    std::fs::remove_file(path).ok();
+                    Ok(())
+                })
+            }
+
+            fn create_dir_all<'a>(
+                &'a self,
+                path: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                Box::pin(async move {
+                    std::fs::create_dir_all(path).expect("scratch mkdir succeeds");
+                    Ok(())
+                })
+            }
+
+            fn dir_copy<'a>(
+                &'a self,
+                _src: &'a Path,
+                _dst: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                unimplemented!("dir_copy is not part of the goldberg stage")
+            }
+
+            fn download<'a>(
+                &'a self,
+                _url: &'a str,
+                _dest: &'a Path,
+                _sha256: &'a str,
+                _label: &'a str,
+            ) -> sabrage_core::executor::BoxFuture<
+                'a,
+                sabrage_core::Result<sabrage_core::executor::Downloaded>,
+            > {
+                unimplemented!("download is not part of the goldberg stage")
+            }
+
+            fn tar_xzf<'a>(
+                &'a self,
+                _archive: &'a Path,
+                _into_dir: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                unimplemented!("tar_xzf is not part of the goldberg stage")
+            }
+
+            fn touch<'a>(
+                &'a self,
+                _path: &'a Path,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<()>> {
+                unimplemented!("touch is not part of the goldberg stage")
+            }
+
+            fn run_child<'a>(
+                &'a self,
+                _spec: &'a sabrage_core::process::ChildSpec,
+            ) -> sabrage_core::executor::BoxFuture<'a, sabrage_core::Result<std::process::ExitStatus>>
+            {
+                unimplemented!("this golden spawns no children")
+            }
+
+            fn spawn_detached<'a>(
+                &'a self,
+                _spec: &'a sabrage_core::process::ChildSpec,
+                _stdio: sabrage_core::executor::DetachedStdio,
+            ) -> sabrage_core::executor::BoxFuture<
+                'a,
+                sabrage_core::Result<Option<sabrage_core::executor::DetachedChild>>,
+            > {
+                unimplemented!("this golden spawns no children")
+            }
+        }
+
+        /// run.sh:150 — `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"`,
+        /// read back off disk: the appid digits and **nothing else**.
+        ///
+        /// The dry-run golden above can only see the payload's length; this one
+        /// goes red for any six-byte impostor (`999999`, `62098\n`) as well as
+        /// for a wrong length.
+        #[test]
+        fn steam_appid_txt_lands_on_disk_as_exactly_the_appid_digits() {
+            let root = scratch("goldberg-bytes");
+            let bs_dir = root.join("BeatSaber");
+            std::fs::create_dir_all(&bs_dir).unwrap();
+            let api = bs_dir.join("steam_api64.dll");
+            std::fs::write(&api, b"steam").unwrap();
+
+            let paths = Paths::new(&root);
+            std::fs::create_dir_all(paths.gbe_dll.parent().unwrap()).unwrap();
+            std::fs::write(&paths.gbe_dll, b"goldberg-bytes").unwrap();
+
+            let opts = StageOptions {
+                bs_dir_override: Some(bs_dir.clone()),
+                dry_run: false,
+                ..StageOptions::default()
+            };
+            let ctx = StageCtx::with_executor(
+                paths,
+                opts,
+                silent_sink(),
+                Default::default(),
+                Arc::new(SyncFsExecutor),
+                sabrage_core::events::RunId::default(),
+            );
+
+            block_on(sabrage_core::stages::run::actions::goldberg_stage(&ctx))
+                .expect("goldberg_stage completes against a complete fixture tree");
+
+            let written = std::fs::read(bs_dir.join("steam_appid.txt"))
+                .expect("goldberg_stage wrote steam_appid.txt beside steam_api64.dll");
+            assert_eq!(
+                written,
+                contract().game.appid.to_string().into_bytes(),
+                "steam_appid.txt must be exactly the contract's appid digits — no trailing \
+                 newline, no other byte"
+            );
+            // Belt and braces: the Goldberg dll really went over the api dll,
+            // so the assertion above is about a stage that actually ran.
+            assert_eq!(std::fs::read(&api).unwrap(), b"goldberg-bytes");
+
+            std::fs::remove_dir_all(&root).ok();
+        }
+
         // ── wine_env ─────────────────────────────────────────────────────────
 
         /// run.sh:242-248, table form. The load-bearing branch is `WINEDEBUG`:
@@ -998,16 +1664,36 @@ mod tests {
     /// not just the doc comment) and pinned here as a substring of the on-disk
     /// `run.sh` — this module never calls native code at all.
     ///
-    /// The two sides of the parity are pinned by two different test suites:
-    /// editing a native literal without updating `run.sh` turns
-    /// **sabrage-core's own** frozen-text unit tests red (they call the
-    /// native function directly and pin its return value —
-    /// `guards::tests::the_guard_texts_are_run_shs_verbatim`,
+    /// # What each half is actually gated by
+    ///
+    /// Editing `run.sh`'s wording without updating the native literal turns
+    /// **this module's** tests red, because they pin the fragment as a
+    /// substring of the on-disk file.
+    ///
+    /// The other direction — editing a native literal without touching
+    /// `run.sh` — is NOT gated by sabrage-core's own frozen-text unit tests
+    /// (`guards::tests::the_guard_texts_are_run_shs_verbatim`,
     /// `mod::tests::the_closing_lines_are_run_shs_verbatim`,
-    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, and
-    /// their neighbors); editing `run.sh`'s wording without updating the
-    /// native literal turns **this module's** tests red instead, since they
-    /// only pin the same fragment as a substring of the on-disk file.
+    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, …), which
+    /// this module's header used to claim: tier 1 selects `sabrage-parity` +
+    /// `sabrage-contract-gen` only (`scripts/dev/parity.sh`,
+    /// `.github/workflows/parity.yml`), and Cargo does not run a
+    /// dev-dependency's `#[cfg(test)]` harness. Those tests exist but nothing
+    /// runs them in the gate, and CI (ubuntu) cannot add `-p sabrage-core`
+    /// because much of that suite is macOS-shaped.
+    ///
+    /// So the native half is pinned **here**, by calling the native renderer
+    /// wherever it is `pub`:
+    /// [`native_run_only_die_text_is_verbatim_in_run_sh`] evaluates the real
+    /// `checks::run_only` evaluators and asserts their own message text is in
+    /// `run.sh`, and modules (5)/(8) do the same for the host manifest, the
+    /// toml template, `win_path`, `wine_env`, `wine_spec` and
+    /// `steam_appid.txt`. What remains substring-only is the text owned by
+    /// `pub(crate)` functions (`stages::run::actions::banner_events`,
+    /// `stages::run::mod`'s exit/teardown lines, `stages::run::guards`'
+    /// audio/dashboard rows, `stages::run::preflight`'s die strings): making
+    /// those `pub` (or adding `pub fn banner_lines()`-shaped accessors) is a
+    /// sabrage-core change this crate cannot make.
     mod run_sh_text_parity {
         use super::repo_root;
 
@@ -1021,6 +1707,56 @@ mod tests {
                 text.contains(fragment),
                 "run.sh no longer contains {fragment:?}, which {native_site} reproduces verbatim"
             );
+        }
+
+        /// The native half, called for real: `checks::run_only`'s evaluators
+        /// carry `run.sh`'s `die` sentences in `message` (they have no doctor
+        /// row, so run.sh IS their prose source). Editing one of those literals
+        /// without editing `run.sh` turns this red — no dependency-crate unit
+        /// test involved.
+        #[test]
+        fn native_run_only_die_text_is_verbatim_in_run_sh() {
+            use sabrage_core::checks::{CheckCtx, CheckOptions, CheckStatus};
+
+            let text = run_sh();
+            let scratch = std::env::temp_dir()
+                .join(format!("sabrage-parity-run-only-{}", std::process::id()));
+            std::fs::remove_dir_all(&scratch).ok();
+            std::fs::create_dir_all(&scratch).unwrap();
+
+            // A fixture root with nothing built and no machine tools: never the
+            // real CrossOver or adb.
+            let mut paths = sabrage_core::Paths::new(&scratch);
+            paths.wine = None;
+            paths.adb = None;
+
+            let defs = sabrage_core::checks::run_only::defs();
+            let eval = |slug: &str, opts: CheckOptions| {
+                let ctx = CheckCtx::new(paths.clone(), opts);
+                let f = defs
+                    .iter()
+                    .find(|(s, _)| *s == slug)
+                    .unwrap_or_else(|| panic!("{slug} is bound"))
+                    .1;
+                f(&ctx)
+            };
+
+            let bridge = eval("run.bridge-built", CheckOptions::new());
+            assert_eq!(bridge.status, CheckStatus::Fail);
+            assert_verbatim(&text, &bridge.message, "checks::run_only::run_bridge_built");
+
+            // `--wired` with no adb at all: run.sh's first --wired die.
+            let wired = eval(
+                "run.wired-adb",
+                CheckOptions {
+                    wired: true,
+                    ..CheckOptions::new()
+                },
+            );
+            assert_eq!(wired.status, CheckStatus::Fail);
+            assert_verbatim(&text, &wired.message, "checks::run_only::run_wired_adb");
+
+            std::fs::remove_dir_all(&scratch).ok();
         }
 
         #[test]
@@ -1206,6 +1942,82 @@ mod tests {
                 "interrupted: stopping wine",
                 "stages::run::mod::run (INT teardown section)",
             );
+        }
+    }
+    // ── (10) repo-root spelling ──────────────────────────────────────────────
+
+    /// Both front-ends embed the repo root as an absolute string inside the
+    /// root-owned host manifest and compare those bytes **literally**
+    /// (`install.sh`'s `[ "$(cat "$HOST_XR_JSON")" = "$WANT" ]`,
+    /// `util::host_manifest_is_current` here). Two spellings of one checkout
+    /// therefore mean two different manifests: alternating between Sabrage and
+    /// `./demo.sh install` each sees the other's file as stale and prompts for
+    /// sudo again.
+    ///
+    /// The shared spelling contract is zsh's **logical** `pwd`: absolute,
+    /// `.`/`..` folded textually, symlinks preserved as the user spelled them.
+    /// demo.sh gets it from `ROOT="$(cd "$(dirname "$0")" && pwd)"`;
+    /// `paths::resolve_repo_root` mirrors it (`logical_absolute`, deliberately
+    /// not `canonicalize`). This module pins both halves — the shell's `pwd`
+    /// staying logical, and the native resolver's two behaviours — so neither
+    /// side can drift to a physical spelling on its own.
+    mod repo_root_spelling {
+        use super::repo_root;
+
+        #[test]
+        fn demo_shs_root_is_the_logical_pwd() {
+            let text = std::fs::read_to_string(repo_root().join("demo.sh")).expect("demo.sh reads");
+            let line = text
+                .lines()
+                .find(|l| l.trim_start().starts_with("ROOT="))
+                .expect("demo.sh assigns ROOT");
+            assert_eq!(
+                line.trim(),
+                r#"ROOT="$(cd "$(dirname "$0")" && pwd)""#,
+                "demo.sh's repo-root spelling is the logical `pwd`; `pwd -P` (or any other \
+                 physical resolution) would resolve symlinks and diverge from \
+                 paths::resolve_repo_root's logical_absolute — see sabrage/PARITY.md"
+            );
+        }
+
+        #[test]
+        fn the_native_resolver_preserves_a_symlinked_spelling_and_folds_dotdot() {
+            let base = std::env::temp_dir().join(format!(
+                "sabrage-parity-rootspelling-{}",
+                std::process::id()
+            ));
+            std::fs::remove_dir_all(&base).ok();
+            let physical = base.join("physical");
+            std::fs::create_dir_all(&physical).unwrap();
+            let link = base.join("checkout");
+            std::os::unix::fs::symlink(&physical, &link).unwrap();
+
+            let spelled = sabrage_core::resolve_repo_root(Some(link.to_str().unwrap()))
+                .expect("an explicit root resolves");
+            assert_eq!(
+                spelled, link,
+                "a symlinked checkout keeps its symlink spelling, exactly as `cd <link> && pwd` \
+                 reports it"
+            );
+
+            // `..` is folded textually, so `<link>/anything/..` is `<link>` —
+            // even though `<link>/anything` does not exist.
+            let dotted = link.join("build/..");
+            let folded = sabrage_core::resolve_repo_root(Some(dotted.to_str().unwrap()))
+                .expect("an explicit root resolves");
+            assert_eq!(folded, link);
+
+            // The symptom the spelling contract exists to prevent: the same
+            // checkout, spelled two ways, must produce one manifest.
+            let a = sabrage_core::Paths::new(&spelled);
+            let b = sabrage_core::Paths::new(&folded);
+            assert_eq!(
+                sabrage_core::util::host_manifest_file_bytes(&a.oxr_dylib),
+                sabrage_core::util::host_manifest_file_bytes(&b.oxr_dylib),
+                "two spellings of one checkout must write identical host-manifest bytes"
+            );
+
+            std::fs::remove_dir_all(&base).ok();
         }
     }
 }

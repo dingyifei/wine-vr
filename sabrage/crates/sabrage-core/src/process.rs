@@ -48,6 +48,15 @@ use crate::stages::EventSink;
 /// Grace period between `SIGTERM` and `SIGKILL` for a cancelled child.
 pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 
+/// Deadline for one read-only probe ([`capture`]).
+///
+/// Generous by a factor of ~100 against what these actually take: `adb devices`
+/// against a healthy server answers in milliseconds, and the slowest legitimate
+/// case is the first `adb` call after a reboot, which forks the server first.
+/// The point is a bound at all, so a wedged probe cannot hold the operation
+/// lock forever.
+pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+
 // ── spec ──────────────────────────────────────────────────────────────────────
 
 /// Everything needed to spawn one child.
@@ -175,12 +184,35 @@ pub fn default_child_path() -> String {
 
 // ── output splitting ──────────────────────────────────────────────────────────
 
+/// How a chunk was terminated — the byte(s) a faithful passthrough has to put
+/// back.
+///
+/// A progress writer's `\r` and a line's `\n` are not interchangeable: printing
+/// a repaint with `println!` turns curl's one self-overwriting line into
+/// hundreds of permanent ones, and appending a newline to the final
+/// unterminated chunk invents output the child never wrote.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkEnd {
+    /// `\n`, or the `\r\n` pair (which is one terminator, not two).
+    Lf,
+    /// A bare `\r`: a repaint of the same terminal line.
+    Cr,
+    /// End of stream with no delimiter at all.
+    Eof,
+}
+
 /// Splits a byte stream into chunks on `\n` **and** `\r`, counting `\r\n` once.
 ///
 /// Progress-bar writers (curl, cargo, git) repaint by emitting `\r`; a plain
 /// line splitter would buffer the entire download into a single chunk delivered
 /// at EOF. Empty chunks are preserved (a blank line in build output is real
 /// output), except for the phantom one `\r\n` would otherwise produce.
+///
+/// [`ChunkSplitter::push_with`] additionally reports each chunk's [`ChunkEnd`],
+/// which is what a byte-faithful renderer needs. A chunk ending in `\r` is held
+/// until the next byte decides whether it was a bare CR or half of a CRLF — the
+/// chunk *sequence* is identical either way, only that one chunk's delivery
+/// waits for the byte behind it (or for [`ChunkSplitter::finish`]).
 #[derive(Debug, Default)]
 pub struct ChunkSplitter {
     buf: Vec<u8>,
@@ -194,21 +226,24 @@ impl ChunkSplitter {
 
     /// Feed bytes, calling `out` once per completed chunk.
     pub fn push(&mut self, bytes: &[u8], out: &mut impl FnMut(String)) {
+        self.push_with(bytes, &mut |chunk, _end| out(chunk));
+    }
+
+    /// [`ChunkSplitter::push`], with each chunk's terminator.
+    pub fn push_with(&mut self, bytes: &[u8], out: &mut impl FnMut(String, ChunkEnd)) {
         for &b in bytes {
             if self.pending_cr {
                 self.pending_cr = false;
+                // The byte behind a CR decides what that CR was.
                 if b == b'\n' {
-                    continue; // CRLF: the CR already flushed this chunk
+                    out(self.take(), ChunkEnd::Lf);
+                    continue;
                 }
+                out(self.take(), ChunkEnd::Cr);
             }
             match b {
-                b'\n' => {
-                    out(self.take());
-                }
-                b'\r' => {
-                    out(self.take());
-                    self.pending_cr = true;
-                }
+                b'\n' => out(self.take(), ChunkEnd::Lf),
+                b'\r' => self.pending_cr = true,
                 _ => self.buf.push(b),
             }
         }
@@ -216,10 +251,18 @@ impl ChunkSplitter {
 
     /// Flush whatever is buffered at EOF (a final chunk with no delimiter).
     pub fn finish(&mut self, out: &mut impl FnMut(String)) {
-        if !self.buf.is_empty() {
-            out(self.take());
+        self.finish_with(&mut |chunk, _end| out(chunk));
+    }
+
+    /// [`ChunkSplitter::finish`], with the final chunk's terminator.
+    pub fn finish_with(&mut self, out: &mut impl FnMut(String, ChunkEnd)) {
+        if self.pending_cr {
+            // A CR with nothing behind it: a bare repaint, terminator included.
+            self.pending_cr = false;
+            out(self.take(), ChunkEnd::Cr);
+        } else if !self.buf.is_empty() {
+            out(self.take(), ChunkEnd::Eof);
         }
-        self.pending_cr = false;
     }
 
     fn take(&mut self) -> String {
@@ -376,10 +419,27 @@ async fn spawn_streamed_inner(
         }
     };
 
-    // The pipes close when the child (and its group) is gone; drain them so no
-    // output is lost, then snapshot the tail.
-    for p in pumps {
-        let _ = p.await;
+    // The pipes close when the child **and every descendant holding them** is
+    // gone — which is not the same thing as the leader being reaped. A build
+    // tool that leaves a daemon behind (wine's `reg add` starts wineserver), or
+    // a descendant that ignored the SIGTERM the leader obeyed, keeps the write
+    // end open; waiting for EOF unconditionally hangs the stage — and, on the
+    // cancelled path, hangs it *after* the SIGKILL escalation was skipped
+    // because the leader had already exited.
+    if !drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await {
+        if cancelled {
+            // Escalate on the group, not on the leader: cancellation means the
+            // whole tool tree stops.
+            let _ = killpg(pgid, Signal::SIGKILL);
+            let _ = drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await;
+        }
+        // Whatever still holds the pipe outlives us: stop reading rather than
+        // wedge the operation lock. No SIGKILL on the uncancelled path — there
+        // the surviving descendant is usually one the pipeline *wanted*
+        // (wineserver, started by install's `reg add`).
+        for p in &pumps {
+            p.abort();
+        }
     }
     let tail_lines: Vec<String> = tail
         .lock()
@@ -390,6 +450,26 @@ async fn spawn_streamed_inner(
         return Err(SabrageError::Cancelled);
     }
     Ok((status, tail_lines))
+}
+
+/// How long to wait for the output pipes to reach EOF once the leader is gone,
+/// before concluding that a surviving descendant is holding them.
+const PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// Await the pipe pumps with a deadline. `true` when they all finished.
+///
+/// Takes the handles by reference so the caller can still `abort()` them: a
+/// dropped [`tokio::task::JoinHandle`] merely *detaches* its task, which for a
+/// pump blocked on a pipe nothing will ever close means leaking a task per
+/// wedged child.
+async fn drain_pumps(pumps: &mut [tokio::task::JoinHandle<()>], budget: Duration) -> bool {
+    tokio::time::timeout(budget, async {
+        for p in pumps.iter_mut() {
+            let _ = p.await;
+        }
+    })
+    .await
+    .is_ok()
 }
 
 async fn pump<R>(
@@ -404,7 +484,11 @@ async fn pump<R>(
 {
     let mut splitter = ChunkSplitter::new();
     let mut buf = [0u8; 8192];
-    let mut emit = |chunk: String| {
+    // `_end` is the chunk's terminator ([`ChunkEnd`]). It is dropped here only
+    // because `StageEvent::Output` has nowhere to carry it yet; the moment that
+    // event gains a terminator field, this is where it gets filled in — the
+    // CLI's `println!` per chunk is what turns curl's repaints into spam.
+    let mut emit = |chunk: String, _end: ChunkEnd| {
         if let Ok(mut t) = tail.lock() {
             if t.len() == CHILD_TAIL_LINES {
                 t.pop_front();
@@ -423,9 +507,9 @@ async fn pump<R>(
             Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
-        splitter.push(&buf[..n], &mut emit);
+        splitter.push_with(&buf[..n], &mut emit);
     }
-    splitter.finish(&mut emit);
+    splitter.finish_with(&mut emit);
 }
 
 // ── reaping ───────────────────────────────────────────────────────────────────
@@ -605,6 +689,12 @@ impl Captured {
 /// and streaming them as [`StageEvent::Output`] would print machine-readable
 /// noise the shell never prints.
 ///
+/// "Effect is nil" has one asterisk, shared with the shell: the first `adb`
+/// command after a reboot forks the adb *server*. `demo.sh` does exactly the
+/// same thing from its own probes, so this is parity rather than a Sabrage
+/// hole — but it does mean a `--dry-run` that probes adb can leave a server
+/// process behind that the plan does not mention.
+///
 /// **Mutations must never come through here.** `adb forward`,
 /// `adb forward --remove`, `adb reverse --remove-all`,
 /// `SwitchAudioSource -t output -s …`, `wineserver -k` and every other write
@@ -613,15 +703,41 @@ impl Captured {
 /// this function is invisible to the plan — correct for a probe, a silent
 /// dry-run hole for anything else.
 ///
-/// stdin is `/dev/null`; there is no process group and no cancellation hook
-/// (these all return in milliseconds), and `spec.env_path` is applied so a
-/// Finder-launched `.app` still finds `adb` (see [`default_child_path`]).
+/// stdin is `/dev/null`, and `spec.env_path` is applied so a Finder-launched
+/// `.app` still finds `adb` (see [`default_child_path`]).
+///
+/// **Bounded.** These all answer in milliseconds — but a wedged `adb` (a server
+/// that stopped answering, a device in a bad state) used to block the caller,
+/// and with it the process-wide operation lock, forever, with Cancel unable to
+/// interrupt it. A probe therefore gets [`DEFAULT_PROBE_TIMEOUT`] and its own
+/// process group; on expiry the group is killed and the probe fails like a
+/// missing binary does (`kind() == "io"`), which every caller already handles.
+/// Use [`capture_with`] to attach the operation's cancellation token.
 pub async fn capture(spec: &ChildSpec) -> Result<Captured> {
+    capture_with(spec, &CancellationToken::new(), DEFAULT_PROBE_TIMEOUT).await
+}
+
+/// [`capture`] with an explicit cancellation token and deadline.
+///
+/// Cancellation yields [`SabrageError::Cancelled`]; the deadline yields an
+/// `Io` error of kind [`std::io::ErrorKind::TimedOut`]. Either way the probe's
+/// whole process group is `SIGKILL`ed — a read-only probe has nothing to flush,
+/// so there is no SIGTERM grace to observe — and the leader is reaped by
+/// `kill_on_drop`.
+pub async fn capture_with(
+    spec: &ChildSpec,
+    cancel: &CancellationToken,
+    deadline: Duration,
+) -> Result<Captured> {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .stderr(Stdio::piped())
+        // Own process group, so a probe that forked (adb starting its server)
+        // can be stopped as a tree rather than orphaned behind a dead leader.
+        .process_group(0)
+        .kill_on_drop(true);
     if let Some(dir) = &spec.cwd {
         cmd.current_dir(dir);
     }
@@ -631,10 +747,38 @@ pub async fn capture(spec: &ChildSpec) -> Result<Captured> {
     if let Some(path) = &spec.env_path {
         cmd.env("PATH", path);
     }
-    let out = cmd
-        .output()
-        .await
+    let child = cmd
+        .spawn()
         .map_err(|e| SabrageError::io(PathBuf::from(&spec.program), e))?;
+    let pgid = child.id().map(|id| Pid::from_raw(id as i32));
+
+    let out = tokio::select! {
+        finished = child.wait_with_output() => {
+            finished.map_err(|e| SabrageError::io(PathBuf::from(&spec.program), e))?
+        }
+        _ = cancel.cancelled() => {
+            if let Some(pgid) = pgid {
+                let _ = killpg(pgid, Signal::SIGKILL);
+            }
+            return Err(SabrageError::Cancelled);
+        }
+        _ = tokio::time::sleep(deadline) => {
+            if let Some(pgid) = pgid {
+                let _ = killpg(pgid, Signal::SIGKILL);
+            }
+            return Err(SabrageError::io(
+                PathBuf::from(&spec.program),
+                std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "probe `{}` did not answer within {:.0}s",
+                        spec.display(),
+                        deadline.as_secs_f32()
+                    ),
+                ),
+            ));
+        }
+    };
     Ok(Captured {
         status: out.status,
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -710,6 +854,58 @@ mod tests {
         assert_eq!(split(&[b"ab\r", b"\ncd\n"]), vec!["ab", "cd"]);
         assert_eq!(split(&[b"partial"]), vec!["partial"]);
         assert!(split(&[b""]).is_empty());
+    }
+
+    fn split_ends(input: &[&[u8]]) -> Vec<(String, ChunkEnd)> {
+        let mut out = Vec::new();
+        let mut s = ChunkSplitter::new();
+        for part in input {
+            s.push_with(part, &mut |c, e| out.push((c, e)));
+        }
+        s.finish_with(&mut |c, e| out.push((c, e)));
+        out
+    }
+
+    /// The terminator is what a byte-faithful renderer puts back: `println!`
+    /// on a CR-terminated repaint is what turns curl's one line into hundreds.
+    #[test]
+    fn chunks_carry_their_terminator() {
+        assert_eq!(
+            split_ends(&[b"a\nb\n"]),
+            vec![
+                ("a".to_string(), ChunkEnd::Lf),
+                ("b".to_string(), ChunkEnd::Lf)
+            ]
+        );
+        // CRLF is one Lf terminator, not a CR followed by a phantom chunk.
+        assert_eq!(
+            split_ends(&[b"a\r\nb\r\n"]),
+            vec![
+                ("a".to_string(), ChunkEnd::Lf),
+                ("b".to_string(), ChunkEnd::Lf)
+            ]
+        );
+        // curl's repaints, including the last one before EOF.
+        assert_eq!(
+            split_ends(&[b"10%\r50%\r"]),
+            vec![
+                ("10%".to_string(), ChunkEnd::Cr),
+                ("50%".to_string(), ChunkEnd::Cr)
+            ]
+        );
+        // A final chunk with no delimiter must not gain one.
+        assert_eq!(
+            split_ends(&[b"partial"]),
+            vec![("partial".to_string(), ChunkEnd::Eof)]
+        );
+        // Straddling reads, including across the CRLF pair.
+        assert_eq!(
+            split_ends(&[b"ab\r", b"\ncd\n"]),
+            vec![
+                ("ab".to_string(), ChunkEnd::Lf),
+                ("cd".to_string(), ChunkEnd::Lf)
+            ]
+        );
     }
 
     fn collecting_sink() -> (EventSink, Arc<StdMutex<Vec<StageEvent>>>) {
@@ -804,6 +1000,97 @@ mod tests {
         let err = spawn_streamed(&s, &sink, &cancel).await.unwrap_err();
         assert!(matches!(err, SabrageError::Cancelled));
         assert_eq!(err.exit_code(), 130);
+    }
+
+    /// The SIGKILL escalation must watch the process *group*, not the leader:
+    /// a descendant that ignores SIGTERM (an ignored disposition survives
+    /// `exec`) keeps the pipes open long after the leader is reaped, and the
+    /// drain that follows used to wait for that EOF with no deadline.
+    #[tokio::test]
+    async fn cancellation_escalates_when_a_descendant_outlives_the_leader() {
+        let run_id = Uuid::new_v4();
+        let (sink, _seen) = collecting_sink();
+        let cancel = CancellationToken::new();
+        let s = spec("/bin/sh", run_id)
+            .arg("-c")
+            .arg("(trap '' TERM; sleep 30) & sleep 30")
+            .kill_grace(Duration::from_millis(300));
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+            token.cancel();
+        });
+        let started = tokio::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(10), spawn_streamed(&s, &sink, &cancel))
+            .await
+            .expect("spawn_streamed must not wait for the ignoring descendant")
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled));
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// Same hazard without any cancellation: a child that backgrounds a
+    /// descendant holding stdout returns its status now, not when the orphan
+    /// finally exits. Nothing is killed — the surviving process is often one the
+    /// pipeline wanted (wine's `reg add` starts wineserver).
+    #[tokio::test]
+    async fn a_backgrounded_descendant_does_not_wedge_the_stage() {
+        let run_id = Uuid::new_v4();
+        let (sink, seen) = collecting_sink();
+        let cancel = CancellationToken::new();
+        let s = spec("/bin/sh", run_id)
+            .arg("-c")
+            .arg("(sleep 30) & printf 'done\\n'; exit 0");
+        let status =
+            tokio::time::timeout(Duration::from_secs(10), spawn_streamed(&s, &sink, &cancel))
+                .await
+                .expect("the orphan must not hold the stage open")
+                .unwrap();
+        assert!(status.success());
+        // The output written before the leader exited is still delivered.
+        let evs = seen.lock().unwrap().clone();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Output { chunk, .. } if chunk == "done"
+            )),
+            "output lost: {evs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_probe_that_never_answers_times_out_instead_of_hanging() {
+        let spec = ChildSpec::new("/bin/sleep", step::BUILD_TOOLS, Uuid::nil()).arg("60");
+        let started = tokio::time::Instant::now();
+        let err = capture_with(&spec, &CancellationToken::new(), Duration::from_millis(200))
+            .await
+            .unwrap_err();
+        // Degrades exactly like a missing binary, which every caller handles.
+        assert_eq!(err.kind(), "io");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        match err {
+            SabrageError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::TimedOut)
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_probe_returns_promptly() {
+        let spec = ChildSpec::new("/bin/sleep", step::BUILD_TOOLS, Uuid::nil()).arg("60");
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let started = tokio::time::Instant::now();
+        let err = capture_with(&spec, &cancel, DEFAULT_PROBE_TIMEOUT)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled));
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

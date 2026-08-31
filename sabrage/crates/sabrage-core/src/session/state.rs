@@ -39,7 +39,31 @@
 //! Every optional field and every flag carries `#[serde(default)]`, so a file
 //! written by an older Sabrage still loads (the phase that adds a field must
 //! not strand a user mid-session). [`SESSION_STATE_VERSION`] is for the case
-//! defaults cannot cover.
+//! defaults cannot cover, and it is enforced in one direction only:
+//! [`SessionState::is_supported_version`] is false for a record written by a
+//! *newer* Sabrage, and every mutating path
+//! ([`super::reconcile`]) must then report it and leave it alone. Rewriting a
+//! v2 record through a v1 struct would silently drop the guard that version
+//! added, and clearing it afterwards would throw away the only description of
+//! a mutation this binary cannot undo.
+//!
+//! # One file, more than one front-end
+//!
+//! There is exactly one record path per machine
+//! ([`crate::paths::Paths::session_state_path`]) and two front-ends that write
+//! it — the Sabrage app and the `sabrage` CLI. An atomic rename stops a torn
+//! read; it does **not** stop a lost update. [`save`] and [`clear`] therefore
+//! refuse to touch a record that names a *live foreign* `owner_pid`
+//! ([`has_live_foreign_owner`]), which is the contract `owner_pid`'s own
+//! documentation already states. The compare against what is on disk happens
+//! under the advisory lock at
+//! [`crate::paths::Paths::session_state_lock_path`], so the other front-end
+//! cannot write between the read and the rename. The lock is best-effort (a
+//! machine that cannot lock must still be able to stop a session) — the
+//! compare is what makes the remaining race *safe*, and the lock is what makes
+//! it rare. What neither covers is a whole `reconcile` pass, which reads,
+//! restores and rewrites across several of these calls; serializing that is
+//! the operation lock's job.
 
 use std::path::{Path, PathBuf};
 
@@ -149,6 +173,17 @@ impl SessionState {
         }
     }
 
+    /// Was this record written by a Sabrage this one understands?
+    ///
+    /// `false` means the file comes from a **newer** schema: it may describe a
+    /// guard this binary has never heard of, so rewriting it through this
+    /// struct would drop that guard's description and clearing it would throw
+    /// away the only record of a mutation nothing here can undo. The mutating
+    /// paths report such a record and leave it exactly as it is.
+    pub fn is_supported_version(&self) -> bool {
+        self.version <= SESSION_STATE_VERSION
+    }
+
     /// Is there any guard left for a recovery to undo?
     ///
     /// The audio device only counts while it has not been restored, and the
@@ -185,12 +220,126 @@ pub fn load(path: &Path) -> Result<Option<SessionState>> {
     })
 }
 
+/// Does `state` describe a session **another live process** is responsible
+/// for?
+///
+/// The three conditions together, because each one alone is wrong:
+///
+/// * `owner_pid` is neither 0 (an older record that never wrote one) nor this
+///   process — our own records are ours to rewrite;
+/// * that pid is still alive — a crashed owner's record is exactly what
+///   recovery exists for, and refusing to touch it would strand the audio
+///   device forever;
+/// * the session itself has not visibly ended: either the recorded wine child
+///   is still that same process, or there is no wine child *yet* — the
+///   pre-spawn window where the guards are already taken and the record is the
+///   only description of them.
+///
+/// A record whose wine pid is gone is therefore never protected by this, no
+/// matter who wrote it: it is a leftover, and undoing its guards is the whole
+/// job. The residual false positive is a recycled `owner_pid`, which costs one
+/// kept record and one row, never a mutation.
+pub fn has_live_foreign_owner(state: &SessionState) -> bool {
+    if state.owner_pid == 0 || state.owner_pid == std::process::id() {
+        return false;
+    }
+    if !crate::process::is_alive(state.owner_pid) {
+        return false;
+    }
+    state
+        .wine
+        .as_ref()
+        .map(|w| w.is_same_process())
+        .unwrap_or(true)
+}
+
+/// How long [`lock_record`] waits for the other front-end's read-modify-write
+/// before going ahead without the lock.
+///
+/// The window it protects is two file operations long, so a wait this size is
+/// already generous; degrading rather than blocking forever is the same choice
+/// [`crate::stages::acquire_operation_lock`]'s file lock makes — a machine
+/// whose support directory cannot be locked must still be able to stop a
+/// session.
+const RECORD_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll interval inside [`RECORD_LOCK_WAIT`].
+const RECORD_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Take the advisory lock that serializes this record's read-modify-write
+/// across processes — `<record>.lock`, i.e.
+/// [`crate::paths::Paths::session_state_lock_path`] for the real record.
+///
+/// A separate file rather than the record itself, so the lock survives the
+/// atomic rename that replaces it. Held by the returned `File`: dropping it
+/// releases the `flock`. `None` — no lock, carry on — for every failure,
+/// including a holder that will not let go: the compare-and-swap in [`save`]
+/// and [`clear`] is what makes the lost update *safe*, and this only makes it
+/// rare.
+async fn lock_record(record_path: &Path) -> Option<std::fs::File> {
+    let path = record_path.with_extension("lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    let deadline = tokio::time::Instant::now() + RECORD_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(RECORD_LOCK_POLL).await;
+            }
+            _ => return None,
+        }
+    }
+}
+
+/// The refusal both [`save`] and [`clear`] raise for a record that belongs to
+/// another live front-end.
+fn owned_elsewhere(verb: &str, path: &Path, existing: &SessionState) -> SabrageError {
+    SabrageError::fatal(
+        format!(
+            "refusing to {verb} {} — it describes the session Sabrage process {} is running \
+             (bottle '{}')",
+            path.display(),
+            existing.owner_pid,
+            existing.bottle
+        ),
+        "./demo.sh stop --bottle <name>",
+    )
+}
+
 /// Write the state file atomically (pretty JSON plus a trailing newline).
 ///
 /// Goes through the [`Executor`] like every other mutation, so `--dry-run`
 /// plans the write instead of performing it. Pretty-printed because a human
 /// reading this file is exactly the situation it exists for.
+///
+/// Refuses when what is already on disk describes a **different** run that
+/// another live process owns ([`has_live_foreign_owner`]): the single record
+/// path is shared by both front-ends, and an atomic rename prevents a torn
+/// read, not a lost update. Saving over one's own run — the ordinary
+/// guard-by-guard flag flip — is unaffected, and so is saving over a record
+/// whose owner is gone. The check and the write happen under
+/// [`lock_record`], so the other front-end cannot slip its own write between
+/// them; a dry run takes no lock, having nothing to serialize.
 pub async fn save(executor: &dyn Executor, path: &Path, state: &SessionState) -> Result<()> {
+    let _lock = if executor.is_dry_run() {
+        None
+    } else {
+        lock_record(path).await
+    };
+    if let Ok(Some(existing)) = load(path) {
+        if existing.run_id != state.run_id && has_live_foreign_owner(&existing) {
+            return Err(owned_elsewhere("overwrite", path, &existing));
+        }
+    }
     if let Some(parent) = path.parent() {
         executor.create_dir_all(parent).await?;
     }
@@ -202,7 +351,21 @@ pub async fn save(executor: &dyn Executor, path: &Path, state: &SessionState) ->
 
 /// Remove the state file. A missing file is success — clearing twice (clean
 /// teardown, then a reconcile that already ran) must not fail.
+///
+/// Refuses, like [`save`], when the record on disk belongs to another live
+/// front-end: a late teardown here must not delete the description of guards
+/// that process still holds.
 pub async fn clear(executor: &dyn Executor, path: &Path) -> Result<()> {
+    let _lock = if executor.is_dry_run() {
+        None
+    } else {
+        lock_record(path).await
+    };
+    if let Ok(Some(existing)) = load(path) {
+        if has_live_foreign_owner(&existing) {
+            return Err(owned_elsewhere("delete", path, &existing));
+        }
+    }
     executor.remove_file(path).await
 }
 
@@ -342,6 +505,125 @@ mod tests {
         let kinds: Vec<PlannedKind> = ex.planned().iter().map(|p| p.kind).collect();
         assert_eq!(kinds, vec![PlannedKind::CreateDir, PlannedKind::Write]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A live process whose pid is not ours, for the ownership guard. Killed
+    /// on drop, so the fixture cannot leak a process into the test machine.
+    struct ForeignProcess(std::process::Child);
+
+    impl ForeignProcess {
+        fn spawn() -> ForeignProcess {
+            ForeignProcess(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("/bin/sleep is on every macOS"),
+            )
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ForeignProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    #[test]
+    fn a_live_foreign_owner_is_recognised_only_while_its_session_can_still_be_running() {
+        let foreign = ForeignProcess::spawn();
+        let mut s = sample();
+
+        // Our own record, whoever it describes.
+        assert!(!has_live_foreign_owner(&s), "owner_pid is this process");
+
+        // Another live process, and the recorded wine pid is not observably
+        // gone — hands off.
+        s.owner_pid = foreign.pid();
+        s.wine = None;
+        assert!(
+            has_live_foreign_owner(&s),
+            "the pre-spawn window is covered"
+        );
+
+        // Same owner, but the session's wine child is provably gone: a
+        // leftover, and undoing its guards is exactly the job.
+        s.wine = Some(ProcInfo {
+            pid: u32::MAX - 1,
+            start_time: 1,
+            exe: PathBuf::new(),
+        });
+        assert!(!has_live_foreign_owner(&s));
+
+        // An owner that has itself exited is never protected either.
+        s.wine = None;
+        s.owner_pid = u32::MAX - 1;
+        assert!(!has_live_foreign_owner(&s));
+        s.owner_pid = 0;
+        assert!(
+            !has_live_foreign_owner(&s),
+            "an older record wrote no owner"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_save_for_a_different_run_does_not_clobber_a_live_owners_record() {
+        let dir = scratch("cas");
+        let path = dir.join("session-state.json");
+        let foreign = ForeignProcess::spawn();
+
+        let mut theirs = sample();
+        theirs.owner_pid = foreign.pid();
+        theirs.wine = None; // mid-launch, guards taken, nothing spawned yet
+        save(&real(), &path, &theirs).await.unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+
+        let mine = SessionState::new(Uuid::new_v4(), "Steam", "/g", "/l", 1);
+        let err = save(&real(), &path, &mine).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:?}");
+        let err = clear(&real(), &path).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to delete"), "{err:?}");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes,
+            "the other front-end's record is byte-identical afterwards"
+        );
+
+        // The owner's own writes still go through, and so does anyone's once
+        // that process is gone.
+        theirs.guards.audio_restored = true;
+        save(&real(), &path, &theirs).await.unwrap();
+
+        // …and once that process is gone, the record is a leftover like any
+        // other: the next launch may replace it.
+        drop(foreign);
+        save(&real(), &path, &mine).await.unwrap();
+        assert_eq!(load(&path).unwrap().unwrap().run_id, mine.run_id);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_newer_schema_is_recognised_and_never_downgraded() {
+        let json = r#"{
+            "version": 2,
+            "runId": "00000000-0000-0000-0000-000000000000",
+            "bottle": "Steam",
+            "bsDir": "/games/bs",
+            "startedAtUnixMs": 1786300214181,
+            "logPath": "/repo/logs/x.log",
+            "futureGuard": {"somethingWeCannotUndo": true}
+        }"#;
+        let s: SessionState = serde_json::from_str(json).unwrap();
+        assert_eq!(s.version, 2);
+        assert!(
+            !s.is_supported_version(),
+            "a v2 record must not be rewritten through the v1 struct"
+        );
+        assert!(sample().is_supported_version());
     }
 
     #[tokio::test]

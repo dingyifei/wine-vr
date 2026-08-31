@@ -266,6 +266,35 @@ pub fn contract() -> &'static Contract {
     &CONTRACT
 }
 
+/// The `contract-sha256` of the contract **this binary was compiled from** —
+/// the same `cat pipeline.toml runtime-template host-template | shasum -a 256`
+/// recipe [`crate::util::contract_hash`] recomputes from `repo_root` on disk,
+/// and the same value `scripts/demo/contract.gen.sh` records in its
+/// `# contract-sha256:` header.
+///
+/// # Why this exists
+///
+/// `meta.contract-sync` compares two *on-disk* things: the checkout's
+/// `contract/` against the checkout's own generated shell file. It says nothing
+/// about the binary doing the comparing. An installed `Sabrage.app` (or a
+/// `sabrage` CLI on `$PATH`) built from checkout X, pointed at a perfectly
+/// self-consistent checkout Y via `repo_root`, passes that check while still
+/// executing **X's** registry, pins, ports, and templates — and the parity
+/// harness cannot see it either, because tier 2 always rebuilds the CLI from
+/// the checkout it diffs.
+///
+/// Comparing this against `util::contract_hash(repo_root)` is what detects that
+/// skew: equal means the binary and the checkout are the same contract;
+/// different means the binary is executing a contract the checkout does not
+/// describe, whatever `meta.contract-sync` says.
+pub static COMPILED_CONTRACT_SHA256: LazyLock<String> = LazyLock::new(|| {
+    crate::util::contract_sha256_from(&[
+        PIPELINE_TOML,
+        RUNTIME_TOML_TEMPLATE,
+        HOST_MANIFEST_TEMPLATE,
+    ])
+});
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -328,6 +357,55 @@ mod tests {
             "DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 \
              -username <steam-user> -dir \"/tmp/Beat Saber 1294\""
         );
+    }
+
+    /// The repo root, four levels above this crate's manifest — the checkout
+    /// this binary was compiled from.
+    fn repo_root() -> std::path::PathBuf {
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root resolves")
+    }
+
+    #[test]
+    fn compiled_contract_sha256_matches_the_checkout_it_was_built_from() {
+        // Also pins that the in-memory recipe and the on-disk recompute agree:
+        // same three files, same order, same digest.
+        let on_disk = crate::util::contract_hash(&repo_root()).expect("contract files readable");
+        assert_eq!(*COMPILED_CONTRACT_SHA256, on_disk);
+        assert_eq!(COMPILED_CONTRACT_SHA256.len(), 64);
+    }
+
+    /// The X-binary/Y-checkout skew: a *self-consistent* checkout whose
+    /// contract differs from the compiled one. `meta.contract-sync` passes
+    /// there (its two inputs agree with each other); the compiled identity does
+    /// not, which is the whole point of exposing it.
+    #[test]
+    fn compiled_contract_sha256_differs_from_another_checkouts_contract() {
+        let scratch = std::env::temp_dir().join(format!(
+            "sabrage-compiled-contract-{}-{}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::remove_dir_all(&scratch);
+        std::fs::create_dir_all(scratch.join("contract")).unwrap();
+        // Checkout Y: same templates, one mutated scalar in pipeline.toml.
+        let mutated = PIPELINE_TOML.replace("stream = [9943, 9944]", "stream = [9955, 9956]");
+        assert_ne!(mutated, PIPELINE_TOML, "the mutation must actually apply");
+        std::fs::write(scratch.join(CONTRACT_FILES[0]), &mutated).unwrap();
+        std::fs::write(scratch.join(CONTRACT_FILES[1]), RUNTIME_TOML_TEMPLATE).unwrap();
+        std::fs::write(scratch.join(CONTRACT_FILES[2]), HOST_MANIFEST_TEMPLATE).unwrap();
+
+        let y = crate::util::contract_hash(&scratch).expect("scratch contract readable");
+        assert_ne!(
+            *COMPILED_CONTRACT_SHA256, y,
+            "the compiled identity must not match a checkout with a different contract"
+        );
+        // And the compiled contract really is still the one in force.
+        assert_eq!(contract().ports.stream, vec![9943, 9944]);
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]

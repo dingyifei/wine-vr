@@ -15,13 +15,17 @@
 //!   launch-flag defaults, the adb-probing and runtime-config-edit
 //!   acknowledgement toggles (design-core §4.2).
 //! * [`library`] — `library.json`: the game registry demo.sh never had
-//!   (design-core §4.3) — [`library::GameEntry`]/[`library::Library`] CRUD,
-//!   [`library::effective_options`]'s settings⊕override merge, and
+//!   (design-core §4.3) — [`library::GameEntry`]/[`library::Library`] CRUD
+//!   (every writer through [`library::transact`], which holds one lock across
+//!   the whole load→mutate→save), [`library::effective_options`]'s
+//!   settings⊕override merge — the single home of that precedence rule,
+//!   reached by id through [`library::Library::launch_options_for`] — and
 //!   [`library::validate`]'s read-only install-health snapshot
 //!   ([`library::GameValidity`]).
-//! * [`goldberg`] — the revert-original-`steam_api64.dll` action
+//! * [`goldberg`] — the restore-the-`.orig-steam`-backup action
 //!   ([`goldberg::revert_original_steam_dll`]), Sabrage's one deliberate
-//!   divergence from `run.sh`'s Goldberg step (`PARITY.md`).
+//!   divergence from `run.sh`'s Goldberg step (`PARITY.md`). It refuses rather
+//!   than claim to have restored an "original" it cannot authenticate.
 
 pub mod goldberg;
 pub mod library;

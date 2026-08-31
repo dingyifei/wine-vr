@@ -63,7 +63,7 @@ use crate::checks::{CheckOutcome, CheckStatus, Registry};
 use crate::contract::{contract, CheckSpec, Gate};
 use crate::error::{Result, SabrageError};
 use crate::events::{step, StageEvent};
-use crate::fixes::{self, backend, helper, FixAction, FixReport};
+use crate::fixes::{self, backend, FixAction, FixReport};
 use crate::stages::{require_bottle, StageCtx};
 use crate::util::bs_version;
 
@@ -104,25 +104,26 @@ struct TomlFacts {
     encoder_process: String,
 }
 
-/// `awk -F'"' '/^[[:space:]]*<key>[[:space:]]*=/{print $2; exit}'`.
+/// One key, read the way the **runtime** reads it:
+/// [`crate::config::runtime_toml::effective_string`] — `Config.cpp`'s
+/// `ParseConfigToml` loop, narrowed to a single key. Quote-aware `#`
+/// stripping, `[table]` headers ignored, split on the first `=`, quotes
+/// removed, and the **last** assignment wins. An unassigned key is the empty
+/// string, which is what the callers below already treat as "unset".
 ///
-/// Third copy of this recipe in the crate (`checks::config::parse_protocol`
-/// and `fixes::helper::parse_encoder_process` are the other two); each is
-/// private to a module the others do not own, so this one is keyed by the
-/// **key name** and covers both of run.sh's uses in one function.
-fn awk_first_quoted(toml_text: &str, key: &str) -> String {
-    for line in toml_text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix(key) else {
-            continue;
-        };
-        if !rest.trim_start().starts_with('=') {
-            continue;
-        }
-        let mut fields = line.split('"');
-        let _before_first_quote = fields.next();
-        return fields.next().unwrap_or("").to_string();
-    }
-    String::new()
+/// Last-wins is the load-bearing part, and the reason this no longer carries
+/// its own `awk` emulation. The runtime is table-blind and re-assigns on every
+/// matching line, so a second `protocol =` further down the file is the value
+/// the launched runtime uses; validating the *first* one let a launch pass
+/// every ALVR gate and then start the legacy backend. run.sh reads it the same
+/// way (`awk … '{v=$2} END{print v}'`, lines 57 and 70).
+///
+/// One narrow DIVERGENCE from run.sh, in this side's favour: an **unquoted**
+/// value (`protocol = alvr`) reads as `alvr` here and as the empty string
+/// through `awk -F'"'`, which then dies. The runtime accepts it, so refusing
+/// the launch would be the wrong verdict.
+fn effective_string(toml_text: &str, key: &str) -> String {
+    crate::config::runtime_toml::effective_string(toml_text, key).unwrap_or_default()
 }
 
 /// run.sh lines 56–57 and 70–71, in one read of the file.
@@ -135,10 +136,10 @@ fn read_toml_facts(toml_path: &Path) -> TomlFacts {
     } else {
         String::new()
     };
-    let raw_encoder = awk_first_quoted(&text, "encoder_process");
+    let raw_encoder = effective_string(&text, "encoder_process");
     TomlFacts {
         present,
-        protocol: awk_first_quoted(&text, "protocol"),
+        protocol: effective_string(&text, "protocol"),
         encoder_process: if raw_encoder.is_empty() {
             "auto".to_string()
         } else {
@@ -424,10 +425,14 @@ fn protocol_gate(
     let slug = spec.slug.as_str();
     let toml = ctx.paths.toml_path.display().to_string();
 
+    // Every branch below emits this same row and then decides, so it is
+    // emitted once, here: the row reports the check, the branch reports the
+    // gate.
+    emit_check(ctx, outcome, spec.native_gate);
+
     if !facts.present {
         // `[ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"` — one die
         // for the pair; the legacy row is never reached in the shell either.
-        emit_check(ctx, outcome, spec.native_gate);
         return Err(die(
             ctx,
             spec,
@@ -438,60 +443,45 @@ fn protocol_gate(
 
     match (slug, facts.protocol.as_str()) {
         // `alvr) : ;;` — both rows pass silently.
-        (_, "alvr") => {
-            emit_check(ctx, outcome, spec.native_gate);
-            Ok(())
-        }
+        (_, "alvr") => Ok(()),
 
         // The supported-set row is happy with `oxrsys`; the legacy row is the
         // one that speaks.
-        ("cfg.protocol.supported", "oxrsys") => {
-            emit_check(ctx, outcome, spec.native_gate);
-            Ok(())
-        }
+        ("cfg.protocol.supported", "oxrsys") => Ok(()),
 
         // DECLARED DIVERGENCE (contract: shell_gate = warn, native_gate =
         // block). run.sh line 60 warns and launches the legacy USB path;
         // Sabrage v1 does not implement it, so it refuses rather than
         // launching something it cannot supervise. The first line is run.sh's
         // warn text verbatim; the second says what this side does instead.
-        ("cfg.protocol.legacy-oxrsys", "oxrsys") => {
-            emit_check(ctx, outcome, spec.native_gate);
-            Err(die(
-                ctx,
-                spec,
-                format!(
-                    "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
+        ("cfg.protocol.legacy-oxrsys", "oxrsys") => Err(die(
+            ctx,
+            spec,
+            format!(
+                "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
                      Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle {}",
-                    ctx.bottle_name()
-                ),
-                Some(format!("set protocol = \"alvr\" in {toml}")),
-            ))
-        }
+                ctx.bottle_name()
+            ),
+            Some(format!("set protocol = \"alvr\" in {toml}")),
+        )),
 
         // Anything else: run.sh lines 61–62's two-line die, attributed to the
         // supported-set row. The legacy row is `tap … skipped` in the shell
         // and never reached here (the die above aborts first).
-        ("cfg.protocol.supported", other) => {
-            emit_check(ctx, outcome, spec.native_gate);
-            Err(die(
-                ctx,
-                spec,
-                format!(
-                    "oxrsys-runtime.toml protocol='{other}' is not valid for the demo\n       \
+        ("cfg.protocol.supported", other) => Err(die(
+            ctx,
+            spec,
+            format!(
+                "oxrsys-runtime.toml protocol='{other}' is not valid for the demo\n       \
                      set protocol = \"alvr\" in {toml} (or delete the file and re-run \
                      ./demo.sh setup)"
-                ),
-                Some(format!("set protocol = \"alvr\" in {toml}")),
-            ))
-        }
+            ),
+            Some(format!("set protocol = \"alvr\" in {toml}")),
+        )),
 
         // Unreachable: `cfg.protocol.supported` aborts on every non-alvr,
         // non-oxrsys value before this row is walked.
-        ("cfg.protocol.legacy-oxrsys", _) => {
-            emit_check(ctx, outcome, spec.native_gate);
-            Ok(())
-        }
+        ("cfg.protocol.legacy-oxrsys", _) => Ok(()),
 
         (_, _) => unreachable!("protocol_gate is only called for the two cfg.protocol.* slugs"),
     }
@@ -617,7 +607,10 @@ async fn autofix(
     }
 
     let slug = spec.slug.as_str();
-    let report = apply_fix(ctx, slug).await?;
+    let report = match apply_fix(ctx, spec).await {
+        Ok(report) => report,
+        Err(e) => return Err(fix_failed(ctx, spec, outcome, e)),
+    };
 
     let rechecked = registry
         .get(slug)
@@ -653,6 +646,47 @@ async fn autofix(
     gate_after_fix(ctx, spec, rechecked)
 }
 
+/// The autofix itself failed — the fix's own error, turned back into the one
+/// `Check` + one `Fatal` this module promises.
+///
+/// Without this an `Err` out of [`apply_fix`] left the slug with **no** check
+/// row at all (the `?` returned above every emit), so an event-only consumer
+/// saw a failed `StageFinished` and an unresolved row. Three shapes:
+///
+/// * `Cancelled` — Stop, not a failure. Propagated untouched, exactly like the
+///   walk's own checkpoint: no row, no die.
+/// * `Fatal` — the fix already emitted its own `Fatal` (`ctx.fatal`, e.g.
+///   `helper::restage_helper`'s "neither the staged copy nor the build output
+///   is arm64"). Its text is run.sh's; only the missing `Check` is added.
+/// * anything else (a raw `Io` from `write_atomic` / `copy_if_changed`) — the
+///   io cause is surfaced as a stderr-shaped `Output` line and the die is
+///   run.sh's post-fix text (`could not force graphics backend to dxmt in …`),
+///   the same shape `actions::die_with_cause` uses.
+fn fix_failed(
+    ctx: &StageCtx,
+    spec: &CheckSpec,
+    pre_fix: CheckOutcome,
+    e: SabrageError,
+) -> SabrageError {
+    if matches!(e, SabrageError::Cancelled) {
+        return e;
+    }
+    // The pre-fix outcome IS the final one — the fix never landed — with the
+    // cause on the row so the UI shows why rather than just "still failing".
+    emit_check(ctx, pre_fix.with_detail(e.to_string()), spec.native_gate);
+    if matches!(e, SabrageError::Fatal { .. }) {
+        return e;
+    }
+    ctx.emit(StageEvent::Output {
+        run_id: ctx.run_id,
+        step: step::RUN_PREFLIGHT.to_string(),
+        stream: crate::events::Stream::Stderr,
+        chunk: e.to_string(),
+    });
+    let (message, remedy) = post_fix_die(ctx, spec.slug.as_str());
+    die(ctx, spec, message, remedy)
+}
+
 /// The non-Fail statuses of an `autofix` slug, reported like any other row.
 fn gate_after_fix(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome) -> Result<()> {
     match outcome.status {
@@ -672,17 +706,35 @@ fn gate_after_fix(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome) -> Re
     }
 }
 
-/// The fix each `autofix`-gated slug maps to.
+/// The fix an `autofix`-gated slug maps to — **the contract's** `fix` id, not a
+/// second slug→fix table maintained here.
 ///
-/// `bottle.gfx-dxmt` deliberately uses
-/// [`backend::set_graphics_backend_for_launch`], not the doctor Fix button's
-/// refusing variant: run.sh rewrites `cxbottle.conf` here and the
+/// The preflight already holds [`crate::stages::OPERATION_LOCK`], so this is
+/// [`fixes::apply_holding_lock`] (the doctor Fix button's `fixes::apply`
+/// would deadlock on the second acquire).
+///
+/// One deliberate override: `bottle.gfx-dxmt` uses
+/// [`backend::set_graphics_backend_for_launch`], not the Fix button's refusing
+/// variant, because run.sh rewrites `cxbottle.conf` here and the
 /// `wineserver-reset` launch action kills that wineserver two blocks later.
-async fn apply_fix(ctx: &StageCtx, slug: &str) -> Result<FixReport> {
-    match slug {
-        "bottle.gfx-dxmt" => backend::set_graphics_backend_for_launch(ctx, &ctx.sink).await,
-        s if HELPER_SLUGS.contains(&s) => helper::restage_helper(ctx, &ctx.sink).await,
-        other => unreachable!("{other} is gated autofix but has no fix mapping"),
+///
+/// A slug gated `autofix` with no mapped fix is a contract error, not a panic:
+/// the launch dies with something a user can act on.
+async fn apply_fix(ctx: &StageCtx, spec: &CheckSpec) -> Result<FixReport> {
+    let Some(action) = spec.fix.as_deref().and_then(FixAction::from_contract_id) else {
+        return Err(SabrageError::fatal(
+            format!(
+                "{} is gated autofix but names no fix this build can apply",
+                spec.slug
+            ),
+            "./demo.sh doctor --bottle <name>",
+        ));
+    };
+    match action {
+        FixAction::SetGraphicsBackend => {
+            backend::set_graphics_backend_for_launch(ctx, &ctx.sink).await
+        }
+        other => fixes::apply_holding_lock(other, ctx, &ctx.sink).await,
     }
 }
 
@@ -730,6 +782,7 @@ impl BottleName for StageCtx {
 mod tests {
     use super::*;
     use crate::checks::CheckStatus;
+    use crate::contract::{CONTRACT_FILES, CONTRACT_GEN_REL_PATH};
     use crate::events::StageEvent;
     use crate::paths::{Bottle, Paths};
     use crate::stages::{StageCtx, StageOptions};
@@ -774,10 +827,22 @@ mod tests {
         for slug in preflight_slugs() {
             let spec = contract().check(slug).unwrap();
             match spec.native_gate {
-                Gate::Autofix => assert!(
-                    slug == "bottle.gfx-dxmt" || HELPER_SLUGS.contains(&slug),
-                    "{slug} is gated autofix but apply_fix has no arm"
-                ),
+                Gate::Autofix => {
+                    assert!(
+                        slug == "bottle.gfx-dxmt" || HELPER_SLUGS.contains(&slug),
+                        "{slug} is gated autofix but apply_fix has no arm"
+                    );
+                    // `apply_fix` dispatches off the contract's own `fix` id,
+                    // so an autofix slug that names no applicable fix would
+                    // die at launch instead of fixing anything.
+                    assert!(
+                        spec.fix
+                            .as_deref()
+                            .and_then(FixAction::from_contract_id)
+                            .is_some(),
+                        "{slug} is gated autofix but names no applicable fix"
+                    );
+                }
                 Gate::Warn => assert_eq!(
                     slug, "game.version",
                     "a second warn-gated slug needs its run.sh text in `gate`"
@@ -787,24 +852,68 @@ mod tests {
         }
     }
 
-    // ── the awk recipe ──────────────────────────────────────────────────────
+    // ── the config reader ───────────────────────────────────────────────────
 
     #[test]
-    fn awk_first_quoted_matches_the_shell_recipe() {
+    fn effective_string_reads_the_key_the_way_the_runtime_does() {
         let toml = "  protocol = \"alvr\"\nencoder_process=\"native\"\n";
-        assert_eq!(awk_first_quoted(toml, "protocol"), "alvr");
-        assert_eq!(awk_first_quoted(toml, "encoder_process"), "native");
+        assert_eq!(effective_string(toml, "protocol"), "alvr");
+        assert_eq!(effective_string(toml, "encoder_process"), "native");
 
-        // `protocol_foo` does not match the anchored key; a commented line
-        // does not start with the key after leading whitespace.
+        // `protocol_foo` is a different key; a commented line assigns nothing.
         let toml = "protocol_foo = \"x\"\n# protocol = \"alvr\"\nprotocol = \"oxrsys\"\n";
-        assert_eq!(awk_first_quoted(toml, "protocol"), "oxrsys");
+        assert_eq!(effective_string(toml, "protocol"), "oxrsys");
 
-        // First match wins (`exit`), and an unquoted value captures nothing.
-        let toml = "protocol = alvr\nprotocol = \"oxrsys\"\n";
-        assert_eq!(awk_first_quoted(toml, "protocol"), "");
+        // THE regression: last assignment wins, across table boundaries, which
+        // is what the runtime (and run.sh's `{v=$2} END{print v}`) does.
+        let toml = "[streaming]\nprotocol = \"alvr\"\n\n[tweaks]\nprotocol = \"oxrsys\"\n";
+        assert_eq!(effective_string(toml, "protocol"), "oxrsys");
+        let toml = "[a]\nencoder_process = \"inproc\"\n[b]\nencoder_process = \"native\"\n";
+        assert_eq!(effective_string(toml, "encoder_process"), "native");
 
-        assert_eq!(awk_first_quoted("", "protocol"), "");
+        // A trailing comment is stripped; a `#` inside the quoted value is not.
+        assert_eq!(
+            effective_string("protocol = \"alvr\" # was oxrsys\n", "protocol"),
+            "alvr"
+        );
+        assert_eq!(
+            effective_string("protocol = \"al#vr\"\n", "protocol"),
+            "al#vr"
+        );
+
+        // An unquoted value is the runtime's own reading — see the DIVERGENCE
+        // note on `effective_string`; `awk -F\'"\'` would capture nothing here.
+        assert_eq!(effective_string("protocol = alvr\n", "protocol"), "alvr");
+
+        assert_eq!(effective_string("", "protocol"), "");
+        assert_eq!(effective_string("[streaming]\n", "protocol"), "");
+    }
+
+    /// The same file, read by this module and by the Settings view, must name
+    /// the same backend — the bug was preflight validating `[streaming]`'s
+    /// `alvr` while the runtime obeyed a later `oxrsys`.
+    #[test]
+    fn the_preflight_facts_agree_with_the_settings_view_on_a_shadowed_key() {
+        let dir = scratch("shadowed-agree");
+        let toml = dir.join("oxrsys-runtime.toml");
+        std::fs::write(
+            &toml,
+            b"[streaming]\nprotocol = \"alvr\"\nencoder_process = \"inproc\"\n\n              [tweaks]\nprotocol = \"oxrsys\"\nencoder_process = \"native\"\n",
+        )
+        .unwrap();
+
+        let facts = read_toml_facts(&toml);
+        let view = crate::config::runtime_toml::read(&toml);
+        assert_eq!(
+            facts.protocol,
+            view.values.protocol.unwrap().as_str(),
+            "preflight and the Settings view must read one value"
+        );
+        assert_eq!(
+            facts.encoder_process,
+            view.values.encoder_process.unwrap().as_str()
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -865,6 +974,41 @@ mod tests {
     fn write(p: &Path, bytes: &[u8]) {
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
+    }
+
+    /// The checkout this test binary was compiled from — three levels above
+    /// the crate manifest (`sabrage/crates/sabrage-core`), the same recipe
+    /// `checks::meta`'s and `util`'s own tests use.
+    fn checkout_root() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root resolves")
+    }
+
+    /// Copy the checkout's `contract/` and its generated shell mirror into a
+    /// scratch root, so the walk's **first** slug — `meta.contract-sync`,
+    /// `block`-gated on this side — passes there.
+    ///
+    /// That evaluator reconciles three hashes: the scratch root's own
+    /// `contract/`, the `# contract-sha256:` header of its
+    /// `scripts/demo/contract.gen.sh`, and the contract THIS binary was
+    /// compiled with. Copying the live files satisfies all three at once
+    /// (the compiled-in copy came from the same checkout), which is what lets
+    /// every test below reach the row it is actually about instead of dying
+    /// on row zero.
+    fn seed_contract(root: &Path) {
+        let src = checkout_root();
+        for rel in CONTRACT_FILES
+            .iter()
+            .copied()
+            .chain([CONTRACT_GEN_REL_PATH])
+        {
+            let dst = root.join(rel);
+            std::fs::create_dir_all(dst.parent().unwrap()).unwrap();
+            std::fs::copy(src.join(rel), &dst)
+                .unwrap_or_else(|e| panic!("seeding {rel} into the scratch root: {e}"));
+        }
     }
 
     fn write_exec(p: &Path, bytes: &[u8]) {
@@ -933,6 +1077,9 @@ mod tests {
     /// is [`crate::executor::DryRunExecutor`] unless `dry_run` is false.
     fn fixture(tag: &str, dry_run: bool) -> Fixture {
         let root = scratch(tag);
+        // Row zero of the walk checks the checkout itself, so the scratch root
+        // has to look like a real (self-consistent) checkout.
+        seed_contract(&root);
         let prefix = root.join("bottle");
         let cx = root.join("CrossOver");
 
@@ -1134,6 +1281,13 @@ mod tests {
         let seen: Vec<String> = f.checks().into_iter().map(|(s, _)| s).collect();
         let want: Vec<String> = preflight_slugs().iter().map(|s| s.to_string()).collect();
         assert_eq!(seen, want, "one Check per slug, in contract order");
+        // Derived above, but named here because it is the newest gate and the
+        // one the fixture has to seed a whole scratch checkout to satisfy.
+        assert_eq!(
+            seen.first().map(String::as_str),
+            Some("meta.contract-sync"),
+            "the contract tripwire is row zero of the walk: {seen:?}"
+        );
 
         // run.wired-adb is the only skipped row on a non-wired clean machine.
         for (slug, status) in f.checks() {
@@ -1147,6 +1301,64 @@ mod tests {
             }
         }
         assert!(f.auto_fixed().is_empty(), "nothing needed fixing");
+    }
+
+    // ── the contract tripwire ───────────────────────────────────────────────
+
+    /// `meta.contract-sync` is `native_gate = "block"`: a checkout whose
+    /// `contract.gen.sh` header no longer matches its `contract/` refuses to
+    /// launch, on the contract's very first slug, before the preflight has
+    /// probed — or auto-fixed — anything else.
+    ///
+    /// The slug has no arm in [`block_die`], so the die text is the
+    /// evaluator's own message and remedy, through the fallback arm.
+    #[tokio::test]
+    async fn a_stale_contract_gen_header_blocks_the_launch_on_the_first_slug() {
+        let f = fixture("contract-stale", true);
+        make_everything_pass(&f);
+        // The shape of a real header, a hash of nothing: the seeded checkout
+        // is now internally inconsistent, exactly as it would be after a
+        // `contract/` edit without `scripts/dev/parity.sh --regen`.
+        write(
+            &f.root.join(CONTRACT_GEN_REL_PATH),
+            b"# contract-sha256: \
+              0000000000000000000000000000000000000000000000000000000000000000\n",
+        );
+
+        let err = run(&f.ctx).await.unwrap_err();
+        let SabrageError::Fatal { message, remedy } = &err else {
+            panic!("a block gate must be Fatal, got {err:?}")
+        };
+        assert_eq!(
+            message,
+            "contract/ and scripts/demo/contract.gen.sh out of sync (contract edited without \
+             regen, or the generated file was hand-edited)"
+        );
+        assert_eq!(remedy.as_deref(), Some("scripts/dev/parity.sh --regen"));
+
+        // Row zero, and nothing after it: the walk stops on the first block.
+        assert_eq!(
+            f.checks(),
+            vec![("meta.contract-sync".to_string(), CheckStatus::Fail)]
+        );
+        assert!(
+            f.auto_fixed().is_empty(),
+            "nothing runs behind a stale contract"
+        );
+        // The Fatal carries the same remedy the check row does, so the GUI
+        // offers `--regen` rather than a bare slug.
+        let fatals: Vec<Option<String>> = f
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                StageEvent::Fatal { remedy, .. } => Some(remedy),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            fatals,
+            vec![Some("scripts/dev/parity.sh --regen".to_string())]
+        );
     }
 
     // ── dep.goldberg tolerance ──────────────────────────────────────────────
@@ -1451,6 +1663,160 @@ mod tests {
             f.ctx.paths.oxr_helper_built.display()
         );
         assert_eq!(err.to_string(), want);
+    }
+
+    /// A2/A7-2 regression: `[streaming] protocol = "alvr"` shadowed by a later
+    /// `protocol = "oxrsys"` used to pass every ALVR gate and then launch the
+    /// legacy backend. The last assignment is the one the runtime obeys, so it
+    /// is the one the preflight must judge.
+    #[tokio::test]
+    async fn a_shadowed_protocol_is_judged_on_the_value_the_runtime_will_use() {
+        let f = fixture("proto-shadowed", true);
+        make_everything_pass(&f);
+        write(
+            &f.ctx.paths.toml_path,
+            b"[streaming]\nprotocol = \"alvr\"\n\n[tweaks]\nprotocol = \"oxrsys\"\n",
+        );
+
+        let err = run(&f.ctx).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
+             Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle FixtureBottle"
+        );
+    }
+
+    /// The same shadowing for `encoder_process`: a first `inproc` must not skip
+    /// the helper pair when a later `native` is what the runtime will use.
+    #[tokio::test]
+    async fn a_shadowed_encoder_process_still_requires_the_helper() {
+        let f = fixture("enc-shadowed", true);
+        make_everything_pass(&f);
+        std::fs::remove_file(&f.ctx.paths.oxr_helper_staged).unwrap();
+        write(
+            &f.ctx.paths.toml_path,
+            b"protocol = \"alvr\"\nencoder_process = \"inproc\"\n\n              [tweaks]\nencoder_process = \"native\"\n",
+        );
+
+        // Dies on the missing helper — under the old first-match reading both
+        // helper rows would have been skipped and the launch would have gone
+        // ahead with no arm64 helper at all.
+        let err = run(&f.ctx).await.unwrap_err();
+        // (The value quoted in the die text comes from `fixes::helper`'s own
+        // reader, which is still first-match — a sibling fix, cross-area.)
+        assert!(err.to_string().contains("needs the arm64 helper"), "{err}");
+        assert!(
+            !f.lines()
+                .iter()
+                .any(|l| l.contains("encoder_process=inproc")),
+            "the shadowed inproc must not print the in-process notice: {:?}",
+            f.lines()
+        );
+    }
+
+    // ── a failing auto-fix still reports its row ────────────────────────────
+
+    /// A7-6: an `Err` out of the fix used to return through `?` before the
+    /// slug's `Check` was emitted — an event-only consumer saw a failed stage
+    /// with the row left hanging. One Check, one Fatal, and the io cause.
+    #[tokio::test]
+    async fn a_backend_autofix_that_cannot_write_still_emits_its_check_and_dies_run_shs_way() {
+        let f = fixture("autofix-unwritable", false);
+        make_everything_pass(&f);
+        let b = f.ctx.bottle.clone().unwrap();
+        let conf = b.conf_path();
+        write(
+            &conf,
+            b"\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n",
+        );
+        // Read-only directory: the atomic write cannot create its temp file.
+        let dir = conf.parent().unwrap().to_path_buf();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+        let err = run(&f.ctx).await.unwrap_err();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "could not force graphics backend to dxmt in {}",
+                conf.display()
+            ),
+            "run.sh's post-fix die text, not a raw io error"
+        );
+        // Exactly one Check for the slug, carrying the failure and its cause.
+        let rows: Vec<CheckOutcome> = f
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                StageEvent::Check { outcome, .. } if outcome.slug == "bottle.gfx-dxmt" => {
+                    Some(outcome)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0].status, CheckStatus::Fail);
+        assert!(rows[0].detail.is_some(), "the io cause belongs on the row");
+        // One Fatal, and the cause is visible as a stderr-shaped Output line.
+        let fatals: Vec<String> = f
+            .events()
+            .into_iter()
+            .filter_map(|e| match e {
+                StageEvent::Fatal { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fatals.len(), 1, "{fatals:?}");
+        assert!(
+            f.events().iter().any(|e| matches!(
+                e,
+                StageEvent::Output {
+                    stream: crate::events::Stream::Stderr,
+                    ..
+                }
+            )),
+            "the io cause must reach the user"
+        );
+        assert!(f.auto_fixed().is_empty(), "nothing was fixed");
+        // The conf is untouched.
+        assert_eq!(
+            std::fs::read_to_string(&conf).unwrap(),
+            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n"
+        );
+    }
+
+    /// The other error shape: the fix raised its own `Fatal` (run.sh's
+    /// `ensure_helper_staged` text). That Fatal is not duplicated, and the
+    /// slug's Check is emitted alongside it.
+    #[tokio::test]
+    async fn a_helper_autofix_fatal_is_reported_once_with_its_check_row() {
+        let f = fixture("helper-fatal-row", false);
+        make_everything_pass(&f);
+        std::fs::remove_file(&f.ctx.paths.oxr_helper_staged).unwrap();
+
+        let err = run(&f.ctx).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("encoder_process=auto needs the arm64 helper"),
+            "{err}"
+        );
+        let rows = f.checks();
+        assert_eq!(
+            rows.iter()
+                .filter(|(s, _)| s == "build.helper-staged")
+                .count(),
+            1,
+            "the slug's row must still be emitted: {rows:?}"
+        );
+        assert_eq!(
+            f.events()
+                .iter()
+                .filter(|e| matches!(e, StageEvent::Fatal { .. }))
+                .count(),
+            1,
+            "the fix's own Fatal, not a second one"
+        );
     }
 
     // ── the die table ───────────────────────────────────────────────────────

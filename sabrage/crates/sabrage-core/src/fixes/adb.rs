@@ -28,7 +28,12 @@
 //! ```
 //!
 //! Note the `&&`: a failed removal prints nothing at all (no warn, no fail, no
-//! die) — reproduced here by simply not emitting a row for that pair.
+//! die). The `info` row is reproduced exactly — it appears only for a removal
+//! that really happened — but the shell's *silence* is not: a structured
+//! [`FixReport`] has to say something, and "no stale adb port forwards to clear"
+//! would be a lie on a device whose forward is still installed. A failed
+//! removal, and a `forward --list` that could not be read at all, therefore warn
+//! and report what is still (possibly) there. PARITY.md carries the divergence.
 
 use std::path::Path;
 use std::time::Duration;
@@ -41,8 +46,8 @@ use crate::stages::{EventSink, StageCtx};
 
 /// `adb forward --list` starts adb's background server on a cold run, which can
 /// block for a few seconds — long enough that a bare `.output().await` on the
-/// async worker is worth bounding. A timeout here degrades to "nothing to
-/// clear" (see [`list_forwards`]), the same as any other query failure.
+/// async worker is worth bounding. A timeout is reported as a query failure
+/// (see [`list_forwards`]), never as an empty forwarding table.
 const ADB_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// This fix's own step id, used when it runs **as a fix** — from the doctor's
@@ -78,9 +83,14 @@ fn parse_forward_list(stdout: &str) -> Vec<(String, String)> {
 /// `std::process::Command::output()` (this fix's `remove_adb_forwards` is
 /// itself async, spawned on the async worker) and bounded by
 /// [`ADB_LIST_TIMEOUT`], since a cold `adb` starting its own server can block
-/// for seconds — a hang here degrades to "nothing to clear", the same
-/// no-forwards-found shape a genuine empty list produces.
-async fn list_forwards(adb: &Path) -> Vec<(String, String)> {
+/// for seconds.
+///
+/// `Err(reason)` for a query that could not be answered — a spawn failure, the
+/// timeout, or a non-zero `adb`. It is deliberately **not** folded into an empty
+/// list: "adb could not tell us" and "there is nothing to clear" are different
+/// facts, and only one of them justifies telling the user their forwarding
+/// table is clean.
+async fn list_forwards(adb: &Path) -> std::result::Result<Vec<(String, String)>, String> {
     let output = tokio::time::timeout(
         ADB_LIST_TIMEOUT,
         tokio::process::Command::new(adb)
@@ -89,8 +99,15 @@ async fn list_forwards(adb: &Path) -> Vec<(String, String)> {
     )
     .await;
     match output {
-        Ok(Ok(out)) => parse_forward_list(&String::from_utf8_lossy(&out.stdout)),
-        Ok(Err(_)) | Err(_) => Vec::new(),
+        Ok(Ok(out)) if out.status.success() => {
+            Ok(parse_forward_list(&String::from_utf8_lossy(&out.stdout)))
+        }
+        Ok(Ok(out)) => Err(format!("adb forward --list exited {}", out.status)),
+        Ok(Err(e)) => Err(format!("could not run {}: {e}", adb.display())),
+        Err(_) => Err(format!(
+            "adb forward --list timed out after {}s",
+            ADB_LIST_TIMEOUT.as_secs()
+        )),
     }
 }
 
@@ -107,7 +124,31 @@ fn stale_local_specs() -> Vec<String> {
 
 /// Remove the stale `tcp:9943`/`tcp:9944` forwards, per serial, as the
 /// standalone fix — every row stamped [`STEP`].
+///
+/// Refuses while a session is live. During a `--wired` session the two forwards
+/// this fix removes are the ones the stream is running over, and doctor cannot
+/// tell them apart from stale ones (it does not know the launch's `wired`
+/// state), so its row offers this remedy either way. [`crate::fixes::apply`]
+/// already gates every fix the same way; the check is repeated here because this
+/// function is the one a caller could reach directly, and disconnecting the
+/// headset is not a mistake worth leaving one door open for.
+///
+/// The launch path calls [`remove_adb_forwards_at`], which is deliberately
+/// **not** gated: clearing leftovers is a preflight step of the very session
+/// being started.
 pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
+    if let Some(reason) = crate::stages::live_session_block(&ctx.paths) {
+        return Err(ctx.fatal(
+            format!(
+                "refusing to remove adb port forwards while a session is live — {reason}; a \
+                 --wired session is streaming over these forwards"
+            ),
+            Some(format!(
+                "./demo.sh stop --bottle {}",
+                ctx.opts.bottle_name.as_deref().unwrap_or("<name>")
+            )),
+        ));
+    }
     remove_adb_forwards_at(ctx, sink, STEP).await
 }
 
@@ -135,8 +176,25 @@ pub async fn remove_adb_forwards_at(
     let dry_run = ctx.executor.is_dry_run();
     let executor = ctx.executor_for(step);
 
+    let listed = match list_forwards(&adb).await {
+        Ok(rows) => rows,
+        Err(reason) => {
+            // Nothing was removed and nothing is known: say both. Reporting the
+            // clean-table string here is how a WiFi-breaking forward survives a
+            // fix the user watched succeed.
+            let text = format!(
+                "could not query adb forwards ({reason}) — stale {} forwards may still be \
+                 installed",
+                stale_locals.join("/")
+            );
+            sink(StageEvent::warn(ctx.run_id, Some(step), text.clone()));
+            return Ok(FixReport::unchanged(FixAction::RemoveAdbForwards, text));
+        }
+    };
+
     let mut cleared: Vec<String> = Vec::new();
-    for (serial, local) in list_forwards(&adb).await {
+    let mut failed: Vec<String> = Vec::new();
+    for (serial, local) in listed {
         if !stale_locals.contains(&local) {
             continue;
         }
@@ -144,10 +202,15 @@ pub async fn remove_adb_forwards_at(
             .child(adb.clone(), step)
             .args(["-s", &serial, "forward", "--remove", &local]);
         // NEVER `--remove-all` here — see this module's header. `run_child`
-        // reports a non-zero exit as `Ok`, matching the shell's tolerant `&&`
-        // (a failed removal prints nothing and is not an error).
+        // reports a non-zero exit as `Ok`, matching the shell's tolerant `&&`:
+        // a failed removal is not an error and never aborts the launch that
+        // calls this. Unlike the shell, it is not silent either — the pair is
+        // remembered so the report cannot claim the table is clean.
         let status = executor.run_child(&spec).await?;
         if !status.success() {
+            let text = format!("could not clear adb forward {local} on {serial} ({status})");
+            sink(StageEvent::warn(ctx.run_id, Some(step), text));
+            failed.push(format!("{serial} {local}"));
             continue;
         }
         let verb = if dry_run { "would clear" } else { "cleared" };
@@ -157,6 +220,22 @@ pub async fn remove_adb_forwards_at(
         );
         sink(StageEvent::info(ctx.run_id, Some(step), line.clone()));
         cleared.push(line);
+    }
+
+    if !failed.is_empty() {
+        let still = failed.join(", ");
+        let description = if cleared.is_empty() {
+            format!("adb forwards still installed: {still}")
+        } else {
+            format!("{}; still installed: {still}", cleared.join("; "))
+        };
+        // `changed` follows what actually happened: a partial clear did change
+        // the machine, a total failure did not.
+        return Ok(if cleared.is_empty() {
+            FixReport::unchanged(FixAction::RemoveAdbForwards, description)
+        } else {
+            FixReport::changed(FixAction::RemoveAdbForwards, description)
+        });
     }
 
     if cleared.is_empty() {
@@ -244,9 +323,42 @@ mod tests {
         std::fs::set_permissions(script_path, perms).unwrap();
     }
 
+    /// A fake `adb` whose exit codes are the fixture: `list_exit` for
+    /// `forward --list`, `remove_exit` for every `-s <serial> forward --remove`.
+    fn write_fake_adb_failing(
+        script_path: &Path,
+        list_stdout: &str,
+        list_exit: i32,
+        remove_exit: i32,
+        log_path: &Path,
+    ) {
+        std::fs::create_dir_all(script_path.parent().unwrap()).unwrap();
+        let script = format!(
+            "#!/bin/sh\n\
+             if [ \"$1\" = forward ] && [ \"$2\" = --list ]; then\n\
+             \x20\x20cat <<'SABRAGE_EOF'\n{list_stdout}SABRAGE_EOF\n\
+             \x20\x20exit {list_exit}\n\
+             fi\n\
+             if [ \"$1\" = -s ]; then\n\
+             \x20\x20echo \"$2 $3 $4 $5\" >> {log}\n\
+             \x20\x20exit {remove_exit}\n\
+             fi\n\
+             exit 1\n",
+            log = log_path.display(),
+        );
+        std::fs::write(script_path, script).unwrap();
+        let mut perms = std::fs::metadata(script_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(script_path, perms).unwrap();
+    }
+
     fn ctx_with_adb(root: &Path, adb: PathBuf, dry_run: bool) -> StageCtx {
         let mut paths = Paths::new(root);
         paths.adb = Some(adb);
+        // The standalone fix consults the live-session policy; point both stores
+        // at the scratch root so it reads fixtures, never the real machine.
+        paths.sabrage_appsup = root.join("Sabrage");
+        paths.oxr_appsup = root.join("OXRSys");
         let opts = StageOptions {
             dry_run,
             ..StageOptions::default()
@@ -260,6 +372,8 @@ mod tests {
         let root = scratch("no-adb");
         let mut paths = Paths::new(&root);
         paths.adb = None;
+        paths.sabrage_appsup = root.join("Sabrage");
+        paths.oxr_appsup = root.join("OXRSys");
         let sink: EventSink = std::sync::Arc::new(|_| {});
         let ctx = StageCtx::new(
             paths,
@@ -398,6 +512,139 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(steps(&seen), vec![Some("run.2.adb-forwards".to_string())]);
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A device that disappeared mid-removal used to be reported exactly like a
+    /// clean forwarding table — "no stale adb port forwards to clear" — while
+    /// the WiFi-breaking forward was still installed.
+    #[tokio::test]
+    async fn a_failed_removal_is_never_reported_as_a_clean_table() {
+        let root = scratch("remove-fails");
+        let adb = root.join("adb.sh");
+        let log = root.join("removed.log");
+        write_fake_adb_failing(
+            &adb,
+            "SERIALX tcp:9943 tcp:9943\nSERIALX tcp:9944 tcp:9944\n",
+            0,
+            1,
+            &log,
+        );
+
+        let ctx = ctx_with_adb(&root, adb, false);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = std::sync::Arc::new(move |ev| s.lock().unwrap().push(ev));
+
+        let report = remove_adb_forwards(&ctx, &sink).await.unwrap();
+        assert!(!report.changed, "nothing was actually cleared");
+        assert_ne!(report.description, "no stale adb port forwards to clear");
+        assert!(
+            report.description.contains("SERIALX tcp:9943"),
+            "{report:?}"
+        );
+        assert!(
+            report.description.contains("SERIALX tcp:9944"),
+            "{report:?}"
+        );
+
+        let warns: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                StageEvent::Line { text, severity, .. }
+                    if *severity == crate::events::Severity::Warn =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            warns.len(),
+            2,
+            "one warn per unremovable forward: {warns:?}"
+        );
+        assert!(warns[0].starts_with("could not clear adb forward tcp:9943 on SERIALX"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// `adb forward --list` that cannot be answered is not an empty table.
+    #[tokio::test]
+    async fn a_query_failure_is_reported_as_a_query_failure() {
+        let root = scratch("list-fails");
+        let adb = root.join("adb.sh");
+        let log = root.join("removed.log");
+        write_fake_adb_failing(&adb, "", 1, 0, &log);
+
+        let ctx = ctx_with_adb(&root, adb, false);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = std::sync::Arc::new(move |ev| s.lock().unwrap().push(ev));
+
+        let report = remove_adb_forwards(&ctx, &sink).await.unwrap();
+        assert!(!report.changed);
+        assert!(
+            report
+                .description
+                .starts_with("could not query adb forwards ("),
+            "{report:?}"
+        );
+        assert!(
+            report.description.contains("tcp:9943/tcp:9944"),
+            "{report:?}"
+        );
+        assert!(!log.exists(), "a failed query must remove nothing");
+        assert!(seen.lock().unwrap().iter().any(|e| matches!(
+            e,
+            StageEvent::Line { severity, .. } if *severity == crate::events::Severity::Warn
+        )));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `--wired` session's own forwards: the standalone fix (a Doctor
+    /// button) must refuse, while the launch path — which clears leftovers
+    /// *before* a session exists — keeps working.
+    #[tokio::test]
+    async fn the_standalone_fix_refuses_during_a_live_session_but_the_launch_path_does_not() {
+        let _g = crate::session::lock_session_globals();
+        let root = scratch("live");
+        let adb = root.join("adb.sh");
+        let log = root.join("removed.log");
+        write_fake_adb(&adb, "SERIALX tcp:9943 tcp:9943\n", &log);
+
+        let ctx = ctx_with_adb(&root, adb, false);
+        let state_path = ctx.paths.session_state_path();
+        std::fs::create_dir_all(state_path.parent().unwrap()).unwrap();
+        let mut state = crate::session::state::SessionState::new(
+            uuid::Uuid::new_v4(),
+            "FixtureBottle",
+            "/bs",
+            "/log",
+            0,
+        );
+        state.wine = crate::process::ProcInfo::observe(std::process::id());
+        std::fs::write(&state_path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        let sink: EventSink = ctx.sink.clone();
+        let err = remove_adb_forwards(&ctx, &sink).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("refusing to remove adb port forwards while a session is live"),
+            "{err}"
+        );
+        assert!(!log.exists(), "adb must not be spawned while refusing");
+
+        // The launch path is the same removal without the gate.
+        let report = remove_adb_forwards_at(&ctx, &sink, crate::events::step::RUN_ADB_FORWARDS)
+            .await
+            .unwrap();
+        assert!(report.changed);
+        assert!(log.exists());
 
         std::fs::remove_dir_all(&root).ok();
     }

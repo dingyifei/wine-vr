@@ -22,10 +22,32 @@
 //!   [`RestoreMode::SafeOnly`] restores what is not attached to a pid (audio,
 //!   adb forwards) and signals nothing.
 //!
-//! A `start_time` of 0 (the "could not observe at spawn" fallback recorded by
-//! [`crate::executor::Executor::spawn_detached`]) can never match a real start
-//! time, so such a record classifies as `IdentityMismatch` while the pid is
-//! alive — deliberately the conservative branch.
+//! * [`Classification::Unverifiable`] — the recorded `start_time` is the 0 the
+//!   spawn fallback writes when the pid could not be observed
+//!   ([`crate::executor::Executor::spawn_detached`]), and that pid is *alive*.
+//!   It can never match a real start time, so it is not `Live`; but calling it
+//!   a recycled pid is a guess in the other direction, and acting on that guess
+//!   means restoring the audio device and pulling the `--wired` forwards out
+//!   from under what may well be the running session. Nothing is touched and
+//!   the record is kept.
+//!
+//! # Records that are not ours to touch
+//!
+//! Three more shapes are reported and left exactly as they are
+//! ([`Reconciled::Busy`]), because in each one the guards belong to somebody
+//! who is still using them:
+//!
+//! * the record of a launch **this process is running right now** — before the
+//!   wine spawn it has `wine: None`, which classifies as `Dead`, and its
+//!   [`crate::session::LIVE_SESSION`] handle does not exist yet either. The
+//!   run stage's published phase ([`crate::session::run_phase`]) is what names
+//!   it, which is why reconciliation takes that as an ambient input;
+//! * a record whose `owner_pid` is a live *foreign* process
+//!   ([`state::has_live_foreign_owner`]) — the other front-end's session;
+//! * a record written by a **newer** Sabrage
+//!   ([`state::SessionState::is_supported_version`]) — it may describe a guard
+//!   this build cannot undo, and rewriting it through this struct would erase
+//!   that description.
 //!
 //! # Detach
 //!
@@ -52,7 +74,10 @@
 //! | ok | `ALVR dashboard closed (left over from the previous session)` |
 //! | info | `cleared adb forward tcp:<port> on <serial>` |
 //! | info | `previous session record kept for a later restore` |
+//! | warn | `previous session record kept: Sabrage process <pid> is running this session` |
+//! | warn | `previous session record kept: written by a newer Sabrage (schema v<n>, this build understands v<m>)` |
 //! | warn | `previous session state kept: wine pid <pid> still alive` (stop only) |
+//! | warn | `previous session state kept: wine pid <pid> is alive but could not be identified` (stop only) |
 //! | warn | `previous session not fully restored: <error>` (stop only) |
 //! | info | `the record is kept; stop again to retry` (stop only) |
 //!
@@ -140,9 +165,14 @@ pub enum Classification {
     Live,
     /// The pid is gone.
     Dead,
-    /// The pid is alive but is **not** our process (recycled pid), or the
-    /// recorded identity is unverifiable.
+    /// The pid is alive but is **not** our process: a recycled pid.
     IdentityMismatch,
+    /// The pid is alive and the record's identity cannot be checked at all —
+    /// `start_time` is the spawn fallback's 0. Treated like [`Live`]: nothing
+    /// is touched.
+    ///
+    /// [`Live`]: Classification::Live
+    Unverifiable,
 }
 
 /// The outcome of a [`reconcile`] pass, as reported to the UI.
@@ -163,16 +193,32 @@ pub enum Reconciled {
     Dead {
         state: SessionState,
         restored: Vec<String>,
+        /// A guard could **not** be released, so the record was kept rather
+        /// than cleared (see [`finish_record`]). The next launch must not
+        /// overwrite it blind: `state.prev_audio_output` is still the device
+        /// the Mac needs to go back to, and by now the machine is on BlackHole,
+        /// so this launch's own `SwitchAudioSource -c` would record the
+        /// loopback as the thing to restore to.
+        #[serde(default)]
+        pending: bool,
     },
     /// The recorded pid now belongs to something else. Only the pid-free
     /// guards were restored ([`RestoreMode::SafeOnly`]).
     IdentityMismatch {
         state: SessionState,
         restored: Vec<String>,
+        /// As [`Reconciled::Dead`]'s.
+        #[serde(default)]
+        pending: bool,
     },
+    /// The record is somebody's — a launch in flight here, another live
+    /// front-end's, or a newer Sabrage's. It was **reported and nothing else**:
+    /// nothing restored, nothing signalled, the file left exactly as it was.
+    /// `reason` is the row the user saw.
+    Busy { state: SessionState, reason: String },
 }
 
-/// How much of a stale session's cleanup [`restore_persisted_guards`] may do.
+/// How much of a stale session's cleanup the restore pass may do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum RestoreMode {
@@ -202,10 +248,25 @@ pub fn classify(state: &SessionState) -> Classification {
     }
     if wine.is_same_process() {
         Classification::Live
-    } else if process::is_alive(wine.pid) {
-        Classification::IdentityMismatch
-    } else {
+    } else if !process::is_alive(wine.pid) {
         Classification::Dead
+    } else if wine.start_time == 0 {
+        // Alive, and nothing about it can be checked: the spawn fallback never
+        // observed a start time. "Recycled pid" would be a guess, and acting on
+        // it dismantles a session that may be the real one.
+        Classification::Unverifiable
+    } else {
+        Classification::IdentityMismatch
+    }
+}
+
+/// Which [`RestoreMode`] a classification licenses, or `None` when nothing may
+/// be touched at all.
+fn restore_mode(class: Classification) -> Option<RestoreMode> {
+    match class {
+        Classification::Live | Classification::Unverifiable => None,
+        Classification::Dead => Some(RestoreMode::Full),
+        Classification::IdentityMismatch => Some(RestoreMode::SafeOnly),
     }
 }
 
@@ -222,16 +283,21 @@ pub fn classify(state: &SessionState) -> Classification {
 /// twice or clear the record out from under it.
 pub async fn reconcile(ctx: &StageCtx) -> Result<Reconciled> {
     let live = crate::session::live_session().map(|h| h.run_id);
-    reconcile_with(ctx, live, || current_output_device(ctx)).await
+    reconcile_with(ctx, live, crate::session::run_phase(), || {
+        current_output_device(ctx)
+    })
+    .await
 }
 
-/// [`reconcile`] with both ambient inputs injected: the live session's run id
-/// and the current-output-device probe. The public entry point supplies the
-/// real ones; tests supply deterministic ones, so neither the global
-/// [`crate::session::LIVE_SESSION`] slot nor `SwitchAudioSource` is involved.
+/// [`reconcile`] with all three ambient inputs injected: the live session's run
+/// id, the run stage's published phase, and the current-output-device probe.
+/// The public entry point supplies the real ones; tests supply deterministic
+/// ones, so neither the global [`crate::session::LIVE_SESSION`] and
+/// [`crate::session::run_phase`] slots nor `SwitchAudioSource` is involved.
 async fn reconcile_with<F, Fut>(
     ctx: &StageCtx,
     live_run_id: Option<RunId>,
+    run_phase: Option<crate::session::RunPhaseInfo>,
     probe: F,
 ) -> Result<Reconciled>
 where
@@ -239,22 +305,23 @@ where
     Fut: Future<Output = Option<AudioProbe>>,
 {
     let path = ctx.paths.session_state_path();
-    let mut state = match state::load(&path) {
-        Ok(Some(s)) => s,
-        Ok(None) => return Ok(Reconciled::NoSession),
-        Err(e) => {
-            // Never silent (a rerouted audio device with no explanation is the
-            // failure `session-state.json` exists to prevent) and never fatal
-            // (a corrupt record must not block every future launch): say so,
-            // say how to clear it, and carry on as if there were nothing to
-            // reconcile.
-            ctx.step(STEP)
-                .warn(format!("previous session state unreadable: {e}"));
-            ctx.step(STEP)
-                .info(format!("delete {} to clear this warning", path.display()));
-            return Ok(Reconciled::NoSession);
-        }
+    let Some(mut state) = load_record(ctx, &path)? else {
+        return Ok(Reconciled::NoSession);
     };
+
+    // ── records that are not ours to touch (module doc) ──────────────────────
+    if let Some(reason) = untouchable(&state, run_phase.as_ref()) {
+        // Silent for our own in-flight launch — there is nothing wrong and
+        // nothing for the user to do — and a row for the two that a person may
+        // need to explain.
+        if !reason.silent {
+            ctx.step(STEP).warn(reason.text.clone());
+        }
+        return Ok(Reconciled::Busy {
+            state,
+            reason: reason.text,
+        });
+    }
 
     let class = classify(&state);
 
@@ -262,34 +329,107 @@ where
     // restore nothing and keep the file.
     if live_run_id.is_some_and(|id| id == state.run_id) {
         return Ok(match class {
-            Classification::Live => Reconciled::Live { state },
+            Classification::Live | Classification::Unverifiable => Reconciled::Live { state },
             Classification::Dead => Reconciled::Dead {
                 state,
                 restored: Vec::new(),
+                pending: false,
             },
             Classification::IdentityMismatch => Reconciled::IdentityMismatch {
                 state,
                 restored: Vec::new(),
+                pending: false,
             },
         });
     }
 
-    match class {
-        // Still running: the session owns its guards. If it is also `detached`
-        // and this process is not its owner, the GUI offers Re-attach — but
-        // that is a UI decision, and nothing here may touch the machine.
-        Classification::Live => Ok(Reconciled::Live { state }),
-        Classification::Dead => {
-            let restored = restore_with(ctx, &mut state, RestoreMode::Full, probe).await?;
-            finish_record(ctx, &path, &mut state, RestoreMode::Full).await?;
-            Ok(Reconciled::Dead { state, restored })
-        }
-        Classification::IdentityMismatch => {
-            let restored = restore_with(ctx, &mut state, RestoreMode::SafeOnly, probe).await?;
-            finish_record(ctx, &path, &mut state, RestoreMode::SafeOnly).await?;
-            Ok(Reconciled::IdentityMismatch { state, restored })
+    // Still running — or running as far as anyone here can tell: the session
+    // owns its guards. If it is also `detached` and this process is not its
+    // owner, the GUI offers Re-attach — but that is a UI decision, and nothing
+    // here may touch the machine.
+    let Some(mode) = restore_mode(class) else {
+        return Ok(Reconciled::Live { state });
+    };
+    let (restored, pending) = restore_and_finish(ctx, &path, &mut state, mode, probe).await?;
+    Ok(match class {
+        Classification::IdentityMismatch => Reconciled::IdentityMismatch {
+            state,
+            restored,
+            pending,
+        },
+        _ => Reconciled::Dead {
+            state,
+            restored,
+            pending,
+        },
+    })
+}
+
+/// Read the record, turning both "there is none" and "it cannot be read" into
+/// `None` — the second with the two rows that explain it.
+///
+/// An unreadable record is never silent (a rerouted audio device with no
+/// explanation is the failure `session-state.json` exists to prevent) and never
+/// fatal (a corrupt record must not block every future launch).
+fn load_record(ctx: &StageCtx, path: &Path) -> Result<Option<SessionState>> {
+    match state::load(path) {
+        Ok(Some(s)) => Ok(Some(s)),
+        Ok(None) => Ok(None),
+        Err(e) => {
+            ctx.step(STEP)
+                .warn(format!("previous session state unreadable: {e}"));
+            ctx.step(STEP)
+                .info(format!("delete {} to clear this warning", path.display()));
+            Ok(None)
         }
     }
+}
+
+/// Why a record may not be touched, and whether saying so is worth a row.
+struct Untouchable {
+    text: String,
+    silent: bool,
+}
+
+/// The three "not ours" shapes, in one place so `reconcile` and `stop`'s tail
+/// cannot drift apart. `None` means the record is fair game.
+fn untouchable(
+    state: &SessionState,
+    run_phase: Option<&crate::session::RunPhaseInfo>,
+) -> Option<Untouchable> {
+    // A launch this process is running *right now*. Before the wine spawn its
+    // record has `wine: None` — which classifies as `Dead` — and there is no
+    // live handle yet, so the published phase is the only thing that knows.
+    // Without this, remounting the Session screen mid-launch restores the audio
+    // device, kills the dashboard this launch just spawned, pulls its forwards
+    // and deletes its record, all under a launch that keeps going.
+    if let Some(info) = run_phase {
+        let in_flight = matches!(
+            info.phase,
+            crate::session::SessionPhase::Preflight
+                | crate::session::SessionPhase::Launching
+                | crate::session::SessionPhase::Stopping
+        );
+        if in_flight && info.run_id == state.run_id {
+            return Some(Untouchable {
+                text: RECORD_IN_FLIGHT.to_string(),
+                silent: true,
+            });
+        }
+    }
+    if state::has_live_foreign_owner(state) {
+        return Some(Untouchable {
+            text: owned_elsewhere_row(state.owner_pid),
+            silent: false,
+        });
+    }
+    if !state.is_supported_version() {
+        return Some(Untouchable {
+            text: newer_schema_row(state.version),
+            silent: false,
+        });
+    }
+    None
 }
 
 // ── stop's tail end ───────────────────────────────────────────────────────────
@@ -319,7 +459,10 @@ where
 /// `stop` stage always reaches its ports and audio reports.
 pub(crate) async fn finish_stopped_session(ctx: &StageCtx) -> Result<()> {
     let live = crate::session::live_session().map(|h| h.run_id);
-    finish_stopped_session_with(ctx, live, || current_output_device(ctx)).await
+    finish_stopped_session_with(ctx, live, crate::session::run_phase(), || {
+        current_output_device(ctx)
+    })
+    .await
 }
 
 /// [`finish_stopped_session`] with the live-session id and the device probe
@@ -328,13 +471,14 @@ pub(crate) async fn finish_stopped_session(ctx: &StageCtx) -> Result<()> {
 async fn finish_stopped_session_with<F, Fut>(
     ctx: &StageCtx,
     live_run_id: Option<RunId>,
+    run_phase: Option<crate::session::RunPhaseInfo>,
     probe: F,
 ) -> Result<()>
 where
     F: FnOnce() -> Fut,
     Fut: Future<Output = Option<AudioProbe>>,
 {
-    let result = finish_stopped_session_inner(ctx, live_run_id, probe).await;
+    let result = finish_stopped_session_inner(ctx, live_run_id, run_phase, probe).await;
     tolerate_reconcile_failure(ctx, result)
 }
 
@@ -369,6 +513,7 @@ fn tolerate_reconcile_failure(ctx: &StageCtx, result: Result<()>) -> Result<()> 
 async fn finish_stopped_session_inner<F, Fut>(
     ctx: &StageCtx,
     live_run_id: Option<RunId>,
+    run_phase: Option<crate::session::RunPhaseInfo>,
     probe: F,
 ) -> Result<()>
 where
@@ -376,16 +521,8 @@ where
     Fut: Future<Output = Option<AudioProbe>>,
 {
     let path = ctx.paths.session_state_path();
-    let mut state = match state::load(&path) {
-        Ok(Some(s)) => s,
-        Ok(None) => return Ok(()),
-        Err(e) => {
-            ctx.step(STEP)
-                .warn(format!("previous session state unreadable: {e}"));
-            ctx.step(STEP)
-                .info(format!("delete {} to clear this warning", path.display()));
-            return Ok(());
-        }
+    let Some(mut state) = load_record(ctx, &path)? else {
+        return Ok(());
     };
 
     // Bottle-scoped: this stage's `wineserver -k` only touched one bottle.
@@ -399,23 +536,29 @@ where
         return Ok(());
     }
 
-    match classify(&state) {
-        Classification::Live => {
-            let pid = state.wine.as_ref().map(|w| w.pid).unwrap_or_default();
-            ctx.step(STEP).warn(format!(
-                "previous session state kept: wine pid {pid} still alive"
-            ));
-            Ok(())
+    // Somebody else's record — the same three shapes `reconcile` refuses,
+    // reported here as one warn because `stop` is the stage a person runs when
+    // they expected the machine to be put back.
+    if let Some(reason) = untouchable(&state, run_phase.as_ref()) {
+        if !reason.silent {
+            ctx.step(STEP).warn(reason.text);
         }
-        Classification::Dead => {
-            restore_with(ctx, &mut state, RestoreMode::Full, probe).await?;
-            finish_record(ctx, &path, &mut state, RestoreMode::Full).await
-        }
-        Classification::IdentityMismatch => {
-            restore_with(ctx, &mut state, RestoreMode::SafeOnly, probe).await?;
-            finish_record(ctx, &path, &mut state, RestoreMode::SafeOnly).await
-        }
+        return Ok(());
     }
+
+    let class = classify(&state);
+    let Some(mode) = restore_mode(class) else {
+        let pid = state.wine.as_ref().map(|w| w.pid).unwrap_or_default();
+        ctx.step(STEP).warn(match class {
+            Classification::Unverifiable => format!(
+                "previous session state kept: wine pid {pid} is alive but could not be identified"
+            ),
+            _ => format!("previous session state kept: wine pid {pid} still alive"),
+        });
+        return Ok(());
+    };
+    restore_and_finish(ctx, &path, &mut state, mode, probe).await?;
+    Ok(())
 }
 
 // ── restoration ───────────────────────────────────────────────────────────────
@@ -451,13 +594,13 @@ struct AudioProbe {
 async fn current_output_device(ctx: &StageCtx) -> Option<AudioProbe> {
     let bin = which("SwitchAudioSource")?;
     let spec = ctx.child(bin.clone(), STEP).args(["-c", "-t", "output"]);
-    let out = process::capture(&spec).await.ok()?;
+    let out = probe_capture(&spec).await?;
     if !out.status.success() {
         return None;
     }
     let listing = ctx.child(bin.clone(), STEP).args(["-a", "-t", "output"]);
-    let outputs = match process::capture(&listing).await {
-        Ok(l) if l.status.success() => output_device_names(&l.stdout),
+    let outputs = match probe_capture(&listing).await {
+        Some(l) if l.status.success() => output_device_names(&l.stdout),
         _ => Vec::new(),
     };
     Some(AudioProbe {
@@ -465,6 +608,27 @@ async fn current_output_device(ctx: &StageCtx) -> Option<AudioProbe> {
         current: out.stdout_trimmed().to_string(),
         outputs,
     })
+}
+
+/// How long one audio probe may take before it is treated as no answer.
+///
+/// `SwitchAudioSource -c -t output` returns in milliseconds; a probe that has
+/// not answered in this long is wedged on a CoreAudio call, and waiting for it
+/// blocks the whole of `run`/`stop` — with the operation lock held — behind a
+/// read-only question whose failure mode is already handled (`None` leaves the
+/// audio guard pending and the record on disk). [`crate::process::capture`]
+/// itself has no deadline and no cancellation hook; bounding it here is the
+/// half that belongs to reconciliation.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// [`crate::process::capture`] with [`PROBE_TIMEOUT`] over it. `None` for a
+/// spawn failure and for a probe that ran out of time — indistinguishable to
+/// every caller, because both mean "we could not look".
+async fn probe_capture(spec: &crate::process::ChildSpec) -> Option<process::Captured> {
+    tokio::time::timeout(PROBE_TIMEOUT, process::capture(spec))
+        .await
+        .ok()?
+        .ok()
 }
 
 /// `SwitchAudioSource -a -t output`'s stdout as one device name per line,
@@ -478,24 +642,14 @@ fn output_device_names(stdout: &str) -> Vec<String> {
         .collect()
 }
 
-/// Undo the guards `state` still records as un-released, honouring `mode`.
-///
-/// Flips each [`state::GuardFlags`] bit and re-saves as it goes, so an
-/// interrupted restore resumes correctly. Returns one human line per action
-/// actually performed (empty when there was nothing left to undo).
-pub async fn restore_persisted_guards(
-    ctx: &StageCtx,
-    state: &mut SessionState,
-    mode: RestoreMode,
-) -> Result<Vec<String>> {
-    restore_with(ctx, state, mode, || current_output_device(ctx)).await
-}
-
-/// [`restore_persisted_guards`] with the device probe injected.
+/// Undo the guards `state` still records as un-released, honouring `mode`,
+/// with the device probe injected (see [`reconcile_with`]).
 ///
 /// Order is audio → dashboard → forwards, each followed by its own
 /// [`state::save`] the moment its flag flips: a crash between two guards must
-/// leave a record describing only the work that is still outstanding.
+/// leave a record describing only the work that is still outstanding. Returns
+/// one human line per action actually performed (empty when there was nothing
+/// left to undo).
 async fn restore_with<F, Fut>(
     ctx: &StageCtx,
     state: &mut SessionState,
@@ -507,131 +661,183 @@ where
     Fut: Future<Output = Option<AudioProbe>>,
 {
     let path = ctx.paths.session_state_path();
-    let dry = ctx.executor.is_dry_run();
     let mut banner = Banner::new(ctx);
     let mut restored: Vec<String> = Vec::new();
 
-    // ── audio ────────────────────────────────────────────────────────────────
-    // Only when the device is *still* BlackHole: a user who already switched it
-    // back by hand must not have their choice overwritten by a recovery pass.
-    if let Some(prev) = state.prev_audio_output.clone() {
-        if !state.guards.audio_restored {
-            if let Some(p) = probe().await {
-                if p.current == BLACKHOLE {
-                    let spec =
-                        ctx.child(p.bin.clone(), STEP)
-                            .args(["-t", "output", "-s", prev.as_str()]);
-                    if ctx.executor.run_child(&spec).await?.success() {
-                        let line = audio_row(dry, &prev);
-                        banner.show();
-                        ctx.step(STEP).ok(line.clone());
-                        restored.push(line);
-                        state.guards.audio_restored = true;
-                        state::save(&*ctx.executor, &path, state).await?;
-                    } else {
-                        // The recorded device is not connected any more — the
-                        // AirPods that went away while the session ran. The
-                        // switch exits non-zero ("Could not find an audio
-                        // device named …  Nothing was changed."), and leaving
-                        // it there means the Mac stays on BlackHole: silent.
-                        // Land on something real instead, and say what happened.
-                        let alt = super::fallback_output_device(&p.outputs);
-                        let mut landed = false;
-                        if let Some(alt) = alt {
-                            let spec = ctx.child(p.bin.clone(), STEP).args([
-                                "-t",
-                                "output",
-                                "-s",
-                                alt.as_str(),
-                            ]);
-                            if ctx.executor.run_child(&spec).await?.success() {
-                                let line = audio_fallback_row(dry, &prev, &alt);
-                                banner.show();
-                                ctx.step(STEP).warn(line.clone());
-                                restored.push(line);
-                                state.guards.audio_restored = true;
-                                state::save(&*ctx.executor, &path, state).await?;
-                                landed = true;
-                            }
-                        }
-                        if !landed {
-                            // No banner: this row reports why there was no
-                            // recovery, not a recovery that happened — the
-                            // same rule the stop-only rows follow. The guard
-                            // stays pending, so the record is kept and the
-                            // next launch or stop tries again.
-                            ctx.step(STEP).warn(super::audio_unrestorable_line(&prev));
-                        }
-                    }
-                } else {
-                    // Already back where it belongs — nothing to undo, and
-                    // nothing to say about it.
-                    state.guards.audio_restored = true;
-                    state::save(&*ctx.executor, &path, state).await?;
-                }
-            }
-        }
-    }
-
-    // ── dashboard (Full only) ────────────────────────────────────────────────
-    // SafeOnly skips this entirely: its whole definition is "signal no pid".
+    restore_audio(ctx, &path, state, probe, &mut banner, &mut restored).await?;
+    // SafeOnly skips the dashboard entirely: its whole definition is "signal no
+    // pid".
     if mode == RestoreMode::Full {
-        if let Some(dashboard) = state.dashboard.clone() {
-            if !state.guards.dashboard_closed {
-                let mut closed = false;
-                if signalable(&dashboard) {
-                    let spec = ctx
-                        .child("/bin/kill", STEP)
-                        .arg("-TERM")
-                        .arg(dashboard.pid.to_string());
-                    closed = ctx.executor.run_child(&spec).await?.success();
-                }
-                if closed {
-                    let line = dashboard_row(dry);
-                    banner.show();
-                    ctx.step(STEP).ok(line.clone());
-                    restored.push(line);
-                }
-                // Flagged either way: whether we killed it, it had already
-                // exited, or the pid now belongs to a stranger, there is
-                // nothing further this record can ask anyone to do.
-                state.guards.dashboard_closed = true;
-                state::save(&*ctx.executor, &path, state).await?;
-            }
-        }
+        restore_dashboard(ctx, &path, state, &mut banner, &mut restored).await?;
     }
-
-    // ── wired adb forwards ───────────────────────────────────────────────────
-    // Exactly the recorded ports, on exactly the recorded serials. Never
-    // `--remove-all` (CLAUDE.md; PARITY.md).
-    if !state.wired_forwards.is_empty() && !state.guards.forwards_cleared {
-        if let Some(adb) = ctx.paths.adb.clone() {
-            for fwd in state.wired_forwards.clone() {
-                let local = format!("tcp:{}", fwd.port);
-                let spec = ctx.child(adb.clone(), STEP).args([
-                    "-s",
-                    fwd.serial.as_str(),
-                    "forward",
-                    "--remove",
-                    local.as_str(),
-                ]);
-                // run.sh's `&&`: a failed removal prints nothing and is not an
-                // error (the device is usually simply gone, and with it the
-                // forward).
-                if !ctx.executor.run_child(&spec).await?.success() {
-                    continue;
-                }
-                let line = forward_row(dry, fwd.port, &fwd.serial);
-                banner.show();
-                ctx.step(STEP).info(line.clone());
-                restored.push(line);
-            }
-            state.guards.forwards_cleared = true;
-            state::save(&*ctx.executor, &path, state).await?;
-        }
-    }
+    restore_forwards(ctx, &path, state, &mut banner, &mut restored).await?;
 
     Ok(restored)
+}
+
+/// `SwitchAudioSource -t output -s <device>`; `true` when it took.
+async fn switch_output(ctx: &StageCtx, bin: &Path, device: &str) -> Result<bool> {
+    let spec = ctx
+        .child(bin.to_path_buf(), STEP)
+        .args(["-t", "output", "-s", device]);
+    Ok(ctx.executor.run_child(&spec).await?.success())
+}
+
+/// Put the Mac's output device back — but only while it is *still* BlackHole:
+/// a user who already switched it back by hand must not have their choice
+/// overwritten by a recovery pass.
+///
+/// Three outcomes, in order of preference: the recorded device; the fallback
+/// [`crate::session::fallback_output_device`] picks when the recorded one is no
+/// longer connected (the AirPods of the 2026-08-29 finding, whose switch exits
+/// non-zero with "Could not find an audio device named … Nothing was changed."
+/// and would otherwise leave the Mac silent on BlackHole); or a warn naming the
+/// device and the commands to fix it by hand, with the guard left **pending**
+/// so the record survives for the next try.
+async fn restore_audio<F, Fut>(
+    ctx: &StageCtx,
+    path: &Path,
+    state: &mut SessionState,
+    probe: F,
+    banner: &mut Banner<'_>,
+    restored: &mut Vec<String>,
+) -> Result<()>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<AudioProbe>>,
+{
+    let Some(prev) = state.prev_audio_output.clone() else {
+        return Ok(());
+    };
+    if state.guards.audio_restored {
+        return Ok(());
+    }
+    // `None` is "we could not look", which is not "there was nothing to do":
+    // the guard stays pending.
+    let Some(p) = probe().await else {
+        return Ok(());
+    };
+    let dry = ctx.executor.is_dry_run();
+
+    if p.current != BLACKHOLE {
+        // Already back where it belongs — nothing to undo, and nothing to say
+        // about it.
+        state.guards.audio_restored = true;
+        return state::save(&*ctx.executor, path, state).await;
+    }
+
+    if switch_output(ctx, &p.bin, &prev).await? {
+        let line = audio_row(dry, &prev);
+        banner.show();
+        ctx.step(STEP).ok(line.clone());
+        restored.push(line);
+        state.guards.audio_restored = true;
+        return state::save(&*ctx.executor, path, state).await;
+    }
+
+    if let Some(alt) = super::fallback_output_device(&p.outputs) {
+        if switch_output(ctx, &p.bin, &alt).await? {
+            let line = audio_fallback_row(dry, &prev, &alt);
+            banner.show();
+            ctx.step(STEP).warn(line.clone());
+            restored.push(line);
+            state.guards.audio_restored = true;
+            return state::save(&*ctx.executor, path, state).await;
+        }
+    }
+
+    // No banner: this row reports why there was no recovery, not a recovery
+    // that happened — the same rule the stop-only rows follow.
+    ctx.step(STEP).warn(super::audio_unrestorable_line(&prev));
+    Ok(())
+}
+
+/// Reap the `alvr_dashboard` this session spawned, by identity.
+///
+/// Flagged either way: whether we killed it, it had already exited, or the pid
+/// now belongs to a stranger, there is nothing further this record can ask
+/// anyone to do.
+async fn restore_dashboard(
+    ctx: &StageCtx,
+    path: &Path,
+    state: &mut SessionState,
+    banner: &mut Banner<'_>,
+    restored: &mut Vec<String>,
+) -> Result<()> {
+    let Some(dashboard) = state.dashboard.clone() else {
+        return Ok(());
+    };
+    if state.guards.dashboard_closed {
+        return Ok(());
+    }
+
+    let mut closed = false;
+    if signalable(&dashboard) {
+        let spec = ctx
+            .child("/bin/kill", STEP)
+            .arg("-TERM")
+            .arg(dashboard.pid.to_string());
+        closed = ctx.executor.run_child(&spec).await?.success();
+    }
+    if closed {
+        let line = dashboard_row(ctx.executor.is_dry_run());
+        banner.show();
+        ctx.step(STEP).ok(line.clone());
+        restored.push(line);
+    }
+    state.guards.dashboard_closed = true;
+    state::save(&*ctx.executor, path, state).await
+}
+
+/// Remove exactly the recorded `--wired` forwards, on exactly the recorded
+/// serials. Never `--remove-all` (CLAUDE.md; PARITY.md).
+///
+/// Each removal that succeeds drops its port from the record; the guard is only
+/// flagged once none are left. A removal that fails is *indeterminate* — the
+/// device is usually simply gone, and with it the forward, but it may equally
+/// be a transient adb failure over a still-installed `tcp:9943`, which silently
+/// breaks the next WiFi discovery. Flagging the guard released on that would
+/// clear the record and leave nothing that knows the port is still there; the
+/// kept record is what the next launch or `stop` retries from.
+async fn restore_forwards(
+    ctx: &StageCtx,
+    path: &Path,
+    state: &mut SessionState,
+    banner: &mut Banner<'_>,
+    restored: &mut Vec<String>,
+) -> Result<()> {
+    if state.wired_forwards.is_empty() || state.guards.forwards_cleared {
+        return Ok(());
+    }
+    let Some(adb) = ctx.paths.adb.clone() else {
+        return Ok(());
+    };
+    let dry = ctx.executor.is_dry_run();
+
+    let mut still_installed = Vec::new();
+    for fwd in state.wired_forwards.clone() {
+        let local = format!("tcp:{}", fwd.port);
+        let spec = ctx.child(adb.clone(), STEP).args([
+            "-s",
+            fwd.serial.as_str(),
+            "forward",
+            "--remove",
+            local.as_str(),
+        ]);
+        // run.sh's `&&`: a failed removal prints nothing and is not an error.
+        if !ctx.executor.run_child(&spec).await?.success() {
+            still_installed.push(fwd);
+            continue;
+        }
+        let line = forward_row(dry, fwd.port, &fwd.serial);
+        banner.show();
+        ctx.step(STEP).info(line.clone());
+        restored.push(line);
+    }
+
+    state.wired_forwards = still_installed;
+    state.guards.forwards_cleared = state.wired_forwards.is_empty();
+    state::save(&*ctx.executor, path, state).await
 }
 
 /// The info emitted instead of clearing a record whose guards are not all
@@ -658,7 +864,34 @@ fn restore_complete(state: &SessionState, mode: RestoreMode) -> bool {
     }
 }
 
-/// Clear the record — or keep it, when a guard is still pending.
+/// Restore what `mode` allows and then either clear the record or keep it —
+/// the two halves every classification that may touch the machine runs, in the
+/// one place both entry points call.
+///
+/// Returns the restoration rows and **whether the record was kept**: a kept
+/// record is not a finished recovery, and the caller has to be able to tell the
+/// difference. A `Dead` that cleared the file and a `Dead` that could not
+/// restore the audio device are otherwise the same value, and the launch that
+/// follows overwrites the only copy of the device name (`stages::run`'s
+/// `carried_audio_device` is the reader).
+async fn restore_and_finish<F, Fut>(
+    ctx: &StageCtx,
+    path: &Path,
+    state: &mut SessionState,
+    mode: RestoreMode,
+    probe: F,
+) -> Result<(Vec<String>, bool)>
+where
+    F: FnOnce() -> Fut,
+    Fut: Future<Output = Option<AudioProbe>>,
+{
+    let restored = restore_with(ctx, state, mode, probe).await?;
+    let kept = finish_record(ctx, path, state, mode).await?;
+    Ok((restored, kept))
+}
+
+/// Clear the record — or keep it, when a guard is still pending. `true` when
+/// it was kept.
 ///
 /// The live failure this exists for: a `stop` whose recorded output device had
 /// disconnected switched nothing, cleared the record anyway, and left the user
@@ -670,13 +903,14 @@ async fn finish_record(
     path: &Path,
     state: &mut SessionState,
     mode: RestoreMode,
-) -> Result<()> {
+) -> Result<bool> {
     if restore_complete(state, mode) {
-        return state::clear(&*ctx.executor, path).await;
+        state::clear(&*ctx.executor, path).await?;
+        return Ok(false);
     }
     state::save(&*ctx.executor, path, state).await?;
     ctx.step(STEP).info(RECORD_KEPT);
-    Ok(())
+    Ok(true)
 }
 
 /// May this identity be signalled?
@@ -747,6 +981,26 @@ fn forward_row(dry_run: bool, port: u16, serial: &str) -> String {
     format!("{verb} adb forward tcp:{port} on {serial}")
 }
 
+/// The reason a record belonging to *this* process's launch is left alone.
+/// Never printed — there is nothing wrong and nothing for anyone to do — but
+/// it travels in [`Reconciled::Busy`] so a caller can say why nothing happened.
+const RECORD_IN_FLIGHT: &str = "session record belongs to the launch in progress";
+
+/// `previous session record kept: Sabrage process <pid> is running this session`
+fn owned_elsewhere_row(owner_pid: u32) -> String {
+    format!("previous session record kept: Sabrage process {owner_pid} is running this session")
+}
+
+/// `previous session record kept: written by a newer Sabrage (schema v<n>, this
+/// build understands v<m>)`
+fn newer_schema_row(version: u32) -> String {
+    format!(
+        "previous session record kept: written by a newer Sabrage (schema v{version}, this build \
+         understands v{})",
+        state::SESSION_STATE_VERSION
+    )
+}
+
 // ── detach ────────────────────────────────────────────────────────────────────
 
 /// Detach from a live session: mark the state file `detached`, fire the
@@ -765,6 +1019,16 @@ fn forward_row(dry_run: bool, port: u16, serial: &str) -> String {
 /// ordered *after* the wait so it can never clobber a newer write, and it
 /// creates nothing: a record the supervisor already cleared stays cleared.
 pub async fn detach(ctx_paths: &Paths, handle: &LiveSessionHandle) -> Result<()> {
+    // Stop is terminal, and detach is subordinate to it. Both tokens feed one
+    // unbiased `select!` in the supervisor, so a detach fired *after* a Stop
+    // can still win that race — disarming the guards, marking the record
+    // `detached` and leaving wine running, while the Stop caller watches the
+    // live slot empty and reports success. A Stop that has fired can never be
+    // superseded here, and cancellation is monotonic, so this check cannot
+    // race back the other way.
+    if handle.cancel.is_cancelled() {
+        return Ok(());
+    }
     handle.detach.cancel();
 
     let deadline = tokio::time::Instant::now() + DETACH_WAIT;
@@ -1150,13 +1414,30 @@ mod tests {
     #[test]
     fn the_spawn_fallback_start_time_can_never_match() {
         // `spawn_detached` records start_time 0 when it cannot observe the pid;
-        // a live pid with that record is the conservative branch, not Live.
+        // a live pid with that record is the conservative branch, not Live —
+        // and not `IdentityMismatch` either, which would claim to know the pid
+        // was recycled and go on to undo the guards of what may be the running
+        // session. Its own answer, which restores nothing (A9-5).
         let unobserved = ProcInfo {
             start_time: 0,
             ..me()
         };
+        assert!(
+            !unobserved.is_same_process(),
+            "0 never matches a real start"
+        );
         assert_eq!(
-            classify(&pending(Some(unobserved), None)),
+            classify(&pending(Some(unobserved.clone()), None)),
+            Classification::Unverifiable
+        );
+        assert_eq!(restore_mode(Classification::Unverifiable), None);
+        assert!(
+            !signalable(&unobserved),
+            "and nothing may be signalled on that identity"
+        );
+        // A start time that IS observed and differs really is a recycled pid.
+        assert_eq!(
+            classify(&pending(Some(recycled()), None)),
             Classification::IdentityMismatch
         );
     }
@@ -1167,7 +1448,7 @@ mod tests {
     async fn no_state_file_is_no_session_and_says_nothing() {
         let dir = scratch("nosession");
         let (ctx, seen) = test_ctx(&dir, true);
-        let out = reconcile_with(&ctx, None, no_probe()).await.unwrap();
+        let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
         assert_eq!(out, Reconciled::NoSession);
         assert!(seen.lock().unwrap().is_empty());
         assert!(ctx.executor.planned().is_empty());
@@ -1181,7 +1462,7 @@ mod tests {
         let state = pending(Some(me()), Some(me()));
         write_state(&ctx, &state);
 
-        let out = reconcile_with(&ctx, None, probing(BLACKHOLE))
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
         assert_eq!(out, Reconciled::Live { state });
@@ -1202,12 +1483,18 @@ mod tests {
         // the kill is *planned*. Under DryRunExecutor nothing is ever spawned.
         write_state(&ctx, &pending(Some(dead()), Some(me())));
 
-        let out = reconcile_with(&ctx, None, probing(BLACKHOLE))
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
-        let Reconciled::Dead { state, restored } = out else {
+        let Reconciled::Dead {
+            state,
+            restored,
+            pending,
+        } = out
+        else {
             panic!("expected Dead, got {out:?}");
         };
+        assert!(!pending, "every guard was released, so the record went");
         assert!(state.guards.audio_restored);
         assert!(state.guards.dashboard_closed);
         assert!(state.guards.forwards_cleared);
@@ -1270,12 +1557,18 @@ mod tests {
         let (ctx, seen) = test_ctx(&dir, true);
         write_state(&ctx, &pending(Some(recycled()), Some(me())));
 
-        let out = reconcile_with(&ctx, None, probing(BLACKHOLE))
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
-        let Reconciled::IdentityMismatch { state, restored } = out else {
+        let Reconciled::IdentityMismatch {
+            state,
+            restored,
+            pending,
+        } = out
+        else {
             panic!("expected IdentityMismatch, got {out:?}");
         };
+        assert!(!pending);
         assert!(state.guards.audio_restored);
         assert!(
             !state.guards.dashboard_closed,
@@ -1293,6 +1586,314 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// A live process that is not this one, for the ownership guard. Killed on
+    /// drop, so no fixture can leak a process onto the machine.
+    struct ForeignProcess(std::process::Child);
+
+    impl ForeignProcess {
+        fn spawn() -> ForeignProcess {
+            ForeignProcess(
+                std::process::Command::new("/bin/sleep")
+                    .arg("30")
+                    .spawn()
+                    .expect("/bin/sleep is on every macOS"),
+            )
+        }
+        fn pid(&self) -> u32 {
+            self.0.id()
+        }
+    }
+
+    impl Drop for ForeignProcess {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    /// A9-1. The window between the first guard and the wine spawn: the record
+    /// exists, `wine` is still `None` (so `classify` says `Dead`), and there is
+    /// no live handle yet — only the run stage's published phase knows this
+    /// launch is happening. Reconciling it (the Session screen remounts, and
+    /// its `onMount` reconcile takes no lock) would restore the audio device
+    /// mid-launch, `SIGTERM` the dashboard this launch just spawned, pull its
+    /// `--wired` forwards and delete its record, under a launch that keeps
+    /// going.
+    #[tokio::test]
+    async fn a_record_belonging_to_the_launch_in_progress_is_never_touched() {
+        for phase in [
+            crate::session::SessionPhase::Preflight,
+            crate::session::SessionPhase::Launching,
+            crate::session::SessionPhase::Stopping,
+        ] {
+            let dir = scratch("in-flight");
+            let (ctx, seen) = test_ctx(&dir, true);
+            // Exactly the pre-spawn record: guards taken, no wine child.
+            let state = pending(None, Some(me()));
+            write_state(&ctx, &state);
+
+            let out = reconcile_with(
+                &ctx,
+                None,
+                Some(crate::session::RunPhaseInfo {
+                    phase,
+                    run_id: state.run_id,
+                    bottle: "Steam".into(),
+                    exit_code: None,
+                }),
+                probing(BLACKHOLE),
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                out,
+                Reconciled::Busy {
+                    state,
+                    reason: RECORD_IN_FLIGHT.to_string(),
+                },
+                "{phase:?}"
+            );
+            assert!(
+                ctx.executor.planned().is_empty(),
+                "{phase:?}: no switch, no kill, no removal, no write"
+            );
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{phase:?}: our own launch is not a warning"
+            );
+            assert!(
+                ctx.paths.session_state_path().exists(),
+                "{phase:?}: the launch still needs its record"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
+    }
+
+    /// …and a phase published for a *different* run does not shield a stale
+    /// record: that is the ordinary "recover before launching" case, and it is
+    /// what `run` calls reconcile for.
+    #[tokio::test]
+    async fn a_launch_in_progress_does_not_shield_some_other_runs_record() {
+        let dir = scratch("in-flight-other");
+        let (ctx, _seen) = test_ctx(&dir, true);
+        let mut state = pending(Some(dead()), None);
+        state.wired_forwards.clear();
+        write_state(&ctx, &state);
+
+        let out = reconcile_with(
+            &ctx,
+            None,
+            Some(crate::session::RunPhaseInfo {
+                phase: crate::session::SessionPhase::Preflight,
+                run_id: Uuid::new_v4(),
+                bottle: "Steam".into(),
+                exit_code: None,
+            }),
+            probing(BLACKHOLE),
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(out, Reconciled::Dead { .. }), "{out:?}");
+        assert!(
+            !ctx.executor.planned().is_empty(),
+            "the previous session's guards are still this launch's to clean up"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-3. The other front-end's record: `sabrage run` in a terminal next to
+    /// an open Sabrage. `owner_pid` says who is running it, and the field's own
+    /// documentation has always said reconcile must not touch its guards.
+    #[tokio::test]
+    async fn a_record_a_live_foreign_process_owns_is_reported_and_left_alone() {
+        let dir = scratch("owned-elsewhere");
+        let (ctx, seen) = test_ctx(&dir, true);
+        let foreign = ForeignProcess::spawn();
+        let mut state = pending(None, Some(me()));
+        state.owner_pid = foreign.pid();
+        write_state(&ctx, &state);
+
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            out,
+            Reconciled::Busy {
+                state,
+                reason: owned_elsewhere_row(foreign.pid()),
+            }
+        );
+        assert!(ctx.executor.planned().is_empty());
+        assert_eq!(
+            rows(&seen),
+            vec![(Severity::Warn, owned_elsewhere_row(foreign.pid()))],
+            "the user is told why nothing was restored"
+        );
+        assert!(ctx.paths.session_state_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-8. A record from a newer Sabrage may describe a guard this build
+    /// cannot undo: rewriting it through this struct would drop that
+    /// description, and clearing it would throw it away entirely.
+    #[tokio::test]
+    async fn a_newer_schema_record_is_reported_and_never_rewritten() {
+        let dir = scratch("newer-schema");
+        let (ctx, seen) = test_ctx(&dir, true);
+        let path = ctx.paths.session_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut state = pending(Some(dead()), None);
+        state.version = state::SESSION_STATE_VERSION + 1;
+        let mut json = serde_json::to_value(&state).unwrap();
+        json["futureGuard"] = serde_json::json!({ "somethingWeCannotUndo": true });
+        std::fs::write(&path, serde_json::to_vec_pretty(&json).unwrap()).unwrap();
+
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(&out, Reconciled::Busy { reason, .. } if *reason == newer_schema_row(2)),
+            "{out:?}"
+        );
+        assert!(
+            ctx.executor.planned().is_empty(),
+            "a guard we do not understand is not a guard we may release"
+        );
+        assert_eq!(rows(&seen), vec![(Severity::Warn, newer_schema_row(2))]);
+        assert!(path.exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-5. `start_time == 0` is the spawn fallback's "could not observe",
+    /// not evidence of a recycled pid. While that pid is alive, dismantling
+    /// the session's guards — switching the audio device back, pulling the
+    /// `--wired` forwards that carry the stream — may be disconnecting the
+    /// running session.
+    #[tokio::test]
+    async fn a_live_pid_with_no_observed_start_time_is_never_dismantled() {
+        let dir = scratch("unverifiable");
+        let (ctx, seen) = test_ctx(&dir, true);
+        let unobserved = ProcInfo {
+            start_time: 0,
+            ..me()
+        };
+        assert_eq!(
+            classify(&pending(Some(unobserved.clone()), None)),
+            Classification::Unverifiable
+        );
+        let state = pending(Some(unobserved), None);
+        write_state(&ctx, &state);
+
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+
+        assert_eq!(out, Reconciled::Live { state });
+        assert!(
+            ctx.executor.planned().is_empty(),
+            "no SwitchAudioSource, no adb forward --remove, no clear"
+        );
+        assert!(seen.lock().unwrap().is_empty());
+        assert!(ctx.paths.session_state_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// …and `stop` says so rather than silently keeping the record.
+    #[tokio::test]
+    async fn stop_names_an_unverifiable_pid_in_its_own_words() {
+        let dir = scratch("stop-unverifiable");
+        let (ctx, seen) = stop_ctx(&dir, true);
+        write_state(
+            &ctx,
+            &pending(
+                Some(ProcInfo {
+                    start_time: 0,
+                    ..me()
+                }),
+                None,
+            ),
+        );
+
+        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            rows(&seen),
+            vec![(
+                Severity::Warn,
+                format!(
+                    "previous session state kept: wine pid {} is alive but could not be identified",
+                    std::process::id()
+                )
+            )]
+        );
+        assert!(ctx.executor.planned().is_empty());
+        assert!(ctx.paths.session_state_path().exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-4. `adb forward --remove` that comes back non-zero is
+    /// indeterminate — usually the device is gone and took the forward with
+    /// it, but it may be a still-installed `tcp:9943` that will silently break
+    /// the next WiFi discovery. Flagging the guard released on that clears the
+    /// record and leaves nothing on the machine that knows the port is there.
+    #[tokio::test]
+    async fn a_forward_that_could_not_be_removed_keeps_the_record() {
+        let dir = scratch("forward-stuck");
+        let (mut ctx, seen) = test_ctx(&dir, true);
+        // Only the 9943 removal fails; 9944's succeeds.
+        ctx.executor = FailSwitchTo::around(ctx.executor.clone(), "tcp:9943");
+        let mut state = pending(Some(dead()), None);
+        state.prev_audio_output = None;
+        write_state(&ctx, &state);
+
+        let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
+        let Reconciled::Dead {
+            state,
+            restored,
+            pending,
+        } = out
+        else {
+            panic!("expected Dead, got {out:?}");
+        };
+
+        assert!(pending, "the record is kept, so the caller is told");
+        assert!(
+            !state.guards.forwards_cleared,
+            "one removal did not take, so the guard is not released"
+        );
+        assert_eq!(
+            state
+                .wired_forwards
+                .iter()
+                .map(|f| f.port)
+                .collect::<Vec<_>>(),
+            vec![9943],
+            "the port that is still installed stays on the record; the removed one goes"
+        );
+        assert_eq!(
+            restored,
+            vec!["would clear adb forward tcp:9944 on 1WMHH000X00000".to_string()],
+            "only what really happened is reported"
+        );
+        assert_eq!(
+            rows(&seen).last().cloned(),
+            Some((Severity::Info, RECORD_KEPT.to_string()))
+        );
+
+        let planned = ctx.executor.planned();
+        assert!(
+            !planned.iter().any(|p| p.kind == PlannedKind::RemoveFile),
+            "the record is what the next stop reads: {planned:?}"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_record_this_process_still_supervises_is_reported_but_never_touched() {
         let dir = scratch("owned");
@@ -1300,14 +1901,15 @@ mod tests {
         let state = pending(Some(dead()), Some(me()));
         write_state(&ctx, &state);
 
-        let out = reconcile_with(&ctx, Some(state.run_id), probing(BLACKHOLE))
+        let out = reconcile_with(&ctx, Some(state.run_id), None, probing(BLACKHOLE))
             .await
             .unwrap();
         assert_eq!(
             out,
             Reconciled::Dead {
                 state,
-                restored: Vec::new()
+                restored: Vec::new(),
+                pending: false,
             }
         );
         assert!(
@@ -1327,7 +1929,7 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::fs::write(&path, b"{not json").unwrap();
 
-        let out = reconcile_with(&ctx, None, no_probe()).await.unwrap();
+        let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
         assert_eq!(out, Reconciled::NoSession);
 
         let seen_rows = rows(&seen);
@@ -1357,12 +1959,18 @@ mod tests {
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        let out = reconcile_with(&ctx, None, probing_list(BLACKHOLE, &LIVE_OUTPUTS))
+        let out = reconcile_with(&ctx, None, None, probing_list(BLACKHOLE, &LIVE_OUTPUTS))
             .await
             .unwrap();
-        let Reconciled::Dead { state, restored } = out else {
+        let Reconciled::Dead {
+            state,
+            restored,
+            pending,
+        } = out
+        else {
             panic!("expected Dead, got {out:?}");
         };
+        assert!(!pending, "the fallback IS a restore, so the record goes");
         let expected = format!(
             "recorded output device '{AIRPODS}' is not connected — would restore output -> \
              MacBook Pro Speakers instead (previous session did not shut down cleanly)"
@@ -1408,6 +2016,7 @@ mod tests {
         let out = reconcile_with(
             &ctx,
             None,
+            None,
             // Only the loopback and the streaming virtuals are connected.
             probing_list(
                 BLACKHOLE,
@@ -1420,9 +2029,19 @@ mod tests {
         )
         .await
         .unwrap();
-        let Reconciled::Dead { state, restored } = out else {
+        let Reconciled::Dead {
+            state,
+            restored,
+            pending,
+        } = out
+        else {
             panic!("expected Dead, got {out:?}");
         };
+        assert!(
+            pending,
+            "a kept record must be distinguishable from a finished one: the launch that \
+             follows has to know `prev_audio_output` is still owed"
+        );
         assert!(restored.is_empty(), "nothing was restored");
         assert!(!state.guards.audio_restored, "the guard stays pending");
         assert_eq!(
@@ -1470,9 +2089,14 @@ mod tests {
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        finish_stopped_session_with(&ctx, None, probing_list(BLACKHOLE, &["BlackHole 2ch"]))
-            .await
-            .expect("a stuck audio guard is a row, never a failed stage");
+        finish_stopped_session_with(
+            &ctx,
+            None,
+            None,
+            probing_list(BLACKHOLE, &["BlackHole 2ch"]),
+        )
+        .await
+        .expect("a stuck audio guard is a row, never a failed stage");
 
         assert_eq!(
             rows(&seen),
@@ -1503,7 +2127,7 @@ mod tests {
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        let out = reconcile_with(&ctx, None, no_probe()).await.unwrap();
+        let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
         let Reconciled::Dead { restored, .. } = out else {
             panic!("expected Dead, got {out:?}");
         };
@@ -1521,7 +2145,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── restore_persisted_guards ─────────────────────────────────────────────
+    // ── restore_with ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_device_the_user_already_switched_back_is_flagged_not_switched() {
@@ -1735,9 +2359,11 @@ mod tests {
         let ev = Reconciled::Dead {
             state: pending(Some(dead()), None),
             restored: vec!["audio: restored output -> X".into()],
+            pending: true,
         };
         let j = serde_json::to_value(&ev).unwrap();
         assert_eq!(j["kind"], "dead");
+        assert_eq!(j["pending"], true);
         assert_eq!(j["state"]["prevAudioOutput"], "MacBook Pro Speakers");
         assert_eq!(serde_json::from_value::<Reconciled>(j).unwrap(), ev);
     }
@@ -1756,7 +2382,7 @@ mod tests {
         let (ctx, seen) = stop_ctx(&dir, true);
         write_state(&ctx, &pending(Some(me()), None));
 
-        finish_stopped_session_with(&ctx, None, probing(BLACKHOLE))
+        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
 
@@ -1786,7 +2412,7 @@ mod tests {
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        finish_stopped_session_with(&ctx, None, probing(BLACKHOLE))
+        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
 
@@ -1822,7 +2448,7 @@ mod tests {
         state.bottle = "SomeOtherBottle".into();
         write_state(&ctx, &state);
 
-        finish_stopped_session_with(&ctx, None, probing(BLACKHOLE))
+        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
             .await
             .unwrap();
 
@@ -1842,7 +2468,7 @@ mod tests {
         let state = pending(Some(dead()), Some(me()));
         write_state(&ctx, &state);
 
-        finish_stopped_session_with(&ctx, Some(state.run_id), probing(BLACKHOLE))
+        finish_stopped_session_with(&ctx, Some(state.run_id), None, probing(BLACKHOLE))
             .await
             .unwrap();
 
@@ -1867,7 +2493,7 @@ mod tests {
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        finish_stopped_session_with(&ctx, None, probing_a_vanished_binary(&dir))
+        finish_stopped_session_with(&ctx, None, None, probing_a_vanished_binary(&dir))
             .await
             .expect("a failed restore must not fail the caller");
 
@@ -1933,7 +2559,7 @@ mod tests {
     async fn stop_without_a_record_is_a_silent_noop() {
         let dir = scratch("stop-none");
         let (ctx, seen) = stop_ctx(&dir, true);
-        finish_stopped_session_with(&ctx, None, no_probe())
+        finish_stopped_session_with(&ctx, None, None, no_probe())
             .await
             .unwrap();
         assert!(seen.lock().unwrap().is_empty());
@@ -1976,6 +2602,44 @@ mod tests {
             on_disk.prev_audio_output.as_deref(),
             Some("MacBook Pro Speakers"),
             "the device stays on BlackHole, and the record still says what it was"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-9. Stop is terminal. Both tokens feed one unbiased `select!` in the
+    /// supervisor, so a detach fired after a Stop can win that race, disarm the
+    /// guards and leave wine running — while the Stop caller watches the live
+    /// slot empty and reports success to the user.
+    #[tokio::test]
+    async fn detach_does_nothing_once_stop_has_already_fired() {
+        let dir = scratch("detach-after-stop");
+        let (ctx, _seen) = test_ctx(&dir, false);
+        let state = pending(Some(me()), Some(me()));
+        write_state(&ctx, &state);
+
+        let handle = LiveSessionHandle {
+            run_id: state.run_id,
+            bottle: state.bottle.clone(),
+            identity: me(),
+            log_path: state.log_path.clone(),
+            started_at_unix_ms: state.started_at_unix_ms,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        };
+        handle.cancel.cancel(); // Stop got there first.
+
+        detach(&ctx.paths, &handle).await.unwrap();
+
+        assert!(
+            !handle.detach.is_cancelled(),
+            "a Stop that has fired cannot be superseded by a detach"
+        );
+        let on_disk = state::load(&ctx.paths.session_state_path())
+            .unwrap()
+            .expect("the record is the teardown\u{2019}s to clear, not ours to rewrite");
+        assert!(
+            !on_disk.detached,
+            "the record must not claim a detach that did not happen"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

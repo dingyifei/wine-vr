@@ -63,7 +63,7 @@ else
 fi
 WINEVR_BOTTLE="${WINEVR_BOTTLE:-<name>}"   # placeholder keeps remedy strings valid under set -u
 PREFIX="${PREFIX:-}"; SYS32="${SYS32:-}"
-BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294}"
+BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/$BS_DIR_LEAF}"
 DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
 if [ "$BOTTLE_OK" = 1 ] && [[ "$BS_DIR" != "$PREFIX/drive_c/"* ]]; then
   if [ -e "$PREFIX/dosdevices/z:" ]; then chk ok bottle.zdrive "bottle z: drive maps / (Beat Saber lives outside drive_c)"
@@ -178,7 +178,8 @@ else chk fail host.manifest "$HOST_XR_JSON missing" "./demo.sh install --bottle 
 
 # 13. runtime config
 if [ -f "$TOML" ]; then
-  PROTO="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
+  # last assignment wins, like the runtime's parser (Config.cpp)
+  PROTO="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{v=$2} END{print v}' "$TOML")"
   if [ "$PROTO" = "alvr" ]; then
     chk ok cfg.protocol.supported "oxrsys-runtime.toml: protocol=alvr"
     tap cfg.protocol.legacy-oxrsys ok
@@ -207,7 +208,7 @@ for n, c in (s.get("client_connections") or {}).items():
   PINNED="$(print -r -- "$PINNED" | tr '\n' ' ' | sed 's/^ *$//')"
   if [ $PYRC -ne 0 ]; then chk warn cfg.session-pins "could not inspect $SESSJSON (broken python3?)"
   elif [ -n "$PINNED" ]; then
-    chk warn cfg.session-pins "session.json pins client IP(s): $PINNED— fine while the Quest keeps that IP; if streaming stops after a DHCP change, delete '$SESSJSON' (recreated with discovery+auto-trust)"
+    chk warn cfg.session-pins "session.json pins client IP(s): $PINNED— fine while the Quest keeps that IP; if streaming stops after a DHCP change, edit the pinned IP in '$SESSJSON' in place (do not delete the file: a recreated session.json streams a black 800x900 screen)"
   else chk ok cfg.session-pins "ALVR session state has no stale manual-IP pins"
   fi
 else

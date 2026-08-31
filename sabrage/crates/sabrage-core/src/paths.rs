@@ -25,10 +25,49 @@ use crate::error::SabrageError;
 /// `$HOME`, or `/` if the environment has none (a headless edge case; every
 /// derived path is then obviously wrong, which is better than panicking inside
 /// a read-only probe).
+///
+/// **Read-only probes only.** Anything that is about to *write* under the user
+/// store must go through [`home_dir_checked`] (or [`Paths::new_checked`]) and
+/// fail closed: an empty `HOME` here yields *relative* paths
+/// (`PathBuf::from("").join("Library/Application Support/OXRSys")`), which a
+/// mutating stage would then create under the process's working directory.
+/// The shell has no such hole — `set -u` aborts on an unset `HOME`, and an
+/// empty one still expands to the absolute `/Library/...`.
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/"))
+}
+
+/// `$HOME`, validated: present, non-empty, and absolute.
+///
+/// The gate every *mutating* entry point should pass before constructing a
+/// [`Paths`] — see [`Paths::new_checked`]. `home_dir`'s fallbacks are fine for
+/// a doctor row that will simply report "missing"; they are not fine for
+/// `setup`, `install`, `run`, `stop`, or a store write, where a bad `HOME`
+/// silently redirects the write out of the user store.
+pub fn home_dir_checked() -> Result<PathBuf, SabrageError> {
+    check_home(std::env::var_os("HOME"))
+}
+
+/// [`home_dir_checked`]'s rule, as a pure function of the raw variable (so it
+/// is testable without mutating this process's environment).
+fn check_home(raw: Option<std::ffi::OsString>) -> Result<PathBuf, SabrageError> {
+    let remedy = "start Sabrage with HOME set to your user home directory";
+    let value = raw.filter(|v| !v.is_empty()).ok_or_else(|| {
+        SabrageError::fatal(
+            "HOME is not set, so ~/Library/Application Support cannot be located",
+            remedy,
+        )
+    })?;
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(SabrageError::fatal(
+            format!("HOME is not an absolute path: {}", path.display()),
+            remedy,
+        ));
+    }
+    Ok(path)
 }
 
 /// `~/Library/Application Support/CrossOver/Bottles`.
@@ -101,11 +140,15 @@ pub const REPO_ROOT_MARKERS: [&str; 2] = ["demo.sh", "scripts/demo/lib.sh"];
 /// 3. a walk up from `std::env::current_exe()`'s ancestors, looking for the
 ///    first directory holding both [`REPO_ROOT_MARKERS`].
 ///
-/// Cases 1 and 2 are canonicalized (falling back to the path as given when the
-/// directory does not exist yet), because the host OpenXR manifest embeds this
-/// path as an absolute string and `install.sh` compares those bytes literally —
-/// a `..`-laden or symlinked root would make the two front-ends thrash each
-/// other with sudo prompts.
+/// Cases 1 and 2 are normalized *logically* ([`logical_absolute`]): made
+/// absolute against the working directory and stripped of `.`/`..`, with
+/// symlinks left exactly as the user spelled them. That is `demo.sh`'s own
+/// spelling — `ROOT="$(cd "$(dirname "$0")" && pwd)"`, where zsh's `cd`/`pwd`
+/// are logical — and the two must agree to the byte: the host OpenXR manifest
+/// embeds this root as an absolute string and `install.sh` compares those
+/// bytes literally, so a divergent spelling makes the two front-ends thrash
+/// each other with sudo prompts. Resolving symlinks here (which this function
+/// used to do) is exactly that divergence on a symlinked checkout.
 ///
 /// An explicit root is **not** validated against [`REPO_ROOT_MARKERS`]: pointing
 /// at a scratch tree is exactly how the dry-run and fixture tests work, and
@@ -116,10 +159,10 @@ pub const REPO_ROOT_MARKERS: [&str; 2] = ["demo.sh", "scripts/demo/lib.sh"];
 /// their own copies.
 pub fn resolve_repo_root(override_root: Option<&str>) -> Result<PathBuf, SabrageError> {
     if let Some(explicit) = override_root.filter(|s| !s.is_empty()) {
-        return Ok(canonicalize_lossy(PathBuf::from(explicit)));
+        return Ok(logical_absolute(PathBuf::from(explicit)));
     }
     if let Some(from_env) = std::env::var(REPO_ROOT_ENV).ok().filter(|s| !s.is_empty()) {
-        return Ok(canonicalize_lossy(PathBuf::from(from_env)));
+        return Ok(logical_absolute(PathBuf::from(from_env)));
     }
     let exe = std::env::current_exe().map_err(|e| {
         SabrageError::fatal(
@@ -143,10 +186,76 @@ pub fn resolve_repo_root(override_root: Option<&str>) -> Result<PathBuf, Sabrage
     })
 }
 
-/// `canonicalize`, or the path unchanged when it cannot be resolved (it may not
-/// exist yet — a fixture root about to be created, say).
-fn canonicalize_lossy(p: PathBuf) -> PathBuf {
-    p.canonicalize().unwrap_or(p)
+/// The repo-root spelling contract, shared with `demo.sh`: absolute, `.`/`..`
+/// folded away **lexically**, symlinks preserved.
+///
+/// zsh's `cd`/`pwd` (and therefore `ROOT="$(cd "$(dirname "$0")" && pwd)"`) are
+/// logical: `..` pops the previous component of the path *as written* and a
+/// symlinked checkout keeps its symlink spelling. `Path::canonicalize` does the
+/// opposite on both counts, which is why it is not used here — the manifest
+/// bytes both front-ends write are derived from this string and compared
+/// literally.
+///
+/// Never touches the filesystem, so a root that does not exist yet (a fixture
+/// tree about to be created) is normalized just the same.
+/// The working directory the way `pwd` prints it.
+///
+/// `$PWD` is the *logical* cwd a shell maintains (`pwd -L`, symlinks intact);
+/// `getcwd()` is the physical one. Prefer `$PWD` — that is what `demo.sh`'s
+/// `ROOT` is built from — but only when it really names this process's cwd,
+/// since a GUI-launched `.app` inherits whatever `PWD` the launching context
+/// had, and cargo hands a test binary a cwd its parent shell's `PWD` never
+/// pointed at.
+fn logical_cwd() -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let physical = std::env::current_dir().ok();
+    let logical = std::env::var_os("PWD").map(PathBuf::from).filter(|p| {
+        p.is_absolute()
+            && match (std::fs::metadata(p), std::fs::metadata(".")) {
+                (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
+                _ => false,
+            }
+    });
+    logical.or(physical)
+}
+
+fn logical_absolute(p: PathBuf) -> PathBuf {
+    use std::path::Component;
+
+    let abs = if p.is_absolute() {
+        p
+    } else {
+        match logical_cwd() {
+            Some(cwd) => cwd.join(p),
+            // No working directory to resolve against: normalize what we have
+            // rather than inventing a root.
+            None => p,
+        }
+    };
+
+    let mut out = PathBuf::new();
+    for c in abs.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                // The ordinary case: pop the previous name, textually.
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                // `cd /..` is `/` in every shell.
+                Some(Component::RootDir) | Some(Component::Prefix(_)) => {}
+                // A relative path with no working directory: keep the `..`.
+                _ => out.push(Component::ParentDir.as_os_str()),
+            },
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
 }
 
 /// First ancestor of `start` (excluding `start` itself, which is an executable
@@ -305,6 +414,20 @@ impl Paths {
         }
     }
 
+    /// [`Paths::new`], but fails closed when `$HOME` is unusable
+    /// ([`home_dir_checked`]).
+    ///
+    /// The constructor every *mutating* entry point should use — the CLI's
+    /// stage dispatch, the Tauri command layer, and anything that writes into
+    /// the Sabrage or OXRSys store. With an empty `HOME`, [`Paths::new`]
+    /// derives `Library/Application Support/OXRSys` *relative to the working
+    /// directory*, and `setup` would then create it there; this refuses first,
+    /// with a remedy, the way `demo.sh`'s `set -u` refuses.
+    pub fn new_checked(repo_root: impl Into<PathBuf>) -> Result<Paths, SabrageError> {
+        home_dir_checked()?;
+        Ok(Paths::new(repo_root))
+    }
+
     /// `$CX/lib/dxmt/<rel>` — a file in CrossOver's shared DXMT overlay.
     /// `None` when CrossOver is absent (the whole overlay section is skipped).
     pub fn cx_dxmt(&self, rel: &str) -> Option<PathBuf> {
@@ -342,6 +465,30 @@ impl Paths {
     /// the next launch (or Stop) put it back.
     pub fn session_state_path(&self) -> PathBuf {
         self.sabrage_appsup.join("session-state.json")
+    }
+
+    /// `<oxr_appsup>/.oxrsys-runtime.toml.lock` — the advisory lock that
+    /// serializes create-and-edit of [`Paths::toml_path`] between front-ends.
+    ///
+    /// The config is write-once and hand-editable, so its editor is a
+    /// read-modify-write with a backup in the middle; two processes doing that
+    /// at once can lose the whole document (`config::runtime_toml`). A
+    /// dotfile, so it never shows up next to the config the user opens.
+    pub fn toml_lock_path(&self) -> PathBuf {
+        self.oxr_appsup.join(".oxrsys-runtime.toml.lock")
+    }
+
+    /// `<sabrage_appsup>/session-state.lock` — the advisory lock that
+    /// serializes the read-modify-write of [`Paths::session_state_path`]
+    /// across processes.
+    ///
+    /// The record is one application-wide file, but two front-ends (the GUI and
+    /// the `sabrage` CLI) can reach it at once; an atomic rename keeps the JSON
+    /// from tearing without keeping one writer from losing the other's update.
+    /// A separate lock file rather than locking the record itself, so the lock
+    /// survives the rename that replaces it.
+    pub fn session_state_lock_path(&self) -> PathBuf {
+        self.sabrage_appsup.join("session-state.lock")
     }
 
     /// Render a repo-relative display path the way doctor does with
@@ -501,6 +648,74 @@ mod tests {
         );
     }
 
+    /// The spelling contract with `demo.sh`: `.`/`..` folded lexically,
+    /// symlinks kept. A canonicalizing root made a symlinked checkout embed a
+    /// different dylib path than the shell for the same file, so each
+    /// front-end saw the other's host manifest as stale (one sudo prompt per
+    /// alternation).
+    #[test]
+    fn a_symlinked_root_keeps_the_shells_logical_spelling() {
+        let base = std::env::temp_dir().join(format!("sabrage-root-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let real = base.join("real");
+        std::fs::create_dir_all(real.join("scripts/demo")).unwrap();
+        let link = base.join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        // The symlink spelling survives, exactly as `cd link && pwd` prints it.
+        let via_link = resolve_repo_root(Some(&link.display().to_string())).unwrap();
+        assert_eq!(via_link, link);
+        assert_ne!(via_link, real);
+        // And the dylib path the host manifest embeds is derived from it.
+        assert!(Paths::new(&via_link).oxr_dylib.starts_with(&link));
+
+        // `..` is still folded away — lexically, so it does not escape the
+        // symlink the way a physical `..` would.
+        let messy = format!("{}/scripts/../scripts/./demo/..", link.display());
+        assert_eq!(
+            resolve_repo_root(Some(&messy)).unwrap(),
+            link.join("scripts")
+        );
+
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
+    #[test]
+    fn a_relative_root_becomes_absolute_without_resolving_symlinks() {
+        let cwd = std::env::current_dir().unwrap();
+        assert_eq!(
+            resolve_repo_root(Some("./fixtures/root")).unwrap(),
+            cwd.join("fixtures/root")
+        );
+        // Lexical `..`, and `/..` is `/`.
+        assert_eq!(
+            resolve_repo_root(Some("/a/b/../c")).unwrap(),
+            PathBuf::from("/a/c")
+        );
+        assert_eq!(resolve_repo_root(Some("/..")).unwrap(), PathBuf::from("/"));
+    }
+
+    #[test]
+    fn home_is_required_to_be_absolute_and_non_empty() {
+        use std::ffi::OsString;
+        // Unset and empty are both refused: an empty `$HOME` would make every
+        // store path relative to the working directory.
+        assert!(check_home(None).is_err());
+        assert!(check_home(Some(OsString::from(""))).is_err());
+        // Relative is refused too.
+        let rel = check_home(Some(OsString::from("relative/home"))).unwrap_err();
+        assert_eq!(rel.kind(), "fatal");
+        assert!(rel.remedy().is_some(), "a refusal must carry a remedy");
+        // Absolute is accepted verbatim.
+        assert_eq!(
+            check_home(Some(OsString::from("/Users/someone"))).unwrap(),
+            PathBuf::from("/Users/someone")
+        );
+        // The checked constructor agrees with the unchecked one on a machine
+        // whose HOME is fine (every test runner's).
+        assert_eq!(Paths::new_checked("/repo").unwrap(), Paths::new("/repo"));
+    }
+
     #[test]
     fn paths_are_derived_from_the_explicit_root() {
         let p = Paths::new("/repo");
@@ -546,6 +761,14 @@ mod tests {
         assert_eq!(
             p.session_state_path(),
             p.sabrage_appsup.join("session-state.json")
+        );
+        assert_eq!(
+            p.session_state_lock_path(),
+            p.sabrage_appsup.join("session-state.lock")
+        );
+        assert_eq!(
+            p.toml_lock_path(),
+            p.oxr_appsup.join(".oxrsys-runtime.toml.lock")
         );
         assert_eq!(p.rel_display(Path::new("/repo/ext/oxrsys")), "ext/oxrsys");
         assert_eq!(p.rel_display(Path::new("/elsewhere")), "/elsewhere");

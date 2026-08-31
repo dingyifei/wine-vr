@@ -306,6 +306,26 @@ async fn rewrite(ctx: &StageCtx, sink: &EventSink, policy: WineserverPolicy) -> 
     }
 
     let (rewritten, _branch) = rewrite_graphics_backend(&conf);
+
+    // The rewrite branch is sed-faithful, which means it can leave the file
+    // without the target line: a `"CX_GRAPHICS_BACKEND"` line whose value is
+    // unquoted (or spaced differently) starts with the key but does not match
+    // the anchored substitution, so nothing is replaced
+    // (`branch_rewrite_leaves_a_malformed_key_line_untouched_like_sed_would`).
+    // Writing those bytes back and reporting "forced to dxmt" would be a fix
+    // claiming a success doctor still fails on. Verify the postcondition the
+    // caller cares about — the line doctor greps for — before writing anything,
+    // and die with the same text run.sh's own post-fix check produces.
+    if !rewritten.lines().any(|l| l == TARGET_LINE) {
+        return Err(ctx.fatal(
+            format!(
+                "could not force graphics backend to dxmt in {}",
+                conf_path.display()
+            ),
+            None,
+        ));
+    }
+
     ctx.executor
         .write_atomic(&conf_path, rewritten.as_bytes())
         .await?;
@@ -585,6 +605,60 @@ mod tests {
         )));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `CX_GRAPHICS_BACKEND` line the anchored rewrite cannot touch (an
+    /// unquoted value, unusual spacing) used to produce `changed: true` and
+    /// "forced to dxmt" over bytes that still did not contain the target line —
+    /// a fix reporting success on a file doctor keeps failing. Both doors now
+    /// verify the postcondition and die with run.sh's own post-fix text.
+    #[tokio::test]
+    async fn a_line_the_rewrite_cannot_canonicalize_is_a_failure_not_a_success() {
+        for (tag, original) in [
+            ("unquoted", "\"CX_GRAPHICS_BACKEND\" = auto\n"),
+            ("no-spaces", "\"CX_GRAPHICS_BACKEND\"=\"auto\"\n"),
+            ("wide", "\"CX_GRAPHICS_BACKEND\"  =  \"auto\"\n"),
+        ] {
+            let root = scratch(&format!("malformed-{tag}"));
+            let (ctx, conf) = fixture_ctx(&root, false);
+            std::fs::write(&conf, original).unwrap();
+
+            let seen: Arc<StdMutex<Vec<crate::events::StageEvent>>> =
+                Arc::new(StdMutex::new(Vec::new()));
+            let s = seen.clone();
+            let sink: EventSink = Arc::new(move |ev| s.lock().unwrap().push(ev));
+
+            let err = set_graphics_backend(&ctx, &sink).await.unwrap_err();
+            assert!(
+                err.to_string()
+                    .starts_with("could not force graphics backend to dxmt in "),
+                "{tag}: {err}"
+            );
+            assert_eq!(
+                std::fs::read_to_string(&conf).unwrap(),
+                original,
+                "{tag}: a failed rewrite must not write anything"
+            );
+            assert!(
+                !seen
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|e| matches!(e, crate::events::StageEvent::Line { text, .. }
+                        if text == FORCED_DESCRIPTION)),
+                "{tag}: must never claim the backend was forced"
+            );
+
+            // The launch door shares the body, so it refuses identically.
+            let err = set_graphics_backend_for_launch(&ctx, &sink)
+                .await
+                .unwrap_err();
+            assert!(err
+                .to_string()
+                .starts_with("could not force graphics backend to dxmt in "));
+
+            std::fs::remove_dir_all(&root).ok();
+        }
     }
 
     #[tokio::test]

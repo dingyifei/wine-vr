@@ -20,6 +20,25 @@
 //! `tokio::sync::Mutex` is not reentrant, and taking it twice on one task
 //! deadlocks in silence.
 //!
+//! A `tokio::sync::Mutex` is a *per-process* primitive, and Sabrage has two
+//! native front-ends (the GUI and the `sabrage` CLI) that write the same
+//! artifacts. [`acquire_operation_lock`] therefore takes a second, **advisory
+//! file lock** ([`OPERATION_LOCK_FILE_NAME`]) in the same call, so a CLI build
+//! cannot overwrite `build-x64/` while the GUI's install is copying out of it.
+//! Both halves are released together when the [`OperationGuard`] drops —
+//! including at `run`'s launch boundary below. demo.sh deliberately does **not**
+//! participate (PARITY.md): the shell pipeline stays a zero-dependency script,
+//! so a concurrent `./demo.sh build` is still unserialized.
+//!
+//! # Live sessions
+//!
+//! Serialization is not the whole policy: `setup`, `build` and `install` replace
+//! the very artifacts a *running* session has open, so [`run_stage`] refuses
+//! them outright while [`live_session_block`] can see a session. `run` and
+//! `stop` are exempt — `run` has its own reconciliation, and `stop` is the way
+//! out. [`crate::fixes::apply`] applies the same policy to every fix whose
+//! registry entry is `forbidden_while_session_live`.
+//!
 //! # Lock policy for `run` (the one exception)
 //!
 //! [`run_stage`]`(`[`Stage::Run`]`)` holds [`OPERATION_LOCK`] through
@@ -56,7 +75,9 @@ pub mod run;
 pub mod setup;
 pub mod stop;
 
-use std::path::PathBuf;
+use std::fs::{File, OpenOptions};
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
@@ -276,11 +297,6 @@ impl StageCtx {
         self.emit(StageEvent::ok(self.run_id, None, text));
     }
 
-    /// `warn "<text>"`.
-    pub fn warn(&self, text: impl Into<String>) {
-        self.emit(StageEvent::warn(self.run_id, None, text));
-    }
-
     /// `die "<message>"`: emits [`StageEvent::Fatal`] and **returns** the error
     /// for the caller to `return Err(…)`. Emitting and returning are one call so
     /// a stage can never abort without the UI hearing why.
@@ -309,11 +325,6 @@ pub struct StepEmitter<'a> {
 }
 
 impl StepEmitter<'_> {
-    /// The step this emitter attributes rows to.
-    pub fn id(&self) -> StepId {
-        self.step
-    }
-
     pub fn info(&self, text: impl Into<String>) {
         self.row(Severity::Info, text, None);
     }
@@ -324,11 +335,6 @@ impl StepEmitter<'_> {
 
     pub fn warn(&self, text: impl Into<String>) {
         self.row(Severity::Warn, text, None);
-    }
-
-    /// A non-aborting `fail` row plus its `remedy:` line.
-    pub fn fail(&self, text: impl Into<String>, remedy: Option<String>) {
-        self.row(Severity::Fail, text, remedy);
     }
 
     /// `die`, attributed to this step. See [`StageCtx::fatal`].
@@ -428,25 +434,231 @@ pub const STOP_WINESERVER_WAIT: Duration = Duration::from_secs(4);
 
 // ── operation lock ────────────────────────────────────────────────────────────
 
-/// One mutating operation at a time — stage or fix.
+/// One mutating operation at a time — stage or fix. The **in-process** half.
 ///
 /// Doctor never takes it; it is read-only by construction.
 pub static OPERATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
-/// The guard [`acquire_operation_lock`] hands back.
-pub type OperationGuard = tokio::sync::MutexGuard<'static, ()>;
+/// The cross-process half's file name, under Sabrage's own support directory.
+///
+/// Sabrage-only on purpose: `demo.sh` does not take it (PARITY.md), so this
+/// serializes the GUI against the `sabrage` CLI and against a second GUI
+/// instance, not against the shell pipeline.
+pub const OPERATION_LOCK_FILE_NAME: &str = "operation.lock";
 
-/// Take the operation lock, waiting if another operation holds it.
+/// How often [`acquire_operation_lock`] retries the advisory file lock while
+/// another Sabrage process holds it.
+const OPERATION_LOCK_POLL: Duration = Duration::from_millis(200);
+
+/// The guard [`acquire_operation_lock`] hands back: the in-process mutex guard
+/// **and** the cross-process advisory lock, released together on drop.
+///
+/// Field order is the release order — the file lock first, then the mutex — so
+/// a waiter that has just been handed the mutex can never find the file still
+/// locked by the process that handed it over.
+pub struct OperationGuard {
+    /// `None` when the advisory lock could not be established at all (no
+    /// writable support directory, a filesystem without `flock`). The
+    /// in-process guarantee is unaffected; only cross-process exclusion
+    /// degrades, and degrading is better than refusing to run a stage.
+    _file: Option<File>,
+    _mutex: tokio::sync::MutexGuard<'static, ()>,
+}
+
+impl std::fmt::Debug for OperationGuard {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OperationGuard")
+            .field("interprocess", &self._file.is_some())
+            .finish()
+    }
+}
+
+/// Take the operation lock, waiting if another operation — in this process or
+/// in another Sabrage process — holds it.
 pub async fn acquire_operation_lock() -> OperationGuard {
-    OPERATION_LOCK.lock().await
+    let mutex = OPERATION_LOCK.lock().await;
+    let file = acquire_lock_file(&operation_lock_path()).await;
+    OperationGuard {
+        _file: file,
+        _mutex: mutex,
+    }
+}
+
+/// Where the advisory lock file lives.
+///
+/// Under `cfg(test)` it is a per-test-process file in the temp directory
+/// instead: a test run must never create anything in the user's real Sabrage
+/// store, and two test binaries running concurrently must not serialize against
+/// each other.
+fn operation_lock_path() -> PathBuf {
+    #[cfg(test)]
+    {
+        std::env::temp_dir().join(format!(
+            "sabrage-{OPERATION_LOCK_FILE_NAME}-{}",
+            std::process::id()
+        ))
+    }
+    #[cfg(not(test))]
+    {
+        crate::paths::sabrage_support_dir().join(OPERATION_LOCK_FILE_NAME)
+    }
+}
+
+/// `flock(LOCK_EX)`, spelled as a poll over `try_lock` so the async worker is
+/// never blocked while another process holds it.
+///
+/// Every failure degrades to `None` rather than propagating: the lock is an
+/// extra safety net over [`OPERATION_LOCK`], and a machine whose support
+/// directory cannot be created must still be able to run `build`.
+async fn acquire_lock_file(path: &Path) -> Option<File> {
+    let file = open_lock_file(path)?;
+    loop {
+        match file.try_lock() {
+            Ok(()) => {
+                // Diagnostic only — who is holding it. Best effort: a failed
+                // write is not a reason to give up a lock we hold.
+                let _ = file.set_len(0);
+                let _ = (&file).write_all(format!("{}\n", std::process::id()).as_bytes());
+                return Some(file);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                tokio::time::sleep(OPERATION_LOCK_POLL).await;
+            }
+            Err(std::fs::TryLockError::Error(_)) => return None,
+        }
+    }
+}
+
+fn open_lock_file(path: &Path) -> Option<File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .ok()
 }
 
 /// Is a mutating operation running right now?
 ///
-/// A `try_lock` probe, so it is racy by nature — true means "was held at this
-/// instant". Doctor uses it to annotate, never to gate.
+/// A `try_lock` probe on the in-process half only, so it is racy by nature —
+/// true means "was held at this instant", and an operation in *another* Sabrage
+/// process is invisible to it. Doctor uses it to annotate, never to gate.
 pub fn operation_in_progress() -> bool {
     OPERATION_LOCK.try_lock().is_err()
+}
+
+// ── live-session policy ───────────────────────────────────────────────────────
+
+/// Why a mutating operation must not start right now, or `None` when nothing on
+/// this machine looks like a live session.
+///
+/// Four signals, cheapest first, and deliberately **not** just the in-process
+/// [`crate::session::live_session`] slot: the session a Doctor button would
+/// break may have been launched by the other front-end, by an earlier run of
+/// this process, or by `./demo.sh run`, none of which publish anything in this
+/// process.
+///
+/// 1. this process's own live-session handle;
+/// 2. the run stage's published phase (a launch that has not spawned yet);
+/// 3. `session-state.json`, when its recorded wine identity is still
+///    [`crate::session::reconcile::Classification::Live`] — covers the other
+///    front-end and a session that outlived the process that started it;
+/// 4. a **fresh** `runtime_status.json` — the only one of the four a
+///    `./demo.sh run` session produces.
+///
+/// A live CrossOver `wineserver` is deliberately *not* one of the signals: it is
+/// alive for any CrossOver app the user has open, and blocking `build` on that
+/// would be wrong. The two fixes whose file a CrossOver process really can
+/// clobber keep their own narrower wineserver probes
+/// ([`crate::fixes::backend`], [`crate::fixes::session_json`]).
+///
+/// TODO: fold this into `session::ensure_idle` once that lands — it is the
+/// session layer's policy, parked here because [`OPERATION_LOCK`] is the other
+/// half of the same "one mutating operation at a time" rule.
+pub fn live_session_block(paths: &Paths) -> Option<String> {
+    if let Some(h) = crate::session::live_session() {
+        return Some(format!(
+            "this Sabrage process is supervising a session for bottle '{}' (wine pid {})",
+            h.bottle, h.identity.pid
+        ));
+    }
+
+    if let Some(info) = crate::session::run_phase() {
+        use crate::session::SessionPhase::*;
+        if matches!(
+            info.phase,
+            Preflight | Launching | Running | Stalled | Stopping
+        ) {
+            return Some(format!(
+                "a launch for bottle '{}' is in progress ({:?})",
+                info.bottle, info.phase
+            ));
+        }
+    }
+
+    if let Ok(Some(state)) = crate::session::state::load(&paths.session_state_path()) {
+        if crate::session::reconcile::classify(&state)
+            == crate::session::reconcile::Classification::Live
+        {
+            let pid = state.wine.as_ref().map(|w| w.pid).unwrap_or(0);
+            return Some(format!(
+                "a session for bottle '{}' is still running (wine pid {pid})",
+                state.bottle
+            ));
+        }
+    }
+
+    let status_path = paths.oxr_appsup.join("runtime_status.json");
+    if let Ok(text) = std::fs::read_to_string(&status_path) {
+        if let Some(rs) = crate::session::watcher::parse_runtime_status(&text) {
+            if crate::session::watcher::is_fresh(
+                rs.updated_at_unix_ms,
+                crate::session::now_unix_ms(),
+            ) {
+                return Some(format!(
+                    "the oxrsys runtime is reporting a live session (state '{}')",
+                    rs.state
+                ));
+            }
+        }
+    }
+
+    None
+}
+
+/// The three stages that replace artifacts a running session has open.
+///
+/// `run` is exempt (it reconciles the previous session itself) and so is `stop`
+/// (it is the way out of a live session).
+fn stage_is_forbidden_while_session_live(stage: Stage) -> bool {
+    matches!(stage, Stage::Setup | Stage::Build | Stage::Install)
+}
+
+/// The `die` a stage produces when [`live_session_block`] sees a session.
+///
+/// Same shape as [`crate::fixes::backend`]'s and [`crate::fixes::session_json`]'s
+/// refusals — message plus the `./demo.sh stop` remedy — so the GUI renders one
+/// familiar row for every "stop the session first" refusal.
+fn deny_stage_while_session_live(stage: Stage, ctx: &StageCtx) -> Result<()> {
+    if !stage_is_forbidden_while_session_live(stage) {
+        return Ok(());
+    }
+    match live_session_block(&ctx.paths) {
+        None => Ok(()),
+        Some(reason) => Err(ctx.fatal(
+            format!(
+                "refusing to run {stage} while a session is live — {reason}; stop the session first"
+            ),
+            Some(format!(
+                "./demo.sh stop --bottle {}",
+                ctx.opts.bottle_name.as_deref().unwrap_or("<name>")
+            )),
+        )),
+    }
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────
@@ -503,6 +715,10 @@ impl StageOutcome {
 /// last — on the failure path too, with the error's `exit_code_equiv` — so a UI
 /// that only listens to events never sees a stage that started and never ended.
 pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
+    // Before the lock, not after: waiting for a build to finish only to refuse
+    // is worse than refusing straight away, and the operation lock is free for
+    // the whole of a live session by design (see "Lock policy for `run`").
+    deny_stage_while_session_live(stage, ctx)?;
     let guard = acquire_operation_lock().await;
     if stage == Stage::Run {
         // The one stage that gives the lock back early — see this module's
@@ -717,6 +933,183 @@ mod tests {
         assert!(operation_in_progress());
         assert!(OPERATION_LOCK.try_lock().is_err());
         drop(guard);
+    }
+
+    /// The in-process mutex is only half of the lock: two Sabrage processes
+    /// (GUI and CLI) have one `OPERATION_LOCK` each, so the exclusion that
+    /// actually protects `build-x64/` is the advisory file lock.
+    ///
+    /// `flock` is per open file description, so a second `File` on the same
+    /// path — even in this same process — is exactly what a second process
+    /// sees.
+    #[tokio::test]
+    async fn the_advisory_file_lock_excludes_a_second_holder_and_releases_on_drop() {
+        let path = std::env::temp_dir().join(format!(
+            "sabrage-oplock-test-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        std::fs::remove_file(&path).ok();
+
+        let held = acquire_lock_file(&path).await.expect("lock acquired");
+        let other = open_lock_file(&path).expect("second handle opens");
+        assert!(
+            matches!(other.try_lock(), Err(std::fs::TryLockError::WouldBlock)),
+            "a second process must not be able to take the lock"
+        );
+        // The pid is written for a diagnostic "held by …" message.
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap().trim(),
+            std::process::id().to_string()
+        );
+
+        drop(held);
+        assert!(
+            other.try_lock().is_ok(),
+            "dropping the guard must release the file lock"
+        );
+        drop(other);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The real guard takes both halves. Only the "held ⇒ locked" direction is
+    /// deterministic here (a sibling test may take the lock the instant this
+    /// one lets go), the same asymmetry `the_operation_lock_admits_one_holder`
+    /// documents.
+    #[tokio::test]
+    async fn acquire_operation_lock_takes_the_file_lock_too() {
+        let guard = acquire_operation_lock().await;
+        let probe = open_lock_file(&operation_lock_path()).expect("lock file opens");
+        assert!(matches!(
+            probe.try_lock(),
+            Err(std::fs::TryLockError::WouldBlock)
+        ));
+        drop(probe);
+        drop(guard);
+    }
+
+    /// A test-run lock file never lands in the user's real Sabrage store.
+    #[test]
+    fn the_test_lock_file_is_not_in_the_user_support_directory() {
+        let path = operation_lock_path();
+        assert!(
+            !path.starts_with(crate::paths::sabrage_support_dir()),
+            "{} must not be under the real support directory during tests",
+            path.display()
+        );
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains(OPERATION_LOCK_FILE_NAME));
+    }
+
+    /// A ctx whose session-state and OXRSys stores are scratch directories, so
+    /// `live_session_block` reads fixtures rather than the real machine.
+    fn ctx_at(root: &std::path::Path, bottle: Option<&str>) -> StageCtx {
+        let mut paths = Paths::new(root);
+        paths.sabrage_appsup = root.join("Sabrage");
+        paths.oxr_appsup = root.join("OXRSys");
+        let opts = StageOptions {
+            bottle_name: bottle.map(str::to_string),
+            ..StageOptions::default()
+        };
+        StageCtx::new(paths, opts, null_sink(), CancellationToken::new())
+    }
+
+    /// Write a `session-state.json` whose recorded wine identity is **this**
+    /// process: alive, and reporting the start time recorded for it, which is
+    /// exactly what `classify` calls `Live`.
+    fn write_live_session_state(ctx: &StageCtx) {
+        let path = ctx.paths.session_state_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut state = crate::session::state::SessionState::new(
+            Uuid::new_v4(),
+            "FixtureBottle",
+            "/bs",
+            "/log",
+            0,
+        );
+        state.wine = crate::process::ProcInfo::observe(std::process::id());
+        assert!(state.wine.is_some(), "this process must be observable");
+        std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn live_session_block_is_none_on_a_scratch_machine() {
+        let _g = crate::session::lock_session_globals();
+        let root = std::env::temp_dir().join(format!("sabrage-live-none-{}", std::process::id()));
+        let ctx = ctx_at(&root, None);
+        assert_eq!(live_session_block(&ctx.paths), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn live_session_block_sees_a_running_session_recorded_on_disk() {
+        let _g = crate::session::lock_session_globals();
+        let root = std::env::temp_dir().join(format!("sabrage-live-state-{}", std::process::id()));
+        let ctx = ctx_at(&root, Some("FixtureBottle"));
+        write_live_session_state(&ctx);
+        let reason = live_session_block(&ctx.paths).expect("a live record must block");
+        assert!(reason.contains("FixtureBottle"), "{reason}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A `./demo.sh run` session writes no `session-state.json`; a fresh
+    /// `runtime_status.json` is the only trace of it Sabrage can read.
+    #[test]
+    fn live_session_block_sees_a_fresh_runtime_status() {
+        let _g = crate::session::lock_session_globals();
+        let root = std::env::temp_dir().join(format!("sabrage-live-status-{}", std::process::id()));
+        let ctx = ctx_at(&root, None);
+        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
+        let now = crate::session::now_unix_ms();
+        std::fs::write(
+            ctx.paths.oxr_appsup.join("runtime_status.json"),
+            format!(r#"{{"state":"streaming","updated_at_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+        assert!(live_session_block(&ctx.paths).is_some_and(|r| r.contains("streaming")));
+
+        // Stale is not live: the file outlives the runtime.
+        std::fs::write(
+            ctx.paths.oxr_appsup.join("runtime_status.json"),
+            r#"{"state":"streaming","updated_at_unix_ms":1}"#,
+        )
+        .unwrap();
+        assert_eq!(live_session_block(&ctx.paths), None);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// setup/build/install replace what a running session has open, so they are
+    /// refused outright; `stop` (the way out) and `run` (which reconciles for
+    /// itself) are not.
+    #[tokio::test]
+    async fn run_stage_refuses_setup_build_and_install_while_a_session_is_live() {
+        let _g = crate::session::lock_session_globals();
+        let root = std::env::temp_dir().join(format!("sabrage-live-stage-{}", std::process::id()));
+        let ctx = ctx_at(&root, Some("FixtureBottle"));
+        write_live_session_state(&ctx);
+
+        for stage in [Stage::Setup, Stage::Build, Stage::Install] {
+            let err = run_stage(stage, &ctx).await.unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.starts_with(&format!("refusing to run {stage} while a session is live")),
+                "{msg}"
+            );
+        }
+        assert!(!stage_is_forbidden_while_session_live(Stage::Run));
+        assert!(!stage_is_forbidden_while_session_live(Stage::Stop));
+        // `stop` still gets as far as its own bottle check, not the refusal.
+        let stop_err = run_stage(Stage::Stop, &ctx_at(&root, None))
+            .await
+            .unwrap_err();
+        assert!(stop_err
+            .to_string()
+            .starts_with("CrossOver bottle name required"));
+
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]

@@ -78,12 +78,20 @@ pub(crate) fn first_device_serial(stdout: &str) -> Option<String> {
 
 /// `"$ADB" devices 2>/dev/null | awk …` — a read-only probe, so it bypasses
 /// the executor and runs under `--dry-run` too.
+///
+/// Carries the launch's cancellation token: this is the one probe a user is
+/// likely to be waiting on (they hit Run before plugging the headset in), and
+/// a wedged `adb` here would otherwise hold the operation lock with Cancel
+/// unable to interrupt it. A cancelled or timed-out probe fails exactly like a
+/// missing binary — `None`, which is run.sh's empty `$WIRED_SER`.
 async fn probe_device_serial(ctx: &StageCtx, adb: &Path, step_id: StepId) -> Option<String> {
     let spec = ctx
         .child(adb.to_path_buf(), step_id)
         .arg("devices")
         .env_path(process::default_child_path());
-    let out = process::capture(&spec).await.ok()?;
+    let out = process::capture_with(&spec, &ctx.cancel, process::DEFAULT_PROBE_TIMEOUT)
+        .await
+        .ok()?;
     first_device_serial(&out.stdout)
 }
 
@@ -96,6 +104,26 @@ fn stream_forward_specs() -> Vec<String> {
         .iter()
         .map(|p| format!("tcp:{p}"))
         .collect()
+}
+
+/// run.sh:108 — remove **both** ports, ignoring every failure.
+///
+/// On a fresh, non-cancelled executor ([`super::teardown_ctx`]): the common
+/// reason to be rolling back is that Stop cancelled the token mid-loop, and
+/// the launch executor refuses every child once it is cancelled — the removal
+/// would be a silent no-op exactly when it matters most.
+async fn rollback_forwards(ctx: &StageCtx, adb: &Path, serial: &str, specs: &[String]) {
+    let rb = super::teardown_ctx(ctx);
+    for q in specs {
+        let undo = rb
+            .child(adb.to_path_buf(), step::RUN_ADB_FORWARDS)
+            .arg("-s")
+            .arg(serial)
+            .arg("forward")
+            .arg("--remove")
+            .arg(q);
+        let _ = rb.executor.run_child(&undo).await;
+    }
 }
 
 /// `launch-action: adb-forward-hygiene` — run.sh lines 93–124.
@@ -136,11 +164,17 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
         ));
     };
     // run.sh:105
-    let Some(serial) = probe_device_serial(ctx, &adb, step::RUN_ADB_FORWARDS).await else {
-        return Err(st.fatal(
-            "--wired: no Quest over adb — connect USB and check 'adb devices'",
-            None,
-        ));
+    let serial = match probe_device_serial(ctx, &adb, step::RUN_ADB_FORWARDS).await {
+        Some(serial) => serial,
+        // Stop landing on the probe is a cancellation, not a verdict about the
+        // device — saying "no Quest over adb" would be inventing one.
+        None if ctx.cancel.is_cancelled() => return Err(SabrageError::Cancelled),
+        None => {
+            return Err(st.fatal(
+                "--wired: no Quest over adb — connect USB and check 'adb devices'",
+                None,
+            ))
+        }
     };
 
     let specs = stream_forward_specs();
@@ -153,24 +187,33 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
             .arg("forward")
             .arg(local)
             .arg(local);
-        let status = ctx.executor.run_child(&spec).await?;
-        if !status.success() {
-            // run.sh:108 — remove *both* ports, ignoring every failure, then die.
-            for q in &specs {
-                let undo = ctx
-                    .child(adb.clone(), step::RUN_ADB_FORWARDS)
-                    .arg("-s")
-                    .arg(&serial)
-                    .arg("forward")
-                    .arg("--remove")
-                    .arg(q);
-                let _ = ctx.executor.run_child(&undo).await;
-            }
-            // run.sh:109
-            return Err(st.fatal(
-                format!("adb forward {local} {local} failed on {serial} — check the USB connection (adb devices)"),
-                None,
-            ));
+        // Every non-success leaves through the same door. run.sh's `if !
+        // "$ADB" … forward` catches a failed *exec* too (a missing or
+        // unrunnable adb is just a nonzero exit to the shell), and a
+        // cancellation between the two ports would otherwise leave the first
+        // forward on the device with nothing on disk naming it — the exact
+        // stale forward that silently breaks the next WiFi run.
+        let failure = match ctx.executor.run_child(&spec).await {
+            Ok(status) if status.success() => None,
+            Ok(_) => Some(None),
+            Err(e) => Some(Some(e)),
+        };
+        if let Some(cause) = failure {
+            rollback_forwards(ctx, &adb, &serial, &specs).await;
+            // run.sh:109.
+            let die = format!(
+                "adb forward {local} {local} failed on {serial} — check the USB connection \
+                 (adb devices)"
+            );
+            return Err(match cause {
+                // A cancelled launch is not a failed one: Stop's own error
+                // travels, and no die row is invented for it.
+                Some(SabrageError::Cancelled) => SabrageError::Cancelled,
+                // The executor's cause first — a spawn failure is stderr the
+                // shell would have shown as adb's own.
+                Some(e) => die_with_cause(ctx, step::RUN_ADB_FORWARDS, e, &die),
+                None => st.fatal(die, None),
+            });
         }
         created.push(WiredForward {
             serial: serial.clone(),
@@ -331,12 +374,26 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
     // Steam library on this machine.
     let backup = orig_steam_path(&api);
     if !backup.exists() {
+        // Sabrage-only row, no shell counterpart (run.sh is silent here): the
+        // live dll is ALREADY the Goldberg build, so the backup this line
+        // mints holds Goldberg, not Steam. The bytes are run.sh's either way —
+        // saying so is the only honest thing left, because
+        // `store::goldberg::revert_original_steam_dll` would otherwise copy
+        // these bytes back and call it a restore.
+        let already_goldberg = util::cmp_files(&ctx.paths.gbe_dll, &api);
         if let Err(e) = ctx.executor.copy_if_changed(&api, &backup).await {
             return Err(die_with_cause(
                 ctx,
                 step::RUN_GOLDBERG,
                 e,
                 "backup of original steam_api64.dll failed",
+            ));
+        }
+        if already_goldberg {
+            st.warn(format!(
+                "steam_api64.dll was already the Goldberg build, so {} is a copy of \
+                 Goldberg — the real Steam dll was never seen here and cannot be restored",
+                backup.display()
             ));
         }
     }
@@ -952,6 +1009,160 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// `adb.calls` — one line per non-`devices` invocation of [`fake_adb`].
+    fn adb_calls(root: &Path) -> Vec<String> {
+        std::fs::read_to_string(root.join("adb.calls"))
+            .unwrap_or_default()
+            .lines()
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// A real (non-dry) ctx over the scratch root, so the fake adb actually
+    /// runs and its exit status decides the branch.
+    fn real_ctx(root: &Path, opts: StageOptions) -> (StageCtx, Arc<Mutex<Vec<StageEvent>>>) {
+        let (mut ctx, seen) = dry_ctx(root, opts);
+        let run_id = ctx.run_id;
+        ctx.executor = Arc::new(crate::executor::RealExecutor::new(
+            run_id,
+            ctx.sink.clone(),
+            ctx.cancel.clone(),
+        ));
+        (ctx, seen)
+    }
+
+    /// run.sh:108 — a nonzero `adb forward` removes BOTH ports before dying.
+    #[tokio::test]
+    async fn a_failed_forward_removes_both_ports_and_dies_with_run_shs_text() {
+        let root = scratch("wired-fail");
+        let (mut ctx, _) = real_ctx(
+            &root,
+            StageOptions {
+                wired: true,
+                ..Default::default()
+            },
+        );
+        ctx.paths.adb = Some(fake_adb(
+            &root,
+            "List of devices attached\n1WMHH0X\tdevice\n",
+            1,
+        ));
+
+        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "adb forward tcp:9943 tcp:9943 failed on 1WMHH0X — check the USB connection \
+             (adb devices)"
+        );
+        let calls = adb_calls(&root);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("forward --remove tcp:9943")),
+            "{calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("forward --remove tcp:9944")),
+            "{calls:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A7-4: a cancellation between the two ports used to return through `?`
+    /// and skip the rollback entirely — leaving `tcp:9943` on the device with
+    /// nothing on disk naming it, which is exactly the stale forward that
+    /// silently breaks the next WiFi run.
+    #[tokio::test]
+    async fn a_cancellation_mid_loop_still_rolls_the_first_forward_back() {
+        let root = scratch("wired-cancel");
+        let (mut ctx, _) = real_ctx(
+            &root,
+            StageOptions {
+                wired: true,
+                ..Default::default()
+            },
+        );
+        ctx.paths.adb = Some(slow_second_port_adb(
+            &root,
+            "List of devices attached\n1WMHH0X\tdevice\n",
+        ));
+
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        let calls = adb_calls(&root);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("forward --remove tcp:9943")),
+            "the rollback must run on a fresh executor, not the cancelled one: {calls:?}"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A cancel landing on the `adb devices` probe reads as a cancellation,
+    /// not as "no Quest over adb" — and the probe itself is interruptible.
+    #[tokio::test]
+    async fn a_cancel_during_the_device_probe_is_a_cancellation() {
+        let root = scratch("wired-probe-cancel");
+        let (mut ctx, _) = real_ctx(
+            &root,
+            StageOptions {
+                wired: true,
+                ..Default::default()
+            },
+        );
+        ctx.paths.adb = Some(slow_devices_adb(&root));
+
+        let cancel = ctx.cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            cancel.cancel();
+        });
+
+        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An `adb` whose `devices` never answers.
+    fn slow_devices_adb(dir: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("adb");
+        std::fs::write(&path, "#!/bin/sh\nsleep 30\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// [`fake_adb`], but `tcp:9944` hangs — so a cancellation can land between
+    /// the two forwards.
+    fn slow_second_port_adb(dir: &Path, devices_stdout: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("adb");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do\n\
+                 \x20 case \"$a\" in devices) printf '%s' '{devices_stdout}'; exit 0;; esac\n\
+                 done\n\
+                 echo \"$@\" >> \"$(dirname \"$0\")/adb.calls\"\n\
+                 case \"$*\" in *--remove*) ;; *9944*) sleep 30;; esac\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
     // ── goldberg ─────────────────────────────────────────────────────────────
 
     /// `bs_dir` with a `steam_api64.dll` under the Plugins path, plus the
@@ -1135,6 +1346,39 @@ mod tests {
             b"REAL-STEAM"
         );
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A7-5: the live dll is already Goldberg and there is no `.orig-steam`.
+    /// run.sh's bytes are unchanged (the backup is still minted — artifact
+    /// parity), but the row says what that backup actually holds, so nothing
+    /// downstream can call copying it back a restore.
+    #[tokio::test]
+    async fn goldberg_says_so_when_the_backup_it_mints_is_itself_goldberg() {
+        let root = scratch("gbe-already");
+        let bs_dir = goldberg_fixture(&root, b"GOLDBERG", b"GOLDBERG");
+        let (ctx, seen) = goldberg_ctx(&root, bs_dir.clone());
+
+        goldberg_stage(&ctx).await.unwrap();
+
+        let api_dir = bs_dir.join("Beat Saber_Data/Plugins/x86_64");
+        let backup = api_dir.join("steam_api64.dll.orig-steam");
+        assert_eq!(
+            texts(&seen.lock().unwrap()),
+            vec![
+                "-- Goldberg".to_string(),
+                format!(
+                    "[warn] steam_api64.dll was already the Goldberg build, so {} is a copy of \
+                     Goldberg — the real Steam dll was never seen here and cannot be restored",
+                    backup.display()
+                ),
+                "[info] goldberg already installed".to_string(),
+            ]
+        );
+        // The backup is still planned — run.sh mints it here too.
+        let plan = ctx.executor.planned();
+        assert_eq!(plan[0].kind, PlannedKind::Copy);
+        assert_eq!(plan[0].dst.as_deref(), Some(backup.as_path()));
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[tokio::test]

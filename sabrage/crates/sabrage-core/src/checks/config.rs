@@ -12,7 +12,23 @@
 //!   break streaming after a DHCP change. Volatile
 //!
 //! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim,
+//! with one recorded exception (below).
+//!
+//! ## `cfg.session-pins` unreadable/malformed divergence (A3b-3)
+//!
+//! doctor.sh's python inspector does `try: json.load(...) except Exception:
+//! sys.exit(0)`, so a read failure or malformed JSON exits 0 and doctor
+//! reports the same "no stale pins" Pass as a genuinely clean file. This
+//! module does not mirror that: [`inspect_session_pins`] distinguishes
+//! `Unreadable`/`Malformed` from `Clean` and [`cfg_session_pins`] Warns on
+//! the former, because collapsing "could not tell" into "clean" hides the
+//! exact degraded state this check exists to surface. `Corrupt` (a shape
+//! failure *after* a successful parse) already got the "broken python3?"
+//! Warn on both sides; this brings the earlier read/parse failures in line
+//! with it instead of with `Clean`. Needs either a matching
+//! `scripts/demo/doctor.sh` change or a `sabrage/PARITY.md` row declaring
+//! the divergence (cross-area — this module cannot make either edit).
 //!
 //! ## `cfg.session-pins` ordering caveat
 //!
@@ -43,16 +59,23 @@ enum ProtocolState {
     Other(String),
 }
 
-/// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML"`.
+/// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{v=$2} END{print v}' "$TOML"`.
 ///
 /// * The regex requires the line to start (after leading whitespace) with the
 ///   literal `protocol`, then optional whitespace, then `=` — a key like
-///   `protocol_foo` or a `#`-commented line does not match.
+///   `protocol_foo` or a `#`-commented line does not match. It does not care
+///   which (or whether a) `[table]` the line sits under: this is table-blind,
+///   matching `ext/oxrsys/runtime/src/Config.cpp`'s own line-oriented reader.
 /// * `-F'"'` splits on double quotes; `$2` is the text between the first and
-///   second quote on the *matching* line, or empty if that line has no quote
-///   at all (an unquoted assignment, or none).
-/// * `exit` after the first match: later matching lines are ignored.
+///   second quote on a matching line, or empty if that line has no quote at
+///   all (an unquoted assignment).
+/// * Every matching line overwrites `v`, so the **last** matching line in the
+///   file wins — not `exit`-after-first-match. This mirrors both the runtime
+///   (a later assignment overwrites an earlier one, regardless of table) and
+///   doctor.sh's own `awk` recipe (`scripts/demo/doctor.sh`,
+///   `scripts/demo/run.sh`), which use this exact `{v=$2} END{print v}` form.
 fn parse_protocol(toml_text: &str) -> String {
+    let mut value = String::new();
     for line in toml_text.lines() {
         let after_leading_ws = line.trim_start();
         let Some(rest) = after_leading_ws.strip_prefix("protocol") else {
@@ -63,9 +86,9 @@ fn parse_protocol(toml_text: &str) -> String {
         }
         let mut fields = line.split('"');
         let _before_first_quote = fields.next();
-        return fields.next().unwrap_or("").to_string();
+        value = fields.next().unwrap_or("").to_string();
     }
-    String::new()
+    value
 }
 
 /// `[ -f "$TOML" ]`, then [`parse_protocol`] on its contents. A read error
@@ -166,11 +189,18 @@ fn cfg_protocol_legacy_oxrsys(ctx: &CheckCtx) -> CheckOutcome {
 
 /// What [`inspect_session_pins`] found.
 enum SessionPinState {
-    /// `json.load()` itself raised (bad syntax, unreadable file) — the
-    /// inspector script's `try/except: sys.exit(0)` swallows exactly this,
-    /// so `PINNED` comes out empty and doctor reports the *clean* state, not
-    /// an error.
-    UnreadableOrMalformed,
+    /// `fs::read_to_string` failed (missing between the `is_file()` gate and
+    /// the read, permissions, …). doctor.sh's inspector script's
+    /// `try/except: sys.exit(0)` swallows the equivalent Python failure
+    /// (`open()` raising) and reports the *clean* state, not an error —
+    /// intentionally NOT mirrored here (A3b-3): collapsing a read failure
+    /// into "no stale pins" hides exactly the degraded state this check
+    /// exists to expose. See the module doc for the resulting divergence.
+    Unreadable(std::io::Error),
+    /// `serde_json::from_str` failed (malformed JSON). Same doctor.sh
+    /// swallow-and-report-clean behavior as `Unreadable`, and the same
+    /// intentional divergence here.
+    Malformed(serde_json::Error),
     /// The JSON parsed, but its shape breaks an assumption the *un-tried*
     /// walk over `client_connections` makes (top level not an object,
     /// `client_connections` present as a non-empty non-object, an entry
@@ -212,11 +242,11 @@ fn json_falsy(v: &serde_json::Value) -> bool {
 fn inspect_session_pins(path: &Path) -> SessionPinState {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
-        Err(_) => return SessionPinState::UnreadableOrMalformed,
+        Err(e) => return SessionPinState::Unreadable(e),
     };
     let value: serde_json::Value = match serde_json::from_str(&text) {
         Ok(v) => v,
-        Err(_) => return SessionPinState::UnreadableOrMalformed,
+        Err(e) => return SessionPinState::Malformed(e),
     };
     let Some(top) = value.as_object() else {
         return SessionPinState::Corrupt;
@@ -274,10 +304,26 @@ fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
         );
     }
     match inspect_session_pins(&sessjson) {
-        SessionPinState::UnreadableOrMalformed | SessionPinState::Clean => CheckOutcome::pass(
+        SessionPinState::Clean => CheckOutcome::pass(
             "cfg.session-pins",
             "ALVR session state has no stale manual-IP pins",
         ),
+        // A3b-3: a read or parse failure is a degraded state, not a clean
+        // one — Warn instead of collapsing into the same Pass as `Clean`.
+        // `.detail` carries the native error; the message reuses doctor's
+        // "could not inspect … (broken python3?)" wording (the closest
+        // doctor.sh row) since the shell has no distinct message for this
+        // case (it silently reports clean — see the enum doc).
+        SessionPinState::Unreadable(e) => CheckOutcome::warn(
+            "cfg.session-pins",
+            format!("could not inspect {} (broken python3?)", sessjson.display()),
+        )
+        .with_detail(format!("read error: {e}")),
+        SessionPinState::Malformed(e) => CheckOutcome::warn(
+            "cfg.session-pins",
+            format!("could not inspect {} (broken python3?)", sessjson.display()),
+        )
+        .with_detail(format!("JSON parse error: {e}")),
         SessionPinState::Corrupt => CheckOutcome::warn(
             "cfg.session-pins",
             format!("could not inspect {} (broken python3?)", sessjson.display()),
@@ -286,8 +332,8 @@ fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
             "cfg.session-pins",
             format!(
                 "session.json pins client IP(s): {pinned}— fine while the Quest keeps that IP; \
-                 if streaming stops after a DHCP change, delete '{}' (recreated with \
-                 discovery+auto-trust)",
+                 if streaming stops after a DHCP change, edit the pinned IP in '{}' in place (do \
+                 not delete the file: a recreated session.json streams a black 800x900 screen)",
                 sessjson.display()
             ),
         ),
@@ -340,10 +386,17 @@ mod tests {
             parse_protocol("video_codec = \"h264\"\nprotocol = \"alvr\"\n"),
             "alvr"
         );
-        // First match wins even if a later line also matches.
+        // Last match wins, like the runtime's line reader and doctor.sh's
+        // `{v=$2} END{print v}` awk (not `exit` after the first match).
         assert_eq!(
             parse_protocol("protocol = \"first\"\nprotocol = \"second\"\n"),
-            "first"
+            "second"
+        );
+        // Table-blind: a later occurrence under `[streaming]` still wins over
+        // an earlier root-level one.
+        assert_eq!(
+            parse_protocol("protocol = \"alvr\"\n\n[streaming]\nprotocol = \"oxrsys\"\n"),
+            "oxrsys"
         );
         assert_eq!(parse_protocol(""), "");
     }
@@ -430,6 +483,56 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// A3b-1 regression: `protocol = "alvr"` shadowed by a later
+    /// `[streaming] protocol = "oxrsys"` must resolve like the runtime (last
+    /// assignment wins, table-blind) — Fail on `cfg.protocol.legacy-oxrsys`,
+    /// not the false-green Pass a first-match reader would give.
+    #[test]
+    fn shadowed_protocol_alvr_then_oxrsys_resolves_to_the_last_assignment() {
+        let tmp = scratch("shadowed-alvr-then-oxrsys");
+        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
+        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+        fs::write(
+            &toml_path,
+            "protocol = \"alvr\"\n\n[streaming]\nprotocol = \"oxrsys\"\n",
+        )
+        .unwrap();
+        let ctx = ctx_with_toml(&tmp, toml_path.clone());
+
+        assert_eq!(cfg_protocol_supported(&ctx).status, CheckStatus::Pass);
+
+        let legacy = cfg_protocol_legacy_oxrsys(&ctx);
+        assert_eq!(legacy.status, CheckStatus::Fail);
+        assert_eq!(
+            legacy.message,
+            "oxrsys-runtime.toml protocol='oxrsys' — the demo streams via ALVR"
+        );
+        assert_eq!(
+            legacy.remedy.as_deref(),
+            Some(format!("set protocol = \"alvr\" in {}", toml_path.display()).as_str())
+        );
+        fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// Same fixture, reverse assignment order: `oxrsys` shadowed by a later
+    /// `alvr` resolves to Pass on both slugs.
+    #[test]
+    fn shadowed_protocol_oxrsys_then_alvr_resolves_to_the_last_assignment() {
+        let tmp = scratch("shadowed-oxrsys-then-alvr");
+        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
+        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+        fs::write(
+            &toml_path,
+            "[streaming]\nprotocol = \"oxrsys\"\nprotocol = \"alvr\"\n",
+        )
+        .unwrap();
+        let ctx = ctx_with_toml(&tmp, toml_path);
+
+        assert_eq!(cfg_protocol_supported(&ctx).status, CheckStatus::Pass);
+        assert_eq!(cfg_protocol_legacy_oxrsys(&ctx).status, CheckStatus::Pass);
+        fs::remove_dir_all(&tmp).ok();
+    }
+
     // ── cfg.session-pins ─────────────────────────────────────────────────────
 
     fn ctx_with_session(tmp: &Path, sessjson: PathBuf) -> CheckCtx {
@@ -452,17 +555,70 @@ mod tests {
         assert_eq!(cfg_session_pins(&ctx).status, CheckStatus::Skipped);
     }
 
+    /// A3b-3 regression: malformed JSON is a degraded state, not a clean one.
     #[test]
-    fn malformed_json_is_silently_clean() {
+    fn malformed_json_warns() {
         let tmp = scratch("session-malformed");
         let sessjson = tmp.join("OXRSys/alvr/session.json");
         fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
         fs::write(&sessjson, b"{not json").unwrap();
-        let ctx = ctx_with_session(&tmp, sessjson);
+        let ctx = ctx_with_session(&tmp, sessjson.clone());
         let o = cfg_session_pins(&ctx);
-        assert_eq!(o.status, CheckStatus::Pass);
-        assert_eq!(o.message, "ALVR session state has no stale manual-IP pins");
+        assert_eq!(o.status, CheckStatus::Warn);
+        assert_eq!(
+            o.message,
+            format!("could not inspect {} (broken python3?)", sessjson.display())
+        );
+        assert!(o
+            .detail
+            .as_deref()
+            .is_some_and(|d| d.contains("JSON parse error")));
         fs::remove_dir_all(&tmp).ok();
+    }
+
+    /// A3b-3 regression: an unreadable session.json (here, permissions
+    /// stripped so `is_file()` still gates it in but the read fails) also
+    /// Warns rather than reporting the false-clean Pass. Skipped when running
+    /// as root (permissions are unenforceable), matching the `chmod 000`
+    /// caveat other RealExecutor-style tests in this crate use.
+    #[test]
+    fn unreadable_session_json_warns() {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if unsafe { libc_geteuid() } == 0 {
+                eprintln!("skipping unreadable_session_json_warns: running as root");
+                return;
+            }
+            let tmp = scratch("session-unreadable");
+            let sessjson = tmp.join("OXRSys/alvr/session.json");
+            fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
+            fs::write(&sessjson, b"{}").unwrap();
+            fs::set_permissions(&sessjson, fs::Permissions::from_mode(0o000)).unwrap();
+            let ctx = ctx_with_session(&tmp, sessjson.clone());
+            let o = cfg_session_pins(&ctx);
+            // Restore permissions before any panic-driven early return so
+            // cleanup below can actually remove the directory.
+            fs::set_permissions(&sessjson, fs::Permissions::from_mode(0o644)).ok();
+            assert_eq!(o.status, CheckStatus::Warn);
+            assert_eq!(
+                o.message,
+                format!("could not inspect {} (broken python3?)", sessjson.display())
+            );
+            assert!(o
+                .detail
+                .as_deref()
+                .is_some_and(|d| d.contains("read error")));
+            fs::remove_dir_all(&tmp).ok();
+        }
+    }
+
+    #[cfg(unix)]
+    unsafe fn libc_geteuid() -> u32 {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        geteuid()
     }
 
     #[test]
@@ -508,8 +664,9 @@ mod tests {
             o.message,
             format!(
                 "session.json pins client IP(s): Quest 3=192.168.1.42 — fine while the Quest \
-                 keeps that IP; if streaming stops after a DHCP change, delete '{}' (recreated \
-                 with discovery+auto-trust)",
+                 keeps that IP; if streaming stops after a DHCP change, edit the pinned IP in \
+                 '{}' in place (do not delete the file: a recreated session.json streams a black \
+                 800x900 screen)",
                 sessjson.display()
             )
         );

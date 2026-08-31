@@ -10,7 +10,7 @@ require_bottle
 [ -f "$BS_DIR/Beat Saber.exe" ] || die "Beat Saber not found at $BS_DIR
        download 1.29.4: $DEPOT_CMD
        (or pass --bs-dir / set WINEVR_BS_DIR)"
-# preflight: game.version
+# preflight-warn: game.version
 BSVER="$(bs_version)"
 case "$BSVER" in 1.29.4*) : ;; *) warn "Beat Saber version '$BSVER' != 1.29.4 — the Meta gate may block startup" ;; esac
 # preflight: run.wine-exec
@@ -52,9 +52,12 @@ if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
 fi
 # preflight: dep.goldberg
 sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256" || [ -f "$GBE_DLL" ] || die "Goldberg dll missing — ./demo.sh setup"
-# preflight: cfg.protocol.supported cfg.protocol.legacy-oxrsys
+# preflight: cfg.protocol.supported
+# preflight-warn: cfg.protocol.legacy-oxrsys
 [ -f "$TOML" ] || die "$TOML missing — ./demo.sh setup"
-PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
+# Last assignment wins, like the runtime's own parser (Config.cpp): a shadowed earlier
+# line must not be the one we validate.
+PROTOCOL="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{v=$2} END{print v}' "$TOML")"
 case "$PROTOCOL" in
   alvr) : ;;
   oxrsys) warn "protocol=oxrsys (legacy USB path) — the demo path is alvr" ;;
@@ -67,7 +70,7 @@ esac
 # Both auto and native hard-require the helper: without it, auto silently downgrades
 # to in-process H.264 (that downgrade reached a live session once — never again).
 # preflight-autofix: build.helper-staged build.helper-arm64
-ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{print $2; exit}' "$TOML")"
+ENCODER_PROC="$(awk -F'"' '/^[[:space:]]*encoder_process[[:space:]]*=/{v=$2} END{print v}' "$TOML")"
 ENCODER_PROC="${ENCODER_PROC:-auto}"
 ensure_helper_staged() {
   helper_is_arm64 "$OXR_HELPER_BIN" && return 0
