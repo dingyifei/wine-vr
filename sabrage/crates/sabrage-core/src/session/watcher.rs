@@ -119,6 +119,56 @@ pub fn is_fresh(updated_at_unix_ms: u64, now_unix_ms: u64) -> bool {
         && behind <= RUNTIME_STATUS_MAX_AGE.as_millis() as u64
 }
 
+/// Does `rs` describe a runtime that is **running right now**?
+///
+/// [`is_fresh`] *and* a `process_id` that is still alive — the two halves
+/// PARITY.md's "External sessions" row states, in the one function both readers
+/// call: [`SessionMonitor::snapshot`]'s [`SessionPhase::External`] derivation
+/// and [`crate::session::session_block_at`]'s status signal (the door every
+/// mutating operation goes through). They used to spell it differently — the
+/// door believed freshness alone — so the Session screen could report Idle
+/// while Settings refused to save, over the very same file.
+///
+/// A status with no `process_id` at all is therefore *not* evidence of a live
+/// runtime: oxrsys has always written that field (`RuntimeStatus.cpp` writes it
+/// unconditionally), so its absence means a file this build cannot vouch for,
+/// and a door that cannot be reasoned about is worse than a door that stays
+/// with the other six signals.
+pub fn runtime_status_live(rs: &RuntimeStatus, now_unix_ms: u64) -> bool {
+    is_fresh(rs.updated_at_unix_ms, now_unix_ms)
+        && rs.process_id.is_some_and(crate::process::is_alive)
+}
+
+/// The wall-clock time an oxrsys log line carries, in [`super::now_unix_ms`]'s
+/// units, or `None` when the line does not start with one.
+///
+/// The pattern is oxrsys's spdlog format (`Config.cpp`:
+/// `[%Y-%m-%d %H:%M:%S.%e] [%l] %v`), and the stamp is **local** time, which is
+/// what makes this comparable with `started_at_unix_ms` at all.
+///
+/// It exists for one question: the runtime log is a single appending, rotating
+/// sink shared by every session, so a line found in
+/// [`RUNTIME_LOG_PRELOAD_LINES`]'s backward window is only *this* session's if
+/// it was written after this session started. Without the stamp, reopening
+/// Sabrage onto a running game republished the previous session's
+/// `(HEVC, native helper)` chip and hid the current one's `(H.264, in-process)`
+/// downgrade.
+pub fn parse_log_timestamp(line: &str) -> Option<u64> {
+    use chrono::TimeZone;
+
+    let rest = line.strip_prefix('[')?;
+    let stamp = rest.split(']').next()?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y-%m-%d %H:%M:%S%.f").ok()?;
+    // A DST fall-back hour is ambiguous: take the earlier of the two readings,
+    // which is the conservative one here (an earlier line is more likely to be
+    // judged history and dropped than wrongly adopted).
+    let local = chrono::Local
+        .from_local_datetime(&naive)
+        .earliest()
+        .or_else(|| chrono::Local.from_local_datetime(&naive).latest())?;
+    u64::try_from(local.timestamp_millis()).ok()
+}
+
 /// Pull an [`EncoderInfo`] out of one oxrsys log line.
 ///
 /// The line, verbatim:
@@ -210,12 +260,22 @@ pub struct SessionMonitor {
     preload_pending: bool,
     /// The last successfully parsed status file.
     runtime_status: Option<RuntimeStatus>,
-    /// Has `runtime_status.json` ever been observed fresh during this
-    /// monitor's lifetime? [`SessionPhase::Stalled`] only makes sense once
-    /// the runtime has proven it can report in at all.
+    /// Has `runtime_status.json` ever been observed fresh **for the run this
+    /// monitor is currently reporting**? [`SessionPhase::Stalled`] only makes
+    /// sense once the runtime has proven it can report in at all.
     ever_fresh: bool,
-    /// Wall-clock time of the most recent fresh observation.
+    /// Wall-clock time of the most recent fresh observation, for that same
+    /// run.
     last_fresh_unix_ms: Option<u64>,
+    /// Which run `ever_fresh`/`last_fresh_unix_ms`/`runtime_status` describe.
+    /// The monitor is built once and outlives every session it watches, so
+    /// without this the *previous* session's freshness history decides whether
+    /// the current one is `Stalled` — a fresh launch inherits `ever_fresh` and
+    /// a timestamp it never wrote, and flips to Stalled the moment it passes
+    /// the startup grace. `None` is a real value (nothing identifiable is
+    /// running), and history recorded under it must not survive into a run
+    /// either.
+    fresh_run_id: Option<crate::events::RunId>,
     /// The phase reported by the *previous* [`snapshot`](Self::snapshot) call.
     /// Purely for detecting the Idle/Exited *entry* edge that clears
     /// `encoder` — nothing else here is a function of history across polls.
@@ -231,9 +291,10 @@ enum Base {
     Live,
     /// `session-state.json` — a session this process did not launch.
     Persisted,
-    /// A fresh `runtime_status.json` naming a live process, with neither of the
-    /// above: a `demo.sh run` in another terminal
-    /// ([`SessionPhase::External`]).
+    /// A session neither of the above knows about: a fresh
+    /// `runtime_status.json` naming a live process, or — before that file
+    /// exists at all — a live `Beat Saber.exe` on the process table. A
+    /// `demo.sh run` in another terminal ([`SessionPhase::External`]).
     External,
     /// Neither: the derived phase is `Idle`.
     None,
@@ -251,6 +312,7 @@ impl SessionMonitor {
             runtime_status: None,
             ever_fresh: false,
             last_fresh_unix_ms: None,
+            fresh_run_id: None,
             last_phase: SessionPhase::Idle,
         };
         let log_path = monitor.runtime_log_path();
@@ -261,8 +323,8 @@ impl SessionMonitor {
     /// One snapshot, combining [`super::live_session`], the run stage's
     /// published [`super::RunPhaseInfo`], the persisted
     /// [`super::state::SessionState`], the wine child's liveness, the
-    /// freshness of `runtime_status.json`, and the newest `encoder ready`
-    /// line in the runtime log.
+    /// freshness of `runtime_status.json`, a running `Beat Saber.exe` nothing
+    /// here started, and the newest `encoder ready` line in the runtime log.
     ///
     /// # Phase precedence (highest first)
     ///
@@ -272,7 +334,7 @@ impl SessionMonitor {
     /// | 2 | `live_session()` | `Running` / `Stalled` / `Exited` |
     /// | 3 | published | `Preflight` / `Launching` |
     /// | 4 | `session-state.json` | `Detached` / `Running` / `Exited` |
-    /// | 5 | fresh `runtime_status.json` + a live pid | `External` |
+    /// | 5 | fresh `runtime_status.json` + a live pid, or a live `Beat Saber.exe` | `External` |
     /// | 6 | published | `Exited` (carrying `exit_code`) |
     /// | 7 | — | `Idle` |
     ///
@@ -324,7 +386,13 @@ impl SessionMonitor {
             status.pid = Some(handle.identity.pid);
             status.started_at_unix_ms = Some(handle.started_at_unix_ms);
             status.log_path = Some(handle.log_path.display().to_string());
-            status.phase = if handle.identity.is_same_process() {
+            // Through `classify`, not `is_same_process()`: an alive pid whose
+            // recorded `start_time` is the spawn fallback's 0 is
+            // `Unverifiable` — live as far as anything can tell — and every
+            // door treats it that way. Rendering it `Exited` put a Launch
+            // button under a session the launch path refuses.
+            status.phase = if super::reconcile::classify_identity(Some(&handle.identity)).is_live()
+            {
                 SessionPhase::Running
             } else {
                 SessionPhase::Exited
@@ -336,11 +404,9 @@ impl SessionMonitor {
             status.started_at_unix_ms = Some(state.started_at_unix_ms);
             status.log_path = Some(state.log_path.display().to_string());
             status.pid = state.wine.as_ref().map(|w| w.pid);
-            let wine_alive = state
-                .wine
-                .as_ref()
-                .map(|w| w.is_same_process())
-                .unwrap_or(false);
+            // Same predicate as the live-handle branch above, and as
+            // `session_block_at`'s third signal: `Unverifiable` is alive.
+            let wine_alive = super::reconcile::classify(&state).is_live();
             status.phase = match (wine_alive, state.detached) {
                 (true, true) => SessionPhase::Detached,
                 (true, false) => SessionPhase::Running,
@@ -350,6 +416,20 @@ impl SessionMonitor {
         }
         // else: nothing live, nothing persisted — `status.phase` stays Idle
         // (`SessionStatus::default()`).
+
+        // ── freshness history belongs to ONE run ────────────────────────────
+        // `ever_fresh`, `last_fresh_unix_ms` and the cached status are what the
+        // stall rule below reasons over, and this monitor outlives every
+        // session it watches (the app builds one, once). Carrying session A's
+        // history into session B classified B as `Stalled` off A's timestamps
+        // the moment B passed the startup grace — a healthy launch reported as
+        // the standby freeze, without B ever having reported in at all.
+        if self.fresh_run_id != status.run_id {
+            self.fresh_run_id = status.run_id;
+            self.ever_fresh = false;
+            self.last_fresh_unix_ms = None;
+            self.runtime_status = None;
+        }
 
         // ── runtime_status.json freshness ───────────────────────────────────
         // The file is global and outlives every session, so a stamp written
@@ -372,18 +452,39 @@ impl SessionMonitor {
                     // and the process it names is alive: `demo.sh run` in
                     // another terminal. Saying "No session running" over that
                     // invites a second launch onto a live game. Never derived
-                    // from freshness alone — the pid has to answer too, and
-                    // the phase carries nothing else, because nothing else
-                    // about that session is knowable from here.
-                    if base == Base::None {
-                        if let Some(pid) = rs.process_id.filter(|p| crate::process::is_alive(*p)) {
-                            base = Base::External;
-                            status.phase = SessionPhase::External;
-                            status.pid = Some(pid);
-                        }
+                    // from freshness alone — the pid has to answer too
+                    // ([`runtime_status_live`], the same predicate every
+                    // mutating door uses) — and the phase carries nothing
+                    // else, because nothing else about that session is
+                    // knowable from here.
+                    if base == Base::None && runtime_status_live(&rs, now) {
+                        base = Base::External;
+                        status.phase = SessionPhase::External;
+                        status.pid = rs.process_id;
                     }
                 }
                 self.runtime_status = Some(rs);
+            }
+        }
+
+        // ── a session with nothing written about it at all ──────────────────
+        // The seventh door signal ([`super::running_game_pid`]) rendered.
+        // `runtime_status.json` only appears once *streaming* starts, which is
+        // minutes after a `./demo.sh run` spawned the game — and for that whole
+        // window every file-based source above reads idle. The doors already
+        // refuse there (A13a-2), so without this the Session screen said
+        // "Idle" and offered Launch/Run/Fix while every one of them died with
+        // a Fatal: exactly the disagreement the `runtime_status_live` fix
+        // above removed, one signal later.
+        //
+        // Last, and only for `Base::None`: it is the one probe that costs a
+        // full process-table walk, and any of the branches above already knows
+        // more about the session than a pid.
+        if base == Base::None {
+            if let Some(pid) = super::running_game_pid() {
+                base = Base::External;
+                status.phase = SessionPhase::External;
+                status.pid = Some(pid);
             }
         }
 
@@ -392,12 +493,14 @@ impl SessionMonitor {
         // at the end of this method, once the phase and the run it belongs to
         // are settled.
         let history = std::mem::take(&mut self.preload_pending);
-        let mut parsed: Option<EncoderInfo> = None;
+        // The line's own wall-clock stamp rides along: during the preload it is
+        // the only proof of which session an `encoder ready` line belongs to.
+        let mut parsed: Option<(EncoderInfo, Option<u64>)> = None;
         if let Some(tailer) = self.runtime_log_tailer.as_mut() {
             if let Ok(batch) = tailer.poll() {
                 for line in &batch.lines {
                     if let Some(info) = parse_encoder_ready(line) {
-                        parsed = Some(info);
+                        parsed = Some((info, parse_log_timestamp(line)));
                     }
                 }
             }
@@ -518,13 +621,30 @@ impl SessionMonitor {
             self.encoder = None;
             self.encoder_run_id = None;
         }
-        if let Some(info) = parsed {
-            // Preloaded history belongs to this session only if this session
-            // started before the monitor did — see `created_at_unix_ms`.
-            let believable = !history
-                || status
-                    .started_at_unix_ms
-                    .is_some_and(|started| started <= self.created_at_unix_ms);
+        if let Some((info, line_unix_ms)) = parsed {
+            // A line the tail read *live* was written after this poll's
+            // predecessor, so the session being reported is the one that wrote
+            // it. A line out of the preload window is history, and history is
+            // only this session's when two things hold at once: the session
+            // predates the monitor (see `created_at_unix_ms`), and the line's
+            // own timestamp is not older than the session
+            // ([`parse_log_timestamp`]). The log is one appending, rotating
+            // sink shared by every session that ever ran, so without the second
+            // half a Sabrage opened onto a live game republished *some*
+            // previous session's chip — masking an `(H.264, in-process)`
+            // downgrade for as long as the session lasted, since the line is
+            // emitted once per session. A preloaded line with no readable
+            // timestamp proves nothing and is dropped.
+            let believable = if history {
+                match (status.started_at_unix_ms, line_unix_ms) {
+                    (Some(started), Some(written)) => {
+                        started <= self.created_at_unix_ms && written >= started
+                    }
+                    _ => false,
+                }
+            } else {
+                true
+            };
             if believable {
                 self.encoder = Some(info);
                 self.encoder_run_id = status.run_id;
@@ -625,6 +745,62 @@ mod tests {
             "an hour ahead is a clock correction or a corrupt number — and it would \
              otherwise read as fresh for that whole hour, suppressing Stalled"
         );
+    }
+
+    /// A10-8. One predicate, two readers: the `External` phase the Session
+    /// screen shows and the door every mutating operation goes through. They
+    /// used to spell "is the runtime live" differently, so the UI could say
+    /// Idle while Settings refused to save over the same file.
+    #[test]
+    fn runtime_status_live_is_freshness_and_a_live_pid_together() {
+        let now = crate::session::now_unix_ms();
+        let status = |pid: Option<u32>, at: u64| RuntimeStatus {
+            state: "streaming".into(),
+            process_id: pid,
+            updated_at_unix_ms: at,
+            application_name: None,
+        };
+        let me = std::process::id();
+        assert!(runtime_status_live(&status(Some(me), now), now));
+        assert!(
+            !runtime_status_live(&status(Some(me), now - 60_000), now),
+            "the file outlives the runtime"
+        );
+        assert!(
+            !runtime_status_live(&status(Some(u32::MAX - 1), now), now),
+            "fresh, but nothing is there"
+        );
+        assert!(
+            !runtime_status_live(&status(None, now), now),
+            "oxrsys always writes process_id; a file without one vouches for nothing"
+        );
+    }
+
+    /// A9-6. The spdlog prefix oxrsys writes (`Config.cpp`'s
+    /// `[%Y-%m-%d %H:%M:%S.%e] [%l] %v`), read back as local wall-clock time —
+    /// the only thing that can say which session a preloaded log line belongs
+    /// to.
+    #[test]
+    fn parse_log_timestamp_reads_the_spdlog_prefix_as_local_time() {
+        use chrono::TimeZone;
+        let at = chrono::Local
+            .with_ymd_and_hms(2026, 8, 10, 1, 30, 13)
+            .single()
+            .expect("an unambiguous local time");
+        assert_eq!(
+            parse_log_timestamp(
+                "[2026-08-10 01:30:13.017] [info] OXRSys/ALVR: encoder ready 2064x2208 @72Hz \
+                 100Mbps (HEVC, native helper)"
+            ),
+            Some(at.timestamp_millis() as u64 + 17)
+        );
+        // Anything that is not that prefix carries no time at all.
+        assert!(parse_log_timestamp(
+            "OXRSys/ALVR: encoder ready 2064x2208 @72Hz 100Mbps (HEVC, native helper)"
+        )
+        .is_none());
+        assert!(parse_log_timestamp("[info] no date here]").is_none());
+        assert!(parse_log_timestamp("").is_none());
     }
 
     // ── parse_encoder_ready ──────────────────────────────────────────────────
@@ -880,9 +1056,27 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
 
+        /// One oxrsys log line, timestamped in the machine's local time the
+        /// way spdlog writes it (`[%Y-%m-%d %H:%M:%S.%e] [%l] %v`).
+        fn log_line(at_unix_ms: u64, message: &str) -> String {
+            use chrono::TimeZone;
+            let at = chrono::Local
+                .timestamp_millis_opt(at_unix_ms as i64)
+                .single()
+                .expect("a representable local time");
+            format!(
+                "[{}] [info] {message}\n",
+                at.format("%Y-%m-%d %H:%M:%S%.3f")
+            )
+        }
+
         /// The other half: preload exists so that a Sabrage opened *onto* a
         /// running session still shows the chip that session already
-        /// negotiated. A session that predates the monitor keeps it.
+        /// negotiated. A session that predates the monitor keeps it — as long
+        /// as the line itself was written after that session started (A9-6:
+        /// the log is one appending sink shared by every session that ever
+        /// ran, so the line's own stamp is the only thing that can say whose
+        /// it is).
         #[tokio::test]
         async fn a_session_that_predates_the_monitor_keeps_its_encoder_chip() {
             let _g = lock_session_globals();
@@ -891,10 +1085,13 @@ mod tests {
             let dir = scratch("encoder-adopted");
             let paths = fixture_paths(&dir);
             std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+            let started = crate::session::now_unix_ms() - 5_000;
             std::fs::write(
                 paths.oxr_appsup.join("oxrsys-runtime.log"),
-                "[2026-08-29 10:00:00.000] [info] OXRSys/ALVR: encoder ready 3008x1664 @72Hz \
-                 80Mbps (HEVC, native helper)\n",
+                log_line(
+                    started + 1_000,
+                    "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
+                ),
             )
             .unwrap();
 
@@ -904,7 +1101,7 @@ mod tests {
                 bottle: "Steam".into(),
                 identity: ProcInfo::observe(std::process::id()).unwrap(),
                 log_path: PathBuf::from("/repo/logs/x.log"),
-                started_at_unix_ms: crate::session::now_unix_ms(),
+                started_at_unix_ms: started,
                 cancel: CancellationToken::new(),
                 detach: CancellationToken::new(),
             });
@@ -919,6 +1116,68 @@ mod tests {
                 "the session was already running when the monitor opened"
             );
             std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A9-6, the half `created_at_unix_ms` alone could not decide: an
+        /// *adopted* session (started before the monitor) is exactly the case
+        /// where the preload window is believed — and the 200 lines it reads
+        /// span every session that ever ran. A line written before this
+        /// session started is a previous session's, and publishing it puts a
+        /// healthy `(HEVC, native helper)` chip where "waiting for encoder…"
+        /// belongs.
+        #[tokio::test]
+        async fn an_adopted_session_only_inherits_lines_written_after_it_started() {
+            let _g = lock_session_globals();
+
+            // (a) older than the session, (b) newer, (c) no timestamp at all.
+            for (row, line, want_codec) in [
+                (
+                    "a line from before this session started",
+                    log_line(
+                        crate::session::now_unix_ms() - 3_600_000,
+                        "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
+                    ),
+                    None,
+                ),
+                (
+                    "a line this session wrote before the monitor opened",
+                    log_line(
+                        crate::session::now_unix_ms() - 4_000,
+                        "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (H.264, in-process)",
+                    ),
+                    Some("H.264"),
+                ),
+                (
+                    "an undated line proves nothing",
+                    "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)\n"
+                        .to_string(),
+                    None,
+                ),
+            ] {
+                force_idle();
+                let dir = scratch("encoder-adopted-window");
+                let paths = fixture_paths(&dir);
+                std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+                std::fs::write(paths.oxr_appsup.join("oxrsys-runtime.log"), &line).unwrap();
+
+                let run_id = Uuid::new_v4();
+                set_live_session(LiveSessionHandle {
+                    run_id,
+                    bottle: "Steam".into(),
+                    identity: ProcInfo::observe(std::process::id()).unwrap(),
+                    log_path: PathBuf::from("/repo/logs/x.log"),
+                    started_at_unix_ms: crate::session::now_unix_ms() - 5_000,
+                    cancel: CancellationToken::new(),
+                    detach: CancellationToken::new(),
+                });
+                let mut m = SessionMonitor::new(paths);
+                let s = m.snapshot().await;
+                clear_live_session(run_id);
+
+                assert_eq!(s.phase, SessionPhase::Running, "{row}");
+                assert_eq!(s.encoder.map(|e| e.codec).as_deref(), want_codec, "{row}");
+                std::fs::remove_dir_all(&dir).ok();
+            }
         }
 
         /// A8-5. `demo.sh run` publishes no handle and writes no
@@ -1010,6 +1269,200 @@ mod tests {
                 let s = m.snapshot().await;
                 publish_run_phase(None);
                 assert_eq!(s.phase, SessionPhase::Preflight);
+                std::fs::remove_dir_all(&dir).ok();
+            }
+        }
+
+        /// A13a-2, rendered. The door grew a seventh signal — a running
+        /// `Beat Saber.exe` — for the window a `./demo.sh run` spends between
+        /// its wine spawn and its first `runtime_status.json`. The phase has
+        /// to carry it too: with the monitor still reporting `Idle` there,
+        /// Library/Session leave Launch enabled and Doctor leaves every Fix
+        /// enabled, and each one then dies with the Fatal the door raises.
+        #[tokio::test]
+        async fn a_running_game_with_nothing_on_disk_is_external_not_idle() {
+            let _g = lock_session_globals();
+            force_idle();
+
+            let dir = scratch("external-running-game");
+            let paths = fixture_paths(&dir);
+            std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+            let mut m = SessionMonitor::new(paths);
+            assert_eq!(
+                m.snapshot().await.phase,
+                SessionPhase::Idle,
+                "nothing on disk, no game: idle"
+            );
+
+            // Stand in for the wine child, argv exactly as wine spells it —
+            // the shape `pgrep -f 'Beat Saber.exe'` and the door both match.
+            let mut game = std::process::Command::new("/bin/sh")
+                .arg("-c")
+                .arg("sleep 20 # Z:\\games\\Beat Saber 1294\\Beat Saber.exe")
+                .spawn()
+                .expect("/bin/sh is on every macOS");
+
+            // The process table is refreshed per call; give the spawn a moment
+            // to appear rather than assuming it already has.
+            let mut seen = SessionStatus::default();
+            for _ in 0..50 {
+                seen = m.snapshot().await;
+                if seen.phase != SessionPhase::Idle {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            let game_pid = game.id();
+            let _ = game.kill();
+            let _ = game.wait();
+
+            assert_eq!(
+                seen.phase,
+                SessionPhase::External,
+                "a running game the door refuses over must not render as Idle"
+            );
+            assert_eq!(seen.pid, Some(game_pid));
+            assert!(!seen.owned_by_this_process, "it is not ours");
+            assert!(seen.run_id.is_none() && seen.bottle.is_none());
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A9-7. The monitor is built once and outlives every session it
+        /// watches, so the freshness history it accumulates has to name the
+        /// run it belongs to. Session A's `ever_fresh` + last-fresh timestamp
+        /// classified session B as `Stalled` the moment B passed the startup
+        /// grace — the standby freeze reported for a launch that had never
+        /// reported in at all.
+        #[tokio::test]
+        async fn freshness_history_never_crosses_from_one_session_to_the_next() {
+            let _g = lock_session_globals();
+            force_idle();
+
+            let dir = scratch("stall-history");
+            let paths = fixture_paths(&dir);
+            std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+            let now = crate::session::now_unix_ms();
+            // The `streaming` status session A left behind, long stale.
+            std::fs::write(
+                paths.oxr_appsup.join("runtime_status.json"),
+                format!(
+                    r#"{{"state":"streaming","process_id":{},"updated_at_unix_ms":{}}}"#,
+                    std::process::id(),
+                    now - 60_000
+                ),
+            )
+            .unwrap();
+
+            // Session B: ours, running, well past the startup grace.
+            let run_b = Uuid::new_v4();
+            set_live_session(LiveSessionHandle {
+                run_id: run_b,
+                bottle: "Steam".into(),
+                identity: ProcInfo::observe(std::process::id()).unwrap(),
+                log_path: PathBuf::from("/repo/logs/x.log"),
+                started_at_unix_ms: now - 60_000,
+                cancel: CancellationToken::new(),
+                detach: CancellationToken::new(),
+            });
+
+            // The history is session A's: not evidence about B.
+            let mut m = SessionMonitor::new(paths.clone());
+            m.ever_fresh = true;
+            m.last_fresh_unix_ms = Some(now - 30_000);
+            m.fresh_run_id = Some(Uuid::new_v4());
+            let s = m.snapshot().await;
+            assert_eq!(
+                s.phase,
+                SessionPhase::Running,
+                "session B has never reported in; A's timestamps cannot stall it"
+            );
+            assert!(!s.runtime_fresh);
+
+            // …and the same history, recorded for THIS run, still stalls it —
+            // the reset must not disable stall detection.
+            let mut m = SessionMonitor::new(paths);
+            m.ever_fresh = true;
+            m.last_fresh_unix_ms = Some(now - 30_000);
+            m.fresh_run_id = Some(run_b);
+            let s = m.snapshot().await;
+            clear_live_session(run_b);
+            assert_eq!(s.phase, SessionPhase::Stalled);
+
+            std::fs::remove_dir_all(&dir).ok();
+        }
+
+        /// A9-5. The spawn fallback records `start_time: 0` when the child
+        /// could not be observed (`Executor::spawn_detached`), and
+        /// `is_same_process()` is false for it forever after. Reconciliation
+        /// calls that alive pid `Unverifiable` and every door treats it as
+        /// live; the monitor used to call it `Exited`, which is a Launch button
+        /// over a session `run` then refuses.
+        #[tokio::test]
+        async fn an_alive_pid_with_no_verifiable_start_time_is_never_reported_exited() {
+            let _g = lock_session_globals();
+            let unverifiable = ProcInfo {
+                pid: std::process::id(),
+                start_time: 0,
+                exe: PathBuf::new(),
+            };
+            assert_eq!(
+                crate::session::reconcile::classify_identity(Some(&unverifiable)),
+                crate::session::reconcile::Classification::Unverifiable,
+                "the premise: alive, and nothing about it can be checked"
+            );
+
+            // …as a live handle.
+            {
+                force_idle();
+                let dir = scratch("unverifiable-handle");
+                let paths = fixture_paths(&dir);
+                std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+                let run_id = Uuid::new_v4();
+                set_live_session(LiveSessionHandle {
+                    run_id,
+                    bottle: "Steam".into(),
+                    identity: unverifiable.clone(),
+                    log_path: PathBuf::from("/repo/logs/x.log"),
+                    started_at_unix_ms: crate::session::now_unix_ms(),
+                    cancel: CancellationToken::new(),
+                    detach: CancellationToken::new(),
+                });
+                let mut m = SessionMonitor::new(paths);
+                let s = m.snapshot().await;
+                clear_live_session(run_id);
+                assert_eq!(s.phase, SessionPhase::Running);
+                std::fs::remove_dir_all(&dir).ok();
+            }
+
+            // …and as a persisted record, which is the shape a Sabrage that
+            // reopens onto that session reads.
+            {
+                force_idle();
+                let dir = scratch("unverifiable-record");
+                let paths = fixture_paths(&dir);
+                std::fs::create_dir_all(&paths.sabrage_appsup).unwrap();
+                std::fs::write(
+                    paths.session_state_path(),
+                    format!(
+                        r#"{{"version":1,"runId":"00000000-0000-0000-0000-000000000000",
+                            "bottle":"Steam","bsDir":"/games/bs","startedAtUnixMs":0,
+                            "logPath":"/repo/logs/x.log",
+                            "wine":{{"pid":{},"startTime":0,"exe":""}}}}"#,
+                        std::process::id()
+                    ),
+                )
+                .unwrap();
+                let mut m = SessionMonitor::new(paths.clone());
+                let s = m.snapshot().await;
+                assert_eq!(s.phase, SessionPhase::Running);
+                assert!(
+                    crate::session::session_block_at(
+                        &paths.session_state_path(),
+                        &paths.oxr_appsup.join("runtime_status.json"),
+                    )
+                    .is_some(),
+                    "the door and the phase have to agree about this record"
+                );
                 std::fs::remove_dir_all(&dir).ok();
             }
         }
@@ -1469,9 +1922,15 @@ mod tests {
                 std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
                 std::fs::create_dir_all(&paths.sabrage_appsup).unwrap();
                 let log_path = paths.oxr_appsup.join("oxrsys-runtime.log");
+                let started = crate::session::now_unix_ms() - 1_000;
+                // Timestamped, and after this session started: a preloaded
+                // line has to prove whose it is (A9-6).
                 std::fs::write(
                     &log_path,
-                    "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)\n",
+                    log_line(
+                        started,
+                        "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
+                    ),
                 )
                 .unwrap();
 
@@ -1481,7 +1940,7 @@ mod tests {
                     bottle: "Steam".into(),
                     identity: ProcInfo::observe(std::process::id()).unwrap(),
                     log_path: PathBuf::from("/repo/logs/x.log"),
-                    started_at_unix_ms: crate::session::now_unix_ms(),
+                    started_at_unix_ms: started,
                     cancel: CancellationToken::new(),
                     detach: CancellationToken::new(),
                 });
@@ -1605,6 +2064,9 @@ mod tests {
                 let mut m = SessionMonitor::new(paths);
                 m.ever_fresh = true;
                 m.last_fresh_unix_ms = Some(now - 20_000);
+                // …recorded for THIS run: freshness history that names another
+                // run is not evidence about this one (A9-7).
+                m.fresh_run_id = Some(run_id);
                 let s = m.snapshot().await;
                 clear_live_session(run_id);
 

@@ -24,9 +24,14 @@
 //! `Unreadable`/`Malformed` from `Clean` and [`cfg_session_pins`] Warns on
 //! the former, because collapsing "could not tell" into "clean" hides the
 //! exact degraded state this check exists to surface. `Corrupt` (a shape
-//! failure *after* a successful parse) already got the "broken python3?"
-//! Warn on both sides; this brings the earlier read/parse failures in line
-//! with it instead of with `Clean`. Needs either a matching
+//! failure *after* a successful parse) genuinely mirrors doctor.sh — that
+//! shape check runs *outside* the shell probe's try/except, so real
+//! doctor.sh hits an uncaught Python exception there too, and "broken
+//! python3?" is an accurate diagnosis on that arm. `Unreadable`/`Malformed`
+//! are different: they are native-only Warns with no shell counterpart at
+//! all (round 2 / A3b-3: their message no longer borrows the "broken
+//! python3?" wording, since this evaluator's own std::fs/serde_json code hit
+//! the failure and there is no python3 to blame). Needs either a matching
 //! `scripts/demo/doctor.sh` change or a `sabrage/PARITY.md` row declaring
 //! the divergence (cross-area — this module cannot make either edit).
 //!
@@ -308,22 +313,30 @@ fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
             "cfg.session-pins",
             "ALVR session state has no stale manual-IP pins",
         ),
-        // A3b-3: a read or parse failure is a degraded state, not a clean
-        // one — Warn instead of collapsing into the same Pass as `Clean`.
-        // `.detail` carries the native error; the message reuses doctor's
-        // "could not inspect … (broken python3?)" wording (the closest
-        // doctor.sh row) since the shell has no distinct message for this
-        // case (it silently reports clean — see the enum doc).
+        // A3b-3 (round 2): a read or parse failure is a degraded state, not
+        // a clean one — Warn instead of collapsing into the same Pass as
+        // `Clean`. Unlike `Corrupt` below, this evaluator's own std::fs /
+        // serde_json code hit the failure — there is no python3 here to
+        // blame, so the message says so accurately; `.detail` carries the
+        // underlying error for anything that renders it.
         SessionPinState::Unreadable(e) => CheckOutcome::warn(
             "cfg.session-pins",
-            format!("could not inspect {} (broken python3?)", sessjson.display()),
+            format!("could not inspect {}: {e}", sessjson.display()),
         )
         .with_detail(format!("read error: {e}")),
         SessionPinState::Malformed(e) => CheckOutcome::warn(
             "cfg.session-pins",
-            format!("could not inspect {} (broken python3?)", sessjson.display()),
+            format!(
+                "could not inspect {}: invalid JSON ({e})",
+                sessjson.display()
+            ),
         )
         .with_detail(format!("JSON parse error: {e}")),
+        // Unlike the two arms above, `Corrupt` genuinely mirrors doctor.sh:
+        // the shape violations it covers happen *outside* the shell probe's
+        // try/except (see the enum doc), so real doctor.sh hits an
+        // uncaught Python exception here too — "broken python3?" is an
+        // accurate diagnosis on this arm, not a borrowed one.
         SessionPinState::Corrupt => CheckOutcome::warn(
             "cfg.session-pins",
             format!("could not inspect {} (broken python3?)", sessjson.display()),
@@ -565,10 +578,18 @@ mod tests {
         let ctx = ctx_with_session(&tmp, sessjson.clone());
         let o = cfg_session_pins(&ctx);
         assert_eq!(o.status, CheckStatus::Warn);
+        let parse_err = serde_json::from_str::<serde_json::Value>("{not json").unwrap_err();
         assert_eq!(
             o.message,
-            format!("could not inspect {} (broken python3?)", sessjson.display())
+            format!(
+                "could not inspect {}: invalid JSON ({parse_err})",
+                sessjson.display()
+            )
         );
+        // A3b-3 round 2: this evaluator's own serde_json code hit the
+        // failure — no python3 in the process, so the message must not
+        // claim one is to blame.
+        assert!(!o.message.contains("python3"), "message: {}", o.message);
         assert!(o
             .detail
             .as_deref()
@@ -601,10 +622,16 @@ mod tests {
             // cleanup below can actually remove the directory.
             fs::set_permissions(&sessjson, fs::Permissions::from_mode(0o644)).ok();
             assert_eq!(o.status, CheckStatus::Warn);
-            assert_eq!(
-                o.message,
-                format!("could not inspect {} (broken python3?)", sessjson.display())
+            assert!(
+                o.message
+                    .starts_with(&format!("could not inspect {}: ", sessjson.display())),
+                "message: {}",
+                o.message
             );
+            // A3b-3 round 2: this evaluator's own std::fs code hit the
+            // failure — no python3 in the process, so the message must not
+            // claim one is to blame.
+            assert!(!o.message.contains("python3"), "message: {}", o.message);
             assert!(o
                 .detail
                 .as_deref()

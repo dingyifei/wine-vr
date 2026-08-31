@@ -363,7 +363,7 @@
             <div class="hr"></div>
             {#if revertConfirm}
               <div class="revert-confirm">
-                <span class="text-muted">Restore the original steam_api64.dll?</span>
+                <span class="text-muted">Restore steam_api64.dll from the .orig-steam backup?</span>
                 <button class="btn btn-secondary" onclick={() => (revertConfirm = false)} disabled={reverting}
                   >Cancel</button
                 >
@@ -373,7 +373,7 @@
               </div>
             {:else}
               <button class="btn btn-secondary" disabled={!canRevert} onclick={() => (revertConfirm = true)}>
-                Revert original steam_api64.dll
+                Restore .orig-steam backup
               </button>
               {#if validity && !canRevert && validity.origSteamPresent && isLivePhase(sessionStore.status.phase)}
                 <div class="text-muted revert-note">A session is live — stop it first.</div>
@@ -385,7 +385,10 @@
               {/if}
             {/if}
             {#if revertReport}
-              <div class="text-muted revert-report">{revertReport.message}</div>
+              <div class="text-muted revert-report">
+                {revertReport.message}
+                <div class="revert-report-path mono">{revertReport.dllPath}</div>
+              </div>
             {/if}
             {#if revertError}
               <div class="validate-error">{revertError}</div>
@@ -638,6 +641,10 @@
   .revert-note {
     font-size: 11.5px;
     margin-top: 6px;
+  }
+  .revert-report-path {
+    margin-top: 2px;
+    word-break: break-all;
   }
   .stream-values {
     display: flex;

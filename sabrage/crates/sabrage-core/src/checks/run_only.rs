@@ -33,8 +33,10 @@
 //! into [`crate::error::SabrageError::Fatal`] carrying exactly that text, so
 //! the two front-ends abort with the same sentence.
 
+use std::io::Read;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use super::Evaluator;
 #[allow(unused_imports)]
@@ -126,14 +128,70 @@ fn run_bridge_built(ctx: &CheckCtx) -> CheckOutcome {
 
 // ── run.wired-adb ────────────────────────────────────────────────────────────
 
-/// `"$ADB" devices` stdout, or empty when the binary is missing or fails to
-/// run. Same probe `checks::headset` makes; duplicated rather than shared
-/// because that one is private to a module this one does not own.
-fn adb_devices_output(adb: &Path) -> String {
-    match Command::new(adb).arg("devices").output() {
-        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
-        Err(_) => String::new(),
+/// Deadline for the one evaluator in this crate's check layer that spawns a
+/// child — the same bound the launch action's twin probe applies
+/// ([`crate::process::DEFAULT_PROBE_TIMEOUT`], via
+/// [`crate::process::capture_with`]).
+const ADB_PROBE_TIMEOUT: Duration = crate::process::DEFAULT_PROBE_TIMEOUT;
+
+/// How often [`adb_devices_output`] asks whether the child is done. Small
+/// enough to be invisible on the healthy path (adb answers in milliseconds),
+/// large enough not to spin a core while waiting out a wedged one.
+const ADB_PROBE_POLL: Duration = Duration::from_millis(20);
+
+/// `"$ADB" devices` stdout, or empty when the binary is missing, fails to run,
+/// or does not answer within `timeout`. Same probe `checks::headset` makes;
+/// duplicated rather than shared because that one is private to a module this
+/// one does not own.
+///
+/// **Bounded**, and that is the whole reason this is not `Command::output()`:
+/// evaluators are synchronous `fn(&CheckCtx)`, so a wedged `adb` (a server
+/// that stopped answering, a device in a bad state) blocked *inside* the
+/// registry evaluator — holding the launch's operation lock with the
+/// preflight's cancellation checkpoint, which sits between evaluators, unable
+/// to interrupt it. On expiry the child is killed and the probe fails exactly
+/// like a missing binary does, which is the case the caller already handles
+/// (run.sh's empty `$WIRED_SER`).
+///
+/// `timeout` is a parameter rather than the constant so a test can pin the
+/// deadline behaviour in milliseconds instead of ten seconds; the one
+/// production call site passes [`ADB_PROBE_TIMEOUT`].
+fn adb_devices_output(adb: &Path, timeout: Duration) -> String {
+    let mut child = match Command::new(adb)
+        .arg("devices")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return String::new(),
+    };
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(ADB_PROBE_POLL),
+            // Expired, or the wait itself failed: leave nothing behind, and
+            // report the probe the way a missing binary reports.
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return String::new();
+            }
+        }
     }
+
+    // The child has exited, so its stdout is closed and complete: reading it
+    // now cannot block. (`adb devices` prints a handful of lines — far under
+    // the pipe buffer — and a child that somehow filled the buffer instead
+    // never exits, and is killed on the deadline above.)
+    let mut out = Vec::new();
+    if let Some(mut stdout) = child.stdout.take() {
+        let _ = stdout.read_to_end(&mut out);
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// `awk 'NR>1 && $2=="device"{print $1; exit}'` over `adb devices` output —
@@ -177,7 +235,7 @@ fn run_wired_adb(ctx: &CheckCtx) -> CheckOutcome {
     if !ctx.opts.allow_adb_probes {
         return CheckOutcome::skipped("run.wired-adb", SkipReason::new(PROBES_DISABLED));
     }
-    match first_connected_serial(&adb_devices_output(adb)) {
+    match first_connected_serial(&adb_devices_output(adb, ADB_PROBE_TIMEOUT)) {
         Some(serial) => CheckOutcome::pass(
             "run.wired-adb",
             format!("Quest over adb for --wired ({serial})"),
@@ -432,6 +490,68 @@ mod tests {
             out.message,
             "--wired: no Quest over adb — connect USB and check 'adb devices'"
         );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A7-4: the probe used to be an unbounded `Command::output()`, so a
+    /// wedged `adb` blocked inside the evaluator — and with it the launch
+    /// preflight, which holds the operation lock and can only check for
+    /// cancellation *between* evaluators. The deadline is what makes that
+    /// hang finite; the child must not be left running either.
+    #[test]
+    fn the_devices_probe_gives_up_on_a_wedged_adb_instead_of_blocking_forever() {
+        let root = scratch("wired-wedged");
+        let adb = root.join("platform-tools/adb");
+        std::fs::create_dir_all(adb.parent().unwrap()).unwrap();
+        // Prints its own pid, then never answers.
+        std::fs::write(
+            &adb,
+            "#!/bin/sh\necho $$ > \"$(dirname \"$0\")/pid\"\nsleep 300\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let started = std::time::Instant::now();
+        let out = adb_devices_output(&adb, Duration::from_millis(300));
+        let waited = started.elapsed();
+
+        assert_eq!(out, "", "a probe that never answered has no device list");
+        assert!(
+            waited < Duration::from_secs(10),
+            "the probe must be bounded, waited {waited:?}"
+        );
+        // The killed child is gone: `kill -0` on its pid fails.
+        let pid = std::fs::read_to_string(root.join("platform-tools/pid")).unwrap_or_default();
+        let pid = pid.trim();
+        if !pid.is_empty() {
+            let alive = Command::new("/bin/kill")
+                .args(["-0", pid])
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false);
+            assert!(!alive, "the timed-out probe left {pid} running");
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The bound does not cost the healthy path its answer: a fast fake still
+    /// gets its stdout read back in full.
+    #[test]
+    fn the_devices_probe_still_returns_stdout_within_the_deadline() {
+        let root = scratch("wired-fast");
+        let adb = root.join("platform-tools/adb");
+        std::fs::create_dir_all(adb.parent().unwrap()).unwrap();
+        std::fs::write(
+            &adb,
+            "#!/bin/sh\nprintf 'List of devices attached\\n1WMHH000X0\\tdevice\\n'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let out = adb_devices_output(&adb, ADB_PROBE_TIMEOUT);
+        assert_eq!(out, "List of devices attached\n1WMHH000X0\tdevice\n");
+        assert_eq!(first_connected_serial(&out).as_deref(), Some("1WMHH000X0"));
         std::fs::remove_dir_all(&root).ok();
     }
 

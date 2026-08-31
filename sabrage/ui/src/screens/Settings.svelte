@@ -95,21 +95,34 @@
     allowAdbChk = s.allowAdbProbes;
   }
 
-  async function persistSettings(patch: Partial<Settings>) {
+  // A newer autosave can settle *after* an older one already rejected and
+  // reseeded the controls from a reverted store — see settingsStore.update's
+  // doc comment. `writeSeq` (bumped synchronously when a write is queued)
+  // lets us tell whether another write was queued behind this one: only the
+  // *last* settled write for a given click is allowed to reseed the
+  // controls, on success as well as on failure, so a later successful save
+  // is never left un-reflected on screen and an earlier failure never
+  // clobbers a later save's result.
+  async function persistSettings(patch: Partial<Settings> | ((current: Settings) => Partial<Settings>)) {
     settingsSaveError = null;
+    const seqBefore = settingsStore.writeSeq;
     try {
       await settingsStore.update(patch);
       flashSaved();
+      if (settingsStore.writeSeq === seqBefore + 1) seedFromSettings();
     } catch (e) {
       settingsSaveError = errMsg(e);
-      seedFromSettings(); // roll the controls back to whatever the store actually kept
+      if (settingsStore.writeSeq === seqBefore + 1) seedFromSettings(); // roll the controls back to whatever the store actually kept
     }
   }
 
   async function persistLaunch(patch: Partial<LaunchDefaults>) {
-    const current = settingsStore.settings;
-    if (!current) return;
-    await persistSettings({ launch: { ...current.launch, ...patch } });
+    if (!settingsStore.settings) return;
+    // Resolved inside settingsStore.update's queued step against whatever
+    // `settings.launch` is when this write actually runs — not a snapshot
+    // captured here, which could already carry an earlier queued write's
+    // now-rolled-back optimistic value (see update's doc comment).
+    await persistSettings((current) => ({ launch: { ...current.launch, ...patch } }));
   }
 
   async function onDefaultBottleChange() {
@@ -442,7 +455,7 @@
 
           {#if configStore.view.invalid.length > 0}
             <div class="warn-block">
-              {#each configStore.view.invalid as iv (iv.key)}
+              {#each configStore.view.invalid as iv (iv.key + " " + iv.raw + " " + iv.reason)}
                 <div class="warn-line">
                   <span class="mono">{iv.key}</span> = <span class="mono">"{iv.raw}"</span> — {iv.reason} (the
                   runtime silently ignores it and falls back to its own default)

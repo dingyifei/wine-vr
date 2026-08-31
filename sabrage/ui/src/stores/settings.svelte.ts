@@ -17,6 +17,15 @@ function createSettingsStore() {
   let loadOk = $state(false);
   let error = $state<string | null>(null);
 
+  /** Bumped synchronously (before any `await`) every time `save`/`update`
+   * queues a write — i.e. it already reflects *this* write by the time the
+   * call that queued it returns control. Callers use it to detect whether a
+   * newer write was queued behind theirs while they were in flight: if
+   * `writeSeq` has moved past `capturedBefore + 1` by the time their own
+   * write settles, a later write superseded it and the caller should not act
+   * on its (now-stale) result — see Settings.svelte's `persistSettings`. */
+  let writeSeq = $state(0);
+
   /** Serializes every write (`save`/`update`) onto one chain so overlapping
    * autosaves settle in call order — at most one `saveSettings` round-trip is
    * ever in flight, and each queued write merges/re-converges against the
@@ -26,6 +35,7 @@ function createSettingsStore() {
    * caller. */
   let chain: Promise<void> = Promise.resolve();
   function enqueue<T>(fn: () => Promise<T>): Promise<T> {
+    writeSeq++;
     const run = chain.then(fn, fn);
     chain = run.then(
       () => undefined,
@@ -94,13 +104,22 @@ function createSettingsStore() {
    * that). `patch.launch`, if present, replaces the whole `LaunchDefaults`
    * object (this merge is shallow) — pass a full `{ ...settings.launch, … }`
    * object to change one flag.
-   */
-  async function update(patch: Partial<Settings>): Promise<void> {
+   *
+   * `patch` may also be a function of the *current* `settings` — resolved
+   * inside the queued step, i.e. against whatever `settings` is when this
+   * write actually runs (which may already reflect an earlier queued
+   * write's failure-triggered `load()`), not a snapshot from whenever the
+   * caller happened to build the patch. Callers building a patch from a
+   * nested sub-object (e.g. `launch`) should prefer this form — otherwise a
+   * stale field captured before an earlier write's rollback can ride along
+   * into this write. */
+  async function update(patch: Partial<Settings> | ((current: Settings) => Partial<Settings>)): Promise<void> {
     return enqueue(() => {
       if (!settings) {
         return Promise.reject(new Error("settings not loaded — reload Settings and try again"));
       }
-      return performSave({ ...settings, ...patch });
+      const resolved = typeof patch === "function" ? patch(settings) : patch;
+      return performSave({ ...settings, ...resolved });
     });
   }
 
@@ -121,6 +140,9 @@ function createSettingsStore() {
     },
     get error() {
       return error;
+    },
+    get writeSeq() {
+      return writeSeq;
     },
     load,
     save,

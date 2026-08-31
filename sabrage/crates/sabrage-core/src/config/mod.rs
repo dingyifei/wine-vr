@@ -17,7 +17,7 @@
 pub mod runtime_toml;
 
 pub use runtime_toml::{
-    apply_patch, blocking_session, effective_string, list_backups, read,
+    apply_patch, blocking_session, effective_accepted, effective_string, list_backups, read,
     read_lines_like_the_runtime, runtime_defaults, validate, write, BackupInfo, EncoderProcess,
     InvalidValue, Patched, Protocol, RuntimeConfigPatch, RuntimeConfigValues, RuntimeConfigView,
     VideoCodec, WriteReport, BACKUP_KEEP, BACKUP_PREFIX, EDITABLE_KEYS, TABLE,

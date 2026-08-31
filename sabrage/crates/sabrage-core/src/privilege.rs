@@ -412,6 +412,9 @@ pub async fn write_host_manifest_privileged(
     oxr_dylib: &Path,
     dest: &Path,
 ) -> Result<PrivilegedWrite> {
+    // Defence in depth: install layer 4 refuses the same path before it even
+    // renders the comparison form, so this fires only for a future caller.
+    reject_unrepresentable_manifest_path(ctx, oxr_dylib)?;
     let content = host_manifest_bytes(oxr_dylib);
     if crate::util::host_manifest_is_current(dest, crate::util::strip_trailing_newlines(&content)) {
         return Ok(PrivilegedWrite::Skipped);
@@ -425,6 +428,15 @@ pub async fn write_host_manifest_privileged(
         ctx.step(step::INSTALL_HOST_MANIFEST)
             .info(WOULD_PROMPT_DRY_RUN);
         return plan_privileged_write(ctx, method, &content, dest).await;
+    }
+
+    // Nothing below this line is undoable from our side: `osascript`'s elevated
+    // `/bin/sh` is not even in our process tree, and past `sudo`'s exec we
+    // cannot signal it at all. So the token is checked *here*, before the
+    // announcement, before the staging file, and before any child — a run
+    // cancelled during layer 3 must not surface an authorization prompt.
+    if ctx.cancel.is_cancelled() {
+        return Err(SabrageError::Cancelled);
     }
 
     // The announcement names the mechanism `detect()` actually picked: the
@@ -580,6 +592,41 @@ fn is_user_cancelled(stderr: &str) -> bool {
     stderr.contains(USER_CANCELLED_MARKER)
 }
 
+/// Refuse a dylib path the host manifest cannot represent.
+///
+/// install.sh's two `${//}` substitutions escape `\` and `"` and **nothing
+/// else**, so a checkout under a path with a tab or a newline in it renders a
+/// manifest that is not JSON — and this is the one write that installs its
+/// output as `root:wheel` over the file the OpenXR loader reads. Failing
+/// closed beats breaking runtime discovery for every app on the machine.
+///
+/// This runs *before* [`crate::util::render_host_manifest`].
+/// [`crate::util::json_escape_string`] is deliberately exactly install.sh's two
+/// substitutions (`\` and `"`), so a control character would reach the
+/// manifest raw on both sides — as invalid JSON. Refusing here is what keeps
+/// the native side from writing that file at all.
+///
+/// Native-only, and a deliberate divergence: install.sh writes the invalid
+/// bytes. It cannot change any existing artifact — every path without a
+/// control character is accepted unchanged.
+pub fn reject_unrepresentable_manifest_path(ctx: &StageCtx, dylib: &Path) -> Result<()> {
+    // The JSON minimum, exactly: U+0000..U+001F are the only characters a JSON
+    // string literal may not carry raw. DEL and the C1 block are legal there,
+    // so a path is not rejected for containing them.
+    if !dylib.to_string_lossy().chars().any(|c| (c as u32) < 0x20) {
+        return Ok(());
+    }
+    Err(ctx.fatal(
+        format!(
+            "{} contains a control character — the host OpenXR manifest would not be valid JSON",
+            dylib.display()
+        ),
+        Some(
+            "move the checkout to a path without tabs, newlines or other control characters, then re-run install".to_string(),
+        ),
+    ))
+}
+
 // ── children ──────────────────────────────────────────────────────────────────
 
 /// Spawn `argv` with both output streams captured and stdin closed.
@@ -587,6 +634,11 @@ async fn run_capturing(
     argv: &[OsString],
     cancel: &CancellationToken,
 ) -> Result<std::process::Output> {
+    // An already-cancelled run spawns nothing at all: the `select!` below can
+    // only cancel a prompt that is already on screen.
+    if cancel.is_cancelled() {
+        return Err(SabrageError::Cancelled);
+    }
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..])
         .stdin(Stdio::null())
@@ -621,6 +673,10 @@ async fn run_capturing(
 /// read the terminal, and a Ctrl-C in that terminal is already delivered to the
 /// whole group.
 async fn run_inheriting(argv: &[OsString], cancel: &CancellationToken) -> Result<ExitStatus> {
+    // As in `run_capturing`: never spawn `sudo` for a run that is already over.
+    if cancel.is_cancelled() {
+        return Err(SabrageError::Cancelled);
+    }
     let mut cmd = tokio::process::Command::new(&argv[0]);
     cmd.args(&argv[1..]).kill_on_drop(true);
     let mut child = cmd
@@ -1315,8 +1371,15 @@ mod tests {
                 shell_quote(&marker.to_string_lossy())
             )),
         ];
+        // Cancelled *after* the child is up: an already-cancelled token never
+        // reaches the spawn at all (see the test below), so pre-cancelling here
+        // would prove nothing about the reap.
         let cancel = CancellationToken::new();
-        cancel.cancel();
+        let stopper = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(60)).await;
+            stopper.cancel();
+        });
 
         let err = run_inheriting(&argv, &cancel).await.unwrap_err();
         assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
@@ -1328,6 +1391,140 @@ mod tests {
             !marker.exists(),
             "a signalled-but-unreaped child would have finished by now"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other end of the same rule: a run that is *already* over spawns
+    /// nothing. `select!` can only cancel a prompt that is already on screen —
+    /// the dialog would still have appeared, and `sudo` would still have taken
+    /// the terminal, after Stop.
+    #[tokio::test]
+    async fn an_already_cancelled_token_never_spawns_the_elevated_child() {
+        let dir = scratch("cancel-nospawn");
+        let marker = dir.join("marker");
+        let argv = vec![
+            OsString::from("/bin/sh"),
+            OsString::from("-c"),
+            OsString::from(format!("touch {}", shell_quote(&marker.to_string_lossy()))),
+        ];
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+
+        for err in [
+            run_inheriting(&argv, &cancel).await.unwrap_err(),
+            run_capturing(&argv, &cancel).await.unwrap_err(),
+        ] {
+            assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        }
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!marker.exists(), "a cancelled run spawned a child anyway");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Install layer 3 can hand this function a run that was cancelled while
+    /// `reg add` was in flight. Nothing below the announcement is undoable from
+    /// our side (the elevated `/bin/sh` is not in our process tree), so the
+    /// token is checked before `NeedsAdmin`, before the staging file, and before
+    /// any child — the user does not get an authorization prompt after Stop.
+    #[tokio::test]
+    async fn a_cancelled_run_neither_announces_nor_stages_the_privileged_write() {
+        let dir = scratch("cancel-before-prompt");
+        let dest = dir.join("openxr/1/active_runtime.x86_64.json");
+        let dylib = PathBuf::from("/repo/runtime/lib.dylib");
+        assert!(!crate::util::host_manifest_is_current(
+            &dest,
+            &crate::util::render_host_manifest(&dylib)
+        ));
+
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = Arc::new(move |ev| s.lock().unwrap().push(ev));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        // Not a dry run: this is the branch that would prompt.
+        let ctx = StageCtx::new(
+            Paths::new("/nonexistent/sabrage/repo"),
+            StageOptions::default(),
+            sink,
+            cancel,
+        );
+        assert!(!ctx.executor.is_dry_run());
+
+        let before = staging_file_count();
+        let err = write_host_manifest_privileged(&ctx, &dylib, &dest)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        assert!(!dest.exists());
+        let evs = seen.lock().unwrap();
+        assert!(evs.is_empty(), "nothing is announced after Stop: {evs:#?}");
+        assert_eq!(
+            staging_file_count(),
+            before,
+            "a cancelled run stages nothing"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How many `host-manifest-*.json` are staged right now. Read-only: the
+    /// point of the assertion above is that this number does not move.
+    fn staging_file_count() -> usize {
+        std::fs::read_dir(sabrage_temp_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|e| {
+                        e.file_name()
+                            .to_string_lossy()
+                            .starts_with("host-manifest-")
+                    })
+                    .count()
+            })
+            .unwrap_or(0)
+    }
+
+    /// install.sh's escaping is two substitutions and nothing else, so a path
+    /// carrying a raw control character renders a manifest that is not JSON —
+    /// and this is the one write that lands as `root:wheel` over the file the
+    /// OpenXR loader reads. It fails closed, before the currency test and
+    /// before any prompt; `json_escape_string` itself stays exactly the shell's
+    /// two substitutions, so every accepted path renders byte-identically on
+    /// both front-ends.
+    #[tokio::test]
+    async fn a_control_character_in_the_path_is_refused_before_any_prompt() {
+        let dir = scratch("control-char");
+        let dest = dir.join("active_runtime.x86_64.json");
+        let (ctx, seen) = ctx_with(StageOptions {
+            dry_run: true,
+            bottle_name: Some("Beat Saber".into()),
+            ..Default::default()
+        });
+
+        for nasty in ["/repo/two\nlines/lib.dylib", "/repo/a\tb/lib.dylib"] {
+            let dylib = PathBuf::from(nasty);
+            let err = write_host_manifest_privileged(&ctx, &dylib, &dest)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, SabrageError::Fatal { .. }), "{err:?}");
+            assert!(err.to_string().contains("control character"), "{err}");
+        }
+        // …and an ordinary path is untouched by the guard: every artifact on
+        // every existing machine renders exactly as before.
+        assert!(reject_unrepresentable_manifest_path(
+            &ctx,
+            Path::new("/Users/me/wine vr/it's/liboxrsys-runtime.dylib")
+        )
+        .is_ok());
+
+        assert!(
+            !seen
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|e| matches!(e, StageEvent::NeedsAdmin { .. })),
+            "no prompt is announced for a path that cannot be written"
+        );
+        assert!(!dest.exists());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

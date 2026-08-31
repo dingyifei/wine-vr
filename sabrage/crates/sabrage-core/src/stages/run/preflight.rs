@@ -90,43 +90,70 @@ pub fn preflight_slugs() -> Vec<&'static str> {
 
 // ── the two config facts, read once ───────────────────────────────────────────
 
-/// `oxrsys-runtime.toml` as run.sh reads it: once, with `awk`, before the
-/// checks that branch on it.
+/// `oxrsys-runtime.toml` read once, before the checks that branch on it — the
+/// same two facts run.sh captures with `awk` on lines 57 and 70, resolved the
+/// way the runtime resolves them ([`read_toml_facts`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TomlFacts {
     /// `[ -f "$TOML" ]`.
     present: bool,
-    /// `$PROTOCOL` — the raw captured value, `""` when the key is absent,
-    /// unquoted, or the file does not exist.
+    /// `$PROTOCOL` — the last value the runtime would **accept**, else the raw
+    /// last assignment, and `""` when the key is absent or the file does not
+    /// exist.
     protocol: String,
     /// `${ENCODER_PROC:-auto}` — already defaulted, exactly like the shell
     /// parameter expansion on line 71.
     encoder_process: String,
 }
 
-/// One key, read the way the **runtime** reads it:
+/// One key's **raw** last assignment:
 /// [`crate::config::runtime_toml::effective_string`] — `Config.cpp`'s
 /// `ParseConfigToml` loop, narrowed to a single key. Quote-aware `#`
 /// stripping, `[table]` headers ignored, split on the first `=`, quotes
-/// removed, and the **last** assignment wins. An unassigned key is the empty
-/// string, which is what the callers below already treat as "unset".
+/// removed, and the **last** assignment wins, with no accepted-set filtering.
+/// An unassigned key is the empty string, which is what the callers below
+/// already treat as "unset".
 ///
-/// Last-wins is the load-bearing part, and the reason this no longer carries
-/// its own `awk` emulation. The runtime is table-blind and re-assigns on every
-/// matching line, so a second `protocol =` further down the file is the value
-/// the launched runtime uses; validating the *first* one let a launch pass
-/// every ALVR gate and then start the legacy backend. run.sh reads it the same
-/// way (`awk … '{v=$2} END{print v}'`, lines 57 and 70).
-///
-/// One narrow DIVERGENCE from run.sh, in this side's favour: an **unquoted**
-/// value (`protocol = alvr`) reads as `alvr` here and as the empty string
-/// through `awk -F'"'`, which then dies. The runtime accepts it, so refusing
-/// the launch would be the wrong verdict.
+/// This is the right reader for a key whose accepted set Sabrage does not
+/// model, and — for the two keys it does model — the right *fallback* when no
+/// occurrence at all is one the runtime would accept: that is the value the
+/// die text has to quote back to the user ([`read_toml_facts`]).
 fn effective_string(toml_text: &str, key: &str) -> String {
     crate::config::runtime_toml::effective_string(toml_text, key).unwrap_or_default()
 }
 
-/// run.sh lines 56–57 and 70–71, in one read of the file.
+/// run.sh lines 56–57 and 70–71, in one read of the file — but resolved the way
+/// the **runtime** resolves them, not the way `awk` does.
+///
+/// `protocol` and `encoder_process` are two of the six keys Sabrage models, so
+/// they go through [`crate::config::runtime_toml::read_lines_like_the_runtime`]:
+/// `Config.cpp` assigns only inside its whitelist and its `catch` block
+/// "ignore[s] malformed values and keep[s] the last valid/default setting", so
+/// the value the launched runtime uses is the last assignment it would
+/// **accept** — `protocol = "alvr"` followed by `protocol = "banana"` still
+/// runs ALVR. Reading the last *raw* assignment instead refused a
+/// configuration the runtime accepts (and could demand the arm64 helper for an
+/// `inproc` runtime). The Settings screen reads the same file through the same
+/// function, so the two can no longer name different backends.
+///
+/// Two fallbacks keep the shell's own texts intact when nothing is accepted:
+///
+/// * `protocol` — the raw last assignment, so `protocol='banana'` is quoted
+///   back in run.sh's die, and the empty string (an absent key, an unreadable
+///   file) still reads as run.sh's empty `$PROTOCOL`;
+/// * `encoder_process` — the raw last assignment, which
+///   [`encoder_mode`] then reports as unrecognized-treated-as-auto, and
+///   `auto` when the key is absent (`${ENCODER_PROC:-auto}`).
+///
+/// Last-wins across `[table]` boundaries is load-bearing either way: the
+/// runtime is table-blind, so a second `protocol =` further down the file is
+/// the value it uses; validating the *first* one let a launch pass every ALVR
+/// gate and then start the legacy backend.
+///
+/// One narrow DIVERGENCE from run.sh, in this side's favour and declared in
+/// `sabrage/PARITY.md`: an **unquoted** value (`protocol = alvr`) is accepted
+/// here and reads as the empty string through `awk -F'"'`, which then dies.
+/// The runtime accepts it, so refusing the launch would be the wrong verdict.
 fn read_toml_facts(toml_path: &Path) -> TomlFacts {
     let present = toml_path.is_file();
     // An unreadable-but-present file degrades to empty captures, exactly like
@@ -136,10 +163,18 @@ fn read_toml_facts(toml_path: &Path) -> TomlFacts {
     } else {
         String::new()
     };
-    let raw_encoder = effective_string(&text, "encoder_process");
+    let (values, _invalid, _shadowed) =
+        crate::config::runtime_toml::read_lines_like_the_runtime(&text);
+    let raw_encoder = values
+        .encoder_process
+        .map(|e| e.as_str().to_string())
+        .unwrap_or_else(|| effective_string(&text, "encoder_process"));
     TomlFacts {
         present,
-        protocol: effective_string(&text, "protocol"),
+        protocol: values
+            .protocol
+            .map(|p| p.as_str().to_string())
+            .unwrap_or_else(|| effective_string(&text, "protocol")),
         encoder_process: if raw_encoder.is_empty() {
             "auto".to_string()
         } else {
@@ -255,10 +290,10 @@ pub async fn run(ctx: &StageCtx) -> Result<PreflightFacts> {
             continue;
         }
 
-        let outcome = registry
+        let bound = *registry
             .get(slug)
-            .expect("every contract slug has a bound evaluator")
-            .evaluate(&check_ctx);
+            .expect("every contract slug has a bound evaluator");
+        let outcome = evaluate(ctx, bound, &check_ctx).await?;
 
         match spec.native_gate {
             Gate::Autofix => {
@@ -276,20 +311,80 @@ pub async fn run(ctx: &StageCtx) -> Result<PreflightFacts> {
     })
 }
 
+/// The preflight slugs whose evaluator spawns a **child process** rather than
+/// reading the filesystem.
+///
+/// Exactly one today: `run.wired-adb` runs `adb devices`, which wakes the adb
+/// daemon and, on a bad USB state, can take the whole of its deadline
+/// ([`crate::checks::run_only`]'s `ADB_PROBE_TIMEOUT`). Every other preflight
+/// evaluator is a `stat`/`read`/`cmp` that answers immediately.
+const CHILD_PROBE_SLUGS: [&str; 1] = ["run.wired-adb"];
+
+/// Evaluate one check without pinning the launch to a blocking probe.
+///
+/// Evaluators are synchronous `fn(&CheckCtx)` (the doctor's shape), so a slow
+/// one runs *inside* this future and the walk's cancellation checkpoint —
+/// which sits between evaluators — cannot interrupt it. For the child-probe
+/// slugs that matters: the stage holds [`crate::stages::OPERATION_LOCK`]
+/// throughout, so a wedged `adb devices` used to make Stop wait for it. Those
+/// run on a blocking thread raced against the launch's token; the probe's own
+/// deadline is what bounds the orphaned thread afterwards.
+///
+/// Everything else is evaluated inline, exactly as before: a `stat` is not
+/// worth a thread hop, and doctor (which has no token at all) keeps calling
+/// the same evaluators directly.
+async fn evaluate(
+    ctx: &StageCtx,
+    check: crate::checks::BoundCheck,
+    check_ctx: &crate::checks::CheckCtx,
+) -> Result<CheckOutcome> {
+    if !CHILD_PROBE_SLUGS.contains(&check.slug()) {
+        return Ok(check.evaluate(check_ctx));
+    }
+    let probe_ctx = check_ctx.clone();
+    let mut probe = tokio::task::spawn_blocking(move || check.evaluate(&probe_ctx));
+    tokio::select! {
+        joined = &mut probe => match joined {
+            Ok(outcome) => Ok(outcome),
+            // A panicking evaluator is a bug in this process, not a launch
+            // verdict: re-raise it where it would have been raised inline.
+            Err(e) => match e.try_into_panic() {
+                Ok(panic) => std::panic::resume_unwind(panic),
+                Err(_) => Err(SabrageError::Cancelled),
+            },
+        },
+        _ = ctx.cancel.cancelled() => Err(SabrageError::Cancelled),
+    }
+}
+
+/// run.sh line 87's `info`, verbatim.
+/// `pub` (A1-3) so `sabrage-parity` can pin it against `run.sh` by calling the
+/// real renderer instead of copying the sentence.
+pub const INPROC_NOTICE: &str =
+    "encoder_process=inproc — in-process x86_64 encode (native helper disabled)";
+
+/// run.sh line 89's `warn`. `pub` (A1-3), same reason as [`INPROC_NOTICE`].
+pub fn unrecognized_encoder_warn(encoder_process: &str) -> String {
+    format!(
+        "oxrsys-runtime.toml encoder_process='{encoder_process}' unrecognized — the runtime \
+         treats unknown values as auto"
+    )
+}
+
+/// run.sh line 15's `warn` — the one `warn`-gated row's text, which is not
+/// doctor's. `pub` (A1-3), same reason as [`INPROC_NOTICE`].
+pub fn game_version_warn(version: &str) -> String {
+    format!("Beat Saber version '{version}' != 1.29.4 — the Meta gate may block startup")
+}
+
 /// run.sh lines 87 / 89, verbatim.
 fn emit_encoder_notice(ctx: &StageCtx, mode: EncoderMode, facts: &TomlFacts) {
     let row = ctx.step(step::RUN_PREFLIGHT);
     match mode {
         EncoderMode::HelperRequired => {}
-        EncoderMode::Inproc => {
-            row.info("encoder_process=inproc — in-process x86_64 encode (native helper disabled)");
-        }
+        EncoderMode::Inproc => row.info(INPROC_NOTICE),
         EncoderMode::UnrecognizedTreatedAsAuto => {
-            row.warn(format!(
-                "oxrsys-runtime.toml encoder_process='{}' unrecognized — the runtime treats \
-                 unknown values as auto",
-                facts.encoder_process
-            ));
+            row.warn(unrecognized_encoder_warn(&facts.encoder_process));
         }
     }
 }
@@ -370,10 +465,7 @@ fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFac
             // pointing somewhere unexpected but present), so it is reported
             // and does not block.
             let text = if slug == "game.version" {
-                format!(
-                    "Beat Saber version '{}' != 1.29.4 — the Meta gate may block startup",
-                    bs_version(&ctx.bs_dir)
-                )
+                game_version_warn(&bs_version(&ctx.bs_dir))
             } else {
                 outcome.message.clone()
             };
@@ -428,6 +520,25 @@ fn protocol_gate(
     // Every branch below emits this same row and then decides, so it is
     // emitted once, here: the row reports the check, the branch reports the
     // gate.
+    //
+    // The row is the *doctor* evaluator's verdict (`awk -F'"'`, last raw
+    // assignment), and the gate below is this side's runtime-semantics fact —
+    // the divergence declared in `sabrage/PARITY.md`. When the two disagree
+    // and the launch proceeds anyway (an unquoted value; a valid assignment
+    // shadowed by a later junk one), the row would otherwise read as a red
+    // check the launch silently ignored, so it says why instead.
+    let outcome = if facts.present
+        && facts.protocol == "alvr"
+        && matches!(outcome.status, CheckStatus::Fail | CheckStatus::Warn)
+    {
+        outcome.with_detail(format!(
+            "the launch reads {toml} the way the runtime does: the last value it would accept \
+             is protocol='alvr', so this row does not block the launch (doctor emulates \
+             run.sh's awk, which sees the last assignment as written)"
+        ))
+    } else {
+        outcome
+    };
     emit_check(ctx, outcome, spec.native_gate);
 
     if !facts.present {
@@ -917,6 +1028,38 @@ mod tests {
             facts.encoder_process,
             view.values.encoder_process.unwrap().as_str()
         );
+
+        // A3b-1/A7-1: a *valid* assignment shadowed by a later INVALID one.
+        // Config.cpp assigns only inside its whitelist, so the runtime keeps
+        // alvr/inproc — the raw-last reading (`banana`/`garbage`) refused a
+        // configuration the runtime accepts and demanded the arm64 helper for
+        // an in-process encode.
+        std::fs::write(
+            &toml,
+            b"protocol = \"alvr\"\nencoder_process = \"inproc\"\n\n[tweaks]\nprotocol = \"banana\"\nencoder_process = \"garbage\"\n",
+        )
+        .unwrap();
+        let facts = read_toml_facts(&toml);
+        let view = crate::config::runtime_toml::read(&toml);
+        assert_eq!(facts.protocol, "alvr");
+        assert_eq!(facts.encoder_process, "inproc");
+        assert_eq!(facts.protocol, view.values.protocol.unwrap().as_str());
+        assert_eq!(
+            facts.encoder_process,
+            view.values.encoder_process.unwrap().as_str()
+        );
+
+        // …but when NO occurrence is one the runtime would accept, the raw
+        // last assignment is still what the die text and the unrecognized-
+        // encoder warn quote back.
+        std::fs::write(
+            &toml,
+            b"protocol = \"banana\"\nencoder_process = \"garbage\"\n",
+        )
+        .unwrap();
+        let facts = read_toml_facts(&toml);
+        assert_eq!(facts.protocol, "banana");
+        assert_eq!(facts.encoder_process, "garbage");
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -1687,6 +1830,121 @@ mod tests {
             err.to_string(),
             "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
              Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle FixtureBottle"
+        );
+    }
+
+    /// The repository's own "every key assigned twice, the second one junk"
+    /// fixture, driven through the whole preflight: what the launch judges and
+    /// what the Settings screen shows must be the same six values, and none of
+    /// them the junk. (`oxrsys-runtime.shadowed-invalid-last.toml` is the file
+    /// `config::runtime_toml`'s tests pin the reader against.)
+    #[tokio::test]
+    async fn the_shadowed_invalid_last_fixture_launches_on_its_valid_values() {
+        let f = fixture("proto-fixture-invalid-tail", true);
+        make_everything_pass(&f);
+        let fixture_toml = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/phase4/oxrsys-runtime.shadowed-invalid-last.toml");
+        write(
+            &f.ctx.paths.toml_path,
+            &std::fs::read(&fixture_toml).expect("the phase4 fixture reads"),
+        );
+
+        let facts = run(&f.ctx).await.expect("the runtime accepts this file");
+        let view = crate::config::runtime_toml::read(&f.ctx.paths.toml_path);
+        assert_eq!(facts.protocol, "alvr");
+        assert_eq!(facts.encoder_process, "native");
+        assert_eq!(facts.protocol, view.values.protocol.unwrap().as_str());
+        assert_eq!(
+            facts.encoder_process,
+            view.values.encoder_process.unwrap().as_str()
+        );
+        // `native` still needs the staged arm64 helper, and it is there.
+        for slug in HELPER_SLUGS {
+            assert_eq!(f.check(slug).unwrap().status, CheckStatus::Pass, "{slug}");
+        }
+    }
+
+    /// A7-1/A3b-1: a valid assignment shadowed by a later INVALID one is the
+    /// mirror image of the test above — the runtime keeps the *valid* value,
+    /// so the launch must too. The raw-last reading died on
+    /// `protocol='banana'` and demanded the arm64 helper for a runtime that
+    /// encodes in-process.
+    #[tokio::test]
+    async fn a_trailing_invalid_assignment_leaves_the_previous_valid_one_in_force() {
+        let f = fixture("proto-invalid-tail", true);
+        make_everything_pass(&f);
+        // No staged helper at all: if the encoder fact regressed to `garbage`
+        // (unrecognized ⇒ treated as auto) this would die on the helper.
+        std::fs::remove_file(&f.ctx.paths.oxr_helper_staged).unwrap();
+        write(
+            &f.ctx.paths.toml_path,
+            b"protocol = \"alvr\"\nencoder_process = \"inproc\"\n\n[tweaks]\nprotocol = \"banana\"\nencoder_process = \"garbage\"\n",
+        );
+
+        let facts = run(&f.ctx).await.expect("the runtime accepts this file");
+        assert_eq!(facts.protocol, "alvr");
+        assert_eq!(facts.encoder_process, "inproc");
+
+        for slug in HELPER_SLUGS {
+            assert_eq!(
+                f.check(slug).unwrap().status,
+                CheckStatus::Skipped,
+                "{slug} must be skipped for an inproc runtime"
+            );
+        }
+        assert!(
+            !f.lines().iter().any(|l| l.contains("unrecognized")),
+            "no unrecognized-encoder warn for a value the runtime ignores: {:?}",
+            f.lines()
+        );
+        // The doctor evaluator still reports its own `awk` verdict (declared
+        // divergence, PARITY.md) — but the row says why the launch went on.
+        let row = f.check("cfg.protocol.supported").unwrap();
+        assert_eq!(row.status, CheckStatus::Fail);
+        assert!(
+            row.detail
+                .unwrap()
+                .contains("the last value it would accept is protocol='alvr'"),
+            "a red row the launch ignores must explain itself"
+        );
+    }
+
+    /// A7-4: `run.wired-adb` shells out to `adb devices`. A wedged adb used to
+    /// block inside the synchronous evaluator, so Stop could not land until it
+    /// returned — with the operation lock held throughout.
+    #[tokio::test]
+    async fn a_cancel_during_the_wired_adb_probe_stops_the_walk_promptly() {
+        let f = fixture("wired-probe-cancel", true);
+        make_everything_pass(&f);
+        let mut ctx = f.ctx.clone();
+        ctx.opts.wired = true;
+        // An `adb` that marks that it started and then never answers.
+        let adb = f.root.join("platform-tools/adb");
+        // `sleep 5`, not a longer one: the abandoned blocking thread outlives
+        // the assertion and the test runtime waits for it on shutdown.
+        write_exec(
+            &adb,
+            b"#!/bin/sh\n: > \"$(dirname \"$0\")/probing\"\nsleep 5\n",
+        );
+        ctx.paths.adb = Some(adb);
+
+        let cancel = ctx.cancel.clone();
+        let marker = f.root.join("platform-tools/probing");
+        tokio::spawn(async move {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            cancel.cancel();
+        });
+
+        let started = std::time::Instant::now();
+        let err = run(&ctx).await.unwrap_err();
+        let waited = started.elapsed();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        assert!(
+            waited < std::time::Duration::from_secs(3),
+            "Stop must not wait out the probe, waited {waited:?}"
         );
     }
 

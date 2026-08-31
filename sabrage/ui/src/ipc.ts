@@ -220,10 +220,11 @@ export interface FixRunOpts {
  * path is `runStage` directly (see `contractFixIdToAction`'s doc comment)
  * rather than `applyFix`.
  *
- * Every fix is additionally `forbidden_while_session_live` on the Rust side
- * and refused by `fixes::apply` before it takes the operation lock, so a Fix
- * button offered during a live session fails with a remedy rather than
- * mutating; disable them with `blocksMutation(status.phase)` so the user
+ * Every fix is additionally `forbidden_while_session_live` on the Rust side,
+ * refused by `fixes::apply` both before it takes the operation lock and again
+ * with it held (a session can start during a long wait), so a Fix button
+ * offered during — or just before — a live session fails with a remedy rather
+ * than mutating; disable them with `blocksMutation(status.phase)` so the user
  * learns that before clicking. */
 export const FIX_META: Record<
   FixAction,
@@ -302,14 +303,39 @@ export const FIX_META: Record<
   },
 };
 
+/** Contract fix ids Sabrage deliberately **withholds** — mirrors
+ * `sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`, and the reason
+ * `contractFixIdToAction` cannot just ask whether `FIX_META` has a key:
+ *
+ * - `fix.create-z-drive` — no `FixAction` models it at all (it is absent from
+ *   `FIX_META` too, so this entry is belt-and-braces);
+ * - `fix.delete-session-json` — modelled *and* documented here (the confirm
+ *   dialog needs its title and `consequence` for the CLI-initiated path), but
+ *   never offered as a button: deleting that file is known to leave the client
+ *   at an 800x900 black screen, and editing the pinned IP on the Settings
+ *   screen is the recovery that works.
+ *
+ * Keeping the metadata while withholding the button is exactly what this set
+ * exists for — `bare in FIX_META` used to be the whole test, which is how
+ * `cfg.session-pins` kept rendering a Fix button for a remedy Rust had already
+ * stopped offering. `run_doctor` now also projects every row's fix id through
+ * `FixAction::from_contract_id` before it goes on the wire and the `fix`
+ * command refuses a withheld action outright, so this is the third of three
+ * doors, not the only one. */
+const DEFERRED_FIX_IDS: ReadonlySet<string> = new Set([
+  "fix.create-z-drive",
+  "fix.delete-session-json",
+]);
+
 /** `"fix.set-graphics-backend"` -> `"set-graphics-backend"`; `null` for a
- * contract id this table does not model — mirrors
- * `FixAction::from_contract_id`. `fix.create-z-drive` is the one remaining
- * deliberately-deferred id (`fix.edit-protocol` resolves to
- * `"edit-protocol"` as of Phase 4). A `null` result means "render no Fix
- * button", not an error. */
+ * contract id this table does not model **and** for one it models but does not
+ * offer (`DEFERRED_FIX_IDS`) — mirrors `FixAction::from_contract_id` exactly.
+ * `fix.edit-protocol` resolves to `"edit-protocol"` as of Phase 4. A `null`
+ * result means "render no Fix button", not an error. */
 export function contractFixIdToAction(id: string): FixAction | null {
-  const bare = id.startsWith("fix.") ? id.slice(4) : id;
+  const full = id.startsWith("fix.") ? id : `fix.${id}`;
+  if (DEFERRED_FIX_IDS.has(full)) return null;
+  const bare = full.slice(4);
   return bare in FIX_META ? (bare as FixAction) : null;
 }
 
@@ -376,7 +402,18 @@ export async function stopSession(
  * Apply one fix. Destructive fixes (`FIX_META[action].destructive`) must not
  * be called with `confirmed: false` — the backend refuses them (see
  * `commands::fix`'s doc comment); show an in-app confirm dialog first, never
- * `window.confirm` (it blocks the webview).
+ * `window.confirm` (it blocks the webview). An action `contractFixIdToAction`
+ * withholds (`DEFERRED_FIX_IDS`) is refused outright, confirmed or not.
+ *
+ * **The first `onEvent` carries the run id.** `fixes::apply` emits an
+ * `"applying fix '<action>'"` line *before* it waits for the operation lock
+ * (and a "waiting for another Sabrage operation to finish" line when it has
+ * to), so `ev.runId` from that first event is a live `cancelStage(runId)`
+ * handle for the whole wait — a fix queued behind another Sabrage process's
+ * build can run for minutes before it mutates anything, and the wait itself
+ * ends immediately on cancel with nothing touched. Capture it and enable a
+ * Cancel affordance; a call site that ignores it leaves the user with no way
+ * out of a queued mutation.
  */
 export async function applyFix(
   action: FixAction,
@@ -759,14 +796,16 @@ export interface QueuedStage {
  * `stopSession` call finds another operation already in flight and has to
  * wait for it.
  *
- * `run_stage` takes the operation lock *before* emitting its first
- * `stageStarted`, so until this event existed a queued run had no id the UI
- * could offer Cancel for: the button stayed disabled for the whole wait, and
- * then the stage mutated the machine when its turn came. Cancelling on this
- * id works — the executor fails every filesystem primitive once the token
- * fires, so a run cancelled while queued is a no-op when it finally gets the
- * lock. Treat it exactly like `stageStarted`'s `runId` (and expect
- * `stageStarted` for the same run later).
+ * `run_stage` used to take the operation lock *before* emitting its first
+ * `stageStarted`, so a queued run had no id the UI could offer Cancel for:
+ * the button stayed disabled for the whole wait, and then the stage mutated
+ * the machine when its turn came. Core now emits `stageStarted` first, so the
+ * id exists either way; this event additionally names the wait *as* a wait
+ * (the common case is queueing behind a `sabrage` CLI build in another
+ * process, which nothing on the stage channel would mention). Cancelling on
+ * this id works — the lock wait itself is cancellable, and the executor fails
+ * every filesystem primitive once the token fires. Treat it exactly like
+ * `stageStarted`'s `runId` (and expect `stageStarted` for the same run).
  */
 export async function onStageQueued(cb: (queued: QueuedStage) => void): Promise<UnlistenFn> {
   return listen<QueuedStage>("stage://queued", (event) => cb(event.payload));
@@ -905,12 +944,23 @@ export async function writeRuntimeConfig(patch: RuntimeConfigPatch): Promise<Wri
 
 /** Mirrors `store::settings::LaunchDefaults` (serde camelCase) — the four
  * `run.sh`-only flags (see `LaunchOpts`'s doc comment), as app-wide defaults
- * rather than one launch's overrides. */
+ * rather than one launch's overrides.
+ *
+ * The index signature is the wire half of `LaunchDefaults`'s own
+ * `#[serde(flatten)] extra` map, for the same reason `Settings` has one a
+ * level up: a key a *newer* Sabrage wrote inside `launch` was previously
+ * dropped while deserializing and deleted by the next autosave. Spread the
+ * loaded object (`{ ...settings.launch, wired: true }`) rather than rebuilding
+ * it field by field, or the extras are stripped before they reach the
+ * backend. */
 export interface LaunchDefaults {
   noAudio: boolean;
   noDashboard: boolean;
   wired: boolean;
   verbose: boolean;
+  /** Keys inside `launch` this build has no field for — a newer schema's.
+   * Opaque: pass them through untouched. */
+  [key: string]: unknown;
 }
 
 /** Mirrors `store::settings::Settings` (serde camelCase).

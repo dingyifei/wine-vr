@@ -55,6 +55,15 @@
    * disabling the real Run button (and leaving Dry-run offered) would just
    * move the failure from "disabled, explained" to "clicked, then refused". */
   const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
+  /** A stage started from elsewhere (this same panel, Doctor's whole-stage
+   * Fix, GateModal's own "Open <stage>" remedy) can still be running after
+   * its dialog was Hidden — `stageStore.gate` goes back to `null` on Hide,
+   * but the underlying `runStage` invocation and its lock hold keep going.
+   * Without this, Run/Dry-run here would silently queue a second `openGate`
+   * that the modal defers until the hidden one finishes, then displays with
+   * the wrong title over the wrong rows — see the GateModal fix this pairs
+   * with. */
+  const stageRunning = $derived(stageStore.running);
 
   onMount(async () => {
     const state = await bottlesStore.load();
@@ -144,14 +153,20 @@
               <p class="text-muted stage-live-note">
                 A session is live — Setup/Build/Install are refused until it's stopped.
               </p>
+            {:else if stageRunning}
+              <p class="text-muted stage-live-note">A stage is already running — wait for it to finish.</p>
             {/if}
             <div class="stage-card-actions">
-              <button class="btn btn-secondary" disabled={sessionLive} onclick={() => run(card, true)}>
+              <button
+                class="btn btn-secondary"
+                disabled={sessionLive || stageRunning}
+                onclick={() => run(card, true)}
+              >
                 Dry-run
               </button>
               <button
                 class="btn btn-primary"
-                disabled={sessionLive || (card.needsBottle && !selectedBottle)}
+                disabled={sessionLive || stageRunning || (card.needsBottle && !selectedBottle)}
                 onclick={() => run(card, false)}
               >
                 Run

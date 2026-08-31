@@ -10,7 +10,23 @@
 //!   net.adb-forwards ok`)
 //!
 //! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim,
+//! with one recorded exception (below).
+//!
+//! ## `net.adb-forwards` failed-probe divergence (A4-4)
+//!
+//! doctor.sh discards adb's stderr and ignores its exit status
+//! (`FWD="$("$ADB" forward --list 2>/dev/null | awk …)"`), so a probe that
+//! *failed* produces an empty `$FWD` and taps `ok` — "no stale forwards" —
+//! silently. [`net_adb_forwards`] Warns instead: a failed query is not
+//! evidence that `tcp:9943`/`tcp:9944` are absent, and left behind they break
+//! WiFi discovery. That makes the two doctors disagree on this slug's tap
+//! channel (`ok` vs `warn`) for one machine state — adb present, its server
+//! unreachable — which `scripts/dev/parity.sh` tier-2 diffs, and prints a
+//! console row doctor.sh never emits. Needs either a matching
+//! `scripts/demo/doctor.sh` change (an exit-status test on the `adb forward
+//! --list` pipeline) or a `sabrage/PARITY.md` row declaring the divergence
+//! (cross-area — this module cannot make either edit).
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -79,16 +95,31 @@ fn net_ports(_ctx: &CheckCtx) -> CheckOutcome {
 /// `"$ADB" forward --list 2>/dev/null | awk '{print $2}'` — the local side
 /// (`tcp:<port>`) of every forward, one per line of `adb forward --list`'s
 /// `<serial> <local> <remote>` rows.
-fn adb_forward_local_specs(adb: &Path) -> Vec<String> {
-    let out = match Command::new(adb).args(["forward", "--list"]).output() {
-        Ok(o) => o,
-        Err(_) => return Vec::new(),
-    };
-    String::from_utf8_lossy(&out.stdout)
+///
+/// `Err` means the probe itself failed (couldn't spawn `adb`, or `adb`
+/// exited non-zero) — distinct from `Ok(vec![])`, which means the probe
+/// ran cleanly and genuinely found no forwards. Callers must not fold the
+/// two together: a failed probe is not evidence of a clean state (A4-4 /
+/// A3b packet — the previous `Vec::new()`-on-any-error return made an ADB
+/// query failure indistinguishable from "no forwards", so `net_adb_forwards`
+/// reported Pass on a broken probe).
+fn adb_forward_local_specs(adb: &Path) -> Result<Vec<String>, String> {
+    let out = Command::new(adb)
+        .args(["forward", "--list"])
+        .output()
+        .map_err(|e| format!("failed to run '{}': {e}", adb.display()))?;
+    if !out.status.success() {
+        return Err(format!(
+            "'{} forward --list' exited with {}",
+            adb.display(),
+            out.status
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| line.split_whitespace().nth(1))
         .map(str::to_string)
-        .collect()
+        .collect())
 }
 
 /// doctor.sh section 16b:
@@ -107,7 +138,24 @@ fn net_adb_forwards(ctx: &CheckCtx) -> CheckOutcome {
     let Some(adb) = ctx.paths.adb.as_deref() else {
         return CheckOutcome::skipped("net.adb-forwards", SkipReason::new("adb not found"));
     };
-    let specs = adb_forward_local_specs(adb);
+    let specs = match adb_forward_local_specs(adb) {
+        Ok(specs) => specs,
+        // A4-4 / A3b packet: a failed probe is not "no stale forwards" —
+        // stale tcp:9943/tcp:9944 forwards may still be present and would
+        // silently break WiFi discovery, so this must not resolve to Pass.
+        Err(e) => {
+            return CheckOutcome::warn(
+                "net.adb-forwards",
+                format!(
+                    "could not query adb port forwards ({e}) — stale tcp:9943/tcp:9944 \
+                     forwards may still be present and would break WiFi discovery; check \
+                     manually with '{} forward --list'",
+                    adb.display()
+                ),
+            )
+            .with_detail(e);
+        }
+    };
     let stale = specs.iter().any(|s| s == "tcp:9943" || s == "tcp:9944");
     if stale {
         CheckOutcome::warn(
@@ -188,7 +236,9 @@ mod tests {
         let Some(adb) = c.paths.adb.clone() else {
             return; // no adb on this machine; covered by the skip test above
         };
-        let specs = adb_forward_local_specs(&adb);
+        let Ok(specs) = adb_forward_local_specs(&adb) else {
+            return; // probe itself failed on this machine; covered below
+        };
         let stale = specs.iter().any(|s| s == "tcp:9943" || s == "tcp:9944");
         let o = net_adb_forwards(&c);
         if stale {
@@ -196,6 +246,47 @@ mod tests {
         } else {
             assert_eq!(o.status, CheckStatus::Pass);
         }
+    }
+
+    // ── A4-4 / A3b packet: a failed adb probe must not read as "clean" ────────
+
+    #[test]
+    fn adb_forward_local_specs_reports_spawn_failure_as_err() {
+        let bogus = Path::new("/nonexistent/sabrage-network-probe/not-a-real-adb-binary");
+        let err = adb_forward_local_specs(bogus).expect_err("spawn must fail for a missing binary");
+        assert!(
+            err.contains("failed to run"),
+            "unexpected error text: {err}"
+        );
+    }
+
+    #[test]
+    fn net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb() {
+        let opts = CheckOptions::new();
+        let mut c = CheckCtx::new(Paths::new("/nonexistent/sabrage-network-probe"), opts);
+        c.paths.adb = Some(std::path::PathBuf::from(
+            "/nonexistent/sabrage-network-probe/not-a-real-adb-binary",
+        ));
+        let o = net_adb_forwards(&c);
+        assert_eq!(o.status, CheckStatus::Warn);
+        assert!(
+            o.message.contains("could not query adb port forwards"),
+            "message must say the probe failed, not that forwards are clean: {}",
+            o.message
+        );
+        assert_ne!(o.message, "no stale adb port forwards");
+    }
+
+    #[test]
+    fn adb_forward_local_specs_reports_nonzero_exit_as_err() {
+        // `false` always exits 1 without touching stdout — exercises the
+        // exit-status branch distinctly from the spawn-failure branch above.
+        let false_bin = Path::new("/usr/bin/false");
+        if !false_bin.is_file() {
+            return; // not present on this machine; the spawn-failure test covers the Result plumbing
+        }
+        let err = adb_forward_local_specs(false_bin).expect_err("non-zero exit must be Err");
+        assert!(err.contains("exited with"), "unexpected error text: {err}");
     }
 
     #[test]

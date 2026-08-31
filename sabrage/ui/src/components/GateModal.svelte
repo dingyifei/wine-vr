@@ -71,8 +71,6 @@
     }
   }
 
-  const isRunMode = $derived(request?.stage === "run");
-
   // ── non-run modes (setup/build/install/stop): this component drives runStage itself ──
 
   let runId = $state<string | null>(null);
@@ -99,6 +97,13 @@
   let sawFatal = $state(false);
   let confirmFix = $state<FixAction | null>(null);
   let fixBusy = $state(false);
+  /** The in-flight fix's own run id, off the first `StageEvent` `applyFix`
+   * streams — distinct from `runId` above (the stage's own run, which a fix
+   * applied from a Fatal row does not touch). `fixes::apply` emits it before
+   * waiting for the operation lock, so a fix queued behind another Sabrage
+   * operation still has a live `cancelStage` target. */
+  let fixRunId = $state<string | null>(null);
+  let fixCancelling = $state(false);
   let fixError = $state<string | null>(null);
   /** Run-mode-only echo of a successful non-destructive fix's description —
    * the non-run path shows the same text as an inline `ok` row instead
@@ -107,25 +112,43 @@
 
   let rowsEl: HTMLDivElement | null = $state(null);
   let consoleEl: HTMLPreElement | null = $state(null);
-  let started: GateRequest | null = null;
+  /**
+   * The request actually driving `rows`/`runId`/`sessionStore.launchRows` —
+   * as opposed to `request` (the prop), which is whatever `stageStore.gate`
+   * currently holds and can be replaced by a fresh `openGate(...)` call
+   * (e.g. StagesPanel's Run button, or a Doctor whole-stage Fix) while this
+   * one is still running and merely hidden (Hide clears `gate` without
+   * touching `running`/`runId`). The template renders from `displayRequest`
+   * below, never from `request` directly, so a queued replacement cannot
+   * relabel the in-flight operation's title/rows/Cancel target — see the
+   * "Hiding a gate lets Cancel target the previous stage" fix.
+   */
+  let activeRequest = $state<GateRequest | null>(null);
+  /** Falls back to `request` only when nothing has started yet (first paint
+   * of a fresh gate, before this effect has run) — otherwise always the
+   * in-flight/just-finished operation. */
+  const displayRequest = $derived(activeRequest ?? request);
+  const isRunMode = $derived(displayRequest?.stage === "run");
 
   // Fresh `openGate(...)` calls always hand in a new object, so identity
   // comparison is enough to detect "a new run was requested" — including a
   // Fix button re-opening the same modal for a different stage. Run mode
   // never calls `start()`: `sessionStore.launch(...)` was already invoked by
-  // whoever opened this gate, and this component only observes it.
+  // whoever opened this gate, and this component only observes it. A
+  // replacement request that arrives while `running` is true is deliberately
+  // left un-started (and un-displayed) until the current one settles.
   $effect(() => {
     const r = request;
-    if (r && r !== started && !running) {
-      started = r;
+    if (r && r !== activeRequest && !running) {
+      activeRequest = r;
       if (r.stage !== "run") {
         void start(r);
       } else {
         resetRunModeLocals();
       }
     }
-    if (!r) {
-      started = null;
+    if (!r && !running) {
+      activeRequest = null;
     }
   });
 
@@ -147,7 +170,7 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
     void onStageQueued((q) => {
-      if (request && q.stage === request.stage) {
+      if (displayRequest && q.stage === displayRequest.stage) {
         queuedRunId = q.runId;
       }
     }).then((fn) => {
@@ -168,12 +191,16 @@
     sawFatal = false;
     confirmFix = null;
     fixError = null;
+    fixRunId = null;
+    fixCancelling = false;
   }
 
   function resetRunModeLocals() {
     queuedRunId = null;
     confirmFix = null;
     fixError = null;
+    fixRunId = null;
+    fixCancelling = false;
     fixNotice = null;
     autoCloseFired = false;
     if (autoCloseTimer) {
@@ -185,6 +212,11 @@
   async function start(req: GateRequest) {
     reset();
     running = true;
+    // Mirrored on the store so other openers (StagesPanel's Run/Dry-run,
+    // Doctor's whole-stage Fix) can disable themselves instead of racing a
+    // second `openGate(...)` against this still-in-flight one — see that
+    // flag's doc comment in stage.svelte.ts.
+    stageStore.setRunning(true);
     try {
       finished = await runStage(
         req.stage,
@@ -195,6 +227,7 @@
       if (!sawFatal) invokeError = errMsg(e);
     } finally {
       running = false;
+      stageStore.setRunning(false);
       req.onFinished?.();
     }
   }
@@ -240,7 +273,7 @@
     if (meta.stage) {
       // A whole-stage remedy (e.g. "run setup" after a build failure): reopen
       // this same modal against that stage instead of a second dialog.
-      stageStore.openGate({ stage: meta.stage, bottle: request?.bottle, bsDir: request?.bsDir });
+      stageStore.openGate({ stage: meta.stage, bottle: displayRequest?.bottle, bsDir: displayRequest?.bsDir });
       return;
     }
     if (meta.destructive) {
@@ -255,20 +288,46 @@
     fixBusy = true;
     fixError = null;
     fixNotice = null;
+    fixRunId = null;
+    fixCancelling = false;
     try {
-      const report = await applyFix(action, { bottle: request?.bottle, bsDir: request?.bsDir }, true, handleEvent);
+      const report = await applyFix(
+        action,
+        { bottle: displayRequest?.bottle, bsDir: displayRequest?.bsDir },
+        true,
+        (ev) => {
+          // The first event of this fix's own stream carries its run id —
+          // capture it once, before delegating to the shared row renderer,
+          // so Cancel can target this fix (not the stage's `runId` above)
+          // even while it is still queued behind another operation.
+          if (fixRunId === null) fixRunId = ev.runId;
+          handleEvent(ev);
+        },
+      );
       if (isRunMode) {
         fixNotice = report.description;
       } else {
         rows.push({ kind: "line", step: null, severity: "ok", text: report.description, remedy: null });
       }
-      if (report.changed && request && request.stage !== "run") {
-        void start(request);
+      if (report.changed && activeRequest && activeRequest.stage !== "run") {
+        void start(activeRequest);
       }
     } catch (e) {
       fixError = errMsg(e);
     } finally {
       fixBusy = false;
+      fixRunId = null;
+      fixCancelling = false;
+    }
+  }
+
+  async function cancelFix() {
+    if (!fixRunId || fixCancelling) return;
+    fixCancelling = true;
+    try {
+      await cancelStage(fixRunId);
+    } finally {
+      fixCancelling = false;
     }
   }
 
@@ -333,7 +392,7 @@
   }
 
   function retryLaunch() {
-    if (request?.launch) void sessionStore.launch(request.launch);
+    if (displayRequest?.launch) void sessionStore.launch(displayRequest.launch);
   }
 
   let autoCloseFired = false;
@@ -451,7 +510,7 @@
       <div>
         <div class="card-kicker">Pipeline</div>
         <div class="dialog-title gate-title">
-          <span>{cap(request.stage)}</span>
+          <span>{cap(displayRequest!.stage)}</span>
           {#if latestProgress}
             <span class="text-muted gate-progress">{latestProgress.label}</span>
           {/if}
@@ -498,6 +557,16 @@
           <div class="confirm-actions">
             <button class="btn btn-secondary" onclick={() => (confirmFix = null)}>Cancel</button>
             <button class="btn btn-primary" onclick={() => doApplyFix(confirmFix!)}>Yes, continue</button>
+          </div>
+        </div>
+      {/if}
+      {#if fixBusy && fixRunId}
+        <div class="confirm-inline">
+          <div class="text-muted">
+            Applying fix{fixCancelling ? " — cancelling…" : "…"} it can be cancelled while it waits or runs.
+          </div>
+          <div class="confirm-actions">
+            <button class="btn btn-secondary" onclick={cancelFix} disabled={fixCancelling}>Cancel</button>
           </div>
         </div>
       {/if}
@@ -550,7 +619,7 @@
           {#if runLaunchedEv}
             <button class="btn btn-primary" onclick={openSessionNow}>Open Session</button>
           {:else if runFatalEv || runDone}
-            {#if runFatalEv && request.launch}
+            {#if runFatalEv && displayRequest?.launch}
               <button class="btn btn-secondary" onclick={retryLaunch}>Retry</button>
             {/if}
             <button class="btn btn-primary" onclick={onClose}>Close</button>

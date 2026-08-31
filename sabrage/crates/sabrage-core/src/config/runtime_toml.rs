@@ -345,25 +345,54 @@ impl RuntimeConfigView {
 /// Two reasons, both meaning "an edit would not land where the runtime looks":
 ///
 /// 1. `toml_edit` cannot parse it at all, so [`apply_patch`] has no document;
-/// 2. it parses, but the physical lines carry an assignment of an editable key
-///    that the document does not — a `"""…"""` (or `'''…'''`) block whose
-///    content looks like `protocol = "oxrsys"`. The runtime reads that line;
-///    `toml_edit` sees string content, so an edit would rewrite some *other*
-///    line and the runtime would keep obeying the one inside the string.
+/// 2. it parses, but the physical lines and the parsed document disagree about
+///    how many assignments of an editable key exist — see
+///    [`line_document_mismatch`].
 fn round_trip_error(text: &str) -> Option<String> {
     let body = strip_bom(text);
     let doc = match body.parse::<DocumentMut>() {
         Ok(doc) => doc,
         Err(e) => return Some(e.to_string()),
     };
+    line_document_mismatch(&doc, text)
+}
+
+/// The second half of [`round_trip_error`], over an already-parsed document, so
+/// [`apply_patch`] can consult it without parsing the file twice.
+///
+/// Both directions of the disagreement are a refusal, because both mean "an
+/// edit would not land where the runtime looks":
+///
+/// * **more physical than parsed** — a `"""…"""` (or `'''…'''`) block whose
+///   content looks like `protocol = "oxrsys"`. The runtime reads that line;
+///   `toml_edit` sees string content, so an edit would rewrite some *other*
+///   line and the runtime would keep obeying the one inside the string;
+/// * **more parsed than physical** — an editable key `toml_edit` can see and
+///   the runtime's line reader cannot. The only shape that produces it is a
+///   byte-order mark sitting on the key's own line (`\u{feff}protocol = …`):
+///   `toml_edit` is handed the BOM-stripped body, while
+///   [`raw_assignments`] scans the original bytes and `str::trim` does not
+///   remove U+FEFF — and neither does `Config.cpp`, which sees the same byte.
+///   Editing that line would report a change the runtime never observes, so it
+///   is refused rather than "fixed" by stripping the BOM from the key (which
+///   would be a byte Sabrage does not own).
+fn line_document_mismatch(doc: &DocumentMut, text: &str) -> Option<String> {
     let seen: Vec<(&str, &str)> = raw_assignments(text).collect();
     for key in EDITABLE_KEYS {
         let physical = seen.iter().filter(|(k, _)| *k == key).count();
-        if physical > occurrences_of(doc.as_table(), key).len() {
+        let parsed = occurrences_of(doc.as_table(), key).len();
+        if physical > parsed {
             return Some(format!(
                 "'{key}' is assigned on a physical line that TOML reads as string content (a \
                  multiline string): the runtime honours that line and an edit here could not \
                  reach it — edit this file by hand"
+            ));
+        }
+        if parsed > physical {
+            return Some(format!(
+                "'{key}' is assigned on a line the runtime's reader does not see (a byte-order \
+                 mark or another stray byte in front of the key): the runtime ignores that line \
+                 and an edit here could not change what it uses — edit this file by hand"
             ));
         }
     }
@@ -495,6 +524,20 @@ impl Setting {
         }
     }
 
+    /// An accepted value as the plain string the runtime holds — no quotes,
+    /// the enum's own spelling for the three string keys. What
+    /// [`effective_accepted`] hands the launch preflight, which compares
+    /// against `"alvr"`/`"inproc"` the way `run.sh` compares its `awk` capture.
+    fn runtime_string(self) -> String {
+        match self {
+            Setting::Protocol(p) => p.as_str().to_string(),
+            Setting::VideoCodec(c) => c.as_str().to_string(),
+            Setting::EncoderProcess(e) => e.as_str().to_string(),
+            Setting::Bitrate(n) | Setting::Refresh(n) => n.to_string(),
+            Setting::Scale(f) => format!("{f}"),
+        }
+    }
+
     /// Store an accepted assignment. Later calls win, which is the runtime's
     /// last-valid-wins rule expressed as a fold.
     fn apply(self, values: &mut RuntimeConfigValues) {
@@ -590,8 +633,21 @@ fn in_bitrate_range(n: i64) -> bool {
     n >= i64::from(BITRATE_RANGE.0) && n <= i64::from(BITRATE_RANGE.1)
 }
 
+/// `Config.cpp:367-372`'s bounds check, at `Config.cpp`'s precision:
+/// `float val = std::stof(value); if (val >= 0.25f && val <= 1.0f)`.
+///
+/// The narrowing to `f32` is the load-bearing part. `std::stof` produces a
+/// C++ `float`, so `1.00000001` *is* `1.0f` to the runtime and is accepted;
+/// comparing the `f64` Rust parsed would reject it and the Settings screen
+/// would then show the `0.75` default for a file the runtime reads as `1.0`.
+/// The bounds themselves are exactly representable, so the two comparisons
+/// agree everywhere except within one `f32` ulp of an endpoint — which is the
+/// whole point.
 fn in_scale_range(f: f64) -> bool {
-    f.is_finite() && f >= RESOLUTION_SCALE_RANGE.0 && f <= RESOLUTION_SCALE_RANGE.1
+    let narrowed = f as f32;
+    narrowed.is_finite()
+        && f64::from(narrowed) >= RESOLUTION_SCALE_RANGE.0
+        && f64::from(narrowed) <= RESOLUTION_SCALE_RANGE.1
 }
 
 // ── the reader (the runtime's own semantics) ─────────────────────────────────
@@ -671,6 +727,34 @@ pub fn effective_string(text: &str, key: &str) -> Option<String> {
     raw_assignments(text)
         .filter(|(k, _)| *k == key)
         .map(|(_, v)| unquote(v).to_string())
+        .last()
+}
+
+/// The value the runtime would end up with for one of the **six modeled** keys:
+/// the last assignment it would *accept*, in the key's canonical spelling.
+///
+/// [`effective_string`] answers "what does the last line say"; this answers
+/// "what is the runtime holding", and the two differ exactly where `Config.cpp`
+/// throws a value away: its whitelist/range check runs per assignment and its
+/// `catch` block keeps the previous accepted value, so
+/// `protocol = "alvr"` followed by `protocol = "banana"` leaves ALVR in force.
+/// Reading that file with the raw last-wins helper reports `banana` and blocks
+/// a launch the runtime would have run — which is the whole reason this exists.
+///
+/// `None` means *no occurrence of this key was accepted* (including "the key is
+/// absent" and "this key is not one of [`EDITABLE_KEYS`]"), so the caller's own
+/// default applies — the same contract [`effective_string`] has, and the reason
+/// callers that only need last-raw semantics for keys Sabrage does not model
+/// keep using that one.
+///
+/// This is [`read_lines_like_the_runtime`]'s fold, narrowed to one key and
+/// rendered back as a string: same [`Setting::read_raw`], so the two cannot
+/// disagree about what the runtime accepts.
+pub fn effective_accepted(text: &str, key: &str) -> Option<String> {
+    raw_assignments(text)
+        .filter(|(k, _)| *k == key)
+        .filter_map(|(_, raw)| Setting::read_raw(key, raw).ok().flatten())
+        .map(Setting::runtime_string)
         .last()
 }
 
@@ -842,6 +926,18 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
             "oxrsys-runtime.toml is not valid TOML, refusing to rewrite it: {e}"
         ))
     })?;
+
+    // The other half of [`round_trip_error`], enforced here rather than only in
+    // [`RuntimeConfigView::parse_error`]: the GUI checks the view before it
+    // offers Save, but `write`, `edit_protocol` and the golden tests all come
+    // through this function, and a file whose physical lines disagree with the
+    // parsed document is one where an edit lands on a line the runtime does not
+    // read. Reporting success for that is worse than refusing.
+    if let Some(why) = line_document_mismatch(&doc, text) {
+        return Err(SabrageError::InvalidInput(format!(
+            "refusing to rewrite oxrsys-runtime.toml: {why}"
+        )));
+    }
 
     let mut changed_keys = Vec::new();
     let mut shadowed = Vec::new();
@@ -1220,31 +1316,68 @@ pub async fn write(
 
     still_safe_to_replace(executor, toml_path, &session_state, &base)?;
 
+    // The prune list is computed BEFORE the new backup is written: a real run
+    // would otherwise see it in the listing and a dry run would not, and the
+    // two modes must plan the same set of removals. It is *executed* after the
+    // commit — see below.
+    let mut stale: Vec<BackupInfo> = Vec::new();
+    let mut reserved: Option<PathBuf> = None;
     if exists {
-        // The prune list is computed BEFORE the new backup is written: a real
-        // run would otherwise see it in the listing and a dry run would not,
-        // and the two modes must plan the same set of removals.
-        let stale: Vec<BackupInfo> = list_backups(backups_dir)
+        stale = list_backups(backups_dir)
             .into_iter()
             .skip(BACKUP_KEEP.saturating_sub(1))
             .collect();
         executor.create_dir_all(backups_dir).await?;
         let backup =
             reserve_backup_path(executor, backups_dir, unix_secs(), base.as_bytes()).await?;
-        for old in stale {
-            executor.remove_file(Path::new(&old.path)).await?;
-        }
         report.backup_path = Some(backup.display().to_string());
+        reserved = Some(backup);
     }
 
-    // Again, immediately before the replacement: the backup write and the prune
-    // above are the widest part of the window a concurrent editor can land in,
-    // and the backup we just took describes `base`, not whatever is there now.
-    still_safe_to_replace(executor, toml_path, &session_state, &base)?;
+    // A10-2: everything from here to the rename is undone on failure, so an
+    // aborted save is a complete no-op — the recovery history a user reaches
+    // for after a failed save must still be the one they had before it. The new
+    // backup has to exist *before* the destination moves (it describes `base`),
+    // but nothing older may be dropped until there is a new state to keep
+    // history for, and the reservation itself is unlinked if the commit never
+    // happens. Without that, the compare-and-swap's "nothing was written" was
+    // a lie: three backups were already gone.
+    //
+    // The check itself runs again immediately before the replacement: the
+    // backup write above is the widest part of the window a concurrent editor
+    // can land in, and the backup we just took describes `base`, not whatever
+    // is there now.
+    let committed = match still_safe_to_replace(executor, toml_path, &session_state, &base) {
+        Ok(()) => {
+            executor
+                .write_atomic(toml_path, patched.text.as_bytes())
+                .await
+        }
+        Err(e) => Err(e),
+    };
+    if let Err(e) = committed {
+        if let Some(backup) = &reserved {
+            // Best-effort: a backup we cannot remove is a stray copy of bytes
+            // that are still on disk, which is harmless next to reporting the
+            // original failure.
+            let _ = executor.remove_file(backup).await;
+        }
+        return Err(e);
+    }
 
-    executor
-        .write_atomic(toml_path, patched.text.as_bytes())
-        .await?;
+    // Best-effort, and deliberately not `?`: the commit above already
+    // happened. A prune failure (an unlinkable stale backup, a Stop landing
+    // between the rename and this loop) reported as `Err` told the caller the
+    // save had failed over a file that already holds the new bytes — the
+    // Settings screen then re-rendered the *old* values with a dirty draft
+    // while the runtime, which re-reads the file every 250 ms, had taken the
+    // new ones, and `fixes::edit_protocol` reported a fix as cancelled after
+    // it had set `protocol = "alvr"`. A backup that outlives its window is a
+    // stray copy of bytes that are still recoverable; a lie about whether the
+    // config was written is not.
+    for old in stale {
+        let _ = executor.remove_file(Path::new(&old.path)).await;
+    }
     Ok(report)
 }
 
@@ -1574,6 +1707,7 @@ mod tests {
     use crate::executor::{DryRunExecutor, PlannedKind, RealExecutor};
     use crate::paths::Paths;
     use crate::stages::{null_sink, StageCtx};
+    use std::os::unix::fs::PermissionsExt;
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
@@ -2285,6 +2419,174 @@ mod tests {
         assert!(err.contains("multiline string"), "{err}");
     }
 
+    /// A10-3/A10-4: the refusal above lived only in the *view*, so every caller
+    /// that does not render Settings first — `write`, `edit_protocol`, the CLI
+    /// — rewrote the outer line, reported success, and left the runtime obeying
+    /// the line inside the string. The refusal belongs to [`apply_patch`], which
+    /// all of them go through.
+    #[tokio::test]
+    async fn the_multiline_shadow_is_refused_by_apply_patch_write_and_edit_protocol() {
+        let text = fixture("oxrsys-runtime.multiline-shadow.toml");
+        assert_eq!(
+            read_lines_like_the_runtime(&text).0.protocol,
+            Some(Protocol::Oxrsys),
+            "the runtime honours the line inside the string"
+        );
+
+        let err = apply_patch(
+            &text,
+            &RuntimeConfigPatch {
+                protocol: Some(Protocol::Alvr),
+                ..RuntimeConfigPatch::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("refusing to rewrite"), "{err}");
+        assert!(err.contains("multiline string"), "{err}");
+
+        // `write` inherits it, and leaves the file — and the backups — alone.
+        let dir = scratch("multiline-shadow");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        std::fs::write(&path, &text).unwrap();
+        let err = write(&real(), &path, &backups, &patch_bitrate(60))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("multiline string"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        assert!(!backups.exists(), "no backup churn from a refused write");
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // …and so does the fix, which used to print `set protocol = "alvr"`.
+        let dir = scratch("multiline-shadow-fix");
+        let ctx = fix_ctx(&dir, false);
+        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
+        std::fs::write(&ctx.paths.toml_path, &text).unwrap();
+        let err = edit_protocol(&ctx, &null_sink())
+            .await
+            .expect_err("the fix cannot honestly claim it set protocol")
+            .to_string();
+        assert!(err.contains("multiline string"), "{err}");
+        assert_eq!(std::fs::read_to_string(&ctx.paths.toml_path).unwrap(), text);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A10-5: a BOM on a root key's own line is the mirror image of the
+    /// multiline case — `toml_edit` (handed the stripped body) sees an editable
+    /// `protocol`, while the runtime's line reader sees `\u{feff}protocol` and
+    /// ignores it. Editing that line changes nothing the runtime reads, so it is
+    /// refused instead of silently reported as saved.
+    #[test]
+    fn a_bom_on_a_root_key_is_not_round_trippable() {
+        let text = "\u{feff}protocol = \"alvr\"\n[streaming]\nbitrate_mbps = 42\n";
+        let (values, invalid, _) = read_lines_like_the_runtime(text);
+        assert_eq!(
+            values.protocol, None,
+            "the runtime does not see a key behind a BOM, so its default applies"
+        );
+        assert!(invalid.is_empty(), "{invalid:#?}");
+
+        let err = read_text(text)
+            .parse_error
+            .expect("the view must refuse this file");
+        assert!(err.contains("protocol"), "{err}");
+        assert!(err.contains("byte-order mark"), "{err}");
+
+        for (label, patch) in [
+            (
+                "the shadowed key itself",
+                RuntimeConfigPatch {
+                    protocol: Some(Protocol::Alvr),
+                    ..RuntimeConfigPatch::default()
+                },
+            ),
+            ("an unrelated key", patch_bitrate(60)),
+        ] {
+            let err = apply_patch(text, &patch).unwrap_err().to_string();
+            assert!(err.contains("refusing to rewrite"), "{label}: {err}");
+        }
+    }
+
+    /// The BOM shape that is *not* a mismatch: the byte sits on a `[table]`
+    /// header, which neither reader treats as an assignment. Refusing that one
+    /// would make every BOM'd file unsavable.
+    #[test]
+    fn a_bom_in_front_of_a_table_header_stays_writable() {
+        let text = "\u{feff}[streaming]\nprotocol = \"alvr\"\nbitrate_mbps = 42\n";
+        assert_eq!(
+            read_lines_like_the_runtime(text).0.protocol,
+            Some(Protocol::Alvr)
+        );
+        assert!(read_text(text).parse_error.is_none());
+        let out = apply_patch(text, &patch_bitrate(60)).unwrap();
+        assert_eq!(out.text, text.replace("= 42", "= 60"));
+    }
+
+    /// A10-7: `Config.cpp:367-372` narrows to a C++ `float` and *then* checks
+    /// the bounds (`float val = std::stof(value); if (val >= 0.25f && val <=
+    /// 1.0f)`), so a value inside one `f32` ulp of an endpoint is accepted
+    /// there. Checking the `f64` instead reported the key invalid and the
+    /// Settings screen showed the `0.75` default for a file the runtime reads
+    /// as `1.0`.
+    #[test]
+    fn the_scale_bounds_are_checked_at_the_runtimes_float_precision() {
+        for (raw, accepted) in [
+            ("1.0", true),
+            ("0.25", true),
+            ("0.75", true),
+            // Round to exactly 1.0f / 0.25f — the runtime takes both.
+            ("1.00000001", true),
+            ("0.2499999999", true),
+            // Still out of range after narrowing.
+            ("1.01", false),
+            ("0.24", false),
+            ("2.0", false),
+            ("-1.0", false),
+            ("1e40", false),
+        ] {
+            let text = format!("[streaming]\nresolution_scale = {raw}\n");
+            let (values, invalid, _) = read_lines_like_the_runtime(&text);
+            assert_eq!(
+                values.resolution_scale.is_some(),
+                accepted,
+                "{raw}: {invalid:?}"
+            );
+            assert_eq!(invalid.is_empty(), accepted, "{raw}: {invalid:?}");
+        }
+    }
+
+    /// A10-9: two rejected occurrences of one key both reach the UI, which keys
+    /// its list by the pair below — so the pair has to stay unique. It is, by
+    /// construction (the fold drops an occurrence identical to one already
+    /// collected), and this pins it: a dedupe loosened to the key alone, or
+    /// dropped, would hand Svelte a duplicate key and throw the screen away.
+    #[test]
+    fn two_invalid_occurrences_of_one_key_stay_distinguishable() {
+        let text = "[streaming]\nprotocol = 'alvr'\nbitrate_mbps = 80\n\n[legacy]\nprotocol = \
+                    \"oxrsys-usb\"\n";
+        let view = read_text(text);
+        assert!(view.parse_error.is_none(), "{:?}", view.parse_error);
+        assert_eq!(view.invalid.len(), 2, "{:#?}", view.invalid);
+        assert!(view.invalid.iter().all(|iv| iv.key == "protocol"));
+
+        let mut identities: Vec<(&str, &str)> = view
+            .invalid
+            .iter()
+            .map(|iv| (iv.key.as_str(), iv.raw.as_str()))
+            .collect();
+        let before = identities.len();
+        identities.sort_unstable();
+        identities.dedup();
+        assert_eq!(
+            identities.len(),
+            before,
+            "(key, raw) is the UI's list identity and must be unique: {:#?}",
+            view.invalid
+        );
+    }
+
     // ── effective_string (the one reader the other modules share) ────────────
 
     #[test]
@@ -2313,6 +2615,82 @@ mod tests {
             None,
             "a commented line is not an assignment"
         );
+    }
+
+    /// A3b-1/A7-1: last-**valid**-wins, the rule `Config.cpp`'s `catch` block
+    /// implements, for the keys Sabrage models. `effective_string` above stops
+    /// at last-*raw*, which reports `banana` for a file the runtime is running
+    /// as ALVR — enough to block a launch that would have worked.
+    #[test]
+    fn effective_accepted_keeps_the_last_value_the_runtime_would_accept() {
+        assert_eq!(
+            effective_accepted("protocol = \"alvr\"\nprotocol = \"banana\"\n", "protocol"),
+            Some("alvr".to_string()),
+            "a trailing junk value is ignored and the previous valid one stays"
+        );
+        assert_eq!(
+            effective_string("protocol = \"alvr\"\nprotocol = \"banana\"\n", "protocol"),
+            Some("banana".to_string()),
+            "which is exactly where the raw reader differs"
+        );
+        assert_eq!(
+            effective_accepted(
+                "[a]\nencoder_process = \"inproc\"\n[b]\nencoder_process = \"native\"\n",
+                "encoder_process"
+            ),
+            Some("native".to_string()),
+            "still table-blind and still last-wins between two accepted values"
+        );
+        assert_eq!(
+            effective_accepted("protocol = alvr\n", "protocol"),
+            Some("alvr".to_string()),
+            "an unquoted value is one the runtime accepts"
+        );
+        assert_eq!(
+            effective_accepted("protocol = 'alvr'\n", "protocol"),
+            None,
+            "a literal-quoted value keeps its quotes and matches nothing"
+        );
+        assert_eq!(effective_accepted("[streaming]\n", "protocol"), None);
+        assert_eq!(
+            effective_accepted("render_device = \"gpu\"\n", "render_device"),
+            None,
+            "a key Sabrage does not model has no accepted set — use effective_string"
+        );
+        assert_eq!(
+            effective_accepted("bitrate_mbps = 80 # was 50\n", "bitrate_mbps"),
+            Some("80".to_string()),
+            "numbers come back in the runtime's own spelling"
+        );
+        assert_eq!(
+            effective_accepted("bitrate_mbps = 80\nbitrate_mbps = 900\n", "bitrate_mbps"),
+            Some("80".to_string()),
+            "out of range is 'malformed' too"
+        );
+    }
+
+    /// The shipped fixture the launch gate has to agree with: a valid `protocol`
+    /// followed by an invalid one. Whatever reads it must land on ALVR.
+    #[test]
+    fn effective_accepted_agrees_with_the_line_reader_on_the_shadowed_fixtures() {
+        for name in [
+            "oxrsys-runtime.shadowed.toml",
+            "oxrsys-runtime.shadowed-invalid-last.toml",
+            "oxrsys-runtime.deployed.toml",
+        ] {
+            let text = fixture(name);
+            let (values, _, _) = read_lines_like_the_runtime(&text);
+            assert_eq!(
+                effective_accepted(&text, "protocol"),
+                values.protocol.map(|p| p.as_str().to_string()),
+                "{name}: one reader, one answer"
+            );
+            assert_eq!(
+                effective_accepted(&text, "encoder_process"),
+                values.encoder_process.map(|e| e.as_str().to_string()),
+                "{name}: one reader, one answer"
+            );
+        }
     }
 
     // ── rule 6, continued: an edit owns six values, not the file's bytes ─────
@@ -2642,6 +3020,103 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// A10-2: pruning is recovery history, and a save that never committed has
+    /// no right to it. The prune used to run between the reservation and the
+    /// replacement, so a failed `write_atomic` returned an error with the config
+    /// untouched and the three oldest backups already gone — and the
+    /// compare-and-swap's "nothing was written" was false for the same reason.
+    #[tokio::test]
+    async fn a_failed_write_prunes_nothing_and_leaves_no_reservation() {
+        let dir = scratch("failed-write-keeps-backups");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&path, deployed()).unwrap();
+        for i in 0..12u64 {
+            std::fs::write(backups.join(format!("{BACKUP_PREFIX}{}", 1_000 + i)), "old").unwrap();
+        }
+        let before = list_backups(&backups);
+        assert_eq!(before.len(), 12);
+
+        // `write_atomic` stages its temp file in the config's own directory, so
+        // a read-only parent fails the commit — and only the commit: `backups/`
+        // is an existing directory of its own and stays writable.
+        let mode = std::fs::metadata(&dir).unwrap().permissions();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        if std::fs::File::create(dir.join(".writable-probe")).is_ok() {
+            // Running as root: the mode says nothing. Nothing to assert.
+            std::fs::set_permissions(&dir, mode).unwrap();
+            let _ = std::fs::remove_dir_all(&dir);
+            return;
+        }
+        let err = write(&real(), &path, &backups, &patch_bitrate(60))
+            .await
+            .expect_err("the commit cannot succeed against a read-only directory");
+        std::fs::set_permissions(&dir, mode).unwrap();
+
+        assert!(
+            err.to_string().contains(&dir.display().to_string()),
+            "{err}: the failure must name the path it could not write"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            deployed(),
+            "the config is unchanged"
+        );
+        assert_eq!(
+            list_backups(&backups),
+            before,
+            "an aborted save is a complete no-op: no prune, no new backup"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The other half of the no-op rule above: once `write_atomic` has
+    /// committed, nothing that happens afterwards may turn the save into an
+    /// `Err`. The prune runs *after* the commit, and its unlink can fail for
+    /// reasons that say nothing about the config file — here the oldest
+    /// backup is a directory, so `remove_file` gets EPERM/EISDIR rather than
+    /// `NotFound`. Reporting that as a failed save left the Settings screen
+    /// showing the old values over a file the runtime had already re-read.
+    #[tokio::test]
+    async fn an_unprunable_stale_backup_still_reports_a_committed_save() {
+        let dir = scratch("unprunable-stale-backup");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        std::fs::write(&path, deployed()).unwrap();
+        // 12 > BACKUP_KEEP, so the three oldest are stale and get pruned.
+        for i in 0..12u64 {
+            std::fs::write(backups.join(format!("{BACKUP_PREFIX}{}", 1_000 + i)), "old").unwrap();
+        }
+        let unprunable = backups.join(format!("{BACKUP_PREFIX}1000"));
+        std::fs::remove_file(&unprunable).unwrap();
+        std::fs::create_dir(&unprunable).unwrap();
+        assert!(
+            std::fs::remove_file(&unprunable).is_err(),
+            "the fixture only means anything if this unlink really fails"
+        );
+
+        let report = write(&real(), &path, &backups, &patch_bitrate(60))
+            .await
+            .expect("a committed write is a success even when the prune cannot finish");
+
+        assert_eq!(report.changed_keys, vec!["bitrate_mbps".to_string()]);
+        assert!(
+            std::fs::read_to_string(&path)
+                .unwrap()
+                .contains("bitrate_mbps = 60"),
+            "the new bytes are on disk — which is why this must not report failure"
+        );
+        assert!(unprunable.is_dir(), "the unprunable entry is left alone");
+        assert!(
+            !backups.join(format!("{BACKUP_PREFIX}1001")).exists()
+                && !backups.join(format!("{BACKUP_PREFIX}1002")).exists(),
+            "the prunable stale backups are still pruned"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn list_backups_sorts_newest_first_and_ignores_strangers() {
         let dir = scratch("list");
@@ -2813,9 +3288,17 @@ mod tests {
             "the shell pipeline writes no session record"
         );
         let now = crate::session::now_unix_ms();
+        // A live `process_id` as well as a fresh stamp: that is the pair
+        // `SessionMonitor` requires before it derives `SessionPhase::External`
+        // (`session/watcher.rs`), and the door the Settings screen renders has
+        // to agree with the phase that screen shows — a status naming a dead
+        // pid renders "Idle" with Save enabled. (`session_block_at` is looser
+        // today: it blocks on freshness alone. A10-8 is filed against that
+        // divergence; this test asserts the shape both predicates agree on.)
+        let pid = std::process::id();
         std::fs::write(
             dir.join("runtime_status.json"),
-            format!(r#"{{"state":"streaming","updated_at_unix_ms":{now}}}"#),
+            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":{now}}}"#),
         )
         .unwrap();
 

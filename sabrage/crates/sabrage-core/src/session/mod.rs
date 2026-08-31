@@ -307,7 +307,7 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
 /// Why a mutating operation must not start right now, or `None` when nothing on
 /// this machine looks like a live session.
 ///
-/// Six signals, cheapest first, and deliberately **not** just the in-process
+/// Seven signals, cheapest first, and deliberately **not** just the in-process
 /// [`live_session`] slot: the session a Settings save or a Doctor button would
 /// break may have been launched by the other front-end, by an earlier run of
 /// this process, or by `./demo.sh run`, none of which publish anything here.
@@ -323,8 +323,14 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
 ///    launch has spawned anything ([`state::has_live_foreign_owner`]);
 /// 5. that record being present but unparseable — it may be describing a live
 ///    session, and nothing here can prove it is not;
-/// 6. a **fresh** `runtime_status.json` — the only one of the six a
-///    `./demo.sh run` session produces.
+/// 6. a **fresh** `runtime_status.json` naming a live pid
+///    ([`watcher::runtime_status_live`], the same predicate
+///    [`watcher::SessionMonitor`] derives [`SessionPhase::External`] from, so
+///    the door and the phase cannot disagree);
+/// 7. a live `Beat Saber.exe` on the process table ([`running_game_pid`]) —
+///    the only signal that needs nothing to have been *written*, and therefore
+///    the only one that covers a `./demo.sh run` between its wine spawn and
+///    its first streaming status.
 ///
 /// A live CrossOver `wineserver` is deliberately *not* a signal: it is alive for
 /// any CrossOver app the user has open, and blocking `build` on that would be
@@ -409,10 +415,7 @@ pub(crate) fn session_block_at(
 
     match state::load(state_path) {
         Ok(Some(s)) => {
-            if matches!(
-                reconcile::classify(&s),
-                reconcile::Classification::Live | reconcile::Classification::Unverifiable
-            ) {
+            if reconcile::classify(&s).is_live() {
                 let pid = s.wine.as_ref().map(|w| w.pid).unwrap_or(0);
                 return block(
                     format!(
@@ -454,7 +457,11 @@ pub(crate) fn session_block_at(
 
     if let Ok(text) = std::fs::read_to_string(runtime_status_path) {
         if let Some(rs) = watcher::parse_runtime_status(&text) {
-            if watcher::is_fresh(rs.updated_at_unix_ms, now_unix_ms()) {
+            // [`watcher::runtime_status_live`], not a second local reading of
+            // the same file: the phase the Session screen renders and the door
+            // this function is have to agree, or Sabrage says "No session
+            // running" while Settings refuses to save (A10-8).
+            if watcher::runtime_status_live(&rs, now_unix_ms()) {
                 return block(
                     format!(
                         "the oxrsys runtime is reporting a live session (state '{}')",
@@ -466,12 +473,53 @@ pub(crate) fn session_block_at(
         }
     }
 
+    // Last, because it is the only signal that costs a full process-table walk
+    // — and the only one that needs nothing to have been *written*. See
+    // [`running_game_pid`].
+    if let Some(pid) = running_game_pid() {
+        return block(
+            format!(
+                "{GAME_EXE} is running (pid {pid}) — a session Sabrage did not start and \
+                 cannot see any other way"
+            ),
+            None,
+        );
+    }
+
     None
+}
+
+/// The game process every launch of this pipeline ends in, however it was
+/// started — `./demo.sh run`, `sabrage run`, or CrossOver's own UI.
+///
+/// Matched on the command line, not the exe path: wine puts the game's path on
+/// argv as a single `Z:\…\Beat Saber.exe` argument, which is the same shape
+/// `pgrep -f 'Beat Saber.exe'` (and `stages::stop`'s survivor probe) matches.
+const GAME_EXE: &str = "Beat Saber.exe";
+
+/// The pid of a running Beat Saber, if there is one.
+///
+/// The signal none of the other six can replace: a `./demo.sh run` writes no
+/// session record, publishes no handle, and — crucially — its runtime does not
+/// write `runtime_status.json` until *streaming* begins, which is minutes after
+/// Goldberg has been installed and the game spawned. In that window every
+/// file-based signal reads idle, so Settings, a Doctor fix, or the Goldberg
+/// revert would happily rewrite files the running game has open (A13a-2). This
+/// closes it from the wine spawn onward.
+///
+/// What it cannot close is the window *before* the spawn — Goldberg is
+/// installed several steps earlier — which needs a marker both front-ends take;
+/// that is a shared-pipeline change (contract + `scripts/demo/run.sh` + here),
+/// not something this function can do alone.
+pub(crate) fn running_game_pid() -> Option<u32> {
+    crate::process::find_processes_by_cmdline(GAME_EXE)
+        .first()
+        .map(|p| p.pid)
 }
 
 /// Refuse `action` while any session is live — the single policy every "not
 /// while the game is running" caller shares, over [`live_session_reason`]'s
-/// five signals.
+/// seven signals.
 ///
 /// The error carries `stop.sh`'s own remedy, so a GUI caller renders the same
 /// row the config and doctor refusals already render.
@@ -861,29 +909,36 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         // 5: a `demo.sh run` session — nothing of ours anywhere, but the
-        // runtime is reporting in right now.
-        std::fs::write(
-            &status,
-            format!(
-                r#"{{"state":"streaming","updated_at_unix_ms":{}}}"#,
-                now_unix_ms()
-            ),
-        )
-        .unwrap();
+        // runtime is reporting in right now, naming a process that is alive.
+        // Both halves, because this is `watcher::runtime_status_live`, the
+        // same predicate the Session screen derives `External` from (A10-8): a
+        // door that refused on freshness alone said "a session is live" over a
+        // file the UI was calling Idle.
+        let write_status = |pid: Option<u32>, at: u64| {
+            let pid = pid
+                .map(|p| format!(r#""process_id":{p},"#))
+                .unwrap_or_default();
+            std::fs::write(
+                &status,
+                format!(r#"{{"state":"streaming",{pid}"updated_at_unix_ms":{at}}}"#),
+            )
+            .unwrap();
+        };
+        write_status(Some(std::process::id()), now_unix_ms());
         let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
         assert!(
             err.to_string().contains("the oxrsys runtime is reporting"),
             "{err}"
         );
-        // …and a stale one is not a session.
-        std::fs::write(
-            &status,
-            format!(
-                r#"{{"state":"streaming","updated_at_unix_ms":{}}}"#,
-                now_unix_ms() - 600_000
-            ),
-        )
-        .unwrap();
+        // …and a stale one is not a session, however alive the pid it names.
+        write_status(Some(std::process::id()), now_unix_ms() - 600_000);
+        assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
+        // …nor a fresh one whose process is gone.
+        write_status(Some(u32::MAX - 1), now_unix_ms());
+        assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
+        // …nor one that names no process at all: oxrsys always writes
+        // `process_id`, so a file without one is not evidence of anything.
+        write_status(None, now_unix_ms());
         assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
         std::fs::remove_file(&status).unwrap();
 
@@ -898,6 +953,56 @@ mod tests {
         });
         std::fs::write(&path, serde_json::to_vec_pretty(&s).unwrap()).unwrap();
         assert!(ensure_idle_at(&path, &status, "rebuild").is_ok());
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A13a-2. `./demo.sh run` installs Goldberg, resets wineserver and spawns
+    /// wine long before its runtime writes a `runtime_status.json` — the file
+    /// only appears once streaming begins. Every file-based signal reads idle
+    /// through that whole window, so the game itself has to be a signal, or
+    /// Settings/Doctor/Revert rewrite files the running game has open.
+    #[test]
+    fn a_running_game_is_a_live_session_even_with_nothing_on_disk() {
+        let _g = lock_session_globals();
+        let dir = state_dir("running-game");
+        let path = dir.join("session-state.json");
+        let status = dir.join("runtime_status.json");
+        assert!(
+            ensure_idle_at(&path, &status, "rebuild").is_ok(),
+            "nothing on disk, no game: idle"
+        );
+
+        // Stand in for the wine child: a process whose argv carries the game's
+        // Windows path, exactly as wine spells it (`Z:\…\Beat Saber.exe`) and
+        // exactly what `pgrep -f 'Beat Saber.exe'` matches.
+        let mut game = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("sleep 20 # Z:\\games\\Beat Saber 1294\\Beat Saber.exe")
+            .spawn()
+            .expect("/bin/sh is on every macOS");
+
+        // The process table is refreshed per call; give the spawn a moment to
+        // appear rather than assuming it already has.
+        let mut err = None;
+        for _ in 0..50 {
+            match ensure_idle_at(&path, &status, "rebuild") {
+                Err(e) => {
+                    err = Some(e);
+                    break;
+                }
+                Ok(()) => std::thread::sleep(std::time::Duration::from_millis(20)),
+            }
+        }
+        let _ = game.kill();
+        let _ = game.wait();
+
+        let err = err.expect("a running Beat Saber blocks every mutating door");
+        assert!(
+            err.to_string().contains("Beat Saber.exe is running"),
+            "{err}"
+        );
+        assert_eq!(err.remedy(), Some("./demo.sh stop --bottle <name>"));
 
         std::fs::remove_dir_all(&dir).ok();
     }

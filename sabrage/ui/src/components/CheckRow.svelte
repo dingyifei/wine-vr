@@ -41,6 +41,13 @@
     {#if row.remedy}
       <div class="text-muted remedy">{row.remedy}</div>
     {/if}
+    {#if row.detail}
+      <!-- The native check's own diagnostic (e.g. "read error"/"JSON parse
+           error") — `message`/`remedy` alone can misdiagnose a failure mode
+           the native code path cannot actually hit (see the "broken python3?"
+           finding); this is the truthful detail underneath. -->
+      <div class="text-muted detail">{row.detail}</div>
+    {/if}
   </div>
   {#if showFix}
     <button
@@ -85,6 +92,11 @@
   .remedy {
     font-size: 11.5px;
     margin-top: 1px;
+  }
+  .detail {
+    font-size: 11px;
+    margin-top: 1px;
+    opacity: 0.75;
   }
   .fix-btn {
     flex: none;

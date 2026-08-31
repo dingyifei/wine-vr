@@ -84,8 +84,26 @@
   // epitaph, not a live one), so a plain `phase !== "idle"` test here used to
   // keep every Run button disabled, and every row sharing the bottle showing
   // "Running", for the rest of the app's life after one session ended.
+  //
+  // `!settingsStore.loadOk` also holds Run disabled until settings.json has
+  // actually loaded successfully: `effectiveLaunchOpts` below falls back to
+  // `?? false` for every global launch flag it can't read, and that fallback
+  // is only correct for the backend's successful "no settings.json yet"
+  // default — not for a corrupt/unreadable file or a failed IPC round-trip,
+  // which would otherwise silently launch with the wrong audio/dashboard/
+  // wired/verbose behavior instead of stopping at a visible error.
+  // `stageStore.running` covers the stage whose dialog was Hidden: Hide clears
+  // `gate` but not the `runStage` invocation behind it, and a Run started on
+  // top of one queues a second `openGate` GateModal refuses to adopt — the
+  // dialog reopens over the hidden stage while the launch runs behind the
+  // operation lock with nothing to cancel it with (the guard StagesPanel and
+  // Doctor already carry).
   const busy = $derived(
-    sessionStore.launching || isLivePhase(sessionStore.status.phase) || stageStore.gate !== null,
+    sessionStore.launching ||
+      isLivePhase(sessionStore.status.phase) ||
+      stageStore.gate !== null ||
+      stageStore.running ||
+      !settingsStore.loadOk,
   );
 
   function effectiveLaunchOpts(entry: GameEntry): LaunchOpts {
@@ -200,6 +218,21 @@
 </div>
 
 <div class="screen-body">
+  {#if settingsStore.loaded && !settingsStore.loadOk}
+    <div class="blueprint error-card settings-error">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <h6>Could not load settings</h6>
+      <p class="text-muted">{settingsStore.error}</p>
+      <p class="text-muted">
+        Run is disabled until settings load successfully — a launch right now would silently fall back to
+        default audio/dashboard/wired/verbose behavior instead of what's actually configured.
+      </p>
+      <button class="btn btn-secondary" onclick={() => void settingsStore.load()}>Retry</button>
+    </div>
+  {/if}
+  {#if stageStore.running}
+    <p class="text-muted">A stage is already running — wait for it to finish.</p>
+  {/if}
   {#if libraryStore.loading && libraryStore.rows.length === 0}
     <p class="text-muted">Loading library…</p>
   {:else if libraryStore.error}
@@ -375,6 +408,15 @@
   .error-card p {
     font-size: 13px;
     margin: 0;
+  }
+  .error-card p + p {
+    margin-top: 6px;
+  }
+  .settings-error {
+    margin-bottom: 16px;
+  }
+  .settings-error .btn {
+    margin-top: 10px;
   }
   .empty-state {
     max-width: 460px;

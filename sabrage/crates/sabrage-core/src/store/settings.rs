@@ -17,11 +17,17 @@
 //! replaced.
 //!
 //! Fields this binary does **not** know are not ignored either: they are
-//! captured into [`Settings::extra`] and written back out verbatim by the next
-//! [`save`]. Without that, running an older Sabrage once — and touching one
-//! toggle, which autosaves the whole object — would silently delete everything
-//! a newer build had written. [`SETTINGS_VERSION`] rides along for the case a
-//! future change cannot be expressed as "unknown keys, preserved".
+//! captured into [`Settings::extra`] — and into [`LaunchDefaults::extra`] for
+//! the one nested object, since an unknown key added *inside* `launch` is
+//! caught by the outer map's flatten no more than a top-level one is caught by
+//! nothing — and written back out verbatim by the next [`save`]. Without that,
+//! running an older Sabrage once — and touching one toggle, which autosaves
+//! the whole object — would silently delete everything a newer build had
+//! written. [`SETTINGS_VERSION`] rides along for the case a future change
+//! cannot be expressed as "unknown keys, preserved": [`load`] **refuses** a
+//! file whose `version` is newer than this binary's, exactly as
+//! [`super::library::load`] does, rather than reading it half-way and
+//! autosaving the remains back.
 
 use std::path::{Path, PathBuf};
 
@@ -37,17 +43,33 @@ use crate::stages::StageOptions;
 /// Mirrors [`StageOptions`]'s flag quartet exactly — see
 /// [`Settings::effective_stage_options`] and `store::library::effective_options`
 /// for where the two meet.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct LaunchDefaults {
     pub no_audio: bool,
     pub no_dashboard: bool,
     pub wired: bool,
     pub verbose: bool,
+    /// Keys of this object a newer Sabrage wrote and this one has no field
+    /// for — [`Settings::extra`]'s story one nesting level down, and the
+    /// reason this struct is no longer `Copy`/`Eq` (a [`Value`] is neither).
+    ///
+    /// The outer flattened map only ever collects *top-level* keys, so before
+    /// this existed a future `launch.someFlag` was dropped while
+    /// deserializing `LaunchDefaults` and deleted by the next autosave — the
+    /// same downgrade loss the outer map exists to prevent, one level deeper.
+    /// The UI hands the whole loaded object back on save
+    /// (`{ ...settings, ...patch }`, `{ ...settings.launch, … }`), so a key
+    /// preserved here survives the full GUI round trip.
+    #[serde(flatten, skip_serializing_if = "Map::is_empty")]
+    pub extra: Map<String, Value>,
 }
 
 /// Schema version written by this Sabrage into `settings.json`. Bump it only
-/// for a change [`Settings::extra`]'s verbatim round-trip cannot absorb.
+/// for a change the [`Settings::extra`]/[`LaunchDefaults::extra`] verbatim
+/// round-trip cannot absorb — and *always* bump it for such a change, because
+/// [`load`] refusing a newer file is the only thing standing between it and an
+/// older build's autosave.
 pub const SETTINGS_VERSION: u32 = 1;
 
 /// Sabrage's global preferences.
@@ -144,19 +166,46 @@ pub fn settings_path(sabrage_appsup: &Path) -> PathBuf {
 ///
 /// * absent → `Ok(Settings::default())` — the ordinary first-run case;
 /// * present but unparseable → `Err` — never silently reset a file the user
-///   (or a bug) actually wrote something into.
+///   (or a bug) actually wrote something into;
+/// * present but written by a **newer** Sabrage (`version` >
+///   [`SETTINGS_VERSION`]) → `Err`, the same refusal
+///   [`super::library::load`] makes for the same reason: the two flattened
+///   `extra` maps preserve unknown *keys*, and a version bump is by
+///   definition reserved for a change they cannot express. Reading such a file
+///   would drop whatever that change was and the next autosave — the UI writes
+///   the whole object on every toggle — would persist the loss. Refusing
+///   leaves the bytes alone and tells the user to update.
+///   (The flip side, as in `library`: any schema change here that `extra`
+///   cannot absorb **must** bump [`SETTINGS_VERSION`].)
+///
+/// The GUI never writes over a refusal: `get_settings` surfaces the `Err`, the
+/// settings store leaves its state unloaded, and its `update` rejects rather
+/// than autosaving anything.
 pub fn load(path: &Path) -> Result<Settings> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Settings::default()),
         Err(e) => return Err(SabrageError::io(path, e)),
     };
-    serde_json::from_str(&text).map_err(|e| {
+    let s: Settings = serde_json::from_str(&text).map_err(|e| {
         SabrageError::io(
             path,
             std::io::Error::new(std::io::ErrorKind::InvalidData, e),
         )
-    })
+    })?;
+    if s.version > SETTINGS_VERSION {
+        return Err(SabrageError::fatal(
+            format!(
+                "{} is version {} — this Sabrage understands version {} \
+                 and would silently drop everything the newer one wrote",
+                path.display(),
+                s.version,
+                SETTINGS_VERSION
+            ),
+            "update Sabrage (or move settings.json aside to start from defaults)",
+        ));
+    }
+    Ok(s)
 }
 
 /// Write `settings.json` atomically (pretty JSON plus a trailing newline),
@@ -262,6 +311,77 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A13a-3 / A13b-4: the two ways a newer file used to lose data on a
+    /// downgrade — a key nested inside `launch`, and a version this binary
+    /// cannot read at all.
+    #[tokio::test]
+    async fn unknown_nested_launch_keys_survive_a_load_save_round_trip() {
+        let dir = scratch("nested-downgrade");
+        let path = dir.join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"defaultBottle":"bs","launch":{"noAudio":true,"futureFlag":"keep-me"}}"#,
+        )
+        .unwrap();
+
+        let mut s = load(&path).unwrap();
+        assert!(s.launch.no_audio);
+        assert_eq!(
+            s.launch.extra["futureFlag"],
+            serde_json::json!("keep-me"),
+            "a key inside `launch` is preserved, not dropped: {:?}",
+            s.launch.extra
+        );
+
+        // The autosave shape: one known toggle flipped, whole object written.
+        s.launch.wired = true;
+        save(&real(), &path, &s).await.unwrap();
+
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"futureFlag\""), "{text}");
+        let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed["launch"]["futureFlag"], serde_json::json!("keep-me"));
+        assert_eq!(parsed["launch"]["wired"], serde_json::json!(true));
+        assert_eq!(load(&path).unwrap(), s);
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_newer_version_is_refused_and_its_bytes_left_alone() {
+        let dir = scratch("newer-version");
+        let path = dir.join("settings.json");
+        let bytes = format!(
+            r#"{{"version":{},"defaultBottle":"bs","launch":{{"noAudio":true,"futureFlag":"keep-me"}}}}"#,
+            SETTINGS_VERSION + 1
+        );
+        std::fs::write(&path, &bytes).unwrap();
+
+        let err = load(&path).unwrap_err();
+        let msg = err.to_string();
+        assert_eq!(err.kind(), "fatal", "{msg}");
+        assert!(msg.contains("is version 2"), "{msg}");
+        assert!(
+            err.remedy().unwrap_or_default().contains("update Sabrage"),
+            "{:?}",
+            err.remedy()
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            bytes,
+            "a refusal never rewrites the file"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_current_version_still_loads() {
+        let s: Settings =
+            serde_json::from_str(&format!(r#"{{"version":{SETTINGS_VERSION}}}"#)).unwrap();
+        assert_eq!(s.version, SETTINGS_VERSION);
+    }
+
     #[test]
     fn a_file_without_a_version_reads_as_the_current_one() {
         let s: Settings = serde_json::from_str(r#"{"repoRoot":"/repo"}"#).unwrap();
@@ -306,6 +426,7 @@ mod tests {
                 no_dashboard: false,
                 wired: true,
                 verbose: false,
+                ..LaunchDefaults::default()
             },
             allow_adb_probes: false,
             runtime_config_edit_acknowledged: true,
@@ -347,6 +468,7 @@ mod tests {
                 no_dashboard: true,
                 wired: false,
                 verbose: true,
+                ..LaunchDefaults::default()
             },
             ..Settings::default()
         };

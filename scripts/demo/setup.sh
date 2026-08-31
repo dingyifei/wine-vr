@@ -58,7 +58,7 @@ info "note: the embedded ALVR core keeps its session.json under '$OXR_APPSUP/alv
 if [ -n "${WINEVR_BOTTLE:-}" ] || [ -n "${WINEVR_BS_DIR:-}" ]; then
   [ -n "${WINEVR_BOTTLE:-}" ] && require_bottle || {
     BS_DIR="$WINEVR_BS_DIR"
-    DEPOT_CMD="DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 -username <steam-user> -dir \"$BS_DIR\""
+    DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
   }
   if [ -f "$BS_DIR/Beat Saber.exe" ]; then ok "Beat Saber found at $BS_DIR"
   else

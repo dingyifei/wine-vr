@@ -113,6 +113,8 @@ pub enum PlannedKind {
     RemoveFile,
     /// A directory tree would be copied (`cp -R`).
     DirCopy,
+    /// A second name would be created for an existing file (`link(2)`).
+    Link,
     /// A pinned artifact would be downloaded.
     Download,
     /// An archive would be extracted.
@@ -158,6 +160,7 @@ impl PlannedAction {
             PlannedKind::RemoveDir => format!("would remove directory {dst}{why}"),
             PlannedKind::RemoveFile => format!("would remove {dst}{why}"),
             PlannedKind::DirCopy => format!("would copy directory {src} → {dst}{why}"),
+            PlannedKind::Link => format!("would hard-link {src} → {dst}{why}"),
             PlannedKind::Download => format!("would download {src} → {dst}{why}"),
             PlannedKind::Extract => format!("would extract {src} → {dst}{why}"),
             PlannedKind::Touch => format!("would create {dst} if absent{why}"),
@@ -250,8 +253,11 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// The write-once documents — `oxrsys-runtime.toml` above all — are
     /// created through this rather than through [`Executor::write_atomic`],
     /// because `exists()`-then-`write_atomic` is a race whose loser silently
-    /// replaces a hand-edited config that never got backed up. `O_EXCL` makes
-    /// "did I create it?" the kernel's answer instead of a stale observation.
+    /// replaces a hand-edited config that never got backed up. An exclusive
+    /// publish (`O_EXCL`, `link(2)`) makes "did I create it?" the kernel's
+    /// answer instead of a stale observation — and the bytes are complete
+    /// before the final name exists, so an interrupted create cannot strand an
+    /// empty file that later runs then refuse to replace.
     ///
     /// The default implementation is the racy check-then-write, kept only so a
     /// decorating [`Executor`] (the test doubles) inherits sane behaviour; both
@@ -278,8 +284,38 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// the executor, which is exactly how a "dry run" ends up deleting a file.
     fn remove_file<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>>;
 
+    /// [`Executor::remove_dir_all`], performed **even when the run has been
+    /// cancelled**.
+    ///
+    /// For one shape only: undoing a partial mutation this stage just made and
+    /// must not leave behind — install's `cp -R` of stock DXMT, interrupted
+    /// part-way, leaves a truncated tree that every later run would accept as a
+    /// finished backup purely because it exists, and Cancel is the likeliest
+    /// reason that copy stopped. Every ordinary removal keeps using
+    /// [`Executor::remove_dir_all`], which stops at cancellation like every
+    /// other mutation.
+    fn remove_dir_all_rollback<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        self.remove_dir_all(path)
+    }
+
     /// `mkdir -p path`.
     fn create_dir_all<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>>;
+
+    /// `link(2)`: a second name, `dst`, for the bytes `src` names **at this
+    /// instant**. Never replaces anything — a taken `dst` fails with
+    /// [`std::io::ErrorKind::AlreadyExists`].
+    ///
+    /// Sabrage uses it to capture the inode a write is about to displace: an
+    /// outside editor that does not participate in the config lock can save
+    /// between the last comparison and the rename, and a link taken just before
+    /// the rename keeps those bytes recoverable instead of losing them.
+    ///
+    /// The default implementation is a copy (a decorating [`Executor`]'s sane
+    /// fallback; it inherits dry-run honesty from
+    /// [`Executor::copy_if_changed`]). Both executors here override it.
+    fn hard_link<'a>(&'a self, src: &'a Path, dst: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move { self.copy_if_changed(src, dst).await.map(|_| ()) })
+    }
 
     /// `cp -R src dst` — symlink- and permission-preserving, via `/bin/cp`.
     fn dir_copy<'a>(&'a self, src: &'a Path, dst: &'a Path) -> BoxFuture<'a, Result<()>>;
@@ -513,6 +549,28 @@ impl Executor for RealExecutor {
             let spec = self.spec("/bin/cp").arg("-R").arg(src).arg(dst);
             process::run_ok(&spec, &self.sink, &self.cancel).await?;
             Ok(())
+        })
+    }
+
+    fn remove_dir_all_rollback<'a>(&'a self, path: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            // Deliberately no `guard()`: this undoes a mutation that already
+            // happened, and a cancelled run is the likeliest reason it has to
+            // run at all. Refusing here is what leaves the half-copy behind.
+            match tokio::fs::remove_dir_all(path).await {
+                Ok(()) => Ok(()),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(e) => Err(SabrageError::io(path, e)),
+            }
+        })
+    }
+
+    fn hard_link<'a>(&'a self, src: &'a Path, dst: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.guard()?;
+            tokio::fs::hard_link(src, dst)
+                .await
+                .map_err(|e| SabrageError::io(dst, e))
         })
     }
 
@@ -814,13 +872,16 @@ async fn write_atomic_real(path: &Path, bytes: &[u8]) -> Result<()> {
         file.write_all(bytes)
             .await
             .map_err(|e| SabrageError::io(&tmp, e))?;
+        // Mode first, *then* the sync: `fsync` flushes the inode's metadata
+        // along with its contents, so a chmod after the sync would be the one
+        // part of the published file that was never made durable.
+        tokio::fs::set_permissions(&tmp, permissions(mode))
+            .await
+            .map_err(|e| SabrageError::io(&tmp, e))?;
         file.sync_all()
             .await
             .map_err(|e| SabrageError::io(&tmp, e))?;
         drop(file);
-        tokio::fs::set_permissions(&tmp, permissions(mode))
-            .await
-            .map_err(|e| SabrageError::io(&tmp, e))?;
         tokio::fs::rename(&tmp, path)
             .await
             .map_err(|e| SabrageError::io(path, e))
@@ -830,50 +891,101 @@ async fn write_atomic_real(path: &Path, bytes: &[u8]) -> Result<()> {
         let _ = tokio::fs::remove_file(&tmp).await;
         return result;
     }
-    // Best effort: some filesystems refuse `fsync` on a directory fd, and a
-    // failure here costs durability, not correctness.
-    if let Ok(dir) = tokio::fs::File::open(path.parent().unwrap_or_else(|| Path::new("."))).await {
-        let _ = dir.sync_all().await;
-    }
-    Ok(())
+    // The rename is only as durable as the directory entry it created, so the
+    // parent is synced too — and a failure there is *reported*. Swallowing it
+    // would let `write_atomic` answer "persisted" for a `session-state.json`
+    // whose entry can still be lost, which is precisely the answer the audio
+    // guard acts on when it goes on to switch the Mac's output device.
+    sync_parent_dir(path).await
 }
 
-/// `O_EXCL` create with contents: `Ok(true)` when this call created the file,
-/// `Ok(false)` when it already existed (and nothing was written).
+/// `fsync` the directory that contains `path`, so the rename that published it
+/// survives a power loss and not merely a crash.
+///
+/// Failures propagate, with one exception: a filesystem that refuses `fsync` on
+/// a directory fd at all cannot offer this guarantee to anybody, and failing
+/// every write there would cost more than the durability it cannot give.
+/// `EIO` — the errno that actually means the entry may be lost — is an error.
+async fn sync_parent_dir(path: &Path) -> Result<()> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    let dir = tokio::fs::File::open(parent)
+        .await
+        .map_err(|e| SabrageError::io(parent, e))?;
+    match dir.sync_all().await {
+        Ok(()) => Ok(()),
+        Err(e) if dir_fsync_unsupported(&e) => Ok(()),
+        Err(e) => Err(SabrageError::io(parent, e)),
+    }
+}
+
+/// Does this `fsync` failure mean "this filesystem does not do that", rather
+/// than "your data may be gone"?
+fn dir_fsync_unsupported(e: &std::io::Error) -> bool {
+    use nix::libc;
+    // Written as comparisons rather than a `matches!`: `ENOTSUP` and
+    // `EOPNOTSUPP` are the same number on some platforms, which would make one
+    // of two constant patterns unreachable.
+    let Some(errno) = e.raw_os_error() else {
+        return false;
+    };
+    errno == libc::ENOTSUP
+        || errno == libc::EOPNOTSUPP
+        || errno == libc::EINVAL
+        || errno == libc::EBADF
+}
+
+/// Create `path` with `bytes` only if it does not exist: `Ok(true)` when this
+/// call created it, `Ok(false)` when something else got there first.
+///
+/// The exclusive create happens on a **sibling temp** that is written, chmodded
+/// and `fsync`ed first, and the final name is then claimed with `link(2)` —
+/// which, like `O_EXCL`, refuses to replace an existing name, so "did I create
+/// it?" is still the kernel's answer rather than a stale `exists()`. Creating
+/// the final name first and writing afterwards (the shape this replaces) has a
+/// window in which a SIGKILL or a power loss strands an empty file that every
+/// later call answers `Ok(false)` for — and for `oxrsys-runtime.toml` an empty
+/// file is *valid TOML*, so setup would go on treating a zero-byte config as
+/// hand-edited content it must not overwrite.
 async fn create_new_real(path: &Path, bytes: &[u8]) -> Result<bool> {
     use tokio::io::AsyncWriteExt;
 
-    let mut file = match tokio::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o644)
-        .open(path)
-        .await
-    {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => return Ok(false),
-        Err(e) => return Err(SabrageError::io(path, e)),
-    };
-    let written = async {
+    let tmp = sibling_tmp(path);
+    let staged = async {
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o644)
+            .open(&tmp)
+            .await
+            .map_err(|e| SabrageError::io(path, e))?;
         file.write_all(bytes)
             .await
             .map_err(|e| SabrageError::io(path, e))?;
-        file.sync_all()
+        // Explicit, so the mode does not depend on this process's umask (the
+        // GUI inherits Finder's, the CLI a login shell's), and set before the
+        // sync so the published inode's metadata is durable too.
+        tokio::fs::set_permissions(&tmp, permissions(0o644))
             .await
             .map_err(|e| SabrageError::io(path, e))?;
-        // Explicit, so the mode does not depend on this process's umask (the
-        // GUI inherits Finder's, the CLI a login shell's).
-        tokio::fs::set_permissions(path, permissions(0o644))
-            .await
-            .map_err(|e| SabrageError::io(path, e))
+        file.sync_all().await.map_err(|e| SabrageError::io(path, e))
     }
     .await;
-    if written.is_err() {
-        // We created it, so we own the cleanup: leaving a truncated file
-        // behind would make the next caller take the "already exists" branch.
-        let _ = tokio::fs::remove_file(path).await;
+    if let Err(e) = staged {
+        let _ = tokio::fs::remove_file(&tmp).await;
+        return Err(e);
     }
-    written.map(|()| true)
+    // `link(2)` publishes the finished bytes under the final name or fails with
+    // `EEXIST`; either way the temp goes, so no `.sabrage-*.tmp` survives.
+    let published = tokio::fs::hard_link(&tmp, path).await;
+    let _ = tokio::fs::remove_file(&tmp).await;
+    match published {
+        Ok(()) => {
+            sync_parent_dir(path).await?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(false),
+        Err(e) => Err(SabrageError::io(path, e)),
+    }
 }
 
 // ── dry run ───────────────────────────────────────────────────────────────────
@@ -1050,6 +1162,13 @@ impl Executor for DryRunExecutor {
     fn dir_copy<'a>(&'a self, src: &'a Path, dst: &'a Path) -> BoxFuture<'a, Result<()>> {
         Box::pin(async move {
             self.record(PlannedKind::DirCopy, Some(src), Some(dst), "cp -R");
+            Ok(())
+        })
+    }
+
+    fn hard_link<'a>(&'a self, src: &'a Path, dst: &'a Path) -> BoxFuture<'a, Result<()>> {
+        Box::pin(async move {
+            self.record(PlannedKind::Link, Some(src), Some(dst), "link(2)");
             Ok(())
         })
     }
@@ -1330,6 +1449,98 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A published rename is only as durable as its directory entry, so the
+    /// parent fsync is part of the contract rather than a best-effort extra: a
+    /// failure to even open the parent must not be reported as "persisted",
+    /// because `session-state.json`'s caller switches the Mac's audio device on
+    /// the strength of that answer.
+    #[tokio::test]
+    async fn a_parent_that_cannot_be_synced_is_reported_not_swallowed() {
+        let dir = scratch("atomic-parent");
+        let f = dir.join("session-state.json");
+        // The happy path first: a real directory syncs.
+        std::fs::write(&f, b"{}").unwrap();
+        sync_parent_dir(&f).await.unwrap();
+
+        // And a parent that cannot be opened at all is an error, not silence.
+        let gone = dir.join("vanished/session-state.json");
+        let err = sync_parent_dir(&gone).await.unwrap_err();
+        assert_eq!(err.kind(), "io");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The final name appears only once the bytes behind it are complete: the
+    /// exclusive create happens on a sibling temp, and `link(2)` claims the real
+    /// name. A crash in the middle can therefore strand a temp, never a
+    /// zero-length `oxrsys-runtime.toml` that every later run reads as
+    /// hand-edited content it must not replace.
+    #[tokio::test]
+    async fn create_new_publishes_finished_bytes_and_leaves_no_temp() {
+        let dir = scratch("create-new-publish");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+        let f = dir.join("oxrsys-runtime.toml");
+
+        assert!(ex.create_new(&f, b"protocol = \"alvr\"\n").await.unwrap());
+        assert_eq!(std::fs::read(&f).unwrap(), b"protocol = \"alvr\"\n");
+        assert_eq!(mode_bits(&f), 0o644);
+        // One link only: the temp is unlinked whichever way the publish went.
+        let names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["oxrsys-runtime.toml".to_string()]);
+
+        // A file already at the final name is never replaced — including the
+        // empty one the old create-then-write shape could strand.
+        let empty = dir.join("empty.toml");
+        std::fs::write(&empty, b"").unwrap();
+        assert!(!ex.create_new(&empty, b"template").await.unwrap());
+        assert_eq!(std::fs::read(&empty).unwrap(), b"");
+        let leftovers: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(".sabrage-"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp files left: {leftovers:?}");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `hard_link` captures the bytes a name points at right now, and refuses
+    /// to replace an existing name.
+    #[tokio::test]
+    async fn hard_link_captures_the_live_bytes_without_replacing() {
+        let dir = scratch("publish");
+        let (run_id, sink, cancel) = sinks();
+        let ex = RealExecutor::new(run_id, sink, cancel);
+
+        let live = dir.join("oxrsys-runtime.toml");
+        std::fs::write(&live, b"displaced by an outside editor").unwrap();
+        let captured = dir.join("oxrsys-runtime.toml.displaced");
+        ex.hard_link(&live, &captured).await.unwrap();
+        // The link holds the bytes that were live at that instant, even after
+        // the destination is replaced by a rename.
+        ex.write_atomic(&live, b"sabrage wrote this").await.unwrap();
+        assert_eq!(
+            std::fs::read(&captured).unwrap(),
+            b"displaced by an outside editor"
+        );
+        // A taken name is never replaced.
+        let err = ex.hard_link(&live, &captured).await.unwrap_err();
+        match err {
+            SabrageError::Io { source, .. } => {
+                assert_eq!(source.kind(), std::io::ErrorKind::AlreadyExists)
+            }
+            other => panic!("expected Io/AlreadyExists, got {other:?}"),
+        }
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn write_atomic_replaces_and_leaves_no_temp_files() {
         let dir = scratch("atomic");
@@ -1456,6 +1667,7 @@ mod tests {
             ex.create_dir_all(&sub).await.err(),
             ex.remove_dir_all(&dir).await.err(),
             ex.remove_file(&victim).await.err(),
+            ex.hard_link(&victim, &dst).await.err(),
             ex.touch(&out).await.err(),
         ] {
             assert!(
@@ -1466,6 +1678,18 @@ mod tests {
         // And nothing happened.
         assert!(!dst.exists() && !out.exists() && !sub.exists());
         assert!(victim.is_file() && dir.is_dir());
+
+        // The one exception, and why it exists: rolling back a mutation this
+        // stage already made must happen *because* the run was cancelled, not
+        // in spite of it (install's interrupted stock-DXMT capture).
+        let half_copy = dir.join("dxmt.stock-backup.partial");
+        std::fs::create_dir_all(half_copy.join("inner")).unwrap();
+        std::fs::write(half_copy.join("inner/one.dll"), b"first entry").unwrap();
+        ex.remove_dir_all_rollback(&half_copy).await.unwrap();
+        assert!(!half_copy.exists(), "a cancelled run kept the partial copy");
+        // Idempotent, like `remove_dir_all`.
+        ex.remove_dir_all_rollback(&half_copy).await.unwrap();
+
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1494,6 +1718,8 @@ mod tests {
         ex.remove_file(&existing).await.unwrap();
         ex.remove_dir_all(&sub).await.unwrap();
         ex.dir_copy(&sub, &dir.join("sub-copy")).await.unwrap();
+        ex.hard_link(&existing, &absent).await.unwrap();
+        ex.remove_dir_all_rollback(&sub).await.unwrap();
         ex.touch(&absent).await.unwrap();
         ex.tar_xzf(&src, &dir).await.unwrap();
         ex.download("https://h/x.tgz", &absent, "deadbeef", "X")
@@ -1510,7 +1736,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(snapshot(&dir), before, "a dry run touched the filesystem");
-        assert_eq!(ex.planned().len(), 12, "every call recorded one action");
+        assert_eq!(ex.planned().len(), 14, "every call recorded one action");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -1589,6 +1815,16 @@ mod tests {
             (
                 act(PlannedKind::DirCopy, Some("/a/d"), Some("/b/d"), "cp -R"),
                 "would copy directory /a/d → /b/d (cp -R)",
+            ),
+            (
+                act(
+                    PlannedKind::Link,
+                    Some("/b/oxrsys-runtime.toml"),
+                    Some("/b/backups/oxrsys-runtime.toml.displaced"),
+                    "link(2)",
+                ),
+                "would hard-link /b/oxrsys-runtime.toml → \
+                 /b/backups/oxrsys-runtime.toml.displaced (link(2))",
             ),
             (
                 act(

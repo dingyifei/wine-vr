@@ -1,7 +1,13 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
   import { errMsg } from "../lib/text";
-  import { canStop as sessionCanStop, type LaunchOpts, type SessionStatus, type StageEvent } from "../ipc";
+  import {
+    canStop as sessionCanStop,
+    isLivePhase,
+    type LaunchOpts,
+    type SessionStatus,
+    type StageEvent,
+  } from "../ipc";
   import BottleSelect from "../components/BottleSelect.svelte";
   import { demoRunCommand } from "../lib/demo";
   import { bottlesStore } from "../stores/bottles.svelte";
@@ -44,6 +50,16 @@
    * nothing has been set yet, so the hint doesn't appear over plain
    * hardcoded fallbacks. */
   let prefilledFromSettings = $state(false);
+  /** True once THIS screen's own onMount has finished prefilling
+   * `selectedBottle` (successfully or not) — deliberately separate from
+   * `bottlesStore.bottlesLoaded`, which is a module-global flag that stays
+   * `true` forever after the FIRST screen anywhere loads it. If the menu
+   * Launch replay effect below gated on that global flag instead, firing
+   * ⌘R from another screen (which had already loaded bottles once) would
+   * see `bottlesLoaded === true` and read `selectedBottle` before this
+   * mount's own prefill assignment below ran, producing a false "No bottle
+   * selected" notice on a perfectly configured install. */
+  let bottlePrefillDone = $state(false);
 
   function pickDefaultBottle(list: string[]): string {
     return list.includes("Steam") ? "Steam" : (list[0] ?? "");
@@ -77,6 +93,8 @@
       prefilledFromSettings = Boolean(appDefaultBottle || appDefaultBsDir || launchTouched);
     } catch {
       // bottlesStore/settingsStore already fall back to their own empty states
+    } finally {
+      bottlePrefillDone = true;
     }
     try {
       // "Previous session did not shut down cleanly" / "running outside this
@@ -104,12 +122,23 @@
 
   const status = $derived(sessionStore.status);
 
+  // `isLivePhase` is the one definition of "a session is live" for the whole
+  // UI (ipc.ts) — Library.svelte already uses it for the same decision. This
+  // used to hand-list only "running"/"launching"/"preflight", which omitted
+  // "stalled"/"stopping"/"detached"/"external" — all four are live sessions
+  // (an external one has no Sabrage-owned handle at all, only a fresh
+  // runtime_status.json naming a live pid) that a second Launch must not run
+  // over.
+  //
+  // `stageStore.running` is the other half of `gate !== null`: Hide closes the
+  // dialog without stopping the stage it was showing, so a Launch fired over a
+  // hidden-but-running install queues a second `openGate` that GateModal
+  // refuses to adopt — the modal reopens showing the *install's* title, rows
+  // and Cancel target while this launch runs behind the operation lock with no
+  // feedback and nothing to cancel it with. Refuse it up front instead, the
+  // same rule StagesPanel and Doctor already apply.
   const busy = $derived(
-    sessionStore.launching ||
-      status.phase === "running" ||
-      status.phase === "launching" ||
-      status.phase === "preflight" ||
-      stageStore.gate !== null,
+    sessionStore.launching || isLivePhase(status.phase) || stageStore.gate !== null || stageStore.running,
   );
 
   /** Delegates to `demoRunCommand` (moved out of this screen in Phase 4 so
@@ -156,8 +185,8 @@
 
   // ── menu-triggered launch (Pipeline ▸ Launch, ⌘R) ───────────────────────────
   // App.svelte navigates here and bumps `launchRequest`; this effect waits for
-  // this screen's own mount-time bottle/options load (`bottlesLoaded`) and then
-  // calls `doLaunch` — never a second, hand-duplicated launch call — so a
+  // this screen's own mount-time bottle/options load (`bottlePrefillDone`) and
+  // then calls `doLaunch` — never a second, hand-duplicated launch call — so a
   // menu-triggered launch behaves exactly like clicking the Launch button
   // below with whatever bottle/options this screen already has selected.
 
@@ -167,7 +196,7 @@
   $effect(() => {
     const reqId = launchRequest;
     if (reqId === lastHandledLaunchRequest) return;
-    if (!bottlesLoaded) return; // re-evaluated once the mount-time load settles
+    if (!bottlePrefillDone) return; // re-evaluated once this mount's own prefill settles
     lastHandledLaunchRequest = reqId;
     if (busy) {
       launchRequestNotice = "A launch or stage is already in progress.";
@@ -414,6 +443,10 @@
 
       {#if launchRequestNotice}
         <p class="text-muted launch-request-notice">{launchRequestNotice}</p>
+      {/if}
+
+      {#if stageStore.running}
+        <p class="text-muted launch-request-notice">A stage is already running — wait for it to finish.</p>
       {/if}
 
       <div class="launch-actions">

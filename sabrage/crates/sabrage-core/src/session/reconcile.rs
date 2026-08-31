@@ -175,6 +175,20 @@ pub enum Classification {
     Unverifiable,
 }
 
+impl Classification {
+    /// Is the recorded process alive as far as anything here can tell?
+    ///
+    /// [`Classification::Unverifiable`] counts: it is the alive-pid case whose
+    /// identity simply cannot be checked, and every door in this codebase
+    /// treats it as running (the module doc's fourth bullet,
+    /// [`crate::session::session_block_at`]'s third signal). Rendering it as
+    /// exited is how the Session screen offers Launch for a session the launch
+    /// path then refuses.
+    pub fn is_live(self) -> bool {
+        matches!(self, Classification::Live | Classification::Unverifiable)
+    }
+}
+
 /// The outcome of a [`reconcile`] pass, as reported to the UI.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
@@ -215,7 +229,40 @@ pub enum Reconciled {
     /// front-end's, or a newer Sabrage's. It was **reported and nothing else**:
     /// nothing restored, nothing signalled, the file left exactly as it was.
     /// `reason` is the row the user saw.
-    Busy { state: SessionState, reason: String },
+    Busy {
+        state: SessionState,
+        reason: String,
+        /// `true` only for *this* process's own in-flight launch, the one
+        /// shape that is not worth a row (and not worth refusing over —
+        /// nothing is wrong). Every other `Busy` describes a record somebody
+        /// else is still using: see [`Reconciled::busy_refusal`], which is
+        /// what a launch must refuse on.
+        #[serde(default)]
+        silent: bool,
+    },
+}
+
+impl Reconciled {
+    /// The reason a caller about to mutate the machine must **stop**, or
+    /// `None` when this outcome licenses carrying on.
+    ///
+    /// A9-1: `Busy` used to be indistinguishable from "nothing to carry
+    /// forward" at the launch site, so a record protected *because* another
+    /// front-end's session is live let the launch continue into preflight's
+    /// auto-fixes, `adb forward --remove` and the bottle's `wineserver -k` —
+    /// taking down the very session the classification had just refused to
+    /// touch. Only this process's own in-flight record (`silent`) is safe to
+    /// carry on over: it is this launch's own.
+    pub fn busy_refusal(&self) -> Option<&str> {
+        match self {
+            Reconciled::Busy {
+                reason,
+                silent: false,
+                ..
+            } => Some(reason),
+            _ => None,
+        }
+    }
 }
 
 /// How much of a stale session's cleanup the restore pass may do.
@@ -240,7 +287,20 @@ pub enum RestoreMode {
 /// `kill(0, …)` addresses the *caller's whole process group* — the one number
 /// that must never reach a liveness probe, let alone a signal.
 pub fn classify(state: &SessionState) -> Classification {
-    let Some(wine) = state.wine.as_ref() else {
+    classify_identity(state.wine.as_ref())
+}
+
+/// [`classify`] over a bare identity, for the caller that has one without a
+/// record around it: [`crate::session::watcher::SessionMonitor`]'s live-handle
+/// branch, whose `ProcInfo` is the same spawn-time identity `wine` holds.
+///
+/// One predicate, so the phase the Session screen shows and the classification
+/// the launch path refuses on cannot disagree — an alive pid with the spawn
+/// fallback's `start_time == 0` was `Unverifiable` (and therefore live) to
+/// reconciliation while the monitor rendered it `Exited`, offering Launch for a
+/// session `run` would then refuse.
+pub fn classify_identity(wine: Option<&ProcInfo>) -> Classification {
+    let Some(wine) = wine else {
         return Classification::Dead;
     };
     if wine.pid == 0 {
@@ -302,7 +362,7 @@ async fn reconcile_with<F, Fut>(
 ) -> Result<Reconciled>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let path = ctx.paths.session_state_path();
     let Some(mut state) = load_record(ctx, &path)? else {
@@ -320,6 +380,7 @@ where
         return Ok(Reconciled::Busy {
             state,
             reason: reason.text,
+            silent: reason.silent,
         });
     }
 
@@ -476,7 +537,7 @@ async fn finish_stopped_session_with<F, Fut>(
 ) -> Result<()>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let result = finish_stopped_session_inner(ctx, live_run_id, run_phase, probe).await;
     tolerate_reconcile_failure(ctx, result)
@@ -518,7 +579,7 @@ async fn finish_stopped_session_inner<F, Fut>(
 ) -> Result<()>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let path = ctx.paths.session_state_path();
     let Some(mut state) = load_record(ctx, &path)? else {
@@ -596,25 +657,33 @@ struct AudioProbe {
 /// [`crate::session::fallback_output_device`]'s not-connected branch, so most
 /// restores pay for it without using it either way; concurrency at least
 /// keeps that from costing two probes' latency in series.
-async fn current_output_device(ctx: &StageCtx) -> Option<AudioProbe> {
-    let bin = which("SwitchAudioSource")?;
+///
+/// `Ok(None)` is "we could not look" (no binary, a failed or wedged probe);
+/// `Err(Cancelled)` is the one answer that is **not** that — see
+/// [`probe_capture`].
+async fn current_output_device(ctx: &StageCtx) -> Result<Option<AudioProbe>> {
+    let Some(bin) = which("SwitchAudioSource") else {
+        return Ok(None);
+    };
     let current_spec = ctx.child(bin.clone(), STEP).args(["-c", "-t", "output"]);
     let listing_spec = ctx.child(bin.clone(), STEP).args(["-a", "-t", "output"]);
-    let (current, listing) =
-        tokio::join!(probe_capture(&current_spec), probe_capture(&listing_spec));
-    let current = current?;
-    if !current.status.success() {
-        return None;
-    }
+    let (current, listing) = tokio::join!(
+        probe_capture(&current_spec, &ctx.cancel),
+        probe_capture(&listing_spec, &ctx.cancel)
+    );
+    let (current, listing) = (current?, listing?);
+    let Some(current) = current.filter(|c| c.status.success()) else {
+        return Ok(None);
+    };
     let outputs = match listing {
         Some(l) if l.status.success() => output_device_names(&l.stdout),
         _ => Vec::new(),
     };
-    Some(AudioProbe {
+    Ok(Some(AudioProbe {
         bin,
         current: current.stdout_trimmed().to_string(),
         outputs,
-    })
+    }))
 }
 
 /// How long one audio probe may take before it is treated as no answer.
@@ -623,19 +692,36 @@ async fn current_output_device(ctx: &StageCtx) -> Option<AudioProbe> {
 /// not answered in this long is wedged on a CoreAudio call, and waiting for it
 /// blocks the whole of `run`/`stop` — with the operation lock held — behind a
 /// read-only question whose failure mode is already handled (`None` leaves the
-/// audio guard pending and the record on disk). [`crate::process::capture`]
-/// itself has no deadline and no cancellation hook; bounding it here is the
-/// half that belongs to reconciliation.
+/// audio guard pending and the record on disk). Shorter than
+/// [`crate::process::DEFAULT_PROBE_TIMEOUT`] on purpose, which is why the
+/// deadline is passed explicitly rather than taken from
+/// [`crate::process::capture`].
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// [`crate::process::capture`] with [`PROBE_TIMEOUT`] over it. `None` for a
-/// spawn failure and for a probe that ran out of time — indistinguishable to
-/// every caller, because both mean "we could not look".
-async fn probe_capture(spec: &crate::process::ChildSpec) -> Option<process::Captured> {
-    tokio::time::timeout(PROBE_TIMEOUT, process::capture(spec))
-        .await
-        .ok()?
-        .ok()
+/// [`crate::process::capture_with`] under the *operation's* token and
+/// [`PROBE_TIMEOUT`]. `None` for a spawn failure, for a probe that ran out of
+/// time, and for a cancelled one — indistinguishable to every caller, because
+/// all three mean "we could not look".
+///
+/// The token matters twice over: Cancel can interrupt a wedged CoreAudio probe
+/// instead of waiting out the deadline with the operation lock held, and
+/// `capture_with` kills the probe's whole **process group** on the way out, so
+/// a `SwitchAudioSource` that forked cannot outlive its dropped leader. (A
+/// `tokio::time::timeout` around `capture` did neither: it fired before
+/// `capture`'s own deadline, so even the group kill never ran.)
+async fn probe_capture(
+    spec: &crate::process::ChildSpec,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<Option<process::Captured>> {
+    match process::capture_with(spec, cancel, PROBE_TIMEOUT).await {
+        Ok(captured) => Ok(Some(captured)),
+        // Cancellation is not "we could not look": swallowing it here would
+        // let the restore carry on — emitting its could-not-restore warn and
+        // keeping the record — for a `stop` the user just cancelled, which
+        // must fail with exit 130 (module doc, "Failure policy").
+        Err(SabrageError::Cancelled) => Err(SabrageError::Cancelled),
+        Err(_) => Ok(None),
+    }
 }
 
 /// `SwitchAudioSource -a -t output`'s stdout as one device name per line,
@@ -665,7 +751,7 @@ async fn restore_with<F, Fut>(
 ) -> Result<Vec<String>>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let path = ctx.paths.session_state_path();
     let mut banner = Banner::new(ctx);
@@ -711,7 +797,7 @@ async fn restore_audio<F, Fut>(
 ) -> Result<()>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let Some(prev) = state.prev_audio_output.clone() else {
         return Ok(());
@@ -721,7 +807,7 @@ where
     }
     // `None` is "we could not look", which is not "there was nothing to do":
     // the guard stays pending.
-    let Some(p) = probe().await else {
+    let Some(p) = probe().await? else {
         return Ok(());
     };
     let dry = ctx.executor.is_dry_run();
@@ -836,6 +922,15 @@ async fn restore_forwards(
             still_installed.push(fwd);
             continue;
         }
+        // Progress is written the moment it happens (the write-before-mutate
+        // rule's other half, `session::state`'s header): a crash after the
+        // `tcp:9943` removal but before the end of this loop must not leave a
+        // record still claiming 9943 is installed. A retry of an
+        // already-absent forward exits non-zero, and this function reads any
+        // non-zero as "still installed" — so that phantom row would be kept
+        // forever and `forwards_cleared` would never flip.
+        state.wired_forwards.retain(|f| f != &fwd);
+        state::save(&*ctx.executor, path, state).await?;
         let line = forward_row(dry, fwd.port, &fwd.serial);
         banner.show();
         ctx.step(STEP).info(line.clone());
@@ -890,7 +985,7 @@ async fn restore_and_finish<F, Fut>(
 ) -> Result<(Vec<String>, bool)>
 where
     F: FnOnce() -> Fut,
-    Fut: Future<Output = Option<AudioProbe>>,
+    Fut: Future<Output = Result<Option<AudioProbe>>>,
 {
     let restored = restore_with(ctx, state, mode, probe).await?;
     let kept = finish_record(ctx, path, state, mode).await?;
@@ -912,7 +1007,11 @@ async fn finish_record(
     mode: RestoreMode,
 ) -> Result<bool> {
     if restore_complete(state, mode) {
-        state::clear(&*ctx.executor, path).await?;
+        // Run-id guarded: this pass may have taken seconds (an audio probe, a
+        // `SIGTERM`, two `adb forward --remove`s), and a launch that started
+        // meanwhile has already written its own record over this path. Only
+        // the record this pass actually reconciled is ours to delete.
+        state::clear_run(&*ctx.executor, path, state.run_id).await?;
         return Ok(false);
     }
     state::save(&*ctx.executor, path, state).await?;
@@ -1021,11 +1120,44 @@ fn newer_schema_row(version: u32) -> String {
 /// [`crate::session::LIVE_SESSION`]. This function triggers that, waits up to
 /// [`DETACH_WAIT`] for the slot to be released (app-quit needs the bookkeeping
 /// finished before the process goes away), and then — only once the supervisor
-/// has stopped writing — re-reads the record and sets `detached` itself if the
-/// flag did not make it to disk. That last step is a safety net, deliberately
-/// ordered *after* the wait so it can never clobber a newer write, and it
-/// creates nothing: a record the supervisor already cleared stays cleared.
+/// has **provably** let go through this detach — sets `detached` itself if the
+/// flag did not make it to disk. That last step is a safety net, and it is
+/// hedged three ways, because every one of these was a way to relabel a session
+/// that in fact stopped:
+///
+/// * it runs only when the wait ended in the slot *clearing*, never on the
+///   [`DETACH_WAIT`] timeout — a supervisor that is still holding the slot is
+///   still writing to that record;
+/// * it re-checks `handle.cancel` afterwards: a Stop that fired during the wait
+///   is terminal and owns the teardown, and its record (kept because a guard
+///   could not be released) must not come back as `detached: true` — the app
+///   then tells the user the game "is still running, unsupervised" about a
+///   session it stopped;
+/// * it goes through [`state::mark_detached`], which creates nothing: a record
+///   the supervisor already cleared stays cleared.
 pub async fn detach(ctx_paths: &Paths, handle: &LiveSessionHandle) -> Result<()> {
+    detach_with(ctx_paths, handle, DETACH_WAIT, |run_id| {
+        crate::session::live_session_is(run_id)
+    })
+    .await
+}
+
+/// [`detach`] with its two ambient inputs injected — the wait budget and the
+/// "is the supervisor still holding the slot" question.
+///
+/// Same reason [`reconcile_with`] exists: the real ones read the process-global
+/// [`crate::session::LIVE_SESSION`], and a test that occupied that slot for the
+/// length of a [`DETACH_WAIT`] would be publishing a live session to every
+/// other test in the binary.
+async fn detach_with<F>(
+    ctx_paths: &Paths,
+    handle: &LiveSessionHandle,
+    wait: Duration,
+    still_supervised: F,
+) -> Result<()>
+where
+    F: Fn(RunId) -> bool,
+{
     // Stop is terminal, and detach is subordinate to it. Both tokens feed one
     // unbiased `select!` in the supervisor, so a detach fired *after* a Stop
     // can still win that race — disarming the guards, marking the record
@@ -1033,34 +1165,43 @@ pub async fn detach(ctx_paths: &Paths, handle: &LiveSessionHandle) -> Result<()>
     // live slot empty and reports success. A Stop that has fired can never be
     // superseded here, and cancellation is monotonic, so this check cannot
     // race back the other way.
+    //
+    // This is also the return that silently absorbs the Tauri quit dialog's
+    // stop-then-timeout arm (`commands::resolve_quit`, which fires `cancel`
+    // and only then calls detach): nothing is detached there, and the message
+    // that arm renders has to say so itself — this function cannot.
     if handle.cancel.is_cancelled() {
         return Ok(());
     }
     handle.detach.cancel();
 
-    let deadline = tokio::time::Instant::now() + DETACH_WAIT;
-    while tokio::time::Instant::now() < deadline {
-        if !crate::session::live_session_is(handle.run_id) {
-            break;
+    let deadline = tokio::time::Instant::now() + wait;
+    let cleared = loop {
+        if !still_supervised(handle.run_id) {
+            break true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break false;
         }
         tokio::time::sleep(DETACH_POLL).await;
+    };
+
+    // Not our record to write: either the supervisor never let go (and is
+    // therefore still writing to it), or a Stop won the race while we waited
+    // and owns the teardown — including the decision to keep the record.
+    if !cleared || handle.cancel.is_cancelled() {
+        return Ok(());
     }
 
-    let path = ctx_paths.session_state_path();
-    if let Ok(Some(mut persisted)) = state::load(&path) {
-        if persisted.run_id == handle.run_id && !persisted.detached {
-            persisted.detached = true;
-            let executor = crate::executor::RealExecutor::new(
-                handle.run_id,
-                crate::stages::null_sink(),
-                tokio_util::sync::CancellationToken::new(),
-            );
-            // Best-effort: a session that keeps running with `detached: false`
-            // on disk still reconciles correctly (Live restores nothing); the
-            // flag only decides whether the GUI offers Re-attach.
-            let _ = state::save(&executor, &path, &persisted).await;
-        }
-    }
+    let executor = crate::executor::RealExecutor::new(
+        handle.run_id,
+        crate::stages::null_sink(),
+        tokio_util::sync::CancellationToken::new(),
+    );
+    // Best-effort: a session that keeps running with `detached: false` on disk
+    // still reconciles correctly (Live restores nothing); the flag only decides
+    // whether the GUI offers Re-attach.
+    let _ = state::mark_detached(&executor, &ctx_paths.session_state_path(), handle.run_id).await;
 
     Ok(())
 }
@@ -1179,7 +1320,9 @@ mod tests {
 
     /// Probe stub: the tool is installed, reports `device`, and lists nothing
     /// (the fallback pool only matters where a test says it does).
-    fn probing(device: &str) -> impl FnOnce() -> std::future::Ready<Option<AudioProbe>> + '_ {
+    fn probing(
+        device: &str,
+    ) -> impl FnOnce() -> std::future::Ready<Result<Option<AudioProbe>>> + '_ {
         probing_list(device, &[])
     }
 
@@ -1187,19 +1330,19 @@ mod tests {
     fn probing_list<'a>(
         device: &'a str,
         outputs: &'a [&'a str],
-    ) -> impl FnOnce() -> std::future::Ready<Option<AudioProbe>> + 'a {
+    ) -> impl FnOnce() -> std::future::Ready<Result<Option<AudioProbe>>> + 'a {
         move || {
-            std::future::ready(Some(AudioProbe {
+            std::future::ready(Ok(Some(AudioProbe {
                 bin: PathBuf::from("/fixture/SwitchAudioSource"),
                 current: device.into(),
                 outputs: outputs.iter().map(|o| o.to_string()).collect(),
-            }))
+            })))
         }
     }
 
     /// Probe stub: no `SwitchAudioSource` on this machine.
-    fn no_probe() -> impl FnOnce() -> std::future::Ready<Option<AudioProbe>> {
-        || std::future::ready(None)
+    fn no_probe() -> impl FnOnce() -> std::future::Ready<Result<Option<AudioProbe>>> {
+        || std::future::ready(Ok(None))
     }
 
     /// Probe stub reporting a binary **inside the fixture that does not exist**,
@@ -1208,14 +1351,14 @@ mod tests {
     /// touching the machine — nothing is executed, and the device is untouched.
     fn probing_a_vanished_binary(
         dir: &Path,
-    ) -> impl FnOnce() -> std::future::Ready<Option<AudioProbe>> {
+    ) -> impl FnOnce() -> std::future::Ready<Result<Option<AudioProbe>>> {
         let bin = dir.join("bin/SwitchAudioSource");
         move || {
-            std::future::ready(Some(AudioProbe {
+            std::future::ready(Ok(Some(AudioProbe {
                 bin,
                 current: BLACKHOLE.to_string(),
                 outputs: Vec::new(),
-            }))
+            })))
         }
     }
 
@@ -1523,8 +1666,12 @@ mod tests {
             vec![Severity::Ok, Severity::Ok, Severity::Info, Severity::Info],
         );
 
-        // Mutations, in order: switch, save, kill, save, two removals, save,
-        // clear. Each guard's flag hits disk before the next guard is touched.
+        // Mutations, in order: switch, save, kill, save, then each removal
+        // followed by its own save (A9-4: progress has to be crash-durable —
+        // a record that still claims a removed forward is installed can never
+        // be completed, because re-removing an absent listener exits
+        // non-zero), the final forwards save, and the clear. Every flag hits
+        // disk before the next guard is touched.
         let planned = ctx.executor.planned();
         let kinds: Vec<PlannedKind> = planned.iter().map(|p| p.kind).collect();
         assert_eq!(
@@ -1537,7 +1684,11 @@ mod tests {
                 PlannedKind::CreateDir,
                 PlannedKind::Write,
                 PlannedKind::Spawn,
+                PlannedKind::CreateDir,
+                PlannedKind::Write,
                 PlannedKind::Spawn,
+                PlannedKind::CreateDir,
+                PlannedKind::Write,
                 PlannedKind::CreateDir,
                 PlannedKind::Write,
                 PlannedKind::RemoveFile,
@@ -1658,6 +1809,7 @@ mod tests {
                 Reconciled::Busy {
                     state,
                     reason: RECORD_IN_FLIGHT.to_string(),
+                    silent: true,
                 },
                 "{phase:?}"
             );
@@ -1731,6 +1883,7 @@ mod tests {
             Reconciled::Busy {
                 state,
                 reason: owned_elsewhere_row(foreign.pid()),
+                silent: false,
             }
         );
         assert!(ctx.executor.planned().is_empty());
@@ -1780,6 +1933,77 @@ mod tests {
     /// the session's guards — switching the audio device back, pulling the
     /// `--wired` forwards that carry the stream — may be disconnecting the
     /// running session.
+    /// A9-1. Every `Busy` except this process's own in-flight record is a
+    /// record somebody is still using — and the launch path has to be able to
+    /// *tell*, or it carries on into preflight's auto-fixes, `adb forward
+    /// --remove` and the bottle's `wineserver -k`, taking down the session the
+    /// classification just refused to touch.
+    #[tokio::test]
+    async fn every_busy_but_our_own_in_flight_record_is_a_refusal() {
+        let dir = scratch("busy-refusal");
+        let (ctx, _seen) = test_ctx(&dir, true);
+
+        // Our own launch, mid-flight: nothing is wrong, nothing to refuse.
+        let mine = pending(Some(dead()), None);
+        write_state(&ctx, &mine);
+        let out = reconcile_with(
+            &ctx,
+            None,
+            Some(crate::session::RunPhaseInfo {
+                phase: crate::session::SessionPhase::Preflight,
+                run_id: mine.run_id,
+                bottle: "Steam".into(),
+                exit_code: None,
+            }),
+            probing(BLACKHOLE),
+        )
+        .await
+        .unwrap();
+        assert!(matches!(out, Reconciled::Busy { silent: true, .. }));
+        assert_eq!(out.busy_refusal(), None);
+
+        // Another live front-end's record: a refusal, carrying the row the
+        // user saw.
+        let foreign = ForeignProcess::spawn();
+        let mut theirs = pending(None, None);
+        theirs.set_owner(foreign.pid());
+        write_state(&ctx, &theirs);
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.busy_refusal(),
+            Some(owned_elsewhere_row(foreign.pid()).as_str())
+        );
+
+        // A newer schema: likewise.
+        let mut newer = pending(Some(dead()), None);
+        newer.version = state::SESSION_STATE_VERSION + 1;
+        write_state(&ctx, &newer);
+        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+            .await
+            .unwrap();
+        assert_eq!(
+            out.busy_refusal(),
+            Some(newer_schema_row(newer.version).as_str())
+        );
+
+        // And the outcomes a launch may carry on over say nothing.
+        assert_eq!(Reconciled::NoSession.busy_refusal(), None);
+        assert_eq!(
+            (Reconciled::Dead {
+                state: mine.clone(),
+                restored: Vec::new(),
+                pending: false,
+            })
+            .busy_refusal(),
+            None
+        );
+
+        assert!(ctx.executor.planned().is_empty(), "nothing was touched");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     #[tokio::test]
     async fn a_live_pid_with_no_observed_start_time_is_never_dismantled() {
         let dir = scratch("unverifiable");
@@ -1898,6 +2122,80 @@ mod tests {
             !planned.iter().any(|p| p.kind == PlannedKind::RemoveFile),
             "the record is what the next stop reads: {planned:?}"
         );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-4. The removals are not atomic with the record that describes them:
+    /// a crash (or a Cancel, or a power loss) between two `adb forward
+    /// --remove`s must leave a record naming only what is *still* installed.
+    /// Removing 9943 and then crashing used to leave both ports on disk, and
+    /// the retry's `--remove` of an already-absent listener exits non-zero —
+    /// which this module reads as "still installed", so the phantom row was
+    /// kept forever and the guard never released.
+    #[tokio::test]
+    async fn a_removal_that_took_is_on_disk_before_the_next_one_is_tried() {
+        let dir = scratch("forward-crash-resume");
+        let (ctx, _seen) = test_ctx(&dir, false);
+        let record = ctx.paths.session_state_path();
+        let snapshot = dir.join("record-as-the-second-removal-saw-it.json");
+
+        // A stub `adb` that fails the *second* removal — and, before failing,
+        // copies the record exactly as it stands at that moment. That copy is
+        // what a crash right there would have left behind.
+        let adb = ctx
+            .paths
+            .adb
+            .clone()
+            .expect("test_ctx points adb at the fixture");
+        std::fs::create_dir_all(adb.parent().unwrap()).unwrap();
+        std::fs::write(
+            &adb,
+            format!(
+                "#!/bin/sh\ncase \"$*\" in\n  *9944*) cp '{}' '{}'; exit 1;;\nesac\nexit 0\n",
+                record.display(),
+                snapshot.display()
+            ),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let mut state = pending(Some(dead()), None);
+        state.prev_audio_output = None; // no audio probe in this test
+        write_state(&ctx, &state);
+
+        let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
+        let Reconciled::Dead { pending, .. } = out else {
+            panic!("expected Dead, got {out:?}");
+        };
+        assert!(pending, "9944 is still installed, so the record is kept");
+
+        let mid = state::load(&snapshot)
+            .unwrap()
+            .expect("the stub copied the record");
+        assert_eq!(
+            mid.wired_forwards
+                .iter()
+                .map(|f| f.port)
+                .collect::<Vec<_>>(),
+            vec![9944],
+            "a crash after the 9943 removal must not leave 9943 on the record"
+        );
+        assert!(!mid.guards.forwards_cleared);
+
+        let after = state::load(&record).unwrap().expect("the record is kept");
+        assert_eq!(
+            after
+                .wired_forwards
+                .iter()
+                .map(|f| f.port)
+                .collect::<Vec<_>>(),
+            vec![9944]
+        );
+        assert!(!after.guards.forwards_cleared);
+
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2647,6 +2945,92 @@ mod tests {
         assert!(
             !on_disk.detached,
             "the record must not claim a detach that did not happen"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A9-9. Stop can also win *during* detach's wait: it fires the terminal
+    /// token and then releases the live slot, and its teardown legitimately
+    /// **keeps** the record when a guard could not be released (a disconnected
+    /// output device). Writing `detached: true` over that record is how the app
+    /// came to tell the user a session it had just stopped "detached instead of
+    /// stopping — it is still running, unsupervised".
+    #[tokio::test]
+    async fn detach_does_not_relabel_a_session_stopped_during_the_wait() {
+        let dir = scratch("detach-stop-wins-the-race");
+        let (ctx, _seen) = test_ctx(&dir, false);
+        let state = pending(Some(me()), Some(me()));
+        write_state(&ctx, &state);
+
+        let handle = LiveSessionHandle {
+            run_id: state.run_id,
+            bottle: state.bottle.clone(),
+            identity: me(),
+            log_path: state.log_path.clone(),
+            started_at_unix_ms: state.started_at_unix_ms,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        };
+
+        // The supervisor holds the slot for the first few polls; then a Stop
+        // fires its terminal token and the slot empties — exactly that order,
+        // which is what the supervisor's teardown does.
+        let polls = std::sync::atomic::AtomicU32::new(0);
+        let cancel = handle.cancel.clone();
+        detach_with(&ctx.paths, &handle, Duration::from_secs(5), |_| {
+            let n = polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < 3 {
+                return true;
+            }
+            cancel.cancel();
+            false
+        })
+        .await
+        .unwrap();
+
+        let on_disk = state::load(&ctx.paths.session_state_path())
+            .unwrap()
+            .expect("the teardown kept the record");
+        assert!(
+            !on_disk.detached,
+            "a session the Stop path tore down must not read as detached"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The other half: the wait can simply run out. A supervisor that still
+    /// holds the live slot is still writing to that record, so the safety net
+    /// must not fire — its whole justification is that the supervisor has
+    /// already let go.
+    #[tokio::test]
+    async fn detach_that_times_out_leaves_the_record_alone() {
+        let dir = scratch("detach-timeout");
+        let (ctx, _seen) = test_ctx(&dir, false);
+        let state = pending(Some(me()), Some(me()));
+        write_state(&ctx, &state);
+        let path = ctx.paths.session_state_path();
+        let before = std::fs::read(&path).unwrap();
+
+        let handle = LiveSessionHandle {
+            run_id: state.run_id,
+            bottle: state.bottle.clone(),
+            identity: me(),
+            log_path: state.log_path.clone(),
+            started_at_unix_ms: state.started_at_unix_ms,
+            cancel: CancellationToken::new(),
+            detach: CancellationToken::new(),
+        };
+
+        // Never released: the supervisor is wedged, or slower than the wait.
+        detach_with(&ctx.paths, &handle, Duration::from_millis(120), |_| true)
+            .await
+            .unwrap();
+
+        assert!(handle.detach.is_cancelled(), "the token still fires");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            before,
+            "a timed-out wait writes nothing at all"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

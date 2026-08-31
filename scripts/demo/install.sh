@@ -57,7 +57,7 @@ if [ -f "$HOST_XR_JSON" ] && [ "$(cat "$HOST_XR_JSON")" = "$WANT" ]; then
 else
   info "writing $HOST_XR_JSON (needs sudo)..."
   sudo mkdir -p "$(dirname "$HOST_XR_JSON")" || die "sudo mkdir failed"
-  print -- "$WANT" | sudo tee "$HOST_XR_JSON" >/dev/null || die "sudo write failed"
+  print -r -- "$WANT" | sudo tee "$HOST_XR_JSON" >/dev/null || die "sudo write failed"
   ok "host registration written"
 fi
 

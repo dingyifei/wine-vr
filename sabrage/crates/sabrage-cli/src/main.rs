@@ -357,6 +357,7 @@ fn cmd_doctor(args: &[String]) -> ! {
     // CLI flags override — the same precedence `demo.sh` gets from exporting
     // over whatever the caller's shell already had set.
     let opts = merge_doctor_options(CheckOptions::from_env(), &parsed);
+    let verbose = opts.verbose;
 
     let ctx = CheckCtx::new(Paths::new(&repo_root), opts);
     // Doctor only ever writes to stdout — no stderr rows exist in its output
@@ -365,7 +366,7 @@ fn cmd_doctor(args: &[String]) -> ! {
 
     println!("{BANNER}");
     let report = run_doctor(&ctx, |outcome| {
-        if let Some(line) = format_outcome(&outcome, colors) {
+        if let Some(line) = format_outcome(&outcome, colors, verbose) {
             println!("{line}");
         }
     });
@@ -437,17 +438,33 @@ fn info_row(text: &str) -> String {
 /// `Skipped`/`NotImplemented` return `None` — those statuses only ever reach
 /// zsh's silent `tap()` channel, never stdout. So do `quiet` passes: rows
 /// doctor.sh taps (`tap <slug> ok`) without printing a console line.
-fn format_outcome(o: &CheckOutcome, colors: bool) -> Option<String> {
+///
+/// `verbose` (A3b-3, round 2) gates one extra continuation line —
+/// `       detail: <d>` — appended when the row has a
+/// [`CheckOutcome::detail`] and the caller asked for it: `detail` is the
+/// "sabrage-only explainability field" (`checks/mod.rs`'s doc comment) that
+/// zsh's own `ok`/`warn`/`fail`/`info` have no slot for, so with `verbose`
+/// false (doctor's default) this function's output stays exactly what it was
+/// before `detail` existed — shell-parity byte-identical.
+fn format_outcome(o: &CheckOutcome, colors: bool, verbose: bool) -> Option<String> {
     if o.quiet {
         return None;
     }
-    match o.status {
+    let mut line = match o.status {
         CheckStatus::Pass => Some(ok_row(&o.message, colors)),
         CheckStatus::Warn => Some(warn_row(&o.message, colors)),
         CheckStatus::Fail => Some(fail_row(&o.message, o.remedy.as_deref(), colors)),
         CheckStatus::Info => Some(info_row(&o.message)),
         CheckStatus::Skipped | CheckStatus::NotImplemented => None,
+    };
+    if verbose {
+        if let (Some(l), Some(detail)) = (&mut line, &o.detail) {
+            l.push('\n');
+            l.push_str("       detail: ");
+            l.push_str(detail);
+        }
     }
+    line
 }
 
 /// The identical four rows, transcribed onto a [`sabrage_core::StageEvent::Line`]
@@ -1481,7 +1498,7 @@ mod tests {
     fn pass_row_has_three_space_gap_like_ok() {
         let o = CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)");
         assert_eq!(
-            format_outcome(&o, false).as_deref(),
+            format_outcome(&o, false, false).as_deref(),
             Some("  OK   Apple Silicon (Apple M-series)")
         );
     }
@@ -1490,7 +1507,7 @@ mod tests {
     fn warn_row_has_one_space_gap_like_warn() {
         let o = CheckOutcome::warn("bottle.template", "bottle template is not win11_64");
         assert_eq!(
-            format_outcome(&o, false).as_deref(),
+            format_outcome(&o, false, false).as_deref(),
             Some("  WARN bottle template is not win11_64")
         );
     }
@@ -1503,7 +1520,7 @@ mod tests {
             "upgrade CrossOver to 26.2+",
         );
         assert_eq!(
-            format_outcome(&o, false).as_deref(),
+            format_outcome(&o, false, false).as_deref(),
             Some("  FAIL CrossOver 26.1 < 26.2\n       remedy: upgrade CrossOver to 26.2+")
         );
     }
@@ -1512,7 +1529,7 @@ mod tests {
     fn fail_row_without_remedy_has_no_remedy_line() {
         let o = CheckOutcome::fail_bare("sys.arch", "not an Apple Silicon Mac (x86_64)");
         assert_eq!(
-            format_outcome(&o, false).as_deref(),
+            format_outcome(&o, false, false).as_deref(),
             Some("  FAIL not an Apple Silicon Mac (x86_64)")
         );
     }
@@ -1524,7 +1541,7 @@ mod tests {
             "Beat Saber check skipped (needs --bottle or --bs-dir)",
         );
         assert_eq!(
-            format_outcome(&o, false).as_deref(),
+            format_outcome(&o, false, false).as_deref(),
             Some("  Beat Saber check skipped (needs --bottle or --bs-dir)")
         );
     }
@@ -1532,17 +1549,44 @@ mod tests {
     #[test]
     fn skipped_and_not_implemented_print_nothing() {
         let skipped = CheckOutcome::skipped("hs.client", "no adb device".into());
-        assert_eq!(format_outcome(&skipped, false), None);
+        assert_eq!(format_outcome(&skipped, false, false), None);
         let ni = CheckOutcome::not_implemented("dep.dxmt");
-        assert_eq!(format_outcome(&ni, false), None);
+        assert_eq!(format_outcome(&ni, false, false), None);
     }
 
     #[test]
     fn colors_wrap_only_the_label_text() {
         let o = CheckOutcome::pass("sys.arch", "Apple Silicon");
         assert_eq!(
-            format_outcome(&o, true).as_deref(),
+            format_outcome(&o, true, false).as_deref(),
             Some("  \x1b[32mOK\x1b[0m   Apple Silicon")
+        );
+    }
+
+    /// A3b-3 (round 2): `detail` is sabrage-only and must never appear in
+    /// default (non-verbose) output — that is doctor's shell-parity byte
+    /// stream. Only `verbose: true` surfaces it, as a `detail:` continuation
+    /// line at the same column `remedy:` uses.
+    #[test]
+    fn detail_is_hidden_by_default_and_shown_only_when_verbose() {
+        let o = CheckOutcome::warn("cfg.session-pins", "could not inspect session.json: oops")
+            .with_detail("read error: oops");
+        assert_eq!(
+            format_outcome(&o, false, false).as_deref(),
+            Some("  WARN could not inspect session.json: oops")
+        );
+        assert_eq!(
+            format_outcome(&o, false, true).as_deref(),
+            Some("  WARN could not inspect session.json: oops\n       detail: read error: oops")
+        );
+    }
+
+    #[test]
+    fn verbose_with_no_detail_prints_nothing_extra() {
+        let o = CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)");
+        assert_eq!(
+            format_outcome(&o, false, true).as_deref(),
+            Some("  OK   Apple Silicon (Apple M-series)")
         );
     }
 

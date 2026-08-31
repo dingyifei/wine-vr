@@ -78,7 +78,7 @@ use crate::events::{step, RunId, StageEvent};
 use crate::executor::{DetachedChild, Executor, RealExecutor};
 use crate::paths::Bottle;
 use crate::process::{self, ProcInfo};
-use crate::session::state::{self, SessionState};
+use crate::session::state::{self, SessionState, WiredForward};
 use crate::session::{self, reconcile::Reconciled, LiveSessionHandle, RunPhaseInfo, SessionPhase};
 use crate::stages::{require_bottle, OperationGuard, StageCtx, STOP_WINESERVER_WAIT};
 
@@ -129,6 +129,27 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     // outlives its launch. See [`RunPhaseScope`].
     let mut phase = RunPhaseScope::new(ctx.run_id, &bottle.name);
 
+    // ── The live-session gate (A8-1) ─────────────────────────────────────────
+    // Asked BEFORE the phase below is published, so this launch's own
+    // `Preflight` cannot self-block through `session_block_at`'s run-phase
+    // arm — and before `reconcile`, which is not a substitute for it:
+    // `reconcile` reads `session-state.json`, and the signals it cannot see
+    // are exactly the ones a second launch runs into. This process's own live
+    // handle, another launch already in flight here, and above all a **fresh
+    // `runtime_status.json`** — the only signal a `./demo.sh run` session
+    // produces at all. Without this, Launch (or ⌘R) during a shell-started
+    // session walked all the way to `wineserver_reset` and took that running
+    // game down with it.
+    if let Some(block) = launch_block(ctx) {
+        let owner = block.bottle.as_deref().unwrap_or(&bottle.name);
+        return Err(refuse_launch(
+            ctx,
+            "a session is already running",
+            &block.reason,
+            owner,
+        ));
+    }
+
     // ── Reconcile ────────────────────────────────────────────────────────────
     // Sabrage-only, and deliberately *before* anything permanent — the
     // preflight's two auto-fixes (the `cxbottle.conf` backend line, the helper
@@ -144,19 +165,41 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     if let Reconciled::Live { state } = &reconciled {
         return Err(already_running(ctx, &bottle, state));
     }
-    // A record that survived reconciliation still names an output device
-    // nobody could switch back to. Carry it forward instead of letting this
-    // launch's own `SwitchAudioSource -c` overwrite it — by now that reads
-    // `BlackHole 2ch`, and recording *that* is how the real device is lost for
-    // good (`AudioGuard::acquire` explains the other half).
+    // A record that is not ours to *touch* is not ours to launch over either
+    // (A9-1 / A9-8). `reconcile` reported it and did nothing else: a live
+    // foreign owner still holds the guards that record describes, and a
+    // newer-schema record names guards this binary cannot even parse. Falling
+    // through used to reach `wineserver_reset`, which takes down the very
+    // session the classification exists to protect — so the outcome that
+    // means "somebody else's" is fatal here, before one permanent mutation.
+    //
+    // `silent: false` is the whole of "somebody else's": the one silent shape
+    // is this process's own in-flight launch, which cannot reach a launch that
+    // has written no record of its own yet.
+    if let Reconciled::Busy {
+        state,
+        reason,
+        silent: false,
+    } = &reconciled
+    {
+        return Err(refuse_launch(
+            ctx,
+            "refusing to launch over the previous session record",
+            reason,
+            &state.bottle,
+        ));
+    }
+    // A record that survived reconciliation still names guards nobody could
+    // release — an output device nothing could switch back to, `--wired`
+    // forwards `adb` would not remove. Carry them forward instead of letting
+    // this launch overwrite the record that describes them (see [`Carried`]).
     let carried = match &reconciled {
         Reconciled::Dead { state, .. } | Reconciled::IdentityMismatch { state, .. } => {
-            unfinished_audio_restore(state)
+            carry_forward(state)
         }
-        // `NoSession`, `Busy` (nothing was touched, so nothing is ours to
-        // carry), and `Live` — which never reaches here, the launch having
-        // already refused.
-        _ => None,
+        // `NoSession`, `Busy` and `Live` — the last two never reach here, the
+        // launch having already refused.
+        _ => Carried::default(),
     };
     checkpoint(ctx)?;
 
@@ -174,13 +217,19 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
         PathBuf::new(),
         session::now_unix_ms(),
     );
-    sess.prev_audio_output = carried;
+    sess.prev_audio_output = carried.audio;
+    sess.wired_forwards = carried.forwards;
 
     // Recorded as each forward is made (session::state's invariant table, row
     // 3), inside `adb_forward_hygiene` itself: a `--wired` launch that never
     // reaches teardown still leaves the forwards on disk for the next
     // reconcile to remove.
     actions::adb_forward_hygiene(ctx, &mut sess, &state_path).await?;
+    // A carried-forward forward and one this launch just made can name the
+    // same `(serial, port)`; recording it twice only buys a second
+    // `adb forward --remove` that finds nothing. The next save (the guards',
+    // or the launch record's) writes the deduplicated list.
+    dedup_forwards(&mut sess.wired_forwards);
     checkpoint(ctx)?;
     actions::wineserver_reset(ctx, &bottle).await?;
     checkpoint(ctx)?;
@@ -250,6 +299,78 @@ fn unfinished_audio_restore(state: &SessionState) -> Option<String> {
         return None;
     }
     state.prev_audio_output.clone()
+}
+
+/// Everything a reconciled-but-kept record hands to the launch that replaces
+/// it.
+///
+/// The record is the *only* description of a guard nothing could release, and
+/// the next launch overwrites it (`SessionState::new` + the first save). Every
+/// outstanding guard therefore has to travel into the new record, or the
+/// retry the record was kept for can never happen (A9-2).
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Carried {
+    /// The output device whose restore never finished — see
+    /// [`unfinished_audio_restore`].
+    audio: Option<String>,
+    /// `--wired` forwards still on a device because `adb forward --remove`
+    /// failed. Without these the exact `(serial, port)` pairs are lost, and a
+    /// stale forward is what silently breaks the next WiFi run.
+    forwards: Vec<WiredForward>,
+}
+
+/// [`Carried`] out of one reconciled record.
+fn carry_forward(state: &SessionState) -> Carried {
+    Carried {
+        audio: unfinished_audio_restore(state),
+        // Same shape as the audio flag: a removal that succeeded set
+        // `forwards_cleared` (and emptied the list), and carries nothing.
+        forwards: if state.guards.forwards_cleared {
+            Vec::new()
+        } else {
+            state.wired_forwards.clone()
+        },
+    }
+}
+
+/// Drop repeated `(serial, port)` pairs, keeping the first of each.
+fn dedup_forwards(forwards: &mut Vec<WiredForward>) {
+    let mut seen: Vec<(String, u16)> = Vec::new();
+    forwards.retain(|f| {
+        let key = (f.serial.clone(), f.port);
+        if seen.contains(&key) {
+            return false;
+        }
+        seen.push(key);
+        true
+    });
+}
+
+/// [`session::live_session_block`] as the *launch* asks it: every signal
+/// except the record on disk, which is [`session::reconcile`]'s to read.
+///
+/// The empty state path is how that is said. Nothing is lost by it — a `Live`
+/// record refuses through [`already_running`] and every untouchable one
+/// through the `Busy` arm — and leaving the record out of this gate preserves
+/// the one behaviour `reconcile` documents by name: an unreadable record
+/// warns and is explained, it does not block every future launch.
+fn launch_block(ctx: &StageCtx) -> Option<session::SessionBlock> {
+    session::session_block_at(
+        Path::new(""),
+        &ctx.paths.oxr_appsup.join("runtime_status.json"),
+    )
+}
+
+/// A launch refusal in the shape [`already_running`] established: what is in
+/// the way, why, and both routes out of it.
+fn refuse_launch(ctx: &StageCtx, headline: &str, reason: &str, bottle: &str) -> SabrageError {
+    ctx.fatal(
+        format!(
+            "{headline} — {reason} — stop it first: Stop in Sabrage, or \
+             ./demo.sh stop --bottle {bottle}"
+        ),
+        None,
+    )
 }
 
 // ── the published run phase ───────────────────────────────────────────────────
@@ -407,8 +528,18 @@ async fn guarded(
     held: &mut Guards,
     lock: Option<OperationGuard>,
 ) -> Result<Reason> {
-    // run.sh:154-200
-    held.audio = Some(AudioGuard::acquire(ctx, facts, sess).await?);
+    // run.sh:154-200 — in two halves on purpose (A8-3). `arm` does everything
+    // that is not a mutation, up to and including the pre-mutation save; the
+    // guard is installed HERE, and only then does `apply_switch` run the child
+    // that can come back `Cancelled` after CoreAudio has already changed. An
+    // `Err` out of the switch therefore unwinds with the guard in `held`,
+    // where `teardown` releases it through the bounded, executor-routed path
+    // that sets `guards.audio_restored` and saves — rather than through
+    // `Drop`, which restores the device but can record neither.
+    held.audio = Some(AudioGuard::arm(ctx, facts, sess).await?);
+    if let Some(audio) = held.audio.as_mut() {
+        audio.apply_switch(ctx, sess).await?;
+    }
     if ctx.cancel.is_cancelled() {
         return Ok(Reason::Cancelled { child: None });
     }
@@ -818,12 +949,27 @@ async fn reap_helper(ctx: &StageCtx) {
 ///
 /// The existence probe keeps a run that never wrote the file from adding a
 /// phantom `would remove …` row to a dry run's plan.
-async fn clear_state(ctx: &StageCtx, path: &Path) -> Result<()> {
-    if path.exists() {
-        state::clear(&*ctx.executor, path).await
-    } else {
-        Ok(())
+async fn clear_state(ctx: &StageCtx, path: &Path, expected: RunId) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
     }
+    // …and only when it is still OUR record (A9-3). A teardown that lands
+    // after the next launch has written its own — detach, relaunch, late
+    // unwind — would otherwise delete a live session's only description:
+    // `state::clear` compares the *owner*, which on this machine is this very
+    // process, so run identity is the only thing that can tell the two apart.
+    // An unreadable record is removed as before; it describes nothing anyone
+    // can act on, and leaving it would block the next reconcile forever.
+    if let Ok(Some(existing)) = state::load(path) {
+        if existing.run_id != expected {
+            ctx.step(step::RUN_TEARDOWN).info(format!(
+                "{} now describes a newer session — left in place",
+                path.display()
+            ));
+            return Ok(());
+        }
+    }
+    state::clear(&*ctx.executor, path).await
 }
 
 /// Is a guard *this teardown was responsible for* still pending?
@@ -855,7 +1001,7 @@ const RECORD_KEPT_LINE: &str = "session record kept for a later restore (a guard
 /// restore, which is the exact failure the fallback was written to prevent.
 async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Result<()> {
     if !teardown_pending(sess) {
-        return clear_state(ctx, path).await;
+        return clear_state(ctx, path, sess.run_id).await;
     }
     state::save(&*ctx.executor, path, sess).await?;
     ctx.step(step::RUN_TEARDOWN).info(RECORD_KEPT_LINE);
@@ -1669,6 +1815,223 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// A8-1: `reconcile` reads `session-state.json`, and a `./demo.sh run`
+    /// session writes no such file — the only trace it leaves on this machine
+    /// is a fresh `runtime_status.json`. Launch used to walk straight past it
+    /// into `wineserver_reset` and take that running game down.
+    #[tokio::test]
+    async fn a_shell_started_session_refuses_the_launch_before_anything_permanent() {
+        let _g = session::lock_session_globals();
+        session::publish_run_phase(None);
+
+        let root = scratch("run-external-refusal");
+        let (mut ctx, seen) = dry_ctx(
+            &root,
+            StageOptions {
+                bottle_name: Some("Steam".to_string()),
+                bs_dir_override: Some(root.join("BeatSaber")),
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        ctx.bottle = Some(bottle(&root));
+
+        // What oxrsys writes while it is streaming — and nothing else: no
+        // session-state.json at all.
+        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
+        std::fs::write(
+            ctx.paths.oxr_appsup.join("runtime_status.json"),
+            format!(
+                r#"{{"state":"streaming","process_id":{},"updated_at_unix_ms":{}}}"#,
+                std::process::id(),
+                session::now_unix_ms()
+            ),
+        )
+        .unwrap();
+        assert!(
+            !ctx.paths.session_state_path().exists(),
+            "the shell front-end leaves no record — that is the whole point"
+        );
+
+        let err = run(&ctx, None).await.unwrap_err();
+        assert!(
+            err.to_string().starts_with("a session is already running")
+                && err.to_string().contains("the oxrsys runtime is reporting"),
+            "{err}"
+        );
+        let evs = seen.lock().unwrap().clone();
+        assert!(
+            !evs.iter().any(|e| matches!(e, StageEvent::Check { .. })),
+            "not one preflight check ran: {:?}",
+            rows(&evs)
+        );
+        assert!(
+            ctx.executor.planned().is_empty(),
+            "no adb hygiene, no wineserver reset, no Goldberg swap: {:?}",
+            ctx.executor.planned()
+        );
+        assert!(session::run_phase().is_none(), "the slot is emptied");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A9-1 / A9-8: `reconcile` classifies a record it may not touch as
+    /// `Busy` and leaves the file alone. Launch used to read that as "nothing
+    /// to carry" and keep going — through the bottle-scoped `wineserver -k`
+    /// that kills the very session the classification protects.
+    #[tokio::test]
+    async fn a_record_another_live_front_end_owns_refuses_the_launch() {
+        let _g = session::lock_session_globals();
+        session::publish_run_phase(None);
+
+        let root = scratch("run-busy-refusal");
+        let (mut ctx, seen) = dry_ctx(
+            &root,
+            StageOptions {
+                bottle_name: Some("Steam".to_string()),
+                bs_dir_override: Some(root.join("BeatSaber")),
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        ctx.bottle = Some(bottle(&root));
+
+        // A real, live process that is not this one — "another Sabrage is
+        // running this session". No `wine` identity yet, i.e. the pre-spawn
+        // window `owner_pid` exists for, so `classify` alone would call this
+        // record Dead and reconcile would restore its guards.
+        let mut owner = std::process::Command::new("/bin/sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let mut foreign = fresh(&root);
+        foreign.set_owner(owner.id());
+        foreign.prev_audio_output = Some("MacBook Pro Speakers".into());
+        std::fs::create_dir_all(&ctx.paths.sabrage_appsup).unwrap();
+        std::fs::write(
+            ctx.paths.session_state_path(),
+            serde_json::to_vec_pretty(&foreign).unwrap(),
+        )
+        .unwrap();
+
+        let out = run(&ctx, None).await;
+        let _ = owner.kill();
+        let _ = owner.wait();
+        let err = out.unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("refusing to launch over the previous session record"),
+            "{err}"
+        );
+        assert!(
+            err.to_string().contains("./demo.sh stop --bottle Steam"),
+            "the refusal names the way out: {err}"
+        );
+        let evs = seen.lock().unwrap().clone();
+        assert!(
+            !evs.iter().any(|e| matches!(e, StageEvent::Check { .. })),
+            "not one preflight check ran: {:?}",
+            rows(&evs)
+        );
+        assert!(
+            ctx.executor.planned().is_empty(),
+            "nothing was restored, removed or reset: {:?}",
+            ctx.executor.planned()
+        );
+        assert!(
+            ctx.paths.session_state_path().exists(),
+            "and the other front-end's record is still exactly where it was"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A9-2: the record kept because an `adb forward --remove` failed carries
+    /// the exact `(serial, port)` the retry needs. Carrying only the audio
+    /// device left the next launch to overwrite the rest.
+    #[test]
+    fn a_kept_records_forwards_travel_into_the_next_launch() {
+        let root = scratch("carried-forwards");
+        let mut kept = fresh(&root);
+        kept.prev_audio_output = Some("MacBook Pro Speakers".into());
+        kept.wired_forwards = vec![
+            WiredForward {
+                serial: "1WMHH000".into(),
+                port: 9943,
+            },
+            WiredForward {
+                serial: "1WMHH000".into(),
+                port: 9944,
+            },
+        ];
+
+        assert_eq!(
+            carry_forward(&kept),
+            Carried {
+                audio: Some("MacBook Pro Speakers".to_string()),
+                forwards: kept.wired_forwards.clone(),
+            }
+        );
+
+        // A removal that succeeded set the flag — and carries nothing, exactly
+        // as a completed audio restore does.
+        let mut done = kept.clone();
+        done.guards.forwards_cleared = true;
+        done.guards.audio_restored = true;
+        assert_eq!(carry_forward(&done), Carried::default());
+
+        // This launch's own hygiene records the same pair again; one removal
+        // is enough.
+        let mut both = kept.wired_forwards.clone();
+        both.extend(kept.wired_forwards.clone());
+        both.push(WiredForward {
+            serial: "OTHER".into(),
+            port: 9943,
+        });
+        dedup_forwards(&mut both);
+        assert_eq!(both.len(), 3);
+        assert_eq!(both[2].serial, "OTHER");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A9-3: a teardown that lands after the next launch has written its own
+    /// record must not delete it. `state::clear` compares the owner, which on
+    /// this machine is this very process — run identity is the only thing that
+    /// tells the two apart.
+    #[tokio::test]
+    async fn a_late_teardown_never_clears_a_newer_runs_record() {
+        let root = scratch("clear-state-cas");
+        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let path = ctx.paths.session_state_path();
+        std::fs::create_dir_all(&ctx.paths.sabrage_appsup).unwrap();
+
+        // The record on disk belongs to a LATER launch.
+        let mut newer = fresh(&root);
+        newer.run_id = Uuid::new_v4();
+        std::fs::write(&path, serde_json::to_vec_pretty(&newer).unwrap()).unwrap();
+
+        clear_state(&ctx, &path, Uuid::nil()).await.unwrap();
+        assert!(
+            !ctx.executor
+                .planned()
+                .iter()
+                .any(|p| p.kind == PlannedKind::RemoveFile),
+            "no removal was even planned: {:?}",
+            ctx.executor.planned()
+        );
+        assert!(rows(&seen.lock().unwrap())
+            .iter()
+            .any(|r| r.contains("now describes a newer session")));
+
+        // …and our own record still goes.
+        std::fs::write(&path, serde_json::to_vec_pretty(&fresh(&root)).unwrap()).unwrap();
+        clear_state(&ctx, &path, Uuid::nil()).await.unwrap();
+        assert!(ctx
+            .executor
+            .planned()
+            .iter()
+            .any(|p| p.kind == PlannedKind::RemoveFile));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn a_nonzero_wine_status_is_propagated_verbatim() {
         let root = scratch("teardown-rc");
@@ -1841,11 +2204,7 @@ mod tests {
         );
         let mut sess = fresh(&root);
         let mut held = Guards {
-            audio: Some(
-                AudioGuard::acquire(&ctx, &facts(), &mut sess)
-                    .await
-                    .unwrap(),
-            ),
+            audio: Some(AudioGuard::arm(&ctx, &facts(), &mut sess).await.unwrap()),
             dashboard: Some(
                 DashboardGuard::acquire(&ctx, &facts(), &mut sess)
                     .await
@@ -1879,11 +2238,7 @@ mod tests {
         );
         let mut sess = fresh(&root);
         let mut held = Guards {
-            audio: Some(
-                AudioGuard::acquire(&ctx, &facts(), &mut sess)
-                    .await
-                    .unwrap(),
-            ),
+            audio: Some(AudioGuard::arm(&ctx, &facts(), &mut sess).await.unwrap()),
             dashboard: Some(
                 DashboardGuard::acquire(&ctx, &facts(), &mut sess)
                     .await

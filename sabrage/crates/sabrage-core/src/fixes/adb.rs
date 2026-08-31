@@ -111,6 +111,26 @@ async fn list_forwards(adb: &Path) -> std::result::Result<Vec<(String, String)>,
     }
 }
 
+/// run.sh's `info` row for one cleared forward, verbatim:
+///
+/// ```zsh
+/// info "cleared stale adb forward $fwd_local on $fwd_ser (left over from a --wired launch — would otherwise break WiFi discovery)"
+/// ```
+///
+/// `verb` is `"cleared"` for a real removal and `"would clear"` for a dry run
+/// (Sabrage-only — the shell has no dry run).
+///
+/// `pub` so `sabrage-parity` can compare the **live** native string against
+/// `run.sh` rather than a fragment copied into the parity crate: tier 1 runs
+/// `-p sabrage-parity` only, so a native literal edited without touching run.sh
+/// is otherwise ungated (A1-3).
+pub fn cleared_forward_line(verb: &str, local: &str, serial: &str) -> String {
+    format!(
+        "{verb} stale adb forward {local} on {serial} (left over from a --wired launch — would \
+         otherwise break WiFi discovery)"
+    )
+}
+
 /// The `tcp:<port>` local-forward specs this fix targets, from the contract's
 /// `[ports] stream` — never a literal `"tcp:9943"` (PARITY.md).
 fn stale_local_specs() -> Vec<String> {
@@ -214,10 +234,7 @@ pub async fn remove_adb_forwards_at(
             continue;
         }
         let verb = if dry_run { "would clear" } else { "cleared" };
-        let line = format!(
-            "{verb} stale adb forward {local} on {serial} (left over from a --wired launch — \
-             would otherwise break WiFi discovery)"
-        );
+        let line = cleared_forward_line(verb, &local, &serial);
         sink(StageEvent::info(ctx.run_id, Some(step), line.clone()));
         cleared.push(line);
     }
@@ -604,6 +621,76 @@ mod tests {
         )));
 
         std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// An `adb` that cannot be spawned at all (deleted between the probe that
+    /// found it and this fix, or not executable) is the other half of "adb
+    /// could not tell us" — and the one the GUI must render.
+    ///
+    /// This pins the payload Doctor has to keep on screen: exactly one `warn`
+    /// naming the query failure and the two ports that may still be installed,
+    /// plus an `unchanged` report carrying the same text. Doctor currently
+    /// records only `fatal` events and repaints the row from a fresh check
+    /// pass, so this warn is dropped and the row goes green over a forwarding
+    /// table nobody could read (review A4-5; the UI half is
+    /// `ui/src/screens/Doctor.svelte`).
+    #[tokio::test]
+    async fn an_unspawnable_adb_warns_once_and_never_reports_a_clean_table() {
+        let root = scratch("list-unspawnable");
+        std::fs::create_dir_all(&root).unwrap();
+        // Nothing is ever written here: the path does not exist.
+        let adb = root.join("no-such-adb");
+        assert!(!adb.exists());
+
+        let ctx = ctx_with_adb(&root, adb, false);
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = std::sync::Arc::new(move |ev| s.lock().unwrap().push(ev));
+
+        let report = remove_adb_forwards(&ctx, &sink).await.unwrap();
+        assert!(!report.changed);
+        assert_ne!(report.description, "no stale adb port forwards to clear");
+        assert!(
+            report
+                .description
+                .starts_with("could not query adb forwards ("),
+            "{report:?}"
+        );
+        assert!(
+            report
+                .description
+                .ends_with("— stale tcp:9943/tcp:9944 forwards may still be installed"),
+            "{report:?}"
+        );
+
+        let warns: Vec<String> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                StageEvent::Line { text, severity, .. }
+                    if *severity == crate::events::Severity::Warn =>
+                {
+                    Some(text.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(warns, vec![report.description.clone()], "{warns:?}");
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The `info` row is rendered in one place, so `sabrage-parity` can compare
+    /// the live string against run.sh instead of a copy (A1-3).
+    #[test]
+    fn the_cleared_forward_line_is_the_one_renderer() {
+        assert_eq!(
+            cleared_forward_line("cleared", "tcp:9943", "SERIALX"),
+            "cleared stale adb forward tcp:9943 on SERIALX (left over from a --wired launch — would otherwise break WiFi discovery)"
+        );
+        assert!(cleared_forward_line("would clear", "tcp:9944", "SerB")
+            .starts_with("would clear stale adb forward tcp:9944 on SerB "));
     }
 
     /// The `--wired` session's own forwards: the standalone fix (a Doctor

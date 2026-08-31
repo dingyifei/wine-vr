@@ -61,7 +61,12 @@
 //! cannot write between the read and the rename. The lock is best-effort (a
 //! machine that cannot lock must still be able to stop a session) — the
 //! compare is what makes the remaining race *safe*, and the lock is what makes
-//! it rare. What neither covers is a whole `reconcile` pass, which reads,
+//! it rare. [`clear_run`] adds the half neither gives: a *late* teardown
+//! deleting a record that already belongs to a newer run is not a lost update
+//! at all — both writers are legitimate — so that removal compares the run id
+//! on disk and leaves a stranger's record where it is. Both mutating paths also
+//! refuse a record from a newer schema, the rule the section above states.
+//! What neither covers is a whole `reconcile` pass, which reads,
 //! restores and rewrites across several of these calls; serializing that is
 //! the operation lock's job.
 
@@ -347,6 +352,27 @@ async fn lock_record(record_path: &Path) -> Option<std::fs::File> {
     }
 }
 
+/// The refusal both [`save`] and [`clear`] raise for a record written by a
+/// **newer** Sabrage.
+///
+/// The module header states the rule ("every mutating path must then report it
+/// and leave it alone") and [`super::reconcile::untouchable`] renders the
+/// friendly row for it — but the rule has to be enforced *here* too, or a path
+/// that never went through reconcile (a launch that carried on past a
+/// `Reconciled::Busy`, a teardown, a guard flag flip) still rewrites a v2
+/// record through the v1 struct and drops the guard that version described.
+fn newer_schema(verb: &str, path: &Path, existing: &SessionState) -> SabrageError {
+    SabrageError::fatal(
+        format!(
+            "refusing to {verb} {} — it was written by a newer Sabrage (schema v{}, this build \
+             understands v{SESSION_STATE_VERSION}) and may describe a guard this build cannot undo",
+            path.display(),
+            existing.version,
+        ),
+        "./demo.sh stop --bottle <name>",
+    )
+}
+
 /// The refusal both [`save`] and [`clear`] raise for a record that belongs to
 /// another live front-end.
 fn owned_elsewhere(verb: &str, path: &Path, existing: &SessionState) -> SabrageError {
@@ -386,7 +412,16 @@ pub async fn save(executor: &dyn Executor, path: &Path, state: &SessionState) ->
         if existing.run_id != state.run_id && has_live_foreign_owner(&existing) {
             return Err(owned_elsewhere("overwrite", path, &existing));
         }
+        if !existing.is_supported_version() {
+            return Err(newer_schema("overwrite", path, &existing));
+        }
     }
+    write_record(executor, path, state).await
+}
+
+/// [`save`]'s write half, with no refusals and no locking of its own — for the
+/// callers that already hold [`lock_record`] and have already decided.
+async fn write_record(executor: &dyn Executor, path: &Path, state: &SessionState) -> Result<()> {
     if let Some(parent) = path.parent() {
         executor.create_dir_all(parent).await?;
     }
@@ -396,13 +431,71 @@ pub async fn save(executor: &dyn Executor, path: &Path, state: &SessionState) ->
     executor.write_atomic(path, &bytes).await
 }
 
-/// Remove the state file. A missing file is success — clearing twice (clean
-/// teardown, then a reconcile that already ran) must not fail.
+/// Set `detached: true` on the record for `run_id` — and **only** if that is
+/// still the record on disk. `true` when the flag was written.
+///
+/// [`super::reconcile::detach`]'s safety net, and the one write that must not
+/// be a read-modify-write across two calls: it runs *after* the supervisor was
+/// asked to let go, so between a [`load`] and a [`save`] the supervisor can
+/// finish its teardown and [`clear`] the record — and `save` would then
+/// **recreate** it, resurrecting a cleared session as a detached one. The load,
+/// the compare and the write all happen under one [`lock_record`], and a record
+/// that is absent (or belongs to another run, or is already detached) is left
+/// exactly as it is: this never creates a file.
+pub async fn mark_detached(executor: &dyn Executor, path: &Path, run_id: RunId) -> Result<bool> {
+    let _lock = if executor.is_dry_run() {
+        None
+    } else {
+        lock_record(path).await
+    };
+    let Ok(Some(mut existing)) = load(path) else {
+        return Ok(false);
+    };
+    if existing.run_id != run_id || existing.detached {
+        return Ok(false);
+    }
+    if has_live_foreign_owner(&existing) {
+        return Err(owned_elsewhere("overwrite", path, &existing));
+    }
+    if !existing.is_supported_version() {
+        return Err(newer_schema("overwrite", path, &existing));
+    }
+    existing.detached = true;
+    write_record(executor, path, &existing).await?;
+    Ok(true)
+}
+
+/// Remove the state file, whichever session it describes. A missing file is
+/// success — clearing twice (clean teardown, then a reconcile that already ran)
+/// must not fail.
 ///
 /// Refuses, like [`save`], when the record on disk belongs to another live
-/// front-end: a late teardown here must not delete the description of guards
-/// that process still holds.
+/// front-end or was written by a newer Sabrage.
+///
+/// Prefer [`clear_run`] wherever the caller knows *which* run it is finishing:
+/// this form deletes whatever it finds, so a slow teardown can delete the
+/// record a newer launch has already written.
 pub async fn clear(executor: &dyn Executor, path: &Path) -> Result<()> {
+    clear_inner(executor, path, None).await
+}
+
+/// [`clear`], but only if the record on disk is still `expected`'s.
+///
+/// The compare-and-swap the single shared record path needs: an atomic rename
+/// stops a torn read, and [`lock_record`] makes a lost update rare, but neither
+/// stops a *late* teardown (or a reconcile that started before a launch did)
+/// from deleting a **newer** run's record — audio device, dashboard and
+/// forwards description and all. A different run on disk is not an error and
+/// not this caller's business: the file is left exactly as it is and `Ok(())`
+/// is returned, because the newer owner is the one responsible for it now.
+pub async fn clear_run(executor: &dyn Executor, path: &Path, expected: RunId) -> Result<()> {
+    clear_inner(executor, path, Some(expected)).await
+}
+
+/// [`clear`]/[`clear_run`]'s shared body: the refusals, then the optional
+/// expected-run compare, all under [`lock_record`] so the record cannot be
+/// replaced between the read and the removal.
+async fn clear_inner(executor: &dyn Executor, path: &Path, expected: Option<RunId>) -> Result<()> {
     let _lock = if executor.is_dry_run() {
         None
     } else {
@@ -411,6 +504,12 @@ pub async fn clear(executor: &dyn Executor, path: &Path) -> Result<()> {
     if let Ok(Some(existing)) = load(path) {
         if has_live_foreign_owner(&existing) {
             return Err(owned_elsewhere("delete", path, &existing));
+        }
+        if !existing.is_supported_version() {
+            return Err(newer_schema("delete", path, &existing));
+        }
+        if expected.is_some_and(|run_id| run_id != existing.run_id) {
+            return Ok(());
         }
     }
     executor.remove_file(path).await
@@ -682,6 +781,69 @@ mod tests {
             "a v2 record must not be rewritten through the v1 struct"
         );
         assert!(sample().is_supported_version());
+    }
+
+    /// A9-8. The version rule is the module header's, not reconcile's: a path
+    /// that never went through reconciliation (a launch that carried on, a
+    /// teardown, a guard flag flip) must not rewrite a v2 record through this
+    /// v1 struct, nor delete it.
+    #[tokio::test]
+    async fn a_newer_schema_record_is_never_overwritten_or_deleted() {
+        let dir = scratch("newer-schema-guard");
+        let path = dir.join("session-state.json");
+        let v2 = r#"{
+  "version": 2,
+  "runId": "00000000-0000-0000-0000-000000000000",
+  "bottle": "Steam",
+  "bsDir": "/games/bs",
+  "startedAtUnixMs": 1786300214181,
+  "logPath": "/repo/logs/x.log",
+  "futureGuard": {"somethingWeCannotUndo": true}
+}
+"#;
+        std::fs::write(&path, v2).unwrap();
+
+        let err = save(&real(), &path, &sample()).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to overwrite"), "{err:?}");
+        assert!(err.to_string().contains("schema v2"), "{err:?}");
+        let err = clear(&real(), &path).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to delete"), "{err:?}");
+        let err = clear_run(&real(), &path, Uuid::nil()).await.unwrap_err();
+        assert!(err.to_string().contains("refusing to delete"), "{err:?}");
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            v2,
+            "the newer record is byte-identical afterwards"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A9-3. `clear` alone is not a compare-and-swap: it deletes whatever it
+    /// finds. A teardown for a run that has already been superseded must leave
+    /// the newer run's record — its audio device and forwards description —
+    /// exactly where it is.
+    #[tokio::test]
+    async fn clear_run_only_removes_the_record_it_names() {
+        let dir = scratch("clear-run-cas");
+        let path = dir.join("session-state.json");
+
+        let run_a = Uuid::new_v4();
+        let mut run_b = sample();
+        run_b.run_id = Uuid::new_v4();
+        save(&real(), &path, &run_b).await.unwrap();
+
+        clear_run(&real(), &path, run_a).await.unwrap();
+        assert!(path.exists(), "run A's teardown deleted run B's record");
+        assert_eq!(load(&path).unwrap().unwrap().run_id, run_b.run_id);
+
+        clear_run(&real(), &path, run_b.run_id).await.unwrap();
+        assert!(!path.exists(), "its own run's record is removed");
+
+        // A missing file is success for both forms.
+        clear_run(&real(), &path, run_b.run_id).await.unwrap();
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -106,16 +106,28 @@ fn stream_forward_specs() -> Vec<String> {
         .collect()
 }
 
-/// run.sh:108 — remove **both** ports, ignoring every failure, then bring the
-/// persisted record back in line (no forwards on the device ⇒ none on disk).
+/// run.sh:108 — remove **both** ports, never aborting on a failed removal, then
+/// bring the persisted record back in line.
+///
+/// "In line" is per port, not wholesale: a removal that **succeeded** drops its
+/// record, a removal that failed keeps it. A failed `--remove` is
+/// *indeterminate* (usually the device is simply gone, and the forward with
+/// it — but it may equally be a transient adb failure over a still-installed
+/// `tcp:9943`, the stale forward that silently breaks the next WiFi run), and
+/// the record is the only thing that would ever retry it. Clearing it
+/// unconditionally erased exactly the recovery path this record exists for.
+/// [`crate::session::reconcile`]'s `restore_forwards` makes the same
+/// distinction, for the same reason.
 ///
 /// On a fresh, non-cancelled executor ([`super::teardown_ctx`]): the common
 /// reason to be rolling back is that Stop cancelled the token mid-loop, and
 /// the launch executor refuses every child (and every write) once it is
 /// cancelled — the removal and the record fix-up would be silent no-ops
-/// exactly when they matter most. The save is best-effort: a failure here
-/// changes nothing about the error travelling out, and the next reconcile
-/// still finds no live wine child to protect the record.
+/// exactly when they matter most. Under `--dry-run` that ctx is the (dry)
+/// original, whose `run_child` reports success: a planned removal drops its
+/// planned record, which keeps the plan self-consistent. The save is
+/// best-effort: a failure here changes nothing about the error travelling out,
+/// and the next reconcile still finds no live wine child to protect the record.
 async fn rollback_forwards(
     ctx: &StageCtx,
     adb: &Path,
@@ -125,7 +137,8 @@ async fn rollback_forwards(
     state_path: &Path,
 ) {
     let rb = super::teardown_ctx(ctx);
-    for q in specs {
+    let mut removed: Vec<u16> = Vec::new();
+    for (port, q) in contract().ports.stream.iter().zip(specs) {
         let undo = rb
             .child(adb.to_path_buf(), step::RUN_ADB_FORWARDS)
             .arg("-s")
@@ -133,9 +146,12 @@ async fn rollback_forwards(
             .arg("forward")
             .arg("--remove")
             .arg(q);
-        let _ = rb.executor.run_child(&undo).await;
+        if matches!(rb.executor.run_child(&undo).await, Ok(status) if status.success()) {
+            removed.push(*port);
+        }
     }
-    sess.wired_forwards.clear();
+    sess.wired_forwards
+        .retain(|f| !(f.serial == serial && removed.contains(&f.port)));
     let _ = state::save(&*rb.executor, state_path, sess).await;
 }
 
@@ -239,10 +255,7 @@ pub async fn adb_forward_hygiene(
         if let Some(cause) = failure {
             rollback_forwards(ctx, &adb, &serial, &specs, sess, state_path).await;
             // run.sh:109.
-            let die = format!(
-                "adb forward {local} {local} failed on {serial} — check the USB connection \
-                 (adb devices)"
-            );
+            let die = wired_forward_failed_die(local, &serial);
             return Err(match cause {
                 // A cancelled launch is not a failed one: Stop's own error
                 // travels, and no die row is invented for it.
@@ -256,11 +269,28 @@ pub async fn adb_forward_hygiene(
     }
     // run.sh:112 — the port list is rendered from the contract so the literal
     // `tcp:9943/tcp:9944` in the shell string cannot drift from `ports.stream`.
-    st.info(format!(
+    st.info(wired_forwards_up_line(&specs, &serial));
+    Ok(())
+}
+
+/// run.sh:109's die, for one port on one device.
+/// `pub` (A1-3) so `sabrage-parity` can pin it against run.sh by calling the
+/// real renderer instead of copying the sentence.
+pub fn wired_forward_failed_die(local: &str, serial: &str) -> String {
+    format!(
+        "adb forward {local} {local} failed on {serial} — check the USB connection \
+         (adb devices)"
+    )
+}
+
+/// run.sh:112 — the port list is rendered from the contract so the literal
+/// `tcp:9943/tcp:9944` in the shell string cannot drift from `ports.stream`.
+/// `pub` (A1-3), same reason as [`wired_forward_failed_die`].
+pub fn wired_forwards_up_line(specs: &[String], serial: &str) -> String {
+    format!(
         "wired mode: adb forward {} up on {serial} (a later non-wired run clears these two)",
         specs.join("/")
-    ));
-    Ok(())
+    )
 }
 
 // ── 2. wineserver reset ───────────────────────────────────────────────────────
@@ -328,15 +358,11 @@ pub async fn wineserver_reset(ctx: &StageCtx, bottle: &Bottle) -> Result<()> {
         .await
         .is_err()
     {
-        st.warn(format!(
-            "wineserver still alive after {}s: {}",
-            RUN_WINESERVER_WAIT.as_secs(),
-            format_survivors(
-                &process::find_processes_by_cmdline("wineserver"),
-                "wineserver"
-            )
-        ));
-        return Err(st.fatal("kill the listed wineserver(s) manually, then re-run", None));
+        st.warn(wineserver_still_alive_warn(&format_survivors(
+            &process::find_processes_by_cmdline("wineserver"),
+            "wineserver",
+        )));
+        return Err(st.fatal(WINESERVER_MANUAL_KILL_DIE, None));
     }
     st.ok("wineserver down");
     Ok(())
@@ -349,6 +375,52 @@ fn orig_steam_path(api: &Path) -> PathBuf {
     let mut s = api.as_os_str().to_os_string();
     s.push(".orig-steam");
     PathBuf::from(s)
+}
+
+/// Where the "the `.orig-steam` minted here is itself a Goldberg build" record
+/// lives: `<sabrage_appsup>/goldberg-provenance/<sha256 of the backup path>`.
+///
+/// Under `~/Library/Application Support/Sabrage/` on purpose (CLAUDE.md: GUI
+/// state lives there). demo.sh writes no such file, so putting it next to the
+/// game's dlls would add a Sabrage-only artifact to every install — a
+/// permanent on-disk divergence for a bit of Sabrage bookkeeping. The path is
+/// hashed because the record is keyed by an absolute path with slashes in it.
+pub(crate) fn goldberg_backup_marker(paths: &crate::paths::Paths, backup: &Path) -> PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    paths
+        .sabrage_appsup
+        .join("goldberg-provenance")
+        .join(format!(
+            "{}.orig-steam-is-goldberg",
+            util::sha256_bytes(backup.as_os_str().as_bytes())
+        ))
+}
+
+/// Did the launch that minted `backup` find the live dll already Goldberg?
+///
+/// The provenance [`goldberg_stage`] cannot otherwise leave behind: its
+/// `already_goldberg` comparison is against the **configured** `gbe_dll`, so it
+/// recognises an older or third-party Goldberg build that no pin matches —
+/// which is exactly the backup a pin-only revert guard would copy back and call
+/// a restore (A7-3 / A13a-1). `false` means "no record", not "provably Steam":
+/// nothing on this machine can prove the latter.
+pub(crate) fn goldberg_backup_is_goldberg(paths: &crate::paths::Paths, backup: &Path) -> bool {
+    goldberg_backup_marker(paths, backup).is_file()
+}
+
+/// Write that record. Best-effort on purpose: run.sh has no such step, so a
+/// failure to journal Sabrage's own bookkeeping must not turn a launch the
+/// shell would complete into a die. The `warn` row is emitted either way.
+async fn record_goldberg_backup(ctx: &StageCtx, backup: &Path) {
+    let marker = goldberg_backup_marker(&ctx.paths, backup);
+    let Some(dir) = marker.parent() else { return };
+    if ctx.executor.create_dir_all(dir).await.is_err() {
+        return;
+    }
+    let _ = ctx
+        .executor
+        .write_atomic(&marker, format!("{}\n", backup.display()).as_bytes())
+        .await;
 }
 
 /// `$BS_DIR/Beat Saber_Data/Plugins/x86_64/steam_api64.dll`, else
@@ -370,6 +442,34 @@ pub(crate) const GOLDBERG_FLAG_FILES: [&str; 3] = [
     "disable_overlay.txt",
 ];
 
+/// run.sh:135's warn — the survivor list is [`format_survivors`]' rendering.
+/// `pub` (A1-3), same reason as [`wired_forward_failed_die`].
+pub fn wineserver_still_alive_warn(survivors: &str) -> String {
+    format!(
+        "wineserver still alive after {}s: {survivors}",
+        RUN_WINESERVER_WAIT.as_secs()
+    )
+}
+
+/// run.sh:136's die, verbatim. `pub` (A1-3).
+pub const WINESERVER_MANUAL_KILL_DIE: &str = "kill the listed wineserver(s) manually, then re-run";
+
+/// run.sh:145's die. `pub` (A1-3).
+pub fn steam_api_missing_die(bs_dir: &Path) -> String {
+    format!(
+        "steam_api64.dll not found under {} — is this a complete Beat Saber install?",
+        bs_dir.display()
+    )
+}
+
+/// run.sh:148's `info`, verbatim. `pub` (A1-3).
+pub const GOLDBERG_ALREADY_INSTALLED: &str = "goldberg already installed";
+
+/// run.sh:149's `ok`. `pub` (A1-3).
+pub fn goldberg_installed_line(api: &Path) -> String {
+    format!("installed goldberg -> {}", api.display())
+}
+
 /// `launch-action: goldberg-stage` — run.sh lines 140–152.
 ///
 /// Byte-exact artifacts, all four of them:
@@ -377,7 +477,9 @@ pub(crate) const GOLDBERG_FLAG_FILES: [&str; 3] = [
 /// * `steam_api64.dll` found under `Beat Saber_Data/Plugins/x86_64/` or at the
 ///   game root, dying when neither exists;
 /// * `<api>.orig-steam` created **once** and never overwritten (it is the only
-///   copy of the real Steam dll on the machine);
+///   copy of the real Steam dll on the machine) — and, when that reserved name
+///   is occupied by something that is not a regular file, the launch is
+///   refused rather than installing Goldberg over an unbacked-up dll;
 /// * the Goldberg dll copied over it when the bytes differ — a hash mismatch
 ///   is *tolerated* here, unlike in setup (parity decision 20);
 /// * `steam_appid.txt` = the appid digits with **no trailing newline**
@@ -390,13 +492,7 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
     let api = steam_api_path(&ctx.bs_dir);
     if !api.is_file() {
         // run.sh:145
-        return Err(st.fatal(
-            format!(
-                "steam_api64.dll not found under {} — is this a complete Beat Saber install?",
-                ctx.bs_dir.display()
-            ),
-            None,
-        ));
+        return Err(st.fatal(steam_api_missing_die(&ctx.bs_dir), None));
     }
     let api_dir = api
         .parent()
@@ -407,7 +503,30 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
     // with an already-Goldberged dll would destroy the only copy of the real
     // Steam library on this machine.
     let backup = orig_steam_path(&api);
-    if !backup.exists() {
+    if backup.is_file() {
+        // The ordinary post-first-launch state: a usable backup is already
+        // there (a symlink resolving to a regular file counts — the copy would
+        // read through it just the same).
+    } else if std::fs::symlink_metadata(&backup).is_ok() {
+        // DIVERGENCE (Sabrage-only, no shell counterpart): something that is
+        // not a regular file occupies the reserved backup name — a directory,
+        // a fifo, a dangling symlink. run.sh's `[ ! -f "$API.orig-steam" ]` is
+        // also false-y there, so the shell runs `cp "$API" "$API.orig-steam"`
+        // and either copies *into* the directory or follows the symlink; it
+        // then installs Goldberg over the live dll regardless. Sabrage refuses
+        // BEFORE touching the live dll instead: the alternative is destroying
+        // the only copy of the real Steam library to satisfy bug-for-bug
+        // parity on a state no correct run produces.
+        return Err(st.fatal(
+            format!(
+                "{} is not a regular file — it is the reserved name for the original \
+                 steam_api64.dll, and Sabrage will not install Goldberg over the live dll \
+                 without a usable backup",
+                backup.display()
+            ),
+            Some(format!("move or delete {}", backup.display())),
+        ));
+    } else {
         // Sabrage-only row, no shell counterpart (run.sh is silent here): the
         // live dll is ALREADY the Goldberg build, so the backup this line
         // mints holds Goldberg, not Steam. The bytes are run.sh's either way —
@@ -424,6 +543,7 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
             ));
         }
         if already_goldberg {
+            record_goldberg_backup(ctx, &backup).await;
             st.warn(format!(
                 "steam_api64.dll was already the Goldberg build, so {} is a copy of \
                  Goldberg — the real Steam dll was never seen here and cannot be restored",
@@ -435,7 +555,7 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
     // run.sh:148-149 — `cmp -s`, not a hash: run tolerates a Goldberg dll that
     // does not match setup's pin (parity decision 20).
     if util::cmp_files(&ctx.paths.gbe_dll, &api) {
-        st.info("goldberg already installed");
+        st.info(GOLDBERG_ALREADY_INSTALLED);
     } else {
         if let Err(e) = ctx.executor.copy_if_changed(&ctx.paths.gbe_dll, &api).await {
             return Err(die_with_cause(
@@ -445,7 +565,7 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
                 "goldberg install failed",
             ));
         }
-        st.ok(format!("installed goldberg -> {}", api.display()));
+        st.ok(goldberg_installed_line(&api));
     }
 
     // run.sh:150 — `printf '%s' "$BS_APPID"`: the digits, no trailing newline.
@@ -533,10 +653,15 @@ pub async fn adb_reverse_cleanup(ctx: &StageCtx, facts: &PreflightFacts) -> Resu
         .arg("reverse")
         .arg("--remove-all");
     let _ = ctx.executor.run_child(&spec).await;
-    ctx.step(step::RUN_ADB_REVERSE).info(format!(
-        "Quest {serial}: cleared adb reverse tunnels (ALVR manages its own)"
-    ));
+    ctx.step(step::RUN_ADB_REVERSE)
+        .info(adb_reverse_cleared_line(&serial));
     Ok(())
+}
+
+/// run.sh:222's `info`. `pub` (A1-3), same reason as
+/// [`wired_forward_failed_die`].
+pub fn adb_reverse_cleared_line(serial: &str) -> String {
+    format!("Quest {serial}: cleared adb reverse tunnels (ALVR manages its own)")
 }
 
 // ── 7. launch ─────────────────────────────────────────────────────────────────
@@ -980,6 +1105,12 @@ mod tests {
 
     /// A `/bin/sh` script standing in for `adb`, so the wired branch is
     /// exercised without an Android SDK, a device, or any real forward.
+    ///
+    /// `forward_exit` models a failure to **create** a forward;
+    /// `forward --remove` always succeeds, which is the ordinary shape of the
+    /// rollback (the port really does come back down). The other shape — a
+    /// removal that fails too, leaving the forward indeterminate — is
+    /// [`every_call_fails_adb`].
     fn fake_adb(dir: &Path, devices_stdout: &str, forward_exit: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("adb");
@@ -991,7 +1122,29 @@ mod tests {
                  \x20 case \"$a\" in devices) printf '%s' '{devices_stdout}'; exit 0;; esac\n\
                  done\n\
                  echo \"$@\" >> \"$(dirname \"$0\")/adb.calls\"\n\
+                 case \"$*\" in *--remove*) exit 0;; esac\n\
                  exit {forward_exit}\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// [`fake_adb`]'s harsher sibling: every non-`devices` call exits nonzero,
+    /// so the rollback's own `forward --remove` fails as well.
+    fn every_call_fails_adb(dir: &Path, devices_stdout: &str) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("adb");
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do\n\
+                 \x20 case \"$a\" in devices) printf '%s' '{devices_stdout}'; exit 0;; esac\n\
+                 done\n\
+                 echo \"$@\" >> \"$(dirname \"$0\")/adb.calls\"\n\
+                 exit 1\n"
             ),
         )
         .unwrap();
@@ -1152,6 +1305,64 @@ mod tests {
         assert!(
             sess.wired_forwards.is_empty(),
             "the in-memory record must reflect the rollback"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A7-2: the rollback's own `--remove` can fail too, and then the forward
+    /// is *indeterminate* — it may still be installed on the device. Clearing
+    /// the record on that outcome deleted the only thing that would ever retry
+    /// it, and the stale `tcp:9943` silently breaks the next WiFi run.
+    #[tokio::test]
+    async fn a_rollback_whose_removal_fails_keeps_the_forward_on_record() {
+        let root = scratch("wired-rollback-fail");
+        let (mut ctx, _) = real_ctx(
+            &root,
+            StageOptions {
+                wired: true,
+                ..Default::default()
+            },
+        );
+        ctx.paths.adb = Some(every_call_fails_adb(
+            &root,
+            "List of devices attached\n1WMHH0X\tdevice\n",
+        ));
+
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "adb forward tcp:9943 tcp:9943 failed on 1WMHH0X — check the USB connection \
+             (adb devices)"
+        );
+        // Both removals were still attempted (run.sh:108 removes both).
+        let calls = adb_calls(&root);
+        for port in ["tcp:9943", "tcp:9944"] {
+            assert!(
+                calls
+                    .iter()
+                    .any(|c| c.contains(&format!("forward --remove {port}"))),
+                "{calls:?}"
+            );
+        }
+        // …and neither succeeded, so the record survives — in memory and on
+        // disk, which is where the next reconcile/stop retries it from.
+        assert_eq!(
+            sess.wired_forwards,
+            vec![WiredForward {
+                serial: "1WMHH0X".into(),
+                port: 9943
+            }],
+            "an indeterminate removal must stay on record"
+        );
+        let on_disk = state::load(&state_path).unwrap().unwrap();
+        assert_eq!(on_disk.wired_forwards, sess.wired_forwards);
+        assert!(
+            !on_disk.guards.forwards_cleared,
+            "nothing may claim the forwards are cleared"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1584,6 +1795,109 @@ mod tests {
         let plan = ctx.executor.planned();
         assert_eq!(plan[0].kind, PlannedKind::Copy);
         assert_eq!(plan[0].dst.as_deref(), Some(backup.as_path()));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A7-5: a `.orig-steam` that is not a regular file (here: a directory)
+    /// used to skip the backup and then install Goldberg anyway — the only
+    /// local copy of the real Steam dll gone, with the stage reporting
+    /// success. Fail closed instead, before the live dll is touched.
+    #[tokio::test]
+    async fn goldberg_refuses_when_the_backup_name_is_not_a_regular_file() {
+        let root = scratch("gbe-backup-conflict");
+        let bs_dir = goldberg_fixture(&root, b"REAL-STEAM", b"GOLDBERG");
+        let api_dir = bs_dir.join("Beat Saber_Data/Plugins/x86_64");
+        let backup = api_dir.join("steam_api64.dll.orig-steam");
+        std::fs::create_dir(&backup).unwrap();
+
+        // A real executor: the point is that nothing on disk changes.
+        let (mut ctx, _) = goldberg_ctx(&root, bs_dir.clone());
+        let run_id = ctx.run_id;
+        ctx.executor = Arc::new(crate::executor::RealExecutor::new(
+            run_id,
+            crate::stages::null_sink(),
+            CancellationToken::new(),
+        ));
+
+        let err = goldberg_stage(&ctx).await.unwrap_err();
+        assert!(
+            err.to_string().contains(&backup.display().to_string()),
+            "the die must name the offending path: {err}"
+        );
+        assert_eq!(
+            std::fs::read(api_dir.join("steam_api64.dll")).unwrap(),
+            b"REAL-STEAM",
+            "the live dll must not be overwritten without a usable backup"
+        );
+        assert!(backup.is_dir(), "nothing was written over the conflict");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A7-3 / A13a-1: when the minted backup is itself a Goldberg build, that
+    /// fact is *recorded* — a transient warn row cannot be consulted by
+    /// `store::goldberg`'s revert, which otherwise only recognises the build
+    /// its own pin names.
+    #[tokio::test]
+    async fn goldberg_records_the_provenance_of_a_backup_that_is_itself_goldberg() {
+        let root = scratch("gbe-provenance");
+        // An UNPINNED Goldberg build: `already_goldberg` compares against the
+        // configured gbe_dll, so this is recognised where a pin would not be.
+        let bs_dir = goldberg_fixture(&root, b"SOME-OTHER-GOLDBERG", b"SOME-OTHER-GOLDBERG");
+        let api_dir = bs_dir.join("Beat Saber_Data/Plugins/x86_64");
+        let backup = api_dir.join("steam_api64.dll.orig-steam");
+        let (mut ctx, _) = goldberg_ctx(&root, bs_dir.clone());
+        let run_id = ctx.run_id;
+        ctx.executor = Arc::new(crate::executor::RealExecutor::new(
+            run_id,
+            crate::stages::null_sink(),
+            CancellationToken::new(),
+        ));
+
+        assert!(
+            !goldberg_backup_is_goldberg(&ctx.paths, &backup),
+            "no record before the stage runs"
+        );
+        goldberg_stage(&ctx).await.unwrap();
+
+        assert!(
+            goldberg_backup_is_goldberg(&ctx.paths, &backup),
+            "the poisoned backup must leave a durable record"
+        );
+        let marker = goldberg_backup_marker(&ctx.paths, &backup);
+        assert!(
+            marker.starts_with(&ctx.paths.sabrage_appsup),
+            "the record lives in Sabrage's own store, never in the game dir: {}",
+            marker.display()
+        );
+        assert!(
+            !api_dir
+                .join("steam_api64.dll.orig-steam.provenance")
+                .exists(),
+            "no Sabrage-only artifact next to the game's dlls"
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The other half of the pin: an ordinary Steam backup leaves NO record,
+    /// so the marker cannot start refusing legitimate reverts.
+    #[tokio::test]
+    async fn goldberg_records_nothing_for_an_ordinary_steam_backup() {
+        let root = scratch("gbe-provenance-clean");
+        let bs_dir = goldberg_fixture(&root, b"REAL-STEAM", b"GOLDBERG");
+        let backup = bs_dir
+            .join("Beat Saber_Data/Plugins/x86_64")
+            .join("steam_api64.dll.orig-steam");
+        let (mut ctx, _) = goldberg_ctx(&root, bs_dir.clone());
+        let run_id = ctx.run_id;
+        ctx.executor = Arc::new(crate::executor::RealExecutor::new(
+            run_id,
+            crate::stages::null_sink(),
+            CancellationToken::new(),
+        ));
+
+        goldberg_stage(&ctx).await.unwrap();
+        assert_eq!(std::fs::read(&backup).unwrap(), b"REAL-STEAM");
+        assert!(!goldberg_backup_is_goldberg(&ctx.paths, &backup));
         std::fs::remove_dir_all(&root).ok();
     }
 

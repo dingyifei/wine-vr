@@ -74,6 +74,21 @@
 //! kill racing a pid that already exited — is still swallowed exactly where
 //! the shell's `|| true` swallows it; only cancellation short-circuits.
 //!
+//! Checkpoints alone are not enough for the two reporting probes, because a
+//! checkpoint can only run between awaits: `lsof` and `SwitchAudioSource` are
+//! read-only and therefore bypass the executor ([`crate::process::capture`]'s
+//! documented probe exception), and a bare `Command::output().await` on either
+//! is unbounded — a wedged `lsof` (hung mount, dead network extension) or a
+//! `SwitchAudioSource` blocked on a degraded CoreAudio server held this stage,
+//! and with it the process-wide operation lock, forever, with Cancel unable to
+//! interrupt and with both reaps and the persisted-guard restore never
+//! reached. Both now go through [`crate::process::capture_with`] carrying
+//! `ctx.cancel` and [`crate::process::DEFAULT_PROBE_TIMEOUT`], as
+//! `run/guards.rs`'s sibling audio probe already did. A probe that blows its
+//! deadline reports a `warn` naming what could not be read — never the green
+//! `"streaming ports free"` / `"audio output: "` rows, which are claims about
+//! the machine that an abandoned probe is no evidence for.
+//!
 //! # Declared divergences (see `sabrage/PARITY.md`)
 //!
 //! * The survivor probe is **argv-based by design**:
@@ -97,12 +112,14 @@
 //!   `pkill -f … || true` reports none of that; a green "encoder helper
 //!   killed" row with the helper still holding the encoder is the one lie this
 //!   step must not tell.
-//! * When the helper reap matches nothing, [`report_foreign_helpers`] scans by
-//!   basename for a helper running from **another checkout** before the
-//!   `"no leftover encoder helper"` row is allowed to print — report-only, no
-//!   kill. The shell has the same blind spot (`pkill -f "$OXR_HELPER_BIN"`
+//! * After the helper reap — always, not only when it matched nothing —
+//!   [`report_foreign_helpers`] scans by basename for a helper running from
+//!   **another checkout**; report-only, no kill, and the
+//!   `"no leftover encoder helper"` row prints only when neither scan found
+//!   anything. The shell has the same blind spot (`pkill -f "$OXR_HELPER_BIN"`
 //!   cannot match a helper whose path is another root's), and the project's
-//!   worktree workflow makes that case ordinary.
+//!   worktree workflow makes that case ordinary — including the shape where a
+//!   local helper *and* a foreign one are running at once.
 //! * The two **reap** steps keep exact exe-path matching
 //!   ([`crate::process::find_processes_by_exe`]) against a known staged
 //!   binary, not argv — a narrower, still-intentional divergence from
@@ -128,6 +145,7 @@
 
 use std::collections::BTreeSet;
 use std::path::Path;
+use std::time::Duration;
 
 use crate::error::{Result, SabrageError};
 use crate::events::{step, StepId};
@@ -224,9 +242,19 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         None,
     )
     .await?;
-    if !helper_matched {
-        report_foreign_helpers(ctx, &ctx.paths.root, scan.by_cmdline(HELPER_BASENAME));
-    }
+    // Unconditional, and report-only. A helper staged under *another* checkout
+    // is invisible to the exact-path reap above whether or not this checkout's
+    // own helper was found, so running the wider scan only on a local miss
+    // re-created exactly the blind spot it exists to close: with a stale helper
+    // from checkout A and a live one from checkout B, `stop` in B killed B's,
+    // skipped the scan, and never mentioned A's (A5-2). `helper_matched` now
+    // only decides whether the shell's not-found row may print.
+    report_foreign_helpers(
+        ctx,
+        &ctx.paths.root,
+        scan.by_cmdline(HELPER_BASENAME),
+        helper_matched,
+    );
     checkpoint(ctx)?;
     reap(
         ctx,
@@ -352,20 +380,57 @@ fn report_survivors(ctx: &StageCtx, survivors: Vec<ProcInfo>) {
 
 // ── step 2: streaming ports ───────────────────────────────────────────────────
 
+/// Did a probe hit its deadline (as opposed to failing the way a missing
+/// binary fails)? [`process::capture_with`] reports the deadline as an
+/// [`SabrageError::Io`] of kind [`std::io::ErrorKind::TimedOut`].
+///
+/// The distinction is what keeps this stage byte-identical to the shell: every
+/// *other* failure — no `lsof` on the machine, a non-zero exit — is what
+/// stop.sh's `2>/dev/null` folds into an empty `$STALE`/`$CUR`, and must keep
+/// producing the shell's row. A deadline is the one outcome the shell cannot
+/// reach at all (its probe has no timeout; it would simply hang), so it is the
+/// only one that may print a Sabrage-only row.
+fn probe_timed_out(e: &SabrageError) -> bool {
+    matches!(e, SabrageError::Io { source, .. } if source.kind() == std::io::ErrorKind::TimedOut)
+}
+
 /// `lsof -nP -iUDP:9944 -iTCP:9943 2>/dev/null | awk 'NR>1{print $1"("$2")"}' |
 /// sort -u | tr '\n' ' '` — `COMMAND(PID)` per listener, deduplicated, sorted,
 /// space-joined with a trailing space when non-empty. See the module docs for
 /// why this duplicates `checks::network`'s private equivalent.
-async fn stale_listeners() -> String {
-    let out = match tokio::process::Command::new("lsof")
+///
+/// `Ok(Some(stale))` is the string the shell's `$(...)` would have captured;
+/// `Ok(None)` means the probe blew `deadline` and this stage knows nothing
+/// about the ports; `Err` is only ever [`SabrageError::Cancelled`].
+///
+/// **Bounded, and cancellation-aware.** This runs through
+/// [`process::capture_with`] rather than a bare `Command::output().await` for
+/// the reason `process`'s own docs give: an `lsof` wedged in the kernel (a
+/// hung NFS mount, a dead network extension) used to block `stop` — and with
+/// it the process-wide operation lock — forever, with Cancel unable to
+/// interrupt it, and with the helper/dashboard reaps and the persisted-guard
+/// restore that follow this call never reached. `capture_with` SIGKILLs the
+/// probe's whole process group on either the token or the deadline.
+///
+/// `lsof` and `deadline` are parameters so the tests can point the probe at a
+/// stub that never answers; production passes `lsof` and
+/// [`process::DEFAULT_PROBE_TIMEOUT`].
+async fn stale_listeners(
+    ctx: &StageCtx,
+    lsof: &Path,
+    deadline: Duration,
+) -> Result<Option<String>> {
+    let spec = ctx
+        .child(lsof.as_os_str().to_os_string(), step::STOP_PORTS)
         .args(LSOF_ARGS)
-        .output()
-        .await
-    {
-        Ok(o) => o,
-        Err(_) => return String::new(),
+        .env_path(process::default_child_path());
+    let text = match process::capture_with(&spec, &ctx.cancel, deadline).await {
+        Ok(out) => out.stdout,
+        Err(SabrageError::Cancelled) => return Err(SabrageError::Cancelled),
+        Err(e) if probe_timed_out(&e) => return Ok(None),
+        // Everything the shell's `2>/dev/null` swallows into an empty `$STALE`.
+        Err(_) => String::new(),
     };
-    let text = String::from_utf8_lossy(&out.stdout);
     let mut rows: BTreeSet<String> = BTreeSet::new();
     for line in text.lines().skip(1) {
         let mut fields = line.split_whitespace();
@@ -378,7 +443,18 @@ async fn stale_listeners() -> String {
         out.push_str(&row);
         out.push(' ');
     }
-    out
+    Ok(Some(out))
+}
+
+/// Sabrage-only (see [`probe_timed_out`]): the row that replaces
+/// `ok "streaming ports free"` when the probe never answered. "Free" is a claim
+/// about the machine, and an abandoned probe is no evidence for it.
+fn ports_unreadable_warn(deadline: Duration) -> String {
+    format!(
+        "could not read the streaming ports: lsof did not answer within {:.0}s — check them with: lsof {}",
+        deadline.as_secs_f32(),
+        LSOF_ARGS.join(" ")
+    )
 }
 
 /// stop.sh:
@@ -388,12 +464,22 @@ async fn stale_listeners() -> String {
 /// else ok "streaming ports free"; fi
 /// ```
 async fn report_ports(ctx: &StageCtx) {
+    report_ports_with(ctx, Path::new("lsof"), process::DEFAULT_PROBE_TIMEOUT).await
+}
+
+/// [`report_ports`] with the probe's program and deadline injectable, so a test
+/// can exercise the abandoned-probe row against a stub that never answers
+/// without waiting out [`process::DEFAULT_PROBE_TIMEOUT`].
+async fn report_ports_with(ctx: &StageCtx, lsof: &Path, deadline: Duration) {
     let st = ctx.step(step::STOP_PORTS);
-    let stale = stale_listeners().await;
-    if stale.is_empty() {
-        st.ok("streaming ports free");
-    } else {
-        st.warn(format!("streaming ports still held by: {stale}"));
+    match stale_listeners(ctx, lsof, deadline).await {
+        // Cancelled: emit nothing. [`run`]'s `checkpoint` on the very next line
+        // turns the same token into the stage's exit code 130 — this step has
+        // nothing truthful left to say.
+        Err(_) => {}
+        Ok(None) => st.warn(ports_unreadable_warn(deadline)),
+        Ok(Some(stale)) if stale.is_empty() => st.ok("streaming ports free"),
+        Ok(Some(stale)) => st.warn(format!("streaming ports still held by: {stale}")),
     }
 }
 
@@ -536,7 +622,20 @@ async fn wait_for_exit(procs: &[ProcInfo]) -> Vec<ProcInfo> {
 /// matches ([`process::find_processes_by_cmdline`], or
 /// [`process::ProcessScan::by_cmdline`] against a snapshot shared with the
 /// stage's other probes); this function only narrows them further.
-fn report_foreign_helpers(ctx: &StageCtx, root: &Path, matches: Vec<ProcInfo>) {
+///
+/// `local_matched` is whether the caller's exact-path reap already killed a
+/// helper from *this* checkout. It gates nothing but the shell's
+/// [`NO_LEFTOVER_HELPER`] row — which may print only when neither scan found
+/// anything, so the killed row and the not-found row can never both appear —
+/// and deliberately not the scan itself: a local helper and a foreign one
+/// coexist all the time in a multi-worktree checkout, and the foreign one is
+/// exactly what nothing else in this stage can see (A5-2).
+fn report_foreign_helpers(
+    ctx: &StageCtx,
+    root: &Path,
+    matches: Vec<ProcInfo>,
+    local_matched: bool,
+) {
     let st = ctx.step(step::STOP_REAP);
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     let foreign: Vec<ProcInfo> = matches
@@ -550,7 +649,9 @@ fn report_foreign_helpers(ctx: &StageCtx, root: &Path, matches: Vec<ProcInfo>) {
         })
         .collect();
     if foreign.is_empty() {
-        st.ok(NO_LEFTOVER_HELPER);
+        if !local_matched {
+            st.ok(NO_LEFTOVER_HELPER);
+        }
         return;
     }
     for p in foreign {
@@ -605,24 +706,63 @@ async fn report_audio(ctx: &StageCtx) {
     let Some(bin) = which("SwitchAudioSource") else {
         return;
     };
-    let raw = tokio::process::Command::new(&bin)
-        .args(["-c", "-t", "output"])
-        .output()
-        .await
-        .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
-        .unwrap_or_default();
-    let cur = crate::util::strip_trailing_newlines(&raw);
+    report_audio_with(ctx, &bin, process::DEFAULT_PROBE_TIMEOUT).await
+}
 
+/// [`report_audio`] past the `command -v` gate, with the probe's binary and
+/// deadline injectable — see [`report_ports_with`].
+async fn report_audio_with(ctx: &StageCtx, bin: &Path, deadline: Duration) {
     let st = ctx.step(step::STOP_AUDIO);
-    match audio_report(cur) {
-        AudioReport::StillBlackhole => {
-            st.warn(AUDIO_STILL_BLACKHOLE_WARN);
-            st.info(AUDIO_RESTORE_HINT);
-        }
-        AudioReport::Restored(cur) => {
-            st.ok(format!("audio output: {cur}"));
-        }
+    match current_output_device(ctx, bin, deadline).await {
+        // Cancelled — see [`report_ports`]: `run`'s next `checkpoint` reports it.
+        Err(_) => {}
+        Ok(None) => st.warn(audio_unreadable_warn(deadline)),
+        Ok(Some(cur)) => match audio_report(&cur) {
+            AudioReport::StillBlackhole => {
+                st.warn(AUDIO_STILL_BLACKHOLE_WARN);
+                st.info(AUDIO_RESTORE_HINT);
+            }
+            AudioReport::Restored(cur) => {
+                st.ok(format!("audio output: {cur}"));
+            }
+        },
     }
+}
+
+/// `CUR="$(SwitchAudioSource -c -t output 2>/dev/null)"`, trimmed the way `$()`
+/// trims — bounded and cancellation-aware for the same reason
+/// [`stale_listeners`] is (a `SwitchAudioSource` blocked on a degraded
+/// CoreAudio server is the audio-side twin of a wedged `lsof`), and with the
+/// same tri-state: `Ok(None)` only for a probe that blew `deadline`, `Err` only
+/// for cancellation, and every other failure folded into the empty `$CUR` the
+/// shell's `2>/dev/null` produces.
+async fn current_output_device(
+    ctx: &StageCtx,
+    bin: &Path,
+    deadline: Duration,
+) -> Result<Option<String>> {
+    let spec = ctx
+        .child(bin.as_os_str().to_os_string(), step::STOP_AUDIO)
+        .args(["-c", "-t", "output"])
+        .env_path(process::default_child_path());
+    match process::capture_with(&spec, &ctx.cancel, deadline).await {
+        Ok(out) => Ok(Some(
+            crate::util::strip_trailing_newlines(&out.stdout).to_string(),
+        )),
+        Err(SabrageError::Cancelled) => Err(SabrageError::Cancelled),
+        Err(e) if probe_timed_out(&e) => Ok(None),
+        Err(_) => Ok(Some(String::new())),
+    }
+}
+
+/// Sabrage-only, [`ports_unreadable_warn`]'s twin: `ok "audio output: "` with an
+/// empty device name is what the old `unwrap_or_default()` printed for a probe
+/// that never returned — a green row naming no device at all.
+fn audio_unreadable_warn(deadline: Duration) -> String {
+    format!(
+        "could not read the current audio output device: SwitchAudioSource did not answer within {:.0}s (check it with: SwitchAudioSource -c -t output)",
+        deadline.as_secs_f32()
+    )
 }
 
 #[cfg(test)]
@@ -641,11 +781,21 @@ mod tests {
 
     // ── STALE string builder ─────────────────────────────────────────────────
 
+    /// The production probe: real `lsof`, real deadline.
+    async fn probe_ports(ctx: &StageCtx) -> Option<String> {
+        stale_listeners(ctx, Path::new("lsof"), process::DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect("not cancelled")
+    }
+
     #[tokio::test]
     async fn stale_listeners_is_well_formed_cmd_pid_pairs_with_a_trailing_space() {
         // Ground truth is machine state (paths.rs's own testing pattern): assert
         // the shape invariant rather than a fixed value.
-        let stale = stale_listeners().await;
+        let (ctx, _seen) = test_ctx(StageOptions::default());
+        let Some(stale) = probe_ports(&ctx).await else {
+            return; // lsof did not answer on this machine; covered below
+        };
         if stale.is_empty() {
             return;
         }
@@ -662,7 +812,9 @@ mod tests {
     async fn report_ports_matches_a_direct_probe() {
         let (ctx, seen) = test_ctx(StageOptions::default());
         report_ports(&ctx).await;
-        let stale = stale_listeners().await;
+        let Some(stale) = probe_ports(&ctx).await else {
+            return; // lsof did not answer on this machine; covered below
+        };
         let evs = seen.lock().unwrap().clone();
         let line = evs.last().expect("one row emitted");
         match (line, stale.is_empty()) {
@@ -690,6 +842,144 @@ mod tests {
             }
             (other, empty) => panic!("unexpected row {other:?} (stale empty: {empty})"),
         }
+    }
+
+    // ── A5-5: the two reporting probes are bounded and cancellable ───────────
+
+    /// An executable that never answers within any test's budget, at a unique
+    /// scratch path. Returns `(dir, bin)`; the caller removes `dir`.
+    fn never_answers(tag: &str) -> (PathBuf, PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "sabrage-stop-probe-{tag}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4().simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("wedged-probe.sh");
+        std::fs::write(&bin, "#!/bin/sh\nsleep 300\n").unwrap();
+        std::fs::set_permissions(&bin, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+        (dir, bin)
+    }
+
+    /// A budget far below [`process::DEFAULT_PROBE_TIMEOUT`] but far above the
+    /// cost of spawning and killing one `/bin/sh`.
+    const PROBE_TEST_BUDGET: Duration = Duration::from_secs(5);
+    const PROBE_TEST_DEADLINE: Duration = Duration::from_millis(300);
+
+    /// A wedged `lsof` used to hold `stop` — and the process-wide operation
+    /// lock — for as long as it stayed wedged, with Cancel unable to interrupt
+    /// it and the two reaps plus the persisted-guard restore never reached.
+    #[tokio::test]
+    async fn stale_listeners_honors_an_already_cancelled_token() {
+        let (dir, bin) = never_answers("ports-cancel");
+        let (ctx, _seen) = test_ctx(StageOptions::default());
+        ctx.cancel.cancel();
+
+        let started = tokio::time::Instant::now();
+        let err = stale_listeners(&ctx, &bin, process::DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect_err("a cancelled probe must not answer with a port list");
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        assert!(started.elapsed() < PROBE_TEST_BUDGET, "the probe ran on");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// …and the stage's own `run` must surface that as exit 130 rather than a
+    /// green ports row: `report_ports` says nothing at all on cancellation.
+    #[tokio::test]
+    async fn a_cancelled_ports_probe_emits_no_row_at_all() {
+        let (dir, bin) = never_answers("ports-cancel-row");
+        let (ctx, seen) = test_ctx(StageOptions::default());
+        ctx.cancel.cancel();
+
+        report_ports_with(&ctx, &bin, process::DEFAULT_PROBE_TIMEOUT).await;
+        assert!(
+            rows(&seen).is_empty(),
+            "a cancelled probe spoke anyway: {:?}",
+            rows(&seen)
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A probe that blows its deadline must warn, never claim free ports.
+    #[tokio::test]
+    async fn a_wedged_lsof_warns_instead_of_reporting_free_ports() {
+        let (dir, bin) = never_answers("ports-deadline");
+        let (ctx, seen) = test_ctx(StageOptions::default());
+
+        let started = tokio::time::Instant::now();
+        report_ports_with(&ctx, &bin, PROBE_TEST_DEADLINE).await;
+        assert!(started.elapsed() < PROBE_TEST_BUDGET, "the probe ran on");
+
+        assert_eq!(
+            rows(&seen),
+            vec![(Severity::Warn, ports_unreadable_warn(PROBE_TEST_DEADLINE))]
+        );
+        assert!(
+            !rows(&seen).iter().any(|(_, t)| t == "streaming ports free"),
+            "claimed free ports on the strength of a probe that never answered"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The audio twin: `SwitchAudioSource` blocked on a degraded CoreAudio
+    /// server used to fall through `unwrap_or_default()` into the green
+    /// `"audio output: "` row, naming no device at all.
+    #[tokio::test]
+    async fn a_wedged_switchaudiosource_warns_instead_of_naming_an_empty_device() {
+        let (dir, bin) = never_answers("audio-deadline");
+        let (ctx, seen) = test_ctx(StageOptions::default());
+
+        let started = tokio::time::Instant::now();
+        report_audio_with(&ctx, &bin, PROBE_TEST_DEADLINE).await;
+        assert!(started.elapsed() < PROBE_TEST_BUDGET, "the probe ran on");
+
+        assert_eq!(
+            rows(&seen),
+            vec![(Severity::Warn, audio_unreadable_warn(PROBE_TEST_DEADLINE))]
+        );
+        assert!(
+            !rows(&seen).iter().any(|(_, t)| t == "audio output: "),
+            "a probe that never answered named the current device"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn current_output_device_honors_an_already_cancelled_token() {
+        let (dir, bin) = never_answers("audio-cancel");
+        let (ctx, seen) = test_ctx(StageOptions::default());
+        ctx.cancel.cancel();
+
+        let started = tokio::time::Instant::now();
+        let err = current_output_device(&ctx, &bin, process::DEFAULT_PROBE_TIMEOUT)
+            .await
+            .expect_err("a cancelled probe must not answer with a device name");
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+        assert!(started.elapsed() < PROBE_TEST_BUDGET, "the probe ran on");
+
+        report_audio_with(&ctx, &bin, process::DEFAULT_PROBE_TIMEOUT).await;
+        assert!(rows(&seen).is_empty(), "{:?}", rows(&seen));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A missing binary is *not* a wedged one: stop.sh's `2>/dev/null` folds a
+    /// command-not-found into an empty `$STALE`, so the shell's green row still
+    /// prints. Only the deadline (which the shell cannot reach) gets the warn.
+    #[tokio::test]
+    async fn a_missing_lsof_still_reports_the_shells_free_ports_row() {
+        let (ctx, seen) = test_ctx(StageOptions::default());
+        report_ports_with(
+            &ctx,
+            Path::new("/nonexistent/sabrage/lsof"),
+            process::DEFAULT_PROBE_TIMEOUT,
+        )
+        .await;
+        assert_eq!(
+            rows(&seen),
+            vec![(Severity::Ok, "streaming ports free".to_string())]
+        );
     }
 
     // ── survivor-line formatting ──────────────────────────────────────────────
@@ -1162,6 +1452,7 @@ mod tests {
             &ctx,
             &ctx.paths.root.clone(),
             process::find_processes_by_cmdline(HELPER_BASENAME),
+            false,
         );
 
         let rows = rows(&seen);
@@ -1188,13 +1479,59 @@ mod tests {
         let any_foreign = matches
             .iter()
             .any(|p| p.exe.file_name().and_then(|n| n.to_str()) == Some(HELPER_BASENAME));
-        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), matches);
+        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), matches, false);
         if !any_foreign {
             assert_eq!(
                 rows(&seen),
                 vec![(Severity::Ok, NO_LEFTOVER_HELPER.to_string())]
             );
         }
+    }
+
+    /// A5-2: with a helper from this checkout killed **and** one left over in
+    /// another checkout, the foreign one must still be reported. The scan used
+    /// to run only on a local miss, so the killed row silently hid it.
+    #[test]
+    fn a_foreign_helper_is_reported_even_when_the_local_reap_matched() {
+        let sleeper = spawn_sleeper(false);
+        let (mut ctx, seen) = test_ctx(StageOptions::default());
+        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+
+        // `local_matched: true` — this checkout's own helper was found and
+        // killed by the exact-path reap just before.
+        report_foreign_helpers(
+            &ctx,
+            &ctx.paths.root.clone(),
+            process::find_processes_by_cmdline(HELPER_BASENAME),
+            true,
+        );
+
+        let rows = rows(&seen);
+        let pid = sleeper.child.id();
+        assert!(
+            rows.iter().any(|(sev, t)| *sev == Severity::Warn
+                && t.starts_with("leftover encoder helper from another checkout: ")
+                && t.contains(&pid.to_string())),
+            "a local match hid the foreign helper: {rows:?}"
+        );
+        // …and the shell's not-found row stays suppressed, so the killed row
+        // and "no leftover encoder helper" never both print.
+        assert!(
+            !rows.iter().any(|(_, t)| t == NO_LEFTOVER_HELPER),
+            "{rows:?}"
+        );
+    }
+
+    /// The other half of the same gate: nothing foreign running and the local
+    /// reap already reported a kill means **no** row at all from this scan.
+    #[test]
+    fn a_matched_local_reap_suppresses_the_not_found_row() {
+        let (mut ctx, seen) = test_ctx(StageOptions::default());
+        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+        // No foreign candidates at all: an empty match list is the shape a
+        // machine with nothing else running produces, machine-independently.
+        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), Vec::new(), true);
+        assert!(rows(&seen).is_empty(), "{:?}", rows(&seen));
     }
 
     #[test]

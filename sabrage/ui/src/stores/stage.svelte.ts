@@ -40,6 +40,19 @@ export interface GateRequest {
 function createStageStore() {
   let stagesPanelOpen = $state(false);
   let gate = $state<GateRequest | null>(null);
+  /**
+   * True while GateModal has an actual `runStage` invocation in flight for a
+   * non-run stage (setup/build/install/stop) — mirrors that component's own
+   * `running` local, set/cleared from there via `setRunning`. Distinct from
+   * `gate !== null`: Hide clears `gate` (and hides the dialog) without
+   * touching this, so callers that would otherwise silently queue a second
+   * `openGate` on top of a still-running, merely-hidden stage (StagesPanel's
+   * Run/Dry-run, Doctor's whole-stage Fix) can disable themselves on it
+   * instead. See GateModal's `activeRequest`/`displayRequest` split, which is
+   * the other half of this fix — this flag is defence in depth, not the only
+   * guard.
+   */
+  let running = $state(false);
 
   function openStagesPanel() {
     stagesPanelOpen = true;
@@ -54,6 +67,9 @@ function createStageStore() {
   function closeGate() {
     gate = null;
   }
+  function setRunning(v: boolean) {
+    running = v;
+  }
 
   return {
     get stagesPanelOpen() {
@@ -62,10 +78,14 @@ function createStageStore() {
     get gate() {
       return gate;
     },
+    get running() {
+      return running;
+    },
     openStagesPanel,
     closeStagesPanel,
     openGate,
     closeGate,
+    setRunning,
   };
 }
 

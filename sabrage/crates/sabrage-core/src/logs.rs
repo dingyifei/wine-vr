@@ -157,9 +157,15 @@ pub fn resolve_source(paths: &Paths, source: &LogSource) -> Option<PathBuf> {
 pub struct LogBatch {
     /// Complete lines only, without their newlines.
     pub lines: Vec<String>,
-    /// The file was replaced (new inode), truncated, or rewritten in place:
-    /// `lines` restarts from the beginning of the new file. The UI clears its
-    /// buffer on this.
+    /// **The lines in THIS batch begin a new incarnation of the file** — it
+    /// was replaced (new inode), truncated, or rewritten in place. The UI
+    /// clears its buffer on this and then appends `lines`.
+    ///
+    /// Read it as a property of the batch, not of the poll: a rotation
+    /// detected while earlier lines were still queued is announced on the
+    /// first batch that actually carries bytes from the reopened file, and the
+    /// batches before it (the previous incarnation's backlog, which
+    /// [`LogBatch::truncated`] promises is never dropped) leave this `false`.
     pub rotated: bool,
     /// This batch hit [`MAX_LINES_PER_POLL`] or [`POLL_BYTE_BUDGET`]: the rest
     /// is still queued internally (never dropped) or still unread in the file,
@@ -236,6 +242,20 @@ pub struct Tailer {
     /// either the `from_end` preload, or the overflow from a batch that hit
     /// [`MAX_LINES_PER_POLL`].
     pending: VecDeque<String>,
+    /// How many of the leading entries in `pending` were read out of a
+    /// **previous** incarnation of the path (A8-4).
+    ///
+    /// A rotation that finds `pending` non-empty cannot deliver those lines as
+    /// the new file's beginning — the consumer clears its buffer on
+    /// [`LogBatch::rotated`] and would then label the old session's last lines
+    /// as the new one's first. So the backlog goes out under `rotated: false`,
+    /// this counter marks how much of it is old, and `drain_capped` never lets
+    /// one batch straddle the boundary.
+    carry: usize,
+    /// A rotation has been *detected* but not yet *announced*: set with
+    /// `carry`, consumed by the first batch that actually carries bytes from
+    /// the reopened file.
+    pending_rotation: bool,
 }
 
 /// `(dev, ino)` — the pair that changes when a path starts naming a different
@@ -337,6 +357,8 @@ impl Tailer {
             splitter,
             unterminated: 0,
             pending,
+            carry: 0,
+            pending_rotation: false,
         })
     }
 
@@ -410,9 +432,13 @@ impl Tailer {
             // `pending` on its own). `LogBatch::truncated` promises those
             // lines are "never dropped" — a rotation must not silently break
             // that promise by wiping `pending` out from under them. Drain and
-            // deliver them now, under `rotated: true` so the UI still clears
-            // its buffer, and pick up the reopened file's own content on the
-            // next `poll()`.
+            // deliver them now — but as what they are: the tail of the
+            // **previous** incarnation. Handing them out under `rotated: true`
+            // told the consumer to clear its buffer and then showed it the old
+            // session's last lines as the new file's first, which is how a
+            // startup failure gets attributed to the wrong session (A8-4). The
+            // marker waits in `pending_rotation` for the first batch that
+            // really does come out of the reopened file.
             let backlog = !self.pending.is_empty();
             self.open = Some((file, current_id));
             self.offset = 0;
@@ -420,10 +446,12 @@ impl Tailer {
             self.splitter = ChunkSplitter::new();
             self.unterminated = 0;
             if backlog {
+                self.carry = self.pending.len();
+                self.pending_rotation = true;
                 let (lines, truncated) = self.drain_capped();
                 return Ok(LogBatch {
                     lines,
-                    rotated: true,
+                    rotated: false,
                     truncated,
                     path: path_str,
                 });
@@ -438,12 +466,21 @@ impl Tailer {
             unterminated,
             pending,
             path,
+            // `carry` and `pending_rotation` are read after these borrows end
+            // (the rotation marker is decided against the drained batch).
+            ..
         } = self;
         let (file, _) = open
             .as_mut()
             .expect("open is Some here: either just (re)opened above, or already open");
         file.seek(SeekFrom::Start(*offset))
             .map_err(|e| SabrageError::io(&*path, e))?;
+
+        // Snapshot everything the read is about to advance, so a read that
+        // turns out to have straddled a rewrite can be undone whole (A8-7).
+        let offset_before = *offset;
+        let signature_before = signature.clone();
+        let pending_before = pending.len();
 
         let mut buf = vec![0u8; READ_CHUNK_BYTES];
         let mut consumed = 0usize;
@@ -475,9 +512,56 @@ impl Tailer {
                 *unterminated = 0;
             }
         }
+
+        // ── the continuity witness, read AGAIN (A8-7) ────────────────────────
+        // The precheck above compared the bytes before the cursor *before*
+        // this read; a truncate-and-regrow-past-the-cursor landing in the
+        // window between the two would be read as a continuation, and the new
+        // file's whole prefix below `offset` silently skipped — the next poll
+        // then sees the signature this read installed and stays "continuous"
+        // forever. Bracketing the read with the same witness closes it: what
+        // sits before `offset_before` must still be what sat there when the
+        // precheck looked.
+        #[cfg(test)]
+        tests::after_read_hook();
+        let straddled = consumed > 0
+            && (read_signature(file, offset_before).map_err(|e| SabrageError::io(&*path, e))?
+                != signature_before
+                || file
+                    .metadata()
+                    .map(|m| file_identity(&m) != current_id)
+                    .unwrap_or(true));
+
+        if straddled {
+            // Undo the read whole: those bytes belong to an incarnation this
+            // tailer can no longer place. Dropping `open` makes the next poll
+            // a fresh open from byte 0, and the deferred marker (A8-4) makes
+            // that batch the one that announces the rotation — this one still
+            // carries only what was already queued.
+            self.pending.truncate(pending_before);
+            self.splitter = ChunkSplitter::new();
+            self.unterminated = 0;
+            self.open = None;
+            self.offset = 0;
+            self.signature.clear();
+            self.pending_rotation = true;
+            let (lines, truncated) = self.drain_capped();
+            return Ok(LogBatch {
+                lines,
+                rotated: false,
+                truncated,
+                path: path_str,
+            });
+        }
+
         *offset += consumed as u64;
         let budget_hit = consumed >= POLL_BYTE_BUDGET;
 
+        // A rotation detected on an earlier poll is announced HERE: with
+        // `carry` down to zero, this batch is the first one whose lines really
+        // do begin the new incarnation. Until then the marker stays pending —
+        // it is never dropped, only deferred.
+        let rotated = rotated || (self.carry == 0 && std::mem::take(&mut self.pending_rotation));
         let (lines, truncated) = self.drain_capped();
         Ok(LogBatch {
             lines,
@@ -490,13 +574,22 @@ impl Tailer {
     /// Take up to [`MAX_LINES_PER_POLL`] lines off the front of `pending`,
     /// leaving the rest queued for the next call.
     fn drain_capped(&mut self) -> (Vec<String>, bool) {
-        let mut lines = Vec::with_capacity(self.pending.len().min(MAX_LINES_PER_POLL));
-        while lines.len() < MAX_LINES_PER_POLL {
+        // While pre-rotation lines are still queued, stop at the boundary: a
+        // batch that mixed the two incarnations would be half cleared and half
+        // kept by a consumer acting on one `rotated` flag (A8-4).
+        let cap = if self.carry > 0 {
+            self.carry.min(MAX_LINES_PER_POLL)
+        } else {
+            MAX_LINES_PER_POLL
+        };
+        let mut lines = Vec::with_capacity(self.pending.len().min(cap));
+        while lines.len() < cap {
             match self.pending.pop_front() {
                 Some(l) => lines.push(l),
                 None => break,
             }
         }
+        self.carry = self.carry.saturating_sub(lines.len());
         let truncated = !self.pending.is_empty();
         (lines, truncated)
     }
@@ -587,6 +680,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ── the truncate/read-race seam (A8-7) ───────────────────────────────────
+
+    thread_local! {
+        /// Per-thread, so one test's hook cannot reach another's `poll` —
+        /// `cargo test` gives each `#[test]` its own thread.
+        static AFTER_READ: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+            const { std::cell::RefCell::new(None) };
+    }
+
+    /// Called by [`Tailer::poll`] between its read loop and its post-read
+    /// continuity check — the exact window a truncate-and-regrow has to land
+    /// in to be read as a continuation. Nothing outside `cfg(test)` can
+    /// register anything, and the default is a no-op.
+    pub(super) fn after_read_hook() {
+        let f = AFTER_READ.with(|h| h.borrow_mut().take());
+        if let Some(f) = f {
+            f();
+            AFTER_READ.with(|h| *h.borrow_mut() = Some(f));
+        }
+    }
+
+    /// Register a one-shot rewrite to happen inside that window. Fires once:
+    /// the test's *later* polls must see an ordinary file.
+    fn on_next_read(f: impl Fn() + 'static) {
+        let fired = std::cell::Cell::new(false);
+        AFTER_READ.with(|h| {
+            *h.borrow_mut() = Some(Box::new(move || {
+                if !fired.replace(true) {
+                    f();
+                }
+            }))
+        });
+    }
+
+    /// Every test that registers one must clear it — the thread is reused by
+    /// nothing here, but a leaked hook is a trap for the next edit.
+    fn clear_read_hook() {
+        AFTER_READ.with(|h| *h.borrow_mut() = None);
     }
 
     /// A [`Paths`] rooted entirely under `root` — including `oxr_appsup` and
@@ -1194,7 +1327,12 @@ mod tests {
         std::fs::write(&path, b"new1\n").unwrap();
 
         let b3 = t.poll().unwrap();
-        assert!(b3.rotated, "the path really did get a new file");
+        assert!(
+            !b3.rotated,
+            "A8-4: these are the OLD file's lines. Announcing the rotation here \
+             makes the consumer clear its buffer and then label `l4000..l4499` \
+             as the new file's beginning"
+        );
         assert!(
             !b3.truncated,
             "the whole remaining backlog fit under the cap"
@@ -1207,9 +1345,122 @@ mod tests {
         assert_eq!(b3.lines[0], "l4000");
         assert_eq!(*b3.lines.last().unwrap(), "l4499");
 
-        // Only now does the new file's own content show up.
+        // …and the marker travels with the batch that really does begin the
+        // new incarnation.
         let b4 = t.poll().unwrap();
-        assert!(!b4.rotated, "already reported as rotated in b3");
+        assert!(b4.rotated, "A8-4: THIS batch is the new file's first");
         assert_eq!(b4.lines, vec!["new1"]);
+
+        // One rotation, one marker: the ordinary appends that follow are
+        // continuations.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "new2").unwrap();
+        }
+        let b5 = t.poll().unwrap();
+        assert!(!b5.rotated);
+        assert_eq!(b5.lines, vec!["new2"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A8-4, the consumer's half: `Logs.svelte` clears its buffer on
+    /// `rotated` and then appends the batch. Replaying that contract over the
+    /// sequence above must leave no line of the previous incarnation on
+    /// screen — and must not have shown the new file's first lines appended
+    /// under the *old* file's tail either.
+    #[test]
+    fn a_rotation_marker_partitions_the_batches_into_clean_incarnations() {
+        let dir = scratch("rotation-epochs");
+        let path = dir.join("a.log");
+        std::fs::write(&path, b"old1\nold2\nold3\n").unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        // `Logs.svelte`'s `onBatch`, in three lines.
+        fn show(screen: &mut Vec<String>, b: &LogBatch) {
+            if b.rotated {
+                screen.clear();
+            }
+            screen.extend(b.lines.iter().cloned());
+        }
+        let mut screen: Vec<String> = Vec::new();
+
+        let b1 = t.poll().unwrap();
+        show(&mut screen, &b1);
+        assert_eq!(screen, vec!["old1", "old2", "old3"]);
+
+        // Rewritten in place, past the cursor — ALVR's `.truncate(true)`.
+        std::fs::write(&path, b"new1\nnew2\nnew3\nnew4\n").unwrap();
+        let b2 = t.poll().unwrap();
+        show(&mut screen, &b2);
+        assert!(b2.rotated);
+        assert_eq!(
+            screen,
+            vec!["new1", "new2", "new3", "new4"],
+            "not one line of the previous session survived the rotation"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A8-7: the continuity witness is read *before* the data. A truncate that
+    /// lands between the two used to be read as a continuation — the tailer
+    /// kept the stale cursor, overwrote its witness with bytes from the new
+    /// file's suffix, and skipped the new file's whole prefix for good.
+    #[test]
+    fn a_rewrite_landing_inside_the_read_window_is_not_read_as_a_continuation() {
+        let dir = scratch("read-window-race");
+        let path = dir.join("a.log");
+        let first: String = (0..200).map(|n| format!("old{n}\n")).collect();
+        std::fs::write(&path, first.as_bytes()).unwrap();
+
+        let mut t = Tailer::open(&path, false, 0).unwrap();
+        let b1 = t.poll().unwrap();
+        assert_eq!(b1.lines.len(), 200);
+
+        // Append, then arrange for the file to be rewritten in place *after*
+        // the read of that append and before the post-read check — the exact
+        // window the precheck cannot cover.
+        {
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .unwrap();
+            writeln!(f, "old200").unwrap();
+        }
+        let rewritten: String = (0..300).map(|n| format!("new{n}\n")).collect();
+        let p = path.clone();
+        on_next_read(move || {
+            // Same inode, grown back past the old cursor: `truncate(true)`,
+            // never a rename.
+            use std::io::Write;
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&p)
+                .unwrap();
+            f.write_all(rewritten.as_bytes()).unwrap();
+        });
+
+        let b2 = t.poll().unwrap();
+        clear_read_hook();
+        assert!(
+            b2.lines.is_empty(),
+            "the straddled read is undone whole, not delivered: {:?}",
+            b2.lines
+        );
+        assert!(!b2.rotated, "nothing from the new incarnation is out yet");
+
+        // The next poll reopens from byte 0 and delivers the new file entire —
+        // prefix included, which is what used to be lost.
+        let b3 = t.poll().unwrap();
+        assert!(b3.rotated, "and THIS batch begins the new incarnation");
+        assert_eq!(b3.lines.len(), 300);
+        assert_eq!(b3.lines[0], "new0");
+        assert_eq!(*b3.lines.last().unwrap(), "new299");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

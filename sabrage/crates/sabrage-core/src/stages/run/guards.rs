@@ -16,7 +16,7 @@
 //! # The lifecycle, and why `Drop` is only a fallback
 //!
 //! ```text
-//! acquire(ctx, facts, state)  →  persist first, then mutate  (never the reverse)
+//! arm(ctx, facts, state)      →  persist first  (apply_switch mutates, never the reverse)
 //! release(self, ctx, state)   →  undo, set the flag, save    (the normal path)
 //! disarm(self)                →  forget without undoing      (detach only)
 //! Drop                        →  best-effort sync fallback, only if neither ran
@@ -147,6 +147,11 @@ pub struct AudioGuard {
     /// `SwitchAudioSource`'s resolved path, kept so `release` and `Drop` do not
     /// have to re-`which` it.
     switch_bin: Option<PathBuf>,
+    /// Was `previous_output` inherited from an EARLIER session's unfinished
+    /// restore rather than read off this machine? Decided in
+    /// [`AudioGuard::arm`] and consumed by [`AudioGuard::apply_switch`], which
+    /// is the other half of the split those two make.
+    carried: bool,
     run_id: RunId,
     sink: EventSink,
     /// A dry run never mutates, so its `Drop` must not either.
@@ -192,7 +197,7 @@ async fn switch_output(ctx: &StageCtx, bin: &Path, device: &str) -> Result<bool>
 
 /// `SwitchAudioSource -a -t output` as one device name per line — read-only,
 /// hence [`crate::process::capture_with`] rather than the executor (the same
-/// exception `AudioGuard::acquire`'s two probes take), carrying `ctx.cancel`
+/// exception `AudioGuard::arm`'s two probes take), carrying `ctx.cancel`
 /// so a Cancel during teardown does not wait out the probe's full timeout.
 ///
 /// An absent or failing binary yields an empty list, which simply means "no
@@ -221,6 +226,7 @@ impl AudioGuard {
         AudioGuard {
             previous_output: None,
             switch_bin: None,
+            carried: false,
             run_id: ctx.run_id,
             sink: ctx.sink.clone(),
             dry_run: ctx.executor.is_dry_run(),
@@ -230,7 +236,7 @@ impl AudioGuard {
     }
 
     /// Test-only: an *armed* guard — one whose `release` actually restores a
-    /// device and says so — built without [`AudioGuard::acquire`]'s three
+    /// device and says so — built without [`AudioGuard::arm`]'s three
     /// machine probes (`which("SwitchAudioSource")` and two `SwitchAudioSource`
     /// captures). `super`'s teardown-order test needs a guard that speaks on
     /// release; it must not need `SwitchAudioSource` installed to get one.
@@ -243,6 +249,7 @@ impl AudioGuard {
         AudioGuard {
             previous_output: Some(previous.into()),
             switch_bin: Some(switch_bin.into()),
+            carried: false,
             run_id: ctx.run_id,
             sink: ctx.sink.clone(),
             dry_run: ctx.executor.is_dry_run(),
@@ -252,8 +259,19 @@ impl AudioGuard {
     }
 
     /// Take the guard, persisting `previous_output` into `state` **before**
-    /// switching the device.
-    pub async fn acquire(
+    /// switching the device — but **without** switching it.
+    ///
+    /// The split from [`AudioGuard::apply_switch`] is what lets the caller
+    /// install the armed guard in its held set *before* the one call that can
+    /// come back `Cancelled` (A8-3). Arming it inside `acquire` and returning
+    /// the switch's `Cancelled` through `?` dropped the guard on the floor:
+    /// `Drop` would then restore the device synchronously and say so, but —
+    /// having neither `&mut SessionState` nor an executor — it could not set
+    /// `guards.audio_restored` or save, so the teardown kept the record and
+    /// reported a guard still pending over a device that was already back.
+    /// Everything up to and including the pre-mutation save lives here; the
+    /// mutation itself lives there.
+    pub async fn arm(
         ctx: &StageCtx,
         facts: &PreflightFacts,
         state: &mut SessionState,
@@ -328,11 +346,31 @@ impl AudioGuard {
         // Arm the guard BEFORE the switch, not after it. `run_child` can report
         // `Cancelled` for a child that already applied the CoreAudio change
         // (`process::spawn_streamed_inner`'s select has no pre-spawn check and
-        // signals a child that may have finished), and the `?` below would then
-        // drop a guard holding `previous_output: None` — the Mac left on
-        // BlackHole with the `Drop` fallback disabled. Armed here, the early
-        // return restores instead.
-        guard.previous_output = Some(previous.clone());
+        // signals a child that may have finished), and returning that through
+        // `?` from a function that still owns the guard would drop it — the
+        // Mac left on BlackHole with the `Drop` fallback disabled. Armed here
+        // and handed back to the caller, the switch's cancellation unwinds
+        // through the ordinary teardown instead.
+        guard.previous_output = Some(previous);
+        guard.carried = carried;
+        Ok(guard)
+    }
+
+    /// The mutation [`AudioGuard::arm`] deliberately left undone: switch the
+    /// default output to `BlackHole 2ch` and pin the device volume.
+    ///
+    /// A guard that armed nothing (`--no-audio`, a non-ALVR protocol, no
+    /// `SwitchAudioSource`, no BlackHole) switches nothing — this is then a
+    /// no-op, and the caller does not have to know which of the four it was.
+    ///
+    /// Must be called with the guard already installed in the caller's held
+    /// set: an `Err` out of here is a guard to release, not one to forget.
+    pub async fn apply_switch(&mut self, ctx: &StageCtx, state: &mut SessionState) -> Result<()> {
+        let (Some(previous), Some(bin)) = (self.previous_output.clone(), self.switch_bin.clone())
+        else {
+            return Ok(());
+        };
+        let st = ctx.step(step::RUN_AUDIO);
 
         let switch = ctx
             .child(bin, step::RUN_AUDIO)
@@ -360,16 +398,16 @@ impl AudioGuard {
             // run.sh:194-195 — warn, and clear the remembered device again so
             // the exit trap restores nothing.
             st.warn(blackhole_switch_failed_line());
-            guard.previous_output = None;
+            self.previous_output = None;
             // …but never clear a device this run only inherited: that record is
             // an EARLIER session's unfinished restore, and this launch failing
             // to switch is no reason to forget it.
-            if !carried {
+            if !self.carried {
                 state.prev_audio_output = None;
                 state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await?;
             }
         }
-        Ok(guard)
+        Ok(())
     }
 
     /// Restore the device, set `guards.audio_restored`, and save.
@@ -851,7 +889,7 @@ mod tests {
             },
         );
         let mut state = fresh_state();
-        let guard = AudioGuard::acquire(&ctx, &facts("alvr"), &mut state)
+        let guard = AudioGuard::arm(&ctx, &facts("alvr"), &mut state)
             .await
             .unwrap();
         assert_eq!(
@@ -868,12 +906,159 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// An [`Executor`] that reports [`SabrageError::Cancelled`] for every
+    /// child — a Stop landing on the `SwitchAudioSource` call. Everything else
+    /// delegates, so nothing here reaches the machine.
+    #[derive(Debug)]
+    struct CancelChildren {
+        inner: Arc<dyn Executor>,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl Executor for CancelChildren {
+        fn with_step(&self, step: crate::events::StepId) -> Arc<dyn Executor> {
+            Arc::new(CancelChildren {
+                inner: self.inner.with_step(step),
+                calls: self.calls.clone(),
+            })
+        }
+        fn is_dry_run(&self) -> bool {
+            self.inner.is_dry_run()
+        }
+        fn planned(&self) -> Vec<crate::executor::PlannedAction> {
+            self.inner.planned()
+        }
+        fn copy_if_changed<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Copied>> {
+            self.inner.copy_if_changed(src, dst)
+        }
+        fn write_atomic<'a>(
+            &'a self,
+            path: &'a Path,
+            bytes: &'a [u8],
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.write_atomic(path, bytes)
+        }
+        fn remove_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_dir_all(p)
+        }
+        fn remove_file<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_file(p)
+        }
+        fn create_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.create_dir_all(p)
+        }
+        fn dir_copy<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.dir_copy(src, dst)
+        }
+        fn download<'a>(
+            &'a self,
+            url: &'a str,
+            dest: &'a Path,
+            sha256: &'a str,
+            label: &'a str,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Downloaded>> {
+            self.inner.download(url, dest, sha256, label)
+        }
+        fn tar_xzf<'a>(
+            &'a self,
+            archive: &'a Path,
+            into_dir: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.tar_xzf(archive, into_dir)
+        }
+        fn touch<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.touch(p)
+        }
+        fn run_child<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+        ) -> crate::executor::BoxFuture<'a, Result<std::process::ExitStatus>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(spec.program.display().to_string());
+            Box::pin(async move { Err(SabrageError::Cancelled) })
+        }
+        fn spawn_detached<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+            stdio: crate::executor::DetachedStdio,
+        ) -> crate::executor::BoxFuture<'a, Result<Option<crate::executor::DetachedChild>>>
+        {
+            self.inner.spawn_detached(spec, stdio)
+        }
+    }
+
+    /// A8-3: `run_child` can report `Cancelled` for a switch CoreAudio has
+    /// already applied. Arming and switching in one call meant that `?` threw
+    /// the guard away before the caller could hold it: `Drop` then restored
+    /// the device and said so, but — with no `&mut SessionState` and no
+    /// executor — could set neither `guards.audio_restored` nor the record, so
+    /// the teardown reported a pending guard over a device already back.
+    #[tokio::test]
+    async fn a_cancelled_switch_leaves_the_guard_armed_for_the_teardown() {
+        let root = scratch("audio-switch-cancelled");
+        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let cancelling = StageCtx {
+            executor: Arc::new(CancelChildren {
+                inner: ctx.executor.clone(),
+                calls: calls.clone(),
+            }),
+            ..ctx.clone()
+        };
+        let mut state = fresh_state();
+
+        // The shape `arm` hands back: the device recorded, the record saved,
+        // the switch not yet run.
+        let mut guard = AudioGuard::armed_for_test(
+            &cancelling,
+            "MacBook Pro Speakers",
+            "/opt/homebrew/bin/SwitchAudioSource",
+        );
+        let err = guard
+            .apply_switch(&cancelling, &mut state)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err}");
+        assert_eq!(
+            calls.lock().unwrap().len(),
+            1,
+            "the switch was attempted exactly once"
+        );
+        assert_eq!(
+            guard.previous_output.as_deref(),
+            Some("MacBook Pro Speakers"),
+            "the guard is still armed — this is what the caller keeps"
+        );
+        assert!(seen.lock().unwrap().is_empty(), "and nothing was announced");
+
+        // The teardown's bounded path — not `Drop` — is what runs next, and it
+        // is the only one that can record the restore.
+        guard.release(&ctx, &mut state).await.unwrap();
+        assert_eq!(
+            rows(&seen.lock().unwrap()),
+            vec!["audio: restored output -> MacBook Pro Speakers".to_string()],
+            "exactly one restore row, from the release rather than from Drop"
+        );
+        assert!(state.guards.audio_restored);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     #[tokio::test]
     async fn a_non_alvr_protocol_touches_audio_not_at_all() {
         let root = scratch("audio-legacy");
         let (ctx, seen) = dry_ctx(&root, StageOptions::default());
         let mut state = fresh_state();
-        let guard = AudioGuard::acquire(&ctx, &facts("oxrsys"), &mut state)
+        let guard = AudioGuard::arm(&ctx, &facts("oxrsys"), &mut state)
             .await
             .unwrap();
         assert!(seen.lock().unwrap().is_empty(), "the shell prints nothing");

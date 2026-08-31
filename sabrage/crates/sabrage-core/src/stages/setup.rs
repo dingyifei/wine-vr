@@ -14,7 +14,15 @@
 //!    `.sha256` provenance marker ([`crate::util::contract_marker_bytes`]).
 //! 3. [`step::SETUP_CONFIG`] — **write-once** `oxrsys-runtime.toml` from
 //!    [`crate::util::toml_template`]; an existing file is never overwritten,
-//!    only reported (and warned about when `protocol` is not `alvr`).
+//!    only reported (and warned about when `protocol` is not `alvr`). The
+//!    creation goes through [`crate::executor::Executor::create_new`] (`O_EXCL`)
+//!    rather than an `exists()` probe plus
+//!    [`crate::executor::Executor::write_atomic`]: the probe and the write are
+//!    separated by an `await`, and the Sabrage operation lock covers neither an
+//!    editor nor a concurrently running `demo.sh setup`, so the racy shape
+//!    could rename a template over a hand-maintained config that was never
+//!    backed up. When the kernel says somebody else created it first, the file
+//!    is reported exactly as the already-present branch reports it.
 //! 4. [`step::SETUP_GAME`] — Beat Saber presence probe; skipped entirely when
 //!    neither `--bottle` nor `--bs-dir` was given.
 //!
@@ -44,6 +52,19 @@
 //! (`sabrage setup --dry-run` over a fresh clone used to print three green
 //! completed-state rows). This is the same verb swap `build.rs` applies to its
 //! own staged-copy outcome, and PARITY.md's "would …" dry-run language row.
+//!
+//! The rule is the **whole** claimed postcondition, not the part of it that
+//! happens to be observable. Two rows named a byte a dry run had not written:
+//!
+//! * the extraction row's parenthetical claims the provenance marker, but
+//!   [`setup_pinned`] returns early ("already present") whenever the marker is
+//!   current — so *reaching* that row at all means the marker is absent or
+//!   stale, and under `--dry-run` nothing wrote it. There is therefore no
+//!   dry-run shape in which the `ok` is truthful, and the row is always the
+//!   future-tense one there;
+//! * the config row said "wrote …" for a file [`crate::executor::DryRunExecutor`]
+//!   only planned. It now says "would write …", and `sabrage setup --dry-run`
+//!   over a fresh checkout leaves — and claims — nothing on disk.
 
 use std::path::Path;
 
@@ -233,7 +254,12 @@ async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
         exec.write_atomic(&marker_path, marker_bytes.as_bytes())
             .await?;
         let st = ctx.step(step::SETUP_PINNED);
-        if extracted_ok {
+        // The `ok` row claims *both* halves of the postcondition — the files
+        // and the marker. `util::dxmt_ok` (files **and** a current marker)
+        // already returned early above, so reaching this line under a dry run
+        // means the marker is missing or stale and nothing wrote it: a complete
+        // file set alone may not buy the green row. See the module docs.
+        if extracted_ok && !exec.is_dry_run() {
             st.ok("extracted ext/dxmt-artifacts (provenance marker written)");
         } else {
             st.info(DXMT_WOULD_EXTRACT_INFO);
@@ -258,26 +284,31 @@ async fn setup_config(ctx: &StageCtx) -> Result<()> {
     exec.create_dir_all(&ctx.paths.oxr_appsup).await?;
 
     if ctx.paths.toml_path.is_file() {
-        let text = std::fs::read_to_string(&ctx.paths.toml_path).unwrap_or_default();
-        let proto = parse_protocol_awk(&text);
-        if proto == "alvr" {
+        report_existing_config(st, &ctx.paths.toml_path);
+    } else {
+        // `O_EXCL`, not `exists()`-then-rename: whoever created the file
+        // between the probe above and this line keeps it (see the module docs).
+        let created = exec
+            .create_new(&ctx.paths.toml_path, util::toml_template().as_bytes())
+            .await?;
+        if !created {
+            // Someone else won the race. The file is now in exactly the shape
+            // the branch above exists to describe, so describe it — the one
+            // thing setup may never do to a config it did not write is
+            // replace it.
+            report_existing_config(st, &ctx.paths.toml_path);
+        } else if exec.is_dry_run() {
+            // Planned, not performed: no bytes are on disk to have written.
             st.info(format!(
-                "config present: {} (protocol=alvr)",
+                "would write {} (protocol=alvr, 42 Mbps, encoder_process=auto)",
                 ctx.paths.toml_path.display()
             ));
         } else {
-            st.warn(format!(
-                "config present with protocol='{proto}' — the demo needs protocol = \"alvr\"; edit {} yourself (not overwriting)",
+            st.ok(format!(
+                "wrote {} (protocol=alvr, 42 Mbps, encoder_process=auto)",
                 ctx.paths.toml_path.display()
             ));
         }
-    } else {
-        exec.write_atomic(&ctx.paths.toml_path, util::toml_template().as_bytes())
-            .await?;
-        st.ok(format!(
-            "wrote {} (protocol=alvr, 42 Mbps, encoder_process=auto)",
-            ctx.paths.toml_path.display()
-        ));
     }
 
     st.info(format!(
@@ -285,6 +316,29 @@ async fn setup_config(ctx: &StageCtx) -> Result<()> {
         ctx.paths.oxr_appsup.display()
     ));
     Ok(())
+}
+
+/// setup.sh's two rows for a config this run did not write: the `info` when its
+/// `protocol` is already `alvr`, the `warn` (verbatim, "not overwriting"
+/// included) when it is anything else.
+///
+/// Two callers, one text: the ordinary already-present case, and the one where
+/// [`crate::executor::Executor::create_new`] reports that another writer got
+/// there first.
+fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) {
+    let text = std::fs::read_to_string(toml_path).unwrap_or_default();
+    let proto = parse_protocol_awk(&text);
+    if proto == "alvr" {
+        st.info(format!(
+            "config present: {} (protocol=alvr)",
+            toml_path.display()
+        ));
+    } else {
+        st.warn(format!(
+            "config present with protocol='{proto}' — the demo needs protocol = \"alvr\"; edit {} yourself (not overwriting)",
+            toml_path.display()
+        ));
+    }
 }
 
 /// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}'`.
@@ -609,6 +663,164 @@ mod tests {
         std::fs::remove_dir_all(&fixture).ok();
     }
 
+    /// The concurrent-writer race A5-3 named, made deterministic: an
+    /// [`crate::executor::Executor`] that stands in for the other process —
+    /// it creates the file itself (as an editor or a concurrent `demo.sh setup`
+    /// would, between `setup_config`'s existence probe and its write) and then
+    /// reports what the kernel reports to the loser of an `O_EXCL` open:
+    /// `Ok(false)`, caller's bytes not written. Everything else forwards to the
+    /// real executor underneath.
+    #[derive(Debug)]
+    struct LosesTheCreateRace {
+        inner: Arc<dyn crate::executor::Executor>,
+        other_writers_bytes: &'static str,
+    }
+
+    impl LosesTheCreateRace {
+        fn around(
+            inner: Arc<dyn crate::executor::Executor>,
+            other_writers_bytes: &'static str,
+        ) -> Arc<LosesTheCreateRace> {
+            Arc::new(LosesTheCreateRace {
+                inner,
+                other_writers_bytes,
+            })
+        }
+    }
+
+    impl crate::executor::Executor for LosesTheCreateRace {
+        fn with_step(&self, step: crate::events::StepId) -> Arc<dyn crate::executor::Executor> {
+            Arc::new(LosesTheCreateRace {
+                inner: self.inner.with_step(step),
+                other_writers_bytes: self.other_writers_bytes,
+            })
+        }
+        fn is_dry_run(&self) -> bool {
+            self.inner.is_dry_run()
+        }
+        fn planned(&self) -> Vec<PlannedAction> {
+            self.inner.planned()
+        }
+        fn create_new<'a>(
+            &'a self,
+            path: &'a Path,
+            _bytes: &'a [u8],
+        ) -> crate::executor::BoxFuture<'a, Result<bool>> {
+            Box::pin(async move {
+                std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+                std::fs::write(path, self.other_writers_bytes).unwrap();
+                Ok(false)
+            })
+        }
+        fn copy_if_changed<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Copied>> {
+            self.inner.copy_if_changed(src, dst)
+        }
+        fn write_atomic<'a>(
+            &'a self,
+            path: &'a Path,
+            bytes: &'a [u8],
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.write_atomic(path, bytes)
+        }
+        fn remove_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_dir_all(p)
+        }
+        fn remove_file<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.remove_file(p)
+        }
+        fn create_dir_all<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.create_dir_all(p)
+        }
+        fn dir_copy<'a>(
+            &'a self,
+            src: &'a Path,
+            dst: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.dir_copy(src, dst)
+        }
+        fn download<'a>(
+            &'a self,
+            url: &'a str,
+            dest: &'a Path,
+            sha256: &'a str,
+            label: &'a str,
+        ) -> crate::executor::BoxFuture<'a, Result<crate::executor::Downloaded>> {
+            self.inner.download(url, dest, sha256, label)
+        }
+        fn tar_xzf<'a>(
+            &'a self,
+            archive: &'a Path,
+            into_dir: &'a Path,
+        ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.tar_xzf(archive, into_dir)
+        }
+        fn touch<'a>(&'a self, p: &'a Path) -> crate::executor::BoxFuture<'a, Result<()>> {
+            self.inner.touch(p)
+        }
+        fn run_child<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+        ) -> crate::executor::BoxFuture<'a, Result<std::process::ExitStatus>> {
+            self.inner.run_child(spec)
+        }
+        fn spawn_detached<'a>(
+            &'a self,
+            spec: &'a crate::process::ChildSpec,
+            stdio: crate::executor::DetachedStdio,
+        ) -> crate::executor::BoxFuture<'a, Result<Option<crate::executor::DetachedChild>>>
+        {
+            self.inner.spawn_detached(spec, stdio)
+        }
+    }
+
+    /// A5-3: a config that appears between the `is_file()` probe and the write
+    /// keeps its bytes. Before the fix the branch ended in `write_atomic`,
+    /// which renames the template over whatever is at the destination — an
+    /// irreversible loss of a hand-maintained config, with no backup.
+    #[tokio::test]
+    async fn a_config_created_by_another_writer_is_reported_not_replaced() {
+        let fixture = scratch("config-race");
+        let paths = fixture_paths(&fixture);
+        let hand_edited = "# hand maintained\nprotocol = \"alvr\"\nbitrate_mbps = 80\n";
+        let (mut ctx, seen) = ctx_with_paths(paths.clone(), StageOptions::default());
+        assert!(!ctx.executor.is_dry_run());
+        ctx.executor = LosesTheCreateRace::around(ctx.executor.clone(), hand_edited);
+
+        // Nothing on disk when the stage probes: the other writer's file
+        // appears only inside the create call, which is the window the old
+        // `is_file()`-then-`write_atomic` shape renamed straight over.
+        assert!(!paths.toml_path.exists());
+        setup_config(&ctx).await.unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&paths.toml_path).unwrap(),
+            hand_edited,
+            "the losing writer replaced a config it did not create"
+        );
+        let rows = lines(&seen);
+        assert!(
+            rows.contains(&(
+                Severity::Info,
+                format!(
+                    "config present: {} (protocol=alvr)",
+                    paths.toml_path.display()
+                )
+            )),
+            "{rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(sev, t)| *sev == Severity::Ok && t.starts_with("wrote ")),
+            "claimed a write that lost the race: {rows:?}"
+        );
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
     // ── setup_pinned ─────────────────────────────────────────────────────────
 
     #[tokio::test]
@@ -752,9 +964,8 @@ mod tests {
         let fixture = scratch("dry-run-honesty-ready");
         let paths = fixture_paths(&fixture);
         fake_submodule_checkout(&paths);
-        // Every extracted file present but the provenance marker absent: the
-        // stage plans the fetch/extract and then finds the set complete, which
-        // is the one shape where the extraction `ok` row is truthful.
+        // Every extracted file present but the provenance marker absent — the
+        // shape a half-finished extraction leaves behind.
         for f in &contract().dxmt.files {
             let p = paths.dxmt_art.join(f);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
@@ -770,10 +981,10 @@ mod tests {
         run(&ctx).await.unwrap();
 
         let rows = lines(&seen);
+        // These two postconditions are true on disk, so they keep their ok row.
         for claim in [
             "submodules ready",
             "ALVR checkout carries the oxrsys patch set (branch oxrsys-v20.14.1)",
-            "extracted ext/dxmt-artifacts (provenance marker written)",
         ] {
             assert!(
                 rows.iter()
@@ -781,6 +992,63 @@ mod tests {
                 "a truthful postcondition lost its ok row {claim:?}: {rows:?}"
             );
         }
+        // A5-1: the extraction row claims the *marker* too, and the marker is
+        // exactly what this fixture lacks (a current one would have short-
+        // circuited the whole step). A dry run wrote none, so the row must stay
+        // future-tense — and the file must still be absent afterwards.
+        assert!(
+            rows.iter()
+                .any(|(sev, t)| *sev == Severity::Info && t == DXMT_WOULD_EXTRACT_INFO),
+            "missing the future-tense extraction row: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|(sev, t)| *sev == Severity::Ok
+                && t == "extracted ext/dxmt-artifacts (provenance marker written)"),
+            "a dry run claimed a provenance marker it never wrote: {rows:?}"
+        );
+        assert!(
+            !paths.dxmt_art.join(".sha256").exists(),
+            "the dry run wrote the marker for real"
+        );
+        std::fs::remove_dir_all(&fixture).ok();
+    }
+
+    /// A5-1, the config half: `setup_config`'s green row says "wrote …" of a
+    /// file [`crate::executor::DryRunExecutor`] only planned. Under `--dry-run`
+    /// it must be the future tense, and nothing may be on disk.
+    #[tokio::test]
+    async fn a_dry_run_never_claims_it_wrote_the_runtime_config() {
+        let fixture = scratch("dry-run-honesty-config");
+        let paths = fixture_paths(&fixture);
+        let (ctx, seen) = ctx_with_paths(
+            paths.clone(),
+            StageOptions {
+                dry_run: true,
+                ..Default::default()
+            },
+        );
+        setup_config(&ctx).await.unwrap();
+
+        let rows = lines(&seen);
+        assert!(
+            rows.iter().any(|(sev, t)| *sev == Severity::Info
+                && t == &format!(
+                    "would write {} (protocol=alvr, 42 Mbps, encoder_process=auto)",
+                    paths.toml_path.display()
+                )),
+            "missing the future-tense config row: {rows:?}"
+        );
+        assert!(
+            !rows
+                .iter()
+                .any(|(sev, t)| *sev == Severity::Ok && t.starts_with("wrote ")),
+            "a dry run claimed a config write it never performed: {rows:?}"
+        );
+        assert!(!paths.toml_path.exists(), "the dry run wrote the config");
+        // The write is still *planned* — only the row's tense changed.
+        assert!(ctx.executor.planned().iter().any(|a| {
+            a.kind == PlannedKind::Write && a.dst.as_deref() == Some(paths.toml_path.as_path())
+        }));
         std::fs::remove_dir_all(&fixture).ok();
     }
 

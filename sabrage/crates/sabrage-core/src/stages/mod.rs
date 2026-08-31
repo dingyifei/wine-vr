@@ -39,6 +39,22 @@
 //! out. [`crate::fixes::apply`] applies the same policy to every fix whose
 //! registry entry is `forbidden_while_session_live`.
 //!
+//! Both doors refuse **twice**: once before waiting on the operation lock (fast,
+//! so a queued operation is not admitted only to be refused later) and once with
+//! the lock in hand, because a `run` that acquired first publishes its live
+//! session and then gives the lock back at the launch boundary.
+//!
+//! # Contract identity
+//!
+//! [`deny_on_contract_skew`] is the second half of the same policy: every stage
+//! that writes contract-derived bytes (`setup`, `build`, `install`, `run` — not
+//! `stop`, the way out) refuses when the contract compiled into this binary is
+//! not the one the checkout at `paths.root` describes
+//! ([`crate::checks::meta::assert_binary_matches_checkout`]). `meta.contract-sync`
+//! reports the same skew as a doctor row; this is the enforcement, so an
+//! X-built binary cannot install X's pins into checkout Y just because nobody
+//! ran doctor first.
+//!
 //! # Lock policy for `run` (the one exception)
 //!
 //! [`run_stage`]`(`[`Stage::Run`]`)` holds [`OPERATION_LOCK`] through
@@ -665,7 +681,7 @@ fn operation_lock_file_busy() -> bool {
 /// `Unverifiable` classification and the foreign-owner window — which meant the
 /// doors that mutate (`setup`/`build`/`install` and every gated fix) were
 /// guarded by *less* than the doors that only refuse. One predicate, one
-/// policy: see [`crate::session::session_block_at`] for the six signals.
+/// policy: see [`crate::session::session_block_at`] for the seven signals.
 pub fn live_session_block(paths: &Paths) -> Option<String> {
     crate::session::live_session_reason(paths)
 }
@@ -699,6 +715,77 @@ fn deny_stage_while_session_live(stage: Stage, ctx: &StageCtx) -> Result<()> {
             )),
         )),
     }
+}
+
+// ── contract identity policy ──────────────────────────────────────────────────
+
+/// Write the contract **this test binary was compiled from** into `root`, so a
+/// scratch checkout is contract-identical to the binary under test and
+/// [`contract_identity_mismatch`] answers `None` for it.
+///
+/// Every fixture root a mutating stage or fix is pointed at needs this: without
+/// it the identity guard (correctly) refuses before the behaviour the test is
+/// about is ever reached.
+#[cfg(test)]
+pub(crate) fn materialize_compiled_contract(root: &Path) {
+    use crate::contract::{
+        CONTRACT_FILES, HOST_MANIFEST_TEMPLATE, PIPELINE_TOML, RUNTIME_TOML_TEMPLATE,
+    };
+    let bodies = [PIPELINE_TOML, RUNTIME_TOML_TEMPLATE, HOST_MANIFEST_TEMPLATE];
+    for (rel, body) in CONTRACT_FILES.iter().zip(bodies) {
+        let path = root.join(rel);
+        std::fs::create_dir_all(path.parent().expect("contract paths have a parent")).unwrap();
+        std::fs::write(path, body).unwrap();
+    }
+}
+
+/// The stages that write contract-derived bytes onto the machine.
+///
+/// `stop` is exempt on purpose: it is the way out of every bad state, including
+/// this one, and it writes nothing the contract describes.
+fn stage_is_gated_by_contract_identity(stage: Stage) -> bool {
+    matches!(
+        stage,
+        Stage::Setup | Stage::Build | Stage::Install | Stage::Run
+    )
+}
+
+/// The `die` any mutating door produces when the contract compiled into this
+/// binary is not the one the checkout at `ctx.paths.root` describes.
+///
+/// The predicate and both strings come from
+/// [`crate::checks::meta::assert_binary_matches_checkout`], so the abort and the
+/// `meta.contract-sync` row say exactly one thing — and a `contract/` that
+/// cannot be read at all fails closed there, not here.
+///
+/// [`crate::fixes::apply`]'s door as much as a stage's: a Doctor "Fix" button
+/// run by an X-built binary writes X's ports, pins and templates into checkout
+/// Y just as an `install` would.
+pub(crate) fn deny_on_contract_skew(ctx: &StageCtx) -> Result<()> {
+    match crate::checks::meta::assert_binary_matches_checkout(&ctx.paths.root) {
+        Ok(()) => Ok(()),
+        Err((message, remedy)) => Err(ctx.fatal(message, Some(remedy))),
+    }
+}
+
+/// [`deny_on_contract_skew`] for the stages it applies to.
+fn deny_stage_on_contract_skew(stage: Stage, ctx: &StageCtx) -> Result<()> {
+    if !stage_is_gated_by_contract_identity(stage) {
+        return Ok(());
+    }
+    deny_on_contract_skew(ctx)
+}
+
+/// Every refusal a stage owes before it may dispatch: a live session, then
+/// contract skew.
+///
+/// One function because both doors ([`run_stage`], [`run_stage_holding_lock`])
+/// and both moments (before the operation lock, and again after acquiring it —
+/// see [`run_stage`]) must apply exactly the same policy; a third door cannot
+/// forget half of it.
+fn deny_before_dispatch(stage: Stage, ctx: &StageCtx) -> Result<()> {
+    deny_stage_while_session_live(stage, ctx)?;
+    deny_stage_on_contract_skew(stage, ctx)
 }
 
 // ── dispatch ──────────────────────────────────────────────────────────────────
@@ -767,11 +854,24 @@ impl StageOutcome {
 /// The live-session refusal stays *before* the event: it is an immediate,
 /// argument-shaped rejection, and demo.sh's equivalent dies before printing a
 /// stage banner too.
+///
+/// # Refused twice, on purpose
+///
+/// [`deny_before_dispatch`] runs **again** after the operation lock is in hand.
+/// The wait is unbounded (another Sabrage process's build, minutes long) and the
+/// world moves during it: a queued `install` admitted while the machine was idle
+/// used to lose the race to a concurrent `run`, which publishes its live handle
+/// and then deliberately *releases* the lock at the launch boundary — so the
+/// install acquired the lock a moment later and replaced the artifacts of a game
+/// that was by then streaming. The second refusal is the same predicate on the
+/// same state; only its timing (after the wait, before the first mutation)
+/// matters. It goes through [`finish_stage`] because `StageStarted` has already
+/// been emitted by then.
 pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
     // Before the lock, not after: waiting for a build to finish only to refuse
     // is worse than refusing straight away, and the operation lock is free for
     // the whole of a live session by design (see "Lock policy for `run`").
-    deny_stage_while_session_live(stage, ctx)?;
+    deny_before_dispatch(stage, ctx)?;
     ctx.emit(StageEvent::StageStarted {
         run_id: ctx.run_id,
         stage,
@@ -782,6 +882,11 @@ pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
     let Some(guard) = acquire_operation_lock_cancellable(&ctx.cancel).await else {
         return finish_stage(stage, ctx, Err(SabrageError::Cancelled));
     };
+    // The world may have changed during the wait — recheck before the first
+    // mutation, with the lock held so the answer cannot go stale again.
+    if let Err(e) = deny_before_dispatch(stage, ctx) {
+        return finish_stage(stage, ctx, Err(e));
+    }
     if stage == Stage::Run {
         // The one stage that gives the lock back early — see this module's
         // "Lock policy for `run`". The guard is *moved into* the stage, which
@@ -802,7 +907,14 @@ pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
 /// [`crate::fixes::apply_holding_lock`] is the fix-shaped door to this function;
 /// a preflight that has taken the lock for the whole launch calls that, never
 /// [`crate::fixes::apply`].
+///
+/// The live-session refusal is deliberately absent here (this door is reached
+/// from inside `run`, before the live handle is published — see
+/// [`crate::fixes::apply_holding_lock`]), but the contract-identity refusal is
+/// not: a binary that cannot identify the checkout it is writing into must not
+/// mutate through *any* door.
 pub async fn run_stage_holding_lock(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
+    deny_stage_on_contract_skew(stage, ctx)?;
     ctx.emit(StageEvent::StageStarted {
         run_id: ctx.run_id,
         stage,
@@ -1183,8 +1295,11 @@ mod tests {
     }
 
     /// A ctx whose session-state and OXRSys stores are scratch directories, so
-    /// `live_session_block` reads fixtures rather than the real machine.
+    /// `live_session_block` reads fixtures rather than the real machine — and
+    /// whose scratch root carries this binary's own contract, so the identity
+    /// guard is satisfied and the *other* refusals are what the tests observe.
     fn ctx_at(root: &std::path::Path, bottle: Option<&str>) -> StageCtx {
+        materialize_compiled_contract(root);
         let mut paths = Paths::new(root);
         paths.sabrage_appsup = root.join("Sabrage");
         paths.oxr_appsup = root.join("OXRSys");
@@ -1233,6 +1348,21 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
+    /// The `runtime_status.json` a live `./demo.sh run` session would have
+    /// written: fresh, and naming a pid that is alive — this process, the only
+    /// pid a test can be sure of ([`crate::session::watcher::runtime_status_live`]
+    /// requires both halves, so freshness alone is no longer a session).
+    fn write_live_runtime_status(ctx: &StageCtx) {
+        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
+        let now = crate::session::now_unix_ms();
+        let pid = std::process::id();
+        std::fs::write(
+            ctx.paths.oxr_appsup.join("runtime_status.json"),
+            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+    }
+
     /// A `./demo.sh run` session writes no `session-state.json`; a fresh
     /// `runtime_status.json` is the only trace of it Sabrage can read.
     #[test]
@@ -1240,19 +1370,14 @@ mod tests {
         let _g = crate::session::lock_session_globals();
         let root = std::env::temp_dir().join(format!("sabrage-live-status-{}", std::process::id()));
         let ctx = ctx_at(&root, None);
-        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
-        let now = crate::session::now_unix_ms();
-        std::fs::write(
-            ctx.paths.oxr_appsup.join("runtime_status.json"),
-            format!(r#"{{"state":"streaming","updated_at_unix_ms":{now}}}"#),
-        )
-        .unwrap();
+        write_live_runtime_status(&ctx);
         assert!(live_session_block(&ctx.paths).is_some_and(|r| r.contains("streaming")));
 
         // Stale is not live: the file outlives the runtime.
+        let pid = std::process::id();
         std::fs::write(
             ctx.paths.oxr_appsup.join("runtime_status.json"),
-            r#"{"state":"streaming","updated_at_unix_ms":1}"#,
+            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":1}}"#),
         )
         .unwrap();
         assert_eq!(live_session_block(&ctx.paths), None);
@@ -1333,6 +1458,223 @@ mod tests {
         assert!(stop_err
             .to_string()
             .starts_with("CrossOver bottle name required"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The refusal is checked before the operation lock **and again after it**.
+    ///
+    /// The window it closes: a stage admitted while the machine was idle waits
+    /// (minutes, behind another Sabrage process's build), a `run` acquires
+    /// first, publishes its live session and hands the lock back at its launch
+    /// boundary — and the queued stage used to walk straight into `dispatch`
+    /// and replace the artifacts of a game that was by then streaming.
+    #[tokio::test]
+    async fn a_queued_stage_is_refused_when_a_session_goes_live_during_the_wait() {
+        let _g = crate::session::lock_session_globals();
+        let root = std::env::temp_dir().join(format!("sabrage-queued-live-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        materialize_compiled_contract(&root);
+
+        let mut paths = Paths::new(&root);
+        paths.sabrage_appsup = root.join("Sabrage");
+        paths.oxr_appsup = root.join("OXRSys");
+        let oxr = paths.oxr_appsup.clone();
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s = seen.clone();
+        let sink: EventSink = Arc::new(move |ev| s.lock().unwrap().push(ev));
+        let ctx = StageCtx::new(
+            paths,
+            StageOptions {
+                // Nothing here may mutate even if the guard were to fail open.
+                dry_run: true,
+                bottle_name: Some("FixtureBottle".into()),
+                ..StageOptions::default()
+            },
+            sink,
+            CancellationToken::new(),
+        );
+        assert_eq!(
+            live_session_block(&ctx.paths),
+            None,
+            "the fixture must be idle at admission"
+        );
+
+        let held = acquire_operation_lock().await;
+        let task = tokio::spawn(async move { run_stage(Stage::Build, &ctx).await });
+
+        // Admitted: the stage got past the pre-lock refusal and is now waiting.
+        let started = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let has = seen.lock().unwrap().iter().any(|ev| {
+                    matches!(ev, StageEvent::StageStarted { stage, .. } if *stage == Stage::Build)
+                });
+                if has {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await;
+        assert!(started.is_ok(), "the queued stage must announce itself");
+
+        // A session starts while it waits — the `run` that won the lock race.
+        std::fs::create_dir_all(&oxr).unwrap();
+        let now = crate::session::now_unix_ms();
+        let pid = std::process::id();
+        std::fs::write(
+            oxr.join("runtime_status.json"),
+            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+        drop(held);
+
+        let err = tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the queued stage must settle once the lock is free")
+            .expect("the stage task must not panic")
+            .expect_err("a stage that acquires the lock under a live session is refused");
+        assert!(
+            err.to_string()
+                .starts_with("refusing to run build while a session is live"),
+            "{err}"
+        );
+
+        let events = seen.lock().unwrap().clone();
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, StageEvent::Section { .. })),
+            "the refused stage must never have reached its dispatch: {events:?}"
+        );
+        // The bracket still closes: StageStarted was emitted before the wait.
+        assert!(matches!(
+            events.last(),
+            Some(StageEvent::StageFinished {
+                stage: Stage::Build,
+                ok: false,
+                ..
+            })
+        ));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// A scratch checkout whose `contract/` is *not* the one this binary was
+    /// compiled from — the X-binary/Y-checkout skew `meta.contract-sync`
+    /// reports and this guard refuses.
+    fn skewed_checkout(tag: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("sabrage-skew-{tag}-{}", std::process::id()));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::create_dir_all(root.join("contract")).unwrap();
+        for rel in crate::contract::CONTRACT_FILES {
+            std::fs::write(
+                root.join(rel),
+                b"not-the-contract-this-binary-was-built-from\n",
+            )
+            .unwrap();
+        }
+        root
+    }
+
+    /// Every mutating stage refuses a checkout this binary does not describe,
+    /// through both doors, before any event or executor call. `stop` stays open
+    /// — it is the way out.
+    #[tokio::test]
+    async fn every_mutating_stage_refuses_a_checkout_the_binary_was_not_built_from() {
+        let _g = crate::session::lock_session_globals();
+        let root = skewed_checkout("stages");
+        // The abort says exactly what the `meta.contract-sync` row says: both
+        // read it from `checks::meta`, which owns the wording.
+        let (expected_message, expected_remedy) =
+            crate::checks::meta::assert_binary_matches_checkout(&root)
+                .expect_err("the fixture must be a skewed checkout");
+        for stage in [Stage::Setup, Stage::Build, Stage::Install, Stage::Run] {
+            let (ctx, seen) = {
+                let mut paths = Paths::new(&root);
+                paths.sabrage_appsup = root.join("Sabrage");
+                paths.oxr_appsup = root.join("OXRSys");
+                let seen = Arc::new(StdMutex::new(Vec::new()));
+                let s = seen.clone();
+                let sink: EventSink = Arc::new(move |ev| s.lock().unwrap().push(ev));
+                (
+                    StageCtx::new(
+                        paths,
+                        StageOptions {
+                            dry_run: true,
+                            bottle_name: Some("FixtureBottle".into()),
+                            ..StageOptions::default()
+                        },
+                        sink,
+                        CancellationToken::new(),
+                    ),
+                    seen,
+                )
+            };
+
+            let err = run_stage(stage, &ctx).await.unwrap_err();
+            assert_eq!(err.to_string(), expected_message, "{stage}");
+            assert!(
+                matches!(&err, SabrageError::Fatal { remedy, .. }
+                    if remedy.as_deref() == Some(expected_remedy.as_str())),
+                "{stage}: the abort must carry the row's remedy: {err:?}"
+            );
+            let events = seen.lock().unwrap().clone();
+            assert!(
+                !events
+                    .iter()
+                    .any(|ev| matches!(ev, StageEvent::StageStarted { .. })),
+                "the refusal precedes the stage banner: {events:?}"
+            );
+
+            // The holding-lock door is gated too — it is reached from the
+            // launch preflight's whole-stage auto-fixes.
+            let guard = acquire_operation_lock().await;
+            let err = run_stage_holding_lock(stage, &ctx).await.unwrap_err();
+            assert_eq!(err.to_string(), expected_message, "{stage}");
+            drop(guard);
+        }
+
+        // `stop` is never gated: it gets as far as its own bottle check.
+        let mut paths = Paths::new(&root);
+        paths.sabrage_appsup = root.join("Sabrage");
+        paths.oxr_appsup = root.join("OXRSys");
+        let ctx = StageCtx::new(
+            paths,
+            StageOptions::default(),
+            null_sink(),
+            CancellationToken::new(),
+        );
+        let stop_err = run_stage(Stage::Stop, &ctx).await.unwrap_err();
+        assert!(stop_err
+            .to_string()
+            .starts_with("CrossOver bottle name required"));
+
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The abort and the `meta.contract-sync` row say the same thing because
+    /// both read it from `checks::meta`: a self-consistent-but-foreign checkout
+    /// makes the doctor row and the stage refusal agree word for word.
+    #[test]
+    fn the_contract_skew_die_is_the_meta_row_verbatim() {
+        let root = skewed_checkout("meta-text");
+        std::fs::create_dir_all(root.join("scripts/demo")).unwrap();
+        let checkout = crate::util::contract_hash(&root).expect("just-written files are readable");
+        std::fs::write(
+            root.join(crate::contract::CONTRACT_GEN_REL_PATH),
+            format!("# contract-sha256: {checkout}\n"),
+        )
+        .unwrap();
+
+        let outcome = crate::checks::registry()
+            .get("meta.contract-sync")
+            .expect("the slug is bound")
+            .evaluate(&CheckCtx::new(Paths::new(&root), CheckOptions::new()));
+        let (message, remedy) = crate::checks::meta::assert_binary_matches_checkout(&root)
+            .expect_err("a foreign checkout must not pass the identity guard");
+        assert_eq!(outcome.message, message);
+        assert_eq!(outcome.remedy.as_deref(), Some(remedy.as_str()));
 
         std::fs::remove_dir_all(&root).ok();
     }

@@ -93,6 +93,14 @@ const REGISTRY_FLUSH_TIMEOUT: Duration = Duration::from_secs(2);
 /// Re-probe interval inside [`REGISTRY_FLUSH_TIMEOUT`].
 const REGISTRY_FLUSH_POLL: Duration = Duration::from_millis(50);
 
+/// Name prefix of an **uncommitted** stock-DXMT capture (layer 1).
+///
+/// `cp -R` is not atomic, so the copy lands under
+/// `dxmt.stock-backup.partial-<uuid>` and is renamed onto `dxmt.stock-backup`
+/// only once it has returned. Anything still carrying this prefix is a
+/// truncated tree from an interrupted run: never trusted, always swept.
+const PARTIAL_BACKUP_PREFIX: &str = "dxmt.stock-backup.partial-";
+
 /// Execute the stage.
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let bottle = require_bottle(ctx)?;
@@ -142,17 +150,26 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     ctx.section(format!("global DXMT overlay ({}/lib/dxmt)", cx.display()));
     let exec1 = ctx.executor_for(step::INSTALL_DXMT_OVERLAY);
     let dxmt_dir = cx.join("lib/dxmt");
+    let dxmt_lib = cx.join("lib");
     let dxmt_backup = cx.join("lib/dxmt.stock-backup");
+    // Whatever an interrupted capture left behind. A partial is incomplete by
+    // construction — it only becomes `dxmt.stock-backup` once `cp -R` has
+    // returned — so it is swept, never inspected: the sweep runs before the
+    // branch below because a partial outlives the run that created it (a
+    // cancelled `remove_dir_all`, a SIGKILL) and nothing else ever collects it.
+    sweep_partial_backups(ctx, exec1.as_ref(), &dxmt_lib).await;
     if dxmt_backup.is_dir() {
         if dir_is_empty(&dxmt_backup) {
-            // The one completeness statement that can be made without guessing
-            // what stock shipped — and the shape a `cp -R` killed right after
-            // it created the directory leaves behind. Deliberately *not*
-            // re-copied: after a successful install `lib/dxmt` holds the fork,
-            // so "re-capture the backup" would overwrite the stock copy with
-            // fork binaries and destroy the only rollback there is.
+            // An empty backup predates the commit-by-rename below (or came
+            // from install.sh, whose `cp -R` has no cleanup at all). It is
+            // deliberately *not* re-copied: by the time anyone sees this,
+            // `lib/dxmt` may already hold the fork, so "re-capture the backup"
+            // would overwrite the stock copy with fork binaries and destroy the
+            // only rollback there is — which is also why the remedy is not
+            // "remove it and re-run install": following that after this stage
+            // has overlaid the fork captures the fork as the alleged stock.
             ctx.step(step::INSTALL_DXMT_OVERLAY).warn(format!(
-                "stock DXMT backup {} is empty — remove it and re-run install to recapture stock (left alone: re-copying now would back up the fork)",
+                "stock DXMT backup {} is empty — the stock copy is gone; reinstall CrossOver to restore it (left alone: re-copying now would back up the fork)",
                 dxmt_backup.display()
             ));
         } else {
@@ -166,16 +183,58 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         // TCC path below — rather than `upgrade_write_error`. This is the
         // *first* write into CrossOver.app, i.e. the likeliest place in the
         // whole pipeline to meet App Management.
-        if let Err(e) = exec1.dir_copy(&dxmt_dir, &dxmt_backup).await {
-            // `cp -R` is not atomic: a failure (or a Ctrl-C) part-way through
-            // leaves a truncated directory that every later install would
-            // accept as a finished backup, purely because it exists. Drop it,
-            // so the retry copies stock again — safe here and only here,
-            // because this branch is reached only when the backup did not
-            // exist when the stage started and the overlay has not been
-            // applied yet.
-            let _ = exec1.remove_dir_all(&dxmt_backup).await;
+        //
+        // It copies to a sibling nothing trusts, because `cp -R` is not atomic:
+        // a failure (or a Stop, or a SIGKILL) part-way through leaves a
+        // truncated tree, and a truncated tree under the committed name is
+        // indistinguishable from a finished backup — every later install would
+        // accept it, and the rollback it promises would restore half of stock.
+        let partial = dxmt_lib.join(format!(
+            "{PARTIAL_BACKUP_PREFIX}{}",
+            uuid::Uuid::new_v4().as_simple()
+        ));
+        if let Err(e) = exec1.dir_copy(&dxmt_dir, &partial).await {
+            discard_partial_backup(ctx, exec1.as_ref(), &partial).await;
             return Err(privilege::upgrade_child_write_error(ctx, e, &dxmt_backup));
+        }
+        // The commit. `mv` within one directory is `rename(2)` — atomic — so
+        // `dxmt.stock-backup` exists only for a `cp -R` that ran to completion,
+        // which is what makes the `is_dir()` test above a completeness test
+        // rather than a guess. Same end state as install.sh's plain `cp -R`, so
+        // a backup made by either front-end reads as complete to the other.
+        //
+        // Skipped when nothing was copied: a dry run (and the mutation-free
+        // test executors) planned the copy instead of performing it, so there
+        // is no partial to rename and the `mv` would be a lie about the disk.
+        if partial.is_dir() && !dxmt_backup.exists() {
+            let spec = ctx
+                .child("/bin/mv", step::INSTALL_DXMT_OVERLAY)
+                .arg(&partial)
+                .arg(&dxmt_backup);
+            let committed = exec1.run_child(&spec).await;
+            // The tail is empty because `run_child` streams rather than
+            // collects; `upgrade_child_write_error` therefore cannot call this
+            // App Management, which is right — the `cp -R` into this very
+            // directory succeeded a moment ago, so TCC is not the cause.
+            let failed = match committed {
+                Ok(status) if status.success() => None,
+                Ok(status) => Some(SabrageError::ChildFailed {
+                    argv0: "/bin/mv".to_string(),
+                    status: crate::process::exit_code_of(status),
+                    tail: Vec::new(),
+                }),
+                Err(e) => Some(e),
+            };
+            if let Some(e) = failed {
+                discard_partial_backup(ctx, exec1.as_ref(), &partial).await;
+                return Err(privilege::upgrade_child_write_error(ctx, e, &dxmt_backup));
+            }
+        } else if partial.is_dir() {
+            // Another writer — an unserialized `./demo.sh install`, which does
+            // not take the operation lock — captured stock between the test
+            // above and now. `mv` would move the partial *inside* it; drop it
+            // instead. The backup that won the race is stock either way.
+            discard_partial_backup(ctx, exec1.as_ref(), &partial).await;
         }
         let st = ctx.step(step::INSTALL_DXMT_OVERLAY);
         if dry_run {
@@ -285,7 +344,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
             // first, so the common case (the flush lands a few hundred ms
             // after `reg add` returns) no longer both warns *and* leaves the
             // very next launch preflight blocking on the same file.
-            if !wait_for_registry_flush(ctx, &bottle.system_reg()).await {
+            // `?`: a Stop during the wait ends the stage here. Reporting the
+            // wait's *timeout* and its *cancellation* as the same `false` used
+            // to turn Stop into a warn, an `OK` row, and a fall-through into
+            // layer 4 — the privileged one.
+            if !wait_for_registry_flush(ctx, &bottle.system_reg()).await? {
                 ctx.step(step::INSTALL_BOTTLE).warn(
                     "registry write not yet visible in system.reg (wine flushes lazily) — re-run doctor later",
                 );
@@ -296,6 +359,18 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     }
 
     // ── 4. host OpenXR registration ──────────────────────────────────────────
+    // The last chance to stop before the pipeline's only privileged write: a
+    // Stop pressed anywhere in layers 1–3 (including while the `reg add` child
+    // was running, which is where the executor's own guard hands cancellation
+    // back) must not be followed by an authorization prompt.
+    ensure_not_cancelled(ctx)?;
+    // A repo path with a control character in it is a path install.sh cannot
+    // represent in the manifest's JSON string literal (its two `${//}`
+    // substitutions escape `\` and `"` and nothing else). Rather than install
+    // invalid JSON as root over the working host registration, refuse — before
+    // the currency test, because a destination that "matches" invalid JSON is
+    // not current in any useful sense.
+    privilege::reject_unrepresentable_manifest_path(ctx, &ctx.paths.oxr_dylib)?;
     ctx.section(format!(
         "host OpenXR registration ({})",
         ctx.paths.host_xr_json.display()
@@ -444,39 +519,117 @@ fn registry_current(system_reg: &Path) -> bool {
     })
 }
 
-/// The bare post-write re-probe: `grep -q 'ActiveRuntime' "$PREFIX/system.reg"`
-/// — looser than [`registry_current`] on purpose, matching the shell exactly
-/// (wine may not have flushed the full line yet).
+/// install.sh's bare post-write re-probe:
+/// `grep -q 'ActiveRuntime' "$PREFIX/system.reg"` — looser than
+/// [`registry_current`], and no longer this stage's predicate for anything:
+/// [`wait_for_registry_flush`] waits *and* warns on the strict one, because
+/// the loose test calls a bottle still holding a stale `ActiveRuntime` value
+/// registered. Kept as a test-only pin on the shell semantics the strict
+/// predicate is contrasted against.
+#[cfg(test)]
 fn system_reg_contains(system_reg: &Path, needle: &str) -> bool {
     std::fs::read(system_reg)
         .map(|bytes| String::from_utf8_lossy(&bytes).contains(needle))
         .unwrap_or(false)
 }
 
-/// [`system_reg_contains`], retried until it holds or
-/// [`REGISTRY_FLUSH_TIMEOUT`] elapses. `true` means the entry became visible.
+/// Wait for wine's lazy `system.reg` flush; `Ok(false)` when it never landed.
 ///
-/// Cancellation ends the wait immediately (the caller's next step is a row, not
-/// a mutation, so there is nothing to unwind); the last probe result stands.
-async fn wait_for_registry_flush(ctx: &StageCtx, system_reg: &Path) -> bool {
+/// Two predicates, deliberately:
+///
+/// * the **wait** is on [`registry_current`] — the same three-literal test the
+///   launch preflight blocks on (`bottle.registry`). Waiting on the shell's
+///   bare `ActiveRuntime` grep instead ended the poll on its first probe
+///   whenever the bottle still held a *stale* ActiveRuntime value, so install
+///   reported success against a file the very next launch rejected;
+/// * the **warn text** is install.sh's, unchanged — but the timeout arm no
+///   longer falls back to its looser `grep -q 'ActiveRuntime'` probe. Doing so
+///   turned "present, but still the *stale* value" into `Ok(true)`: no warn,
+///   an `OK ActiveRuntime registered` row, and the very next launch rejecting
+///   the same file — the false green this function exists to remove, just
+///   `REGISTRY_FLUSH_TIMEOUT` later. A timeout is now always a warn, which is
+///   one more warn than the shell prints for a stale-value bottle (a
+///   divergence in the honest direction; the shell's own row is unchanged for
+///   every state where the flush landed).
+///
+/// Cancellation is [`SabrageError::Cancelled`], never `Ok(false)`: the caller's
+/// next steps are an `OK` row and the pipeline's one privileged write, and a
+/// Stop must not be reported as a completed registration.
+async fn wait_for_registry_flush(ctx: &StageCtx, system_reg: &Path) -> Result<bool> {
     let deadline = std::time::Instant::now() + REGISTRY_FLUSH_TIMEOUT;
     loop {
-        if system_reg_contains(system_reg, "ActiveRuntime") {
-            return true;
+        if registry_current(system_reg) {
+            return Ok(true);
         }
-        if ctx.cancel.is_cancelled() || std::time::Instant::now() >= deadline {
-            return false;
+        ensure_not_cancelled(ctx)?;
+        if std::time::Instant::now() >= deadline {
+            // The loop only reaches here with `registry_current` false.
+            return Ok(false);
         }
         tokio::time::sleep(REGISTRY_FLUSH_POLL).await;
     }
 }
 
-/// True when `dir` holds no entries at all — the only completeness statement
-/// that can be made about a stock DXMT backup without assuming what a given
-/// CrossOver version shipped, and the shape a `cp -R` interrupted immediately
-/// after creating the directory leaves behind.
+/// True when `dir` holds no entries at all — the shape an install.sh `cp -R`
+/// (or a pre-rename sabrage) interrupted immediately after creating the
+/// directory leaves behind. A backup this stage committed is complete by
+/// construction; this catches the ones it did not.
 fn dir_is_empty(dir: &Path) -> bool {
     std::fs::read_dir(dir).is_ok_and(|mut entries| entries.next().is_none())
+}
+
+/// Delete an uncommitted stock-DXMT capture, cancellation included.
+///
+/// The executor is tried first (so a dry run records the removal and performs
+/// nothing), but a truncated tree is *exactly* what a cancelled `cp -R` leaves,
+/// and every [`crate::executor::RealExecutor`] mutation refuses once the token
+/// is cancelled — so the fallback goes straight to the filesystem. It is safe
+/// there and only there: the path carries [`PARTIAL_BACKUP_PREFIX`] and a uuid
+/// this run minted, so nothing else can be looking at it.
+///
+/// A removal that still fails is a `warn`, not a failure: the leftover is
+/// inert (nothing ever reads a partial) and the next install sweeps it.
+async fn discard_partial_backup(ctx: &StageCtx, exec: &dyn Executor, partial: &Path) {
+    if exec.remove_dir_all(partial).await.is_ok() || !partial.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::remove_dir_all(partial) {
+        ctx.step(step::INSTALL_DXMT_OVERLAY).warn(format!(
+            "could not remove the partial DXMT backup {} ({e}) — it is never trusted as the backup, and the next install sweeps it",
+            partial.display()
+        ));
+    }
+}
+
+/// Drop every `dxmt.stock-backup.partial-*` under `lib_dir`.
+async fn sweep_partial_backups(ctx: &StageCtx, exec: &dyn Executor, lib_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(lib_dir) else {
+        return;
+    };
+    let stale: Vec<std::path::PathBuf> = entries
+        .flatten()
+        .filter(|e| {
+            e.file_name()
+                .to_string_lossy()
+                .starts_with(PARTIAL_BACKUP_PREFIX)
+        })
+        .map(|e| e.path())
+        .collect();
+    for partial in stale {
+        discard_partial_backup(ctx, exec, &partial).await;
+    }
+}
+
+/// [`SabrageError::Cancelled`] once Stop has been pressed.
+///
+/// Layer 4 is the pipeline's only privileged write: a Stop that arrived during
+/// layer 3 must end the stage *before* the authorization prompt, not after the
+/// user has typed a password into it.
+fn ensure_not_cancelled(ctx: &StageCtx) -> Result<()> {
+    if ctx.cancel.is_cancelled() {
+        return Err(SabrageError::Cancelled);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -538,10 +691,19 @@ mod tests {
         /// `dir_copy` fails the way a refused `cp -R` does — a `ChildFailed`
         /// carrying `cp`'s own permission error as its tail.
         deny_dir_copy: bool,
+        /// `dir_copy` fails the way an **interrupted** `cp -R` does: the
+        /// destination is really created and really left half-populated, then
+        /// the copy reports failure. `remove_dir_all` becomes real too, so the
+        /// on-disk end state of the failure path is observable — which is the
+        /// whole question ("is a truncated tree trusted next time?").
+        truncating_dir_copy: bool,
         /// Report `is_dry_run() == false` while still mutating nothing: the
         /// only way to exercise the real-run branches (the registry re-probe,
         /// the completed-action rows) without spawning wine.
         pose_as_real: bool,
+        /// Cancel this token from inside `run_child` — the shape of a Stop
+        /// pressed while layer 3's `reg add` is running.
+        cancel_in_run_child: Option<CancellationToken>,
     }
 
     impl TestExecutor {
@@ -551,7 +713,9 @@ mod tests {
                 writes: Arc::new(StdMutex::new(Vec::new())),
                 deny_prefix: None,
                 deny_dir_copy: false,
+                truncating_dir_copy: false,
                 pose_as_real: false,
+                cancel_in_run_child: None,
             })
         }
 
@@ -562,7 +726,9 @@ mod tests {
                 writes: self.writes.clone(),
                 deny_prefix: self.deny_prefix.clone(),
                 deny_dir_copy: self.deny_dir_copy,
+                truncating_dir_copy: self.truncating_dir_copy,
                 pose_as_real: self.pose_as_real,
+                cancel_in_run_child: self.cancel_in_run_child.clone(),
             };
             f(&mut next);
             Arc::new(next)
@@ -590,7 +756,9 @@ mod tests {
                 writes: self.writes.clone(),
                 deny_prefix: self.deny_prefix.clone(),
                 deny_dir_copy: self.deny_dir_copy,
+                truncating_dir_copy: self.truncating_dir_copy,
                 pose_as_real: self.pose_as_real,
+                cancel_in_run_child: self.cancel_in_run_child.clone(),
             })
         }
 
@@ -637,6 +805,15 @@ mod tests {
             &'a self,
             path: &'a Path,
         ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            if self.truncating_dir_copy {
+                return Box::pin(async move {
+                    match std::fs::remove_dir_all(path) {
+                        Ok(()) => Ok(()),
+                        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                        Err(e) => Err(SabrageError::io(path, e)),
+                    }
+                });
+            }
             self.inner.remove_dir_all(path)
         }
 
@@ -656,6 +833,19 @@ mod tests {
             src: &'a Path,
             dst: &'a Path,
         ) -> crate::executor::BoxFuture<'a, Result<()>> {
+            if self.truncating_dir_copy {
+                return Box::pin(async move {
+                    // What `cp -R` leaves when it is killed after its first
+                    // entry: the destination exists and is NOT empty.
+                    std::fs::create_dir_all(dst).unwrap();
+                    std::fs::write(dst.join("d3d11.dll"), b"half a tree").unwrap();
+                    Err(SabrageError::ChildFailed {
+                        argv0: "cp".to_string(),
+                        status: 130,
+                        tail: vec!["cp: interrupted".to_string()],
+                    })
+                });
+            }
             if self.deny_dir_copy {
                 return Box::pin(async move {
                     Err(SabrageError::ChildFailed {
@@ -707,6 +897,9 @@ mod tests {
             &'a self,
             spec: &'a crate::process::ChildSpec,
         ) -> crate::executor::BoxFuture<'a, Result<std::process::ExitStatus>> {
+            if let Some(cancel) = &self.cancel_in_run_child {
+                cancel.cancel();
+            }
             self.inner.run_child(spec)
         }
     }
@@ -1440,14 +1633,29 @@ mod tests {
             fatals[0].1
         );
 
+        // The refused copy went to an uncommitted sibling, and that is what is
+        // removed. The committed name was never involved at all — which is the
+        // stronger statement: it exists only for a `cp -R` that finished.
+        let plan = ctx.executor.planned();
         assert!(
-            ctx.executor.planned().iter().any(|p| {
+            plan.iter().any(|p| {
                 p.kind == crate::executor::PlannedKind::RemoveDir
-                    && p.dst.as_deref() == Some(backup.as_path())
+                    && p.dst.as_deref().is_some_and(|d| {
+                        d.parent() == backup.parent()
+                            && d.file_name().is_some_and(|n| {
+                                n.to_string_lossy().starts_with(PARTIAL_BACKUP_PREFIX)
+                            })
+                    })
             }),
-            "the truncated backup is removed: {:#?}",
-            ctx.executor.planned()
+            "the truncated capture is removed: {plan:#?}"
         );
+        assert!(
+            !plan
+                .iter()
+                .any(|p| p.dst.as_deref() == Some(backup.as_path())),
+            "nothing is planned against the committed backup name: {plan:#?}"
+        );
+        assert!(!backup.exists());
     }
 
     // ── layer 3: the lazy system.reg flush ───────────────────────────────────
@@ -1480,19 +1688,25 @@ mod tests {
     async fn a_late_system_reg_flush_is_waited_for_instead_of_warned_about() {
         let (ctx, seen) = real_seeming_fixture();
         let reg = ctx.bottle.as_ref().unwrap().system_reg();
-        assert!(!reg.exists());
+        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
+        // A value that is present but not ours, so the stage deterministically
+        // takes the `reg add` branch rather than the "already set" one — the
+        // race this fixture has to rule out. The flush then lands *inside* the
+        // window: a half-written `"ActiveRuntime"=` line would satisfy the
+        // shell's bare grep but never `registry_current`, and the wait no
+        // longer settles for that (a stale bottle reported as registered is
+        // the false green the timeout arm's own test covers).
+        std::fs::write(
+            &reg,
+            "[Software\\Khronos\\OpenXR\\1]\n\"ActiveRuntime\"=\"C:\\\\other\\\\someruntime.json\"\n",
+        )
+        .unwrap();
+        assert!(!registry_current(&reg));
         let writer = std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(150));
-            // Half a flush: enough for the post-write re-probe's bare
-            // `ActiveRuntime` grep, deliberately NOT enough for
-            // `registry_current`'s three-literal test — so the stage takes the
-            // `reg add` branch whichever side of this write it starts on, and
-            // the test cannot race itself into the "already set" branch.
-            std::fs::write(
-                &reg,
-                "[Software\\\\Khronos\\\\OpenXR\\\\1]\n\"ActiveRuntime\"=\n",
-            )
-            .unwrap();
+            let mut text = std::fs::read_to_string(&reg).unwrap();
+            text.push_str("\"ActiveRuntime\"=\"C:\\\\openxr\\\\wineopenxr64.json\"\n");
+            std::fs::write(&reg, text).unwrap();
         });
 
         run(&ctx).await.expect("install completes");
@@ -1547,6 +1761,314 @@ mod tests {
             StageEvent::Line { severity: Severity::Ok, text, .. }
                 if text == "ActiveRuntime registered"
         )));
+    }
+
+    /// The one thing an existing `dxmt.stock-backup` has to mean: `cp -R` ran to
+    /// completion. A copy interrupted after its first entry leaves a *non-empty*
+    /// truncated tree, which the emptiness test cannot tell from a finished
+    /// backup — so the copy lands under a name nothing trusts and is renamed
+    /// onto the committed one only on success.
+    #[tokio::test]
+    async fn an_interrupted_backup_never_becomes_the_trusted_stock_backup() {
+        let (base, _) = full_fixture();
+        let (sink, seen) = collecting_sink();
+        let exec = TestExecutor::dry_run(sink.clone(), base.run_id, base.cancel.clone())
+            .with(|e| e.truncating_dir_copy = true);
+        let ctx = StageCtx {
+            executor: exec,
+            sink,
+            ..base.clone()
+        };
+        let lib = ctx.paths.cx.as_ref().unwrap().join("lib");
+        let backup = lib.join("dxmt.stock-backup");
+
+        run(&ctx).await.unwrap_err();
+
+        // The truncated tree is neither the backup nor left lying around under
+        // a name a later run could mistake for one.
+        assert!(
+            !backup.exists(),
+            "a half-copied tree must not become the stock backup"
+        );
+        assert!(
+            partial_backups(&lib).is_empty(),
+            "the partial capture is cleaned up: {:?}",
+            partial_backups(&lib)
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                StageEvent::Line { text, .. } if text == "stock DXMT backup already exists"
+            )),
+            "nothing may report the interrupted capture as a backup"
+        );
+
+        // …and the next run re-copies stock instead of trusting the wreckage.
+        let (sink2, seen2) = collecting_sink();
+        let exec2 = TestExecutor::dry_run(sink2.clone(), base.run_id, base.cancel.clone());
+        let ctx2 = StageCtx {
+            executor: exec2,
+            sink: sink2,
+            opts: StageOptions {
+                dry_run: true,
+                ..base.opts.clone()
+            },
+            ..base.clone()
+        };
+        run(&ctx2).await.expect("the retry completes");
+        assert!(
+            ctx2.executor
+                .planned()
+                .iter()
+                .any(|p| p.kind == crate::executor::PlannedKind::DirCopy),
+            "the retry re-captures stock: {:#?}",
+            ctx2.executor.planned()
+        );
+        assert!(
+            !seen2.lock().unwrap().iter().any(|e| matches!(
+                e,
+                StageEvent::Line { text, .. } if text == "stock DXMT backup already exists"
+            )),
+            "{:#?}",
+            seen2.lock().unwrap()
+        );
+    }
+
+    /// A partial left by a run that was killed outright (no cleanup ran at all)
+    /// is swept on the next install, never inspected and never promoted.
+    #[tokio::test]
+    async fn a_leftover_partial_capture_is_swept_not_promoted() {
+        let (ctx, seen, _writes) = testexec_fixture(false);
+        let lib = ctx.paths.cx.as_ref().unwrap().join("lib");
+        let leftover = lib.join(format!("{PARTIAL_BACKUP_PREFIX}deadbeef"));
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("d3d11.dll"), b"half a tree").unwrap();
+
+        run(&ctx).await.expect("dry run completes all four layers");
+
+        let plan = ctx.executor.planned();
+        assert!(
+            plan.iter()
+                .any(|p| p.kind == crate::executor::PlannedKind::RemoveDir
+                    && p.dst.as_deref() == Some(leftover.as_path())),
+            "the leftover is swept: {plan:#?}"
+        );
+        assert!(
+            plan.iter()
+                .any(|p| p.kind == crate::executor::PlannedKind::DirCopy),
+            "and stock is still captured: {plan:#?}"
+        );
+        assert!(
+            !seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                StageEvent::Line { text, .. } if text == "stock DXMT backup already exists"
+            )),
+            "a partial is never reported as the backup"
+        );
+        // A dry run swept nothing for real.
+        assert!(leftover.is_dir());
+    }
+
+    /// Every `dxmt.stock-backup.partial-*` under `lib`.
+    fn partial_backups(lib: &Path) -> Vec<std::path::PathBuf> {
+        let Ok(entries) = std::fs::read_dir(lib) else {
+            return Vec::new();
+        };
+        entries
+            .flatten()
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(PARTIAL_BACKUP_PREFIX)
+            })
+            .map(|e| e.path())
+            .collect()
+    }
+
+    /// Stop pressed while layer 3's `reg add` runs. The flush poll used to
+    /// report cancellation and timeout as the same `false`, so the stage warned,
+    /// printed `OK ActiveRuntime registered`, and walked into layer 4 — the
+    /// pipeline's only privileged write — with the run already over.
+    #[tokio::test]
+    async fn a_cancel_during_the_registry_wait_stops_before_the_privileged_layer() {
+        let (base, _) = full_fixture();
+        let (sink, seen) = collecting_sink();
+        let exec =
+            TestExecutor::dry_run(sink.clone(), base.run_id, base.cancel.clone()).with(|e| {
+                e.pose_as_real = true;
+                e.cancel_in_run_child = Some(base.cancel.clone());
+            });
+        let ctx = StageCtx {
+            executor: exec,
+            sink,
+            ..base.clone()
+        };
+
+        let err = run(&ctx).await.unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
+
+        let evs = seen.lock().unwrap();
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Line {
+                    severity: Severity::Warn,
+                    ..
+                }
+            )),
+            "a Stop is not a lazy-flush warning: {evs:#?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Line { text, .. } if text == "ActiveRuntime registered"
+            )),
+            "a cancelled run never claims the registration completed: {evs:#?}"
+        );
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, StageEvent::NeedsAdmin { .. })),
+            "no authorization is announced after Stop: {evs:#?}"
+        );
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Section { title, .. } if title.starts_with("host OpenXR registration")
+            )),
+            "layer 4 is never entered: {evs:#?}"
+        );
+    }
+
+    /// The wait's predicate is the launch gate's, not the shell's looser grep: a
+    /// bottle still holding a *stale* `ActiveRuntime` value satisfies
+    /// `grep -q ActiveRuntime` on the first probe, so waiting on that ended the
+    /// poll instantly and install reported success against a file the very next
+    /// launch preflight (`bottle.registry`) blocks on.
+    #[tokio::test]
+    async fn a_stale_active_runtime_value_does_not_end_the_flush_wait() {
+        let (ctx, seen) = real_seeming_fixture();
+        let reg = ctx.bottle.as_ref().unwrap().system_reg();
+        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
+        std::fs::write(
+            &reg,
+            "[Software\\Khronos\\OpenXR\\1]\n\"ActiveRuntime\"=\"C:\\\\other\\\\someruntime.json\"\n",
+        )
+        .unwrap();
+        assert!(system_reg_contains(&reg, "ActiveRuntime"));
+        assert!(!registry_current(&reg), "stale, so `reg add` still runs");
+
+        let target = reg.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(150));
+            let mut text = std::fs::read_to_string(&target).unwrap();
+            text.push_str("\"ActiveRuntime\"=\"C:\\\\openxr\\\\wineopenxr64.json\"\n");
+            std::fs::write(&target, text).unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        run(&ctx).await.expect("install completes");
+        let elapsed = started.elapsed();
+        writer.join().unwrap();
+
+        assert!(
+            elapsed >= Duration::from_millis(150),
+            "the wait ended before the real value flushed: {elapsed:?}"
+        );
+        assert!(registry_current(&reg));
+        let evs = seen.lock().unwrap();
+        assert!(
+            !evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Line {
+                    severity: Severity::Warn,
+                    ..
+                }
+            )),
+            "the flush landed inside the window: {evs:#?}"
+        );
+        assert!(evs.iter().any(|e| matches!(
+            e,
+            StageEvent::Line { severity: Severity::Ok, text, .. }
+                if text == "ActiveRuntime registered"
+        )));
+    }
+
+    /// The timeout arm of the same wait. When the flush never lands, the row
+    /// has to say so: falling back to the shell's `grep -q 'ActiveRuntime'`
+    /// there reported a bottle whose value is still *stale* as registered —
+    /// no warn, an `OK` row, and the next launch preflight blocking on the
+    /// very same file. One warn more than the shell prints for this state, in
+    /// the honest direction.
+    #[tokio::test]
+    async fn a_flush_that_never_lands_warns_even_with_a_stale_active_runtime() {
+        let (ctx, seen) = real_seeming_fixture();
+        let reg = ctx.bottle.as_ref().unwrap().system_reg();
+        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
+        // Present for the shell's loose grep, wrong for the launch gate — and
+        // nothing ever rewrites it, so the wait runs out.
+        std::fs::write(
+            &reg,
+            "[Software\\Khronos\\OpenXR\\1]\n\"ActiveRuntime\"=\"C:\\\\other\\\\someruntime.json\"\n",
+        )
+        .unwrap();
+        assert!(system_reg_contains(&reg, "ActiveRuntime"));
+
+        run(&ctx).await.expect("install completes");
+        assert!(!registry_current(&reg), "the flush never landed");
+
+        let evs = seen.lock().unwrap();
+        assert!(
+            evs.iter().any(|e| matches!(
+                e,
+                StageEvent::Line { severity: Severity::Warn, text, .. }
+                    if text.starts_with("registry write not yet visible in system.reg")
+            )),
+            "a stale value that never flushed is not a silent success: {evs:#?}"
+        );
+    }
+
+    /// A repo path with a control character in it cannot be rendered as valid
+    /// JSON (the escape helper is install.sh's two substitutions, by design), and
+    /// the host manifest is installed as `root:wheel` over the file the OpenXR
+    /// loader reads. Layer 4 refuses before the currency test, so nothing is
+    /// compared, staged or prompted for.
+    #[tokio::test]
+    async fn a_control_character_in_the_dylib_path_refuses_layer_four() {
+        let (mut ctx, seen, writes) = testexec_fixture(false);
+        let nasty = ctx
+            .paths
+            .oxr_dylib
+            .parent()
+            .unwrap()
+            .join("libo\nxrsys-runtime.dylib");
+        std::fs::write(&nasty, b"dylib").unwrap();
+        ctx.paths.oxr_dylib = nasty.clone();
+        // Stale, so layer 4 would otherwise go down the privileged-write branch.
+        std::fs::remove_file(&ctx.paths.host_xr_json).unwrap();
+
+        let err = run(&ctx).await.unwrap_err();
+        assert!(matches!(err, SabrageError::Fatal { .. }), "{err:?}");
+        assert!(err.to_string().contains("control character"), "{err}");
+        assert!(writes.lock().unwrap().is_empty(), "nothing was staged");
+        let evs = seen.lock().unwrap();
+        assert!(
+            !evs.iter()
+                .any(|e| matches!(e, StageEvent::NeedsAdmin { .. })),
+            "{evs:#?}"
+        );
+        let fatals: Vec<&String> = evs
+            .iter()
+            .filter_map(|e| match e {
+                StageEvent::Fatal { message, .. } => Some(message),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(fatals.len(), 1, "{fatals:#?}");
+        assert!(
+            fatals[0].contains(&nasty.display().to_string()),
+            "{}",
+            fatals[0]
+        );
     }
 
     #[tokio::test]

@@ -364,15 +364,18 @@ mod tests {
 
         /// Does the loop body starting at `rest` actually emit for `var`?
         ///
-        /// Both halves are required: the `${_x%%:*}` slug extraction (directly
-        /// in the `chk` argument, or via the intermediate `_slug=` assignment
-        /// section 10 uses) **and** at least one `chk`/`tap` call. Deleting the
-        /// body's `chk` lines while keeping the `slug:value` header — the
-        /// realistic way a check evaporates — then reads as uncovered.
+        /// The two halves must be *joined*, not merely both present: a
+        /// `chk`/`tap` call only counts when that call itself carries the
+        /// loop item's slug — either `${_x%%:*}` inline (sections 4/6/9) or a
+        /// variable the extraction was assigned to (`_slug="${_o%%:*}"`,
+        /// section 10). Counting "some line extracts" AND "some line calls"
+        /// independently credits every slug in the header as soon as the body
+        /// contains *any* unrelated emission, which is exactly the shape a
+        /// deleted per-item check leaves behind (round-1 finding A1-7).
         fn loop_body_emits(rest: &[String], var: &str, call_re: &Regex) -> bool {
-            let prefix = format!("${{{var}%%:*}}");
-            let mut saw_extraction = false;
-            let mut saw_call = false;
+            let extraction = format!("${{{var}%%:*}}");
+            // Shell text that provably carries this loop item's slug.
+            let mut carriers = vec![Regex::new(&regex::escape(&extraction)).unwrap()];
             let mut depth = 0usize;
             for line in rest {
                 let logical = strip_comment(line);
@@ -387,14 +390,36 @@ mod tests {
                 if trimmed.ends_with("; do") || trimmed == "do" {
                     depth += 1;
                 }
-                if logical.contains(&prefix) {
-                    saw_extraction = true;
+                // Assignments first: one logical line can both extract and
+                // emit (`_slug="${_o%%:*}"; chk ok "$_slug" …`).
+                for (idx, _) in logical.match_indices(&extraction) {
+                    if let Some(name) = assigned_variable(&logical[..idx]) {
+                        let n = regex::escape(&name);
+                        carriers.push(Regex::new(&format!(r"\$(?:\{{{n}\}}|{n}\b)")).unwrap());
+                    }
                 }
-                if call_re.is_match(logical) {
-                    saw_call = true;
+                if call_re.is_match(logical) && carriers.iter().any(|re| re.is_match(logical)) {
+                    return true;
                 }
             }
-            saw_extraction && saw_call
+            false
+        }
+
+        /// The variable an extraction is being assigned to, given everything
+        /// on the line before it: `_slug="` / `local _slug=` → `_slug`.
+        /// `None` when the extraction is not the right-hand side of an
+        /// assignment (e.g. it is an argument, or part of a larger word).
+        fn assigned_variable(before: &str) -> Option<String> {
+            let head = before.trim_end_matches('"').strip_suffix('=')?;
+            let name: String = head
+                .chars()
+                .rev()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+                .collect();
+            (!name.is_empty()).then_some(name)
         }
 
         pub(super) fn scan_doctor_slugs(text: &str) -> Scan {
@@ -585,6 +610,54 @@ mod tests {
             assert_eq!(slugs_of(fixture), vec!["overlay.woxr-dll".to_string()]);
         }
 
+        /// Round-1 finding A1-7: keeping the extraction line and an unrelated
+        /// emission, while deleting the per-item `chk`, must NOT credit the
+        /// header's slugs — the call has to carry the loop item itself.
+        #[test]
+        fn an_unrelated_emission_in_the_loop_body_credits_nothing() {
+            let gutted =
+                "# 10. overlay\nfor _o in overlay.woxr-dll:a:b overlay.woxr-so:c:d; do\n  \
+                          _slug=\"${_o%%:*}\"\n  tap net.ports ok\ndone\n";
+            let scan = scan_doctor_slugs(gutted);
+            assert_eq!(
+                scan.order,
+                vec!["net.ports".to_string()],
+                "only the unrelated static emission is real"
+            );
+            assert_eq!(scan.header_only_loops.len(), 1, "{:?}", scan.order);
+
+            // Same shape, but with the extraction inline in the argument of an
+            // emission for a *different* slug.
+            let decoy = "# 4. toolchain\nfor _t in tool.cmake:cmake; do\n  \
+                         chk ok rust.x64-target \"${_t#*:}\"\n  echo \"${_t%%:*}\"\ndone\n";
+            let scan = scan_doctor_slugs(decoy);
+            assert_eq!(scan.order, vec!["rust.x64-target".to_string()]);
+            assert_eq!(scan.header_only_loops.len(), 1);
+        }
+
+        /// The same line may both extract and emit; and a variable holding
+        /// some *other* part of the loop item (`${_o#*:}`, the value half) is
+        /// not a slug carrier.
+        #[test]
+        fn only_a_call_carrying_the_slug_counts() {
+            let same_line = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
+                             _slug=\"${_o%%:*}\"; chk ok \"$_slug\" \"current\"\ndone\n";
+            assert_eq!(slugs_of(same_line), vec!["overlay.woxr-dll".to_string()]);
+
+            let value_half = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
+                              _pair=\"${_o#*:}\"\n  chk ok \"$_pair\" \"current\"\ndone\n";
+            let scan = scan_doctor_slugs(value_half);
+            assert!(scan.order.is_empty(), "{:?}", scan.order);
+            assert_eq!(scan.header_only_loops.len(), 1);
+
+            // A near-miss variable name must not be mistaken for the carrier.
+            let near_miss = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
+                             _slug=\"${_o%%:*}\"\n  chk ok \"$_slugx\" \"current\"\ndone\n";
+            let scan = scan_doctor_slugs(near_miss);
+            assert!(scan.order.is_empty(), "{:?}", scan.order);
+            assert_eq!(scan.header_only_loops.len(), 1);
+        }
+
         #[test]
         fn the_scan_records_first_emission_order_not_a_set() {
             let fixture = "# 0. meta\nchk ok meta.contract-sync \"a\"\n# 1. system\n\
@@ -728,47 +801,155 @@ mod tests {
         /// `# preflight*:` lines) to the next tag group, or to end of file.
         /// `autofix` groups are exempt: their blocks legitimately contain both
         /// verbs (the fix's own failure path dies).
+        ///
+        /// A group carrying **two different gates** cannot be judged from the
+        /// bag of verbs its body contains — one `die` and one `warn` satisfy
+        /// both claims however they are wired, so swapping them (making the
+        /// legacy protocol fatal and an unsupported one a mere warning) reads
+        /// as green (round-1 finding A1-6). Every slug in a mixed group is
+        /// therefore anchored to the line it actually emits, via
+        /// [`VERB_ANCHORS`].
         #[test]
         fn each_preflight_tag_group_uses_the_verb_its_gate_claims() {
             let root = repo_root();
             let text = std::fs::read_to_string(root.join("scripts/demo/run.sh"))
                 .expect("scripts/demo/run.sh reads");
+            let problems: Vec<String> = tag_groups(&text)
+                .iter()
+                .flat_map(group_verb_errors)
+                .collect();
+            assert!(problems.is_empty(), "{}", problems.join("\n"));
+        }
+
+        /// Per-slug message anchors: the pinned run.sh text a slug's branch
+        /// emits. Required for every slug in a mixed-gate tag group, and
+        /// enforced wherever else it is declared.
+        const VERB_ANCHORS: [(&str, &str); 2] = [
+            (
+                "cfg.protocol.legacy-oxrsys",
+                "protocol=oxrsys (legacy USB path)",
+            ),
+            ("cfg.protocol.supported", "is not valid for the demo"),
+        ];
+
+        fn anchor_for(slug: &str) -> Option<&'static str> {
+            VERB_ANCHORS
+                .iter()
+                .find(|(s, _)| *s == slug)
+                .map(|(_, needle)| *needle)
+        }
+
+        /// Everything wrong with one tag group's verbs — a list rather than
+        /// assertions so the mutation test below can run it over a modified
+        /// run.sh in memory.
+        fn group_verb_errors(group: &TagGroup) -> Vec<String> {
             let die_re = Regex::new(r"\bdie\b").unwrap();
             let warn_re = Regex::new(r"\bwarn\b").unwrap();
-            for group in tag_groups(&text) {
-                let has_die = die_re.is_match(&group.body);
-                let has_warn = warn_re.is_match(&group.body);
-                if group.gates.contains(&Gate::Autofix) {
-                    continue;
-                }
-                if group.gates.contains(&Gate::Block) {
-                    assert!(
-                        has_die,
-                        "block-tagged {:?} but its run.sh block never calls die:\n{}",
-                        group.slugs, group.body
-                    );
-                }
-                if group.gates.contains(&Gate::Warn) {
-                    assert!(
-                        has_warn,
-                        "warn-tagged {:?} but its run.sh block never calls warn:\n{}",
-                        group.slugs, group.body
-                    );
-                    if !group.gates.contains(&Gate::Block) {
-                        assert!(
-                            !has_die,
-                            "warn-only {:?} but its run.sh block calls die — the contract says \
-                             the launch continues:\n{}",
-                            group.slugs, group.body
-                        );
+            let mut out: Vec<String> = Vec::new();
+            if group.gates.contains(&Gate::Autofix) {
+                return out;
+            }
+            let has_die = die_re.is_match(&group.body);
+            let has_warn = warn_re.is_match(&group.body);
+
+            // Mixed group: the group-level verb bag proves nothing about which
+            // slug got which verb, so bind each slug to its own emitting line.
+            let mixed = group.gates.iter().any(|g| *g != group.gates[0]);
+            for (slug, gate) in &group.slug_gates {
+                let Some(needle) = anchor_for(slug) else {
+                    if mixed {
+                        out.push(format!(
+                            "{slug} shares a mixed-gate tag group {:?} but has no VERB_ANCHORS \
+                             entry — its gate cannot be told from the group's verbs; add the \
+                             line it emits",
+                            group.gates
+                        ));
                     }
+                    continue;
+                };
+                let Some(line) = group.body.lines().find(|l| l.contains(needle)) else {
+                    out.push(format!(
+                        "{slug}'s pinned message {needle:?} is gone from its run.sh block:\n{}",
+                        group.body
+                    ));
+                    continue;
+                };
+                let (want, unwanted) = match gate {
+                    Gate::Warn => (&warn_re, &die_re),
+                    _ => (&die_re, &warn_re),
+                };
+                if !want.is_match(line) || unwanted.is_match(line) {
+                    out.push(format!(
+                        "{slug} is tagged {} but the line emitting its message uses the other \
+                         verb:\n{line}",
+                        gate.as_str()
+                    ));
                 }
             }
+
+            if group.gates.contains(&Gate::Block) && !has_die {
+                out.push(format!(
+                    "block-tagged {:?} but its run.sh block never calls die:\n{}",
+                    group.slugs, group.body
+                ));
+            }
+            if group.gates.contains(&Gate::Warn) {
+                if !has_warn {
+                    out.push(format!(
+                        "warn-tagged {:?} but its run.sh block never calls warn:\n{}",
+                        group.slugs, group.body
+                    ));
+                }
+                if !group.gates.contains(&Gate::Block) && has_die {
+                    out.push(format!(
+                        "warn-only {:?} but its run.sh block calls die — the contract says the \
+                         launch continues:\n{}",
+                        group.slugs, group.body
+                    ));
+                }
+            }
+            out
+        }
+
+        /// Swapping the two verbs of the mixed protocol group in memory — the
+        /// exact change the old group-level verb bag could not see — must be
+        /// reported.
+        #[test]
+        fn swapping_the_verbs_of_a_mixed_tag_group_is_caught() {
+            let root = repo_root();
+            let text = std::fs::read_to_string(root.join("scripts/demo/run.sh"))
+                .expect("scripts/demo/run.sh reads");
+            let swapped = text
+                .replace(
+                    "oxrsys) warn \"protocol=oxrsys (legacy USB path)",
+                    "oxrsys) die \"protocol=oxrsys (legacy USB path)",
+                )
+                .replace(
+                    "*) die \"oxrsys-runtime.toml protocol=",
+                    "*) warn \"oxrsys-runtime.toml protocol=",
+                );
+            assert_ne!(swapped, text, "the mutation no longer matches run.sh");
+
+            let mixed: Vec<TagGroup> = tag_groups(&swapped)
+                .into_iter()
+                .filter(|g| g.slugs.iter().any(|s| s.starts_with("cfg.protocol.")))
+                .collect();
+            assert_eq!(mixed.len(), 1, "the protocol tag group moved");
+            let problems = group_verb_errors(&mixed[0]);
+            assert_eq!(
+                problems.len(),
+                2,
+                "both halves of the verb swap must be reported, got: {problems:?}"
+            );
         }
 
         struct TagGroup {
             slugs: Vec<String>,
             gates: Vec<Gate>,
+            /// Per **slug** gate — `gates` is per tag *line*, and one line can
+            /// name several slugs (`# preflight-autofix: build.helper-staged
+            /// build.helper-arm64`), so the two are not index-parallel.
+            slug_gates: Vec<(String, Gate)>,
             body: String,
         }
 
@@ -788,6 +969,7 @@ mod tests {
                 };
                 let mut slugs: Vec<String> = Vec::new();
                 let mut gates: Vec<Gate> = Vec::new();
+                let mut slug_gates: Vec<(String, Gate)> = Vec::new();
                 let mut cap = Some(cap);
                 while let Some(c) = cap {
                     let gate = TAG_GATES
@@ -796,7 +978,10 @@ mod tests {
                         .map(|(_, g)| *g)
                         .expect("the regex only matches the three known tags");
                     gates.push(gate);
-                    slugs.extend(c[2].split_whitespace().map(str::to_string));
+                    for slug in c[2].split_whitespace() {
+                        slugs.push(slug.to_string());
+                        slug_gates.push((slug.to_string(), gate));
+                    }
                     i += 1;
                     cap = lines.get(i).and_then(|l| tag_re.captures(l.trim_start()));
                 }
@@ -807,6 +992,7 @@ mod tests {
                 groups.push(TagGroup {
                     slugs,
                     gates,
+                    slug_gates,
                     body: lines[start..i].join("\n"),
                 });
             }

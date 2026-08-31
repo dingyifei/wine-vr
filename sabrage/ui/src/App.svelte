@@ -30,6 +30,13 @@
    * copy of the launch logic living here. */
   let launchRequest = $state(0);
 
+  /** Bumped every time the Pipeline ▸ Run Doctor menu item (⌘D) fires —
+   * Doctor watches this prop and always forces a fresh pass, whether it was
+   * already the open screen (plain navigation is then a no-op) or the cache
+   * from a recent run was still fresh. See Doctor.svelte's own doc comment
+   * on `doctorRequest`/`doctorAutorunDecided`. */
+  let doctorRequest = $state(0);
+
   function navigate(next: Screen) {
     screen = next;
   }
@@ -59,8 +66,10 @@
   onMount(() => {
     let unlisten: (() => void) | undefined;
     void onMenu((id: string) => {
-      if (id === "doctor") navigate("doctor");
-      else if (id === "launch") {
+      if (id === "doctor") {
+        navigate("doctor");
+        doctorRequest++;
+      } else if (id === "launch") {
         navigate("session");
         launchRequest++;
       } else if (id === "stop") void sessionStore.stop();
@@ -84,7 +93,7 @@
     {:else if screen === "session"}
       <Session onNavigate={navigate} {launchRequest} />
     {:else if screen === "doctor"}
-      <Doctor />
+      <Doctor {doctorRequest} />
     {:else if screen === "logs"}
       <Logs />
     {:else if screen === "settings"}

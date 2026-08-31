@@ -90,14 +90,20 @@ const ALVR_VERSION: &str = "v20.14.1";
 /// attaches to its `slug`, and — when the contract names one — the `fix` id
 /// (`CheckOutcome` itself carries neither; see `checks/mod.rs`'s doc comment
 /// on the group → module mapping, and `fixes/mod.rs` for the id vocabulary).
-/// `fix` is the bare contract id (`"fix.set-graphics-backend"`); the frontend
-/// maps it to a [`FixAction`] wire value itself (`ipc.ts`'s
-/// `contractFixIdToAction`, mirroring [`FixAction::from_contract_id`]) rather
-/// than have this command do it, so the one remaining deferred contract id
-/// (`fix.create-z-drive`) is a client-side "no button" decision instead of a
-/// silently-dropped field. `fix.edit-protocol` is no longer deferred (Phase
-/// 4, `sabrage_core::fixes::FixAction::EditProtocol`): it round-trips through
-/// `from_contract_id` like every other fix and needs no special case here.
+/// `fix` is the bare contract id (`"fix.set-graphics-backend"`) — and only
+/// ever one this build actually offers: every id is projected through
+/// [`offered_fix_id`] before it goes on the wire, so a deliberately withheld
+/// one ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]:
+/// `fix.create-z-drive`, and the known-bad `fix.delete-session-json`) reaches
+/// no client at all. The frontend still maps the id it *does* receive to a
+/// [`FixAction`] wire value itself (`ipc.ts`'s `contractFixIdToAction`,
+/// mirroring [`FixAction::from_contract_id`], deferred set included), but that
+/// mirror is now defence in depth rather than the policy: a hand-maintained
+/// TypeScript table could otherwise render a Fix button for a remedy Rust
+/// withholds, which is exactly how `cfg.session-pins` kept offering the
+/// black-screen `delete-session-json` button. `fix.edit-protocol` is no longer
+/// deferred (Phase 4, `sabrage_core::fixes::FixAction::EditProtocol`): it
+/// round-trips through `from_contract_id` like every other fix.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorEvent {
@@ -108,6 +114,23 @@ pub struct DoctorEvent {
     pub remedy: Option<String>,
     pub detail: Option<String>,
     pub fix: Option<String>,
+}
+
+/// The fix id a [`DoctorEvent`] may carry, given the one the contract names
+/// for that check (`None` when it names none).
+///
+/// [`FixAction::from_contract_id`] is the single source of truth for "does
+/// this build offer that remedy as a button": it returns `None` both for an
+/// id no [`FixAction`] models and for one that is modelled but withheld
+/// ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]). Projecting through it
+/// here keeps a withheld id off the wire entirely, so no frontend — however
+/// its own fix table drifted — can offer the button.
+///
+/// The id is round-tripped back out of the parsed action rather than passed
+/// through verbatim, so what the client receives is by construction a
+/// spelling [`FixAction::from_contract_id`] accepts.
+fn offered_fix_id(contract_fix: Option<&str>) -> Option<String> {
+    FixAction::from_contract_id(contract_fix?).map(FixAction::to_contract_id)
 }
 
 /// The aggregate a `run_doctor` invocation resolves to, over the same
@@ -212,7 +235,7 @@ pub async fn run_doctor(
         core_run_doctor(&ctx, |outcome| {
             let spec = contract().check(&outcome.slug);
             let group = spec.map(|s| s.group.as_str()).unwrap_or("").to_string();
-            let fix = spec.and_then(|s| s.fix.clone());
+            let fix = offered_fix_id(spec.and_then(|s| s.fix.as_deref()));
             total += 1;
             if outcome.status.counts_as_fail() {
                 fail_count += 1;
@@ -744,6 +767,43 @@ pub(crate) enum TeardownWait {
     TimedOut,
 }
 
+/// What [`resolve_quit`]'s `Stop` arm must tell the user about a teardown that
+/// did not simply finish — `None` when it did.
+///
+/// Pure, and deliberately says only what happened. It used to claim a detach
+/// on [`TeardownWait::TimedOut`] ("Sabrage detached from it and quit") and then
+/// call `detach_live_session()` to make it true; that call is a provable
+/// no-op in both refusal arms, so the message was a lie:
+///
+/// * `TimedOut` — the stop already fired the session's `cancel` token, and
+///   [`sabrage_core::session::reconcile::detach`] returns `Ok(())` without
+///   disarming a guard or marking the record once that token is set;
+/// * `Detached` — the slot is already clear, so [`detach_live_session`] finds
+///   no live handle at all.
+///
+/// Not detaching is also the *better* outcome, which is why this only fixes
+/// the wording: `detached: true` means "leave every guard in place, and no
+/// later reconcile may undo that" (`session::reconcile`'s module doc), whereas
+/// a record left `detached: false` with a dead owner is exactly the shape
+/// `reconcile::classify` recovers on the next Sabrage start — restoring the
+/// audio device and removing the `--wired` forwards.
+pub(crate) fn quit_stop_refusal(waited: TeardownWait) -> Option<String> {
+    match waited {
+        TeardownWait::NothingLive | TeardownWait::Cleared => None,
+        TeardownWait::Detached => Some(
+            "the session detached instead of stopping — it is still running, \
+             unsupervised (./demo.sh stop --bottle <name>)"
+                .to_string(),
+        ),
+        TeardownWait::TimedOut => Some(format!(
+            "the session did not finish stopping within {} s — Sabrage stopped waiting and quit; \
+             the game may still be running (./demo.sh stop --bottle <name>). The next Sabrage \
+             start will reconcile whatever is left.",
+            LIVE_SESSION_STOP_TIMEOUT.as_secs()
+        )),
+    }
+}
+
 /// Bounded poll for "the live-session slot no longer holds `run_id`",
 /// factored out of [`stop_live_session_and_wait`] so the deadline behaviour is
 /// unit-testable without a real session: `is_clear` is the predicate the real
@@ -1069,31 +1129,11 @@ pub async fn resolve_quit(
             quit_approved.0.store(false, Ordering::SeqCst);
         }
         QuitChoice::Stop => {
-            // Only a confirmed teardown may approve the quit: `QuitApproved`
-            // is what makes `lib.rs`'s `RunEvent::Exit` arm skip its detach
-            // fallback, so approving on a hung teardown would exit with the
-            // game still running AND its guards still armed. On anything but
-            // a clean stop, fall back to the documented "keep running" answer
-            // (detach: guards disarmed, record marked `detached`) and exit
-            // anyway — the user must never be left unable to quit — while
-            // returning the reason so the dialog can say what happened.
-            let waited = stop_live_session_and_wait().await;
-            let refusal = match waited {
-                TeardownWait::NothingLive | TeardownWait::Cleared => None,
-                TeardownWait::Detached => Some(
-                    "the session detached instead of stopping — it is still running, \
-                     unsupervised (./demo.sh stop --bottle <name>)"
-                        .to_string(),
-                ),
-                TeardownWait::TimedOut => Some(format!(
-                    "the session did not finish stopping within {} s — Sabrage detached from it \
-                     and quit; the game may still be running (./demo.sh stop --bottle <name>)",
-                    LIVE_SESSION_STOP_TIMEOUT.as_secs()
-                )),
-            };
-            if refusal.is_some() {
-                let _ = detach_live_session().await;
-            }
+            // The quit is approved either way — the user must never be left
+            // unable to quit — but only a *clean* teardown gets to say so
+            // silently: anything else returns the reason, so the dialog can
+            // say what actually happened ([`quit_stop_refusal`]).
+            let refusal = quit_stop_refusal(stop_live_session_and_wait().await);
             quit_approved.0.store(true, Ordering::SeqCst);
             app.exit(0);
             if let Some(message) = refusal {
@@ -1112,11 +1152,35 @@ pub async fn resolve_quit(
     Ok(())
 }
 
-/// Apply one fix ([`FixAction`]). Destructive fixes (currently only
-/// `DeleteSessionJson` — [`FixAction::def`]) require `confirmed: true`; the
-/// frontend shows its own in-app confirm dialog first (never
-/// `window.confirm`, which blocks the webview) and this check is the
-/// backend's half of that contract, not a substitute for it.
+/// Why the GUI fix door refuses `action`, if it does — the two rejections
+/// [`fix`] owes before it builds a [`StageCtx`] or touches the operation lock.
+///
+/// Pure, so both rules are unit-testable without a Tauri runtime:
+///
+/// * **withheld** — [`FixAction::is_deferred`]; the mirror in `ipc.ts` is not
+///   trusted to have kept up with `DEFERRED_CONTRACT_FIX_IDS`;
+/// * **unconfirmed destructive** — the backend half of the in-app confirm
+///   dialog contract (see [`fix`]).
+fn gui_fix_refusal(action: FixAction, confirmed: bool) -> Option<String> {
+    if action.is_deferred() {
+        return Some(format!(
+            "{action} is not offered by this build of Sabrage — see its consequence note; \
+             run `sabrage fix {action}` explicitly if you still want it"
+        ));
+    }
+    if action.def().destructive && !confirmed {
+        return Some(format!(
+            "{action} is destructive and needs confirmation before it can run"
+        ));
+    }
+    None
+}
+
+/// Apply one fix ([`FixAction`]). Destructive fixes ([`FixAction::def`];
+/// `DeleteSessionJson` is the only one today, and it is *also* withheld — see
+/// below) require `confirmed: true`; the frontend shows its own in-app confirm
+/// dialog first (never `window.confirm`, which blocks the webview) and this
+/// check is the backend's half of that contract, not a substitute for it.
 ///
 /// A fix whose [`FixAction::as_stage`] is `Some` (`RunSetup`/`RunBuild`/
 /// `RunInstall`) still works through this command — it delegates to
@@ -1124,6 +1188,14 @@ pub async fn resolve_quit(
 /// stage (see [`fixes::apply`]'s doc comment) — but the intended UI path for
 /// those three is calling [`run_stage`] directly so the GateModal it opens is
 /// the same one a plain stage run uses.
+///
+/// An action this build **withholds** ([`FixAction::is_deferred`]) is refused
+/// here outright, whatever the frontend believed: the GUI's own fix table is a
+/// hand-maintained mirror, and `cfg.session-pins` was still rendering a button
+/// for the known-bad `delete-session-json` remedy after Rust stopped offering
+/// it. The `sabrage fix <id>` CLI path is deliberately *not* gated the same
+/// way — a user who has read [`sabrage_core::fixes::FixDef::consequence`] can
+/// still ask for it explicitly there.
 #[tauri::command]
 pub async fn fix(
     action: FixAction,
@@ -1132,17 +1204,20 @@ pub async fn fix(
     on_event: Channel<StageEvent>,
     registry: State<'_, RunRegistry>,
 ) -> Result<FixReport, String> {
-    if action.def().destructive && !confirmed {
-        return Err(format!(
-            "{action} is destructive and needs confirmation before it can run"
-        ));
+    if let Some(refusal) = gui_fix_refusal(action, confirmed) {
+        return Err(refusal);
     }
     // A fix waits on the same operation lock a stage does, and its whole-stage
     // forms (`run-setup`/`run-build`/`run-install`) run for minutes — so it
     // needs the same cancellation handle a stage gets. Without this
     // registration a fix, queued or running, could not be cancelled at all.
+    // The handle is reachable because `fixes::apply` emits a row carrying
+    // `ctx.run_id` *before* it waits for the lock (see its doc comment), so
+    // the frontend can name — and cancel — a fix that is still queued; the
+    // `forget` below therefore also covers the cancelled path.
     // (The live-session refusal `FixDef::forbidden_while_session_live`
-    // describes is enforced inside `fixes::apply`, before it takes the lock.)
+    // describes is enforced inside `fixes::apply`: once before the lock as an
+    // immediate rejection, and again with it held.)
     let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let paths = Paths::new_checked(repo_root).map_err(|e| e.to_string())?;
     let mut stage_opts = stage_options_from_env_and_gui(opts.bottle, opts.bs_dir);
@@ -1693,10 +1768,16 @@ pub fn read_runtime_config(
 /// ([`runtime_config::write`]'s write-once-on-create rule).
 ///
 /// Refuses **before** calling [`runtime_config::write`] when the file is one
-/// `toml_edit` cannot round-trip ([`runtime_config::RuntimeConfigView::parse_error`])
-/// — `write` would refuse on its own re-parse too (via `apply_patch`), but
-/// checking here first gives a clearer message (the fallback reader's own
-/// diagnosis) without a redundant disk read.
+/// Sabrage must not rewrite ([`runtime_config::RuntimeConfigView::parse_error`]):
+/// either `toml_edit` cannot parse it at all, or its physical lines and the
+/// parsed document disagree about where an editable key is assigned (a
+/// `"""…"""` block containing `protocol = …`, a BOM in front of a key) — an
+/// edit would then land somewhere the runtime's own line reader does not look.
+/// `apply_patch` refuses on both counts too, so `write` is safe on its own;
+/// checking here first only buys the message the *view* already computed,
+/// without a redundant disk read. The two refusals must therefore stay
+/// equivalent — `parse_error` and `apply_patch` share `line_document_mismatch`
+/// precisely so they cannot drift.
 ///
 /// Two guards this command did not use to have:
 ///
@@ -1723,8 +1804,10 @@ pub async fn write_runtime_config(
     let paths = cache.paths_checked()?;
     let view = runtime_config::read(&paths.toml_path);
     if let Some(err) = view.parse_error {
+        // Not "is not valid TOML": the multiline-string case parses fine, it
+        // just cannot be edited safely. `err` is the specific diagnosis.
         return Err(format!(
-            "{} is not valid TOML ({err}) — refusing to rewrite it; edit it by hand",
+            "{}: {err} — refusing to rewrite it; edit it by hand",
             paths.toml_path.display()
         ));
     }
@@ -2388,6 +2471,82 @@ mod tests {
             wait_for_slot_clear(|| false, Duration::from_millis(0)),
             TeardownWait::TimedOut,
             "a slot that never clears must report the timeout, not success"
+        );
+    }
+
+    #[test]
+    fn the_stop_and_quit_refusal_claims_only_what_happened() {
+        // A11-1 (round 2): the `TimedOut` arm used to say "Sabrage detached
+        // from it and quit" and call `detach_live_session()` to back that up
+        // — but the stop has already fired the session's cancel token, and
+        // `reconcile::detach` returns `Ok(())` without detaching once it is
+        // set. The claim was unbackable; the message must not make it.
+        assert_eq!(quit_stop_refusal(TeardownWait::NothingLive), None);
+        assert_eq!(
+            quit_stop_refusal(TeardownWait::Cleared),
+            None,
+            "a clean teardown is a silent, successful quit"
+        );
+        let timed_out = quit_stop_refusal(TeardownWait::TimedOut).expect("an unfinished teardown");
+        assert!(
+            !timed_out.contains("detach"),
+            "must not claim a detach that provably did not happen: {timed_out}"
+        );
+        assert!(
+            timed_out.contains("may still be running") && timed_out.contains("./demo.sh stop"),
+            "must still say what is left and how to finish it: {timed_out}"
+        );
+        let detached = quit_stop_refusal(TeardownWait::Detached).expect("a detach is not a stop");
+        assert!(
+            detached.contains("detached instead of stopping"),
+            "the one arm where a detach really did happen still names it: {detached}"
+        );
+    }
+
+    #[test]
+    fn a_withheld_fix_reaches_no_doctor_row_and_no_fix_call() {
+        // A4-2 / A12-1: `DEFERRED_CONTRACT_FIX_IDS` was enforced only in
+        // `FixAction::from_contract_id`, which the GUI mirrored by hand in
+        // TypeScript — so `cfg.session-pins` still rendered a Fix button for
+        // the known-bad `delete-session-json`. Both IPC doors now refuse it.
+        for id in sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS {
+            assert_eq!(
+                offered_fix_id(Some(id)),
+                None,
+                "{id} is withheld and must never reach the client"
+            );
+        }
+        assert_eq!(offered_fix_id(None), None);
+        assert_eq!(
+            offered_fix_id(Some("fix.set-graphics-backend")),
+            Some("fix.set-graphics-backend".to_string()),
+            "an offered id passes through unchanged"
+        );
+        assert_eq!(
+            offered_fix_id(Some("fix.not-a-real-fix")),
+            None,
+            "an id no FixAction models is not offerable either"
+        );
+
+        // The contract's own `cfg.session-pins` row is the reachable case.
+        let session_pins = contract().check("cfg.session-pins").expect("slug present");
+        assert_eq!(
+            session_pins.fix.as_deref(),
+            Some("fix.delete-session-json"),
+            "the contract still names the remedy; withholding it is Sabrage's decision"
+        );
+        assert_eq!(offered_fix_id(session_pins.fix.as_deref()), None);
+
+        // …and the `fix` command refuses it even if a frontend asks anyway.
+        let refusal = gui_fix_refusal(FixAction::DeleteSessionJson, true)
+            .expect("a withheld fix is refused however it was reached");
+        assert!(
+            refusal.contains("not offered by this build"),
+            "unexpected refusal: {refusal}"
+        );
+        assert!(
+            gui_fix_refusal(FixAction::RestageHelper, false).is_none(),
+            "an ordinary fix needs neither confirmation nor an exemption"
         );
     }
 

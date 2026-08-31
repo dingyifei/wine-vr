@@ -28,7 +28,7 @@ use crate::executor::Executor;
 use crate::paths::{resolve_bs_dir, Bottle, Paths};
 use crate::stages::run::actions::steam_api_path;
 use crate::stages::StageOptions;
-use crate::util::{bs_version, file_sha256_matches};
+use crate::util::{bs_version, cmp_files, file_sha256_matches};
 
 use super::goldberg::orig_steam_path;
 use super::settings::Settings;
@@ -348,30 +348,39 @@ pub fn effective_options(settings: &Settings, entry: &GameEntry) -> StageOptions
 // ── validity ──────────────────────────────────────────────────────────────
 
 /// Where the installed `steam_api64.dll` stands relative to the Goldberg
-/// pin and its `.orig-steam` backup. See [`validate`]'s rule for how each
+/// dll and its `.orig-steam` backup. See [`validate`]'s rule for how each
 /// variant is derived.
+///
+/// "Is Goldberg" means **either** the contract-pinned build (`gbe_dll_sha256`)
+/// **or** the payload this checkout would actually install
+/// (`Paths::gbe_dll`, `third_party/gbe/steam_api64.dll`) byte for byte. The
+/// pin alone was not enough: `run`/`run.sh` install whatever is at that path
+/// and only *warn* when it does not match the pin (PARITY.md, "Goldberg
+/// hash-tolerance at run"), and a contract pin bump retroactively makes an
+/// installed dll unrecognized — in both cases a pin-only test called Goldberg
+/// bytes `Original`, and the revert door then offered to "restore" them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GoldbergState {
-    /// The pinned Goldberg dll is installed and a `.orig-steam` backup exists
+    /// The Goldberg dll is installed and a `.orig-steam` backup exists
     /// — the ordinary post-launch state. The backup is still only *a* backup:
     /// nothing on this machine can prove it is the real Steam dll (it is
     /// whatever the first launch found in place), which is why
     /// [`super::goldberg::revert_original_steam_dll`] talks about restoring
     /// the backup rather than "the original".
     Applied,
-    /// The pinned Goldberg dll is installed and there is **no** `.orig-steam`
+    /// The Goldberg dll is installed and there is **no** `.orig-steam`
     /// backup: this install arrived already Goldberg'd (or the backup was
     /// deleted), so no copy of the real Steam dll exists here at all. Not
     /// [`GoldbergState::Original`] — the bytes are provably Goldberg's.
     AppliedUnverified,
-    /// A dll is present, is not the pinned Goldberg build, and there is no
-    /// `.orig-steam` backup: Goldberg was never installed here (the real
-    /// Steam dll, untouched).
+    /// A dll is present, is neither the pinned Goldberg build nor this
+    /// checkout's Goldberg payload, and there is no `.orig-steam` backup:
+    /// as far as anything here can tell, Goldberg was never installed (the
+    /// real Steam dll, untouched).
     Original,
-    /// A `.orig-steam` backup exists but the live dll does not match the
-    /// pin — installed once, then swapped for something else (or the pin
-    /// moved) since.
+    /// A `.orig-steam` backup exists but the live dll is not Goldberg's —
+    /// installed once, then swapped for something else since.
     Modified,
     /// No `steam_api64.dll` at all, under either search path.
     NoDll,
@@ -433,15 +442,14 @@ fn bottle_template_value(conf: &str) -> Option<String> {
 ///
 /// `paths` is accepted (rather than only `bs_dir`/`bottle_name`) for the same
 /// reason `CheckCtx` carries the whole `Paths` set: callers already have one
-/// in hand, and a future rule here may need another field of it (an
-/// oxrsys-appsup probe, say) without a signature change.
+/// in hand. Its `gbe_dll` — the Goldberg payload *this checkout* installs — is
+/// read by the Goldberg classification below, alongside the contract pin.
 ///
 /// Thin wrapper around [`validate_with_bottle`] — see that function for the
 /// actual rules and for why the split exists.
 pub fn validate(paths: &Paths, bs_dir: &Path, bottle_name: &str) -> GameValidity {
-    let _ = paths; // no current rule needs it; kept for signature symmetry — see the doc above.
     let bottle = Bottle::unvalidated(bottle_name);
-    validate_with_bottle(bs_dir, bottle_name, &bottle)
+    validate_with_bottle(&paths.gbe_dll, bs_dir, bottle_name, &bottle)
 }
 
 /// [`validate`]'s actual logic, taking an already-resolved [`Bottle`] rather
@@ -457,8 +465,19 @@ pub fn validate(paths: &Paths, bs_dir: &Path, bottle_name: &str) -> GameValidity
 /// pre-built `Bottle` (whose `prefix` may point anywhere) so tests can do the
 /// same; [`validate`] is the only caller that actually derives one from
 /// `$HOME`.
-fn validate_with_bottle(bs_dir: &Path, bottle_name: &str, bottle: &Bottle) -> GameValidity {
-    validate_pinned(bs_dir, bottle_name, bottle, &contract().deps.gbe_dll_sha256)
+fn validate_with_bottle(
+    gbe_dll: &Path,
+    bs_dir: &Path,
+    bottle_name: &str,
+    bottle: &Bottle,
+) -> GameValidity {
+    validate_pinned(
+        gbe_dll,
+        bs_dir,
+        bottle_name,
+        bottle,
+        &contract().deps.gbe_dll_sha256,
+    )
 }
 
 /// [`validate_with_bottle`] with the Goldberg pin passed in.
@@ -469,6 +488,7 @@ fn validate_with_bottle(bs_dir: &Path, bottle_name: &str, bottle: &Bottle) -> Ga
 /// instead. [`validate_with_bottle`] is the only caller that reads the real
 /// contract pin.
 fn validate_pinned(
+    gbe_dll: &Path,
     bs_dir: &Path,
     bottle_name: &str,
     bottle: &Bottle,
@@ -504,7 +524,7 @@ fn validate_pinned(
     };
     let z_drive_ok = outside_drive_c.then(|| bottle.z_drive().exists());
 
-    // The pin is consulted *first*, on every branch: a dll's own bytes are the
+    // The dll's own bytes are consulted *first*, on every branch: they are the
     // only positive evidence available here. Deriving "original" from the mere
     // absence of a backup is how an already-Goldberg'd install gets labelled
     // untouched — and then backed up, and then "restored" — see
@@ -512,7 +532,15 @@ fn validate_pinned(
     let api = steam_api_path(bs_dir);
     let dll_present = api.is_file();
     let orig_steam_present = orig_steam_path(&api).is_file();
-    let dll_is_goldberg = dll_present && file_sha256_matches(&api, gbe_dll_sha256);
+    // Two ways to be Goldberg, because the pin is not the only Goldberg this
+    // pipeline installs: `run`/`run.sh` copy `third_party/gbe/steam_api64.dll`
+    // whatever it hashes to (a pin mismatch is a warn, never a block — see
+    // PARITY.md), and a contract pin bump orphans a dll that was pinned when
+    // it was installed. A pin-only test labelled both of those `Original` —
+    // "the untouched Steam dll" — and the Edit-game screen then offered to
+    // restore them.
+    let dll_is_goldberg =
+        dll_present && (file_sha256_matches(&api, gbe_dll_sha256) || cmp_files(gbe_dll, &api));
     let goldberg = match (dll_present, dll_is_goldberg, orig_steam_present) {
         (false, _, _) => GoldbergState::NoDll,
         (_, true, true) => GoldbergState::Applied,
@@ -1013,6 +1041,7 @@ mod tests {
                 no_dashboard: true,
                 wired: false,
                 verbose: false,
+                ..Default::default()
             },
             ..Settings::default()
         };
@@ -1042,6 +1071,7 @@ mod tests {
                 no_dashboard: true,
                 wired: false,
                 verbose: false,
+                ..Default::default()
             },
             ..Settings::default()
         };
@@ -1122,7 +1152,7 @@ mod tests {
         )
         .unwrap();
 
-        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
         assert_eq!(v.detected_version.as_deref(), Some("1.34.2_9999999999"));
         assert!(!v.version_ok);
         assert!(v.bottle_exists);
@@ -1145,7 +1175,7 @@ mod tests {
         fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
         fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
 
-        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
         assert!(
             v.outside_drive_c,
             "scratch dir is not under the bottle's drive_c"
@@ -1177,7 +1207,7 @@ mod tests {
         // (run.sh:143-145) — see `healthy_game_without_steam_dll_is_not_ready`.
         fs::write(bs_dir.join("steam_api64.dll"), b"REAL-STEAM").unwrap();
 
-        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
         assert!(v.exe_present && v.version_ok && v.bottle_exists && v.bottle_backend_dxmt);
         assert!(
             !v.outside_drive_c,
@@ -1214,7 +1244,7 @@ mod tests {
         fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
         fs::write(bs_dir.join("steam_api64.dll"), b"REAL-STEAM").unwrap();
 
-        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
         assert_eq!(v.bottle_template.as_deref(), Some("win10_64"));
         assert!(!v.bottle_backend_dxmt);
         assert_eq!(v.status, GameStatus::Ready);
@@ -1240,7 +1270,10 @@ mod tests {
         // can fabricate bytes matching the contract's real digest, which is
         // exactly what `validate_pinned` exists for.
         let pin = crate::util::sha256_bytes(b"GOLDBERG-EMULATOR-BYTES");
-        let v = |pin: &str| validate_pinned(&bs_dir, &bottle.name, &bottle, pin);
+        // The checkout's staged Goldberg payload — the *other* way a dll is
+        // known to be Goldberg. Absent for every case below except the last.
+        let payload = bs_dir.join("third_party-gbe-steam_api64.dll");
+        let v = |pin: &str| validate_pinned(&payload, &bs_dir, &bottle.name, &bottle, pin);
 
         // No dll at all.
         assert_eq!(v(&pin).goldberg, GoldbergState::NoDll);
@@ -1274,6 +1307,28 @@ mod tests {
         fs::write(dir.join("steam_api64.dll"), b"GOLDBERG-EMULATOR-BYTES").unwrap();
         assert_eq!(v(&pin).goldberg, GoldbergState::Applied);
 
+        // A13a-1: a Goldberg build that is **not** the pin — an older or
+        // hand-swapped `third_party/gbe/steam_api64.dll`, or a dll installed
+        // before a pin bump — with no backup. Byte-identical to the payload
+        // this checkout installs, so it is not the untouched Steam original,
+        // and the revert door must not offer to "restore" it.
+        fs::remove_file(dir.join("steam_api64.dll.orig-steam")).unwrap();
+        fs::write(&payload, b"CUSTOM-GOLDBERG-BUILD").unwrap();
+        fs::write(dir.join("steam_api64.dll"), b"CUSTOM-GOLDBERG-BUILD").unwrap();
+        let got = v(&pin); // `pin` matches the *other* fixture bytes, never these
+        assert_ne!(
+            got.goldberg,
+            GoldbergState::Original,
+            "a dll matching the installed Goldberg payload is never the Steam original"
+        );
+        assert_eq!(got.goldberg, GoldbergState::AppliedUnverified);
+        // …and with a backup alongside it, the ordinary applied state.
+        fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM").unwrap();
+        assert_eq!(v(&pin).goldberg, GoldbergState::Applied);
+        // Restore the matrix's tail state for the contract-pin assertion below.
+        fs::remove_file(&payload).unwrap();
+        fs::write(dir.join("steam_api64.dll"), b"GOLDBERG-EMULATOR-BYTES").unwrap();
+
         // And the real contract pin still flows through `validate` itself:
         // these fixture bytes are not it, so the same tree reads as Modified.
         assert_eq!(
@@ -1304,7 +1359,7 @@ mod tests {
         fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
         fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
 
-        let v = validate_with_bottle(&bs_dir, &b.name, &b);
+        let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
         assert_eq!(v.goldberg, GoldbergState::NoDll);
         assert_ne!(
             v.status,

@@ -73,9 +73,8 @@ fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
     if !in_sync {
         let outcome = CheckOutcome::fail(
             "meta.contract-sync",
-            "contract/ and scripts/demo/contract.gen.sh out of sync (contract edited without \
-             regen, or the generated file was hand-edited)",
-            "scripts/dev/parity.sh --regen",
+            OUT_OF_SYNC_MESSAGE,
+            OUT_OF_SYNC_REMEDY,
         );
         // Sabrage-only explainability: the two hashes doctor.sh only compares,
         // never shows.
@@ -93,10 +92,8 @@ fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
     if &want != compiled {
         return CheckOutcome::fail(
             "meta.contract-sync",
-            "this Sabrage binary was built from a different contract than the checkout it's \
-             pointed at",
-            "rebuild it from this checkout (cd sabrage && cargo build) or point Settings \u{203a} \
-             Repository at the checkout it was built from",
+            STALE_BINARY_MESSAGE,
+            STALE_BINARY_REMEDY,
         )
         .with_detail(format!("checkout={want} binary={compiled}"));
     }
@@ -106,6 +103,56 @@ fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
         "contract/ in sync with scripts/demo/contract.gen.sh",
     )
     .with_detail(format!("want={want} have={want}"))
+}
+
+/// Message for the "checkout itself is out of sync" (or unreadable) case —
+/// shared between the Doctor row and [`assert_binary_matches_checkout`] so a
+/// mutating-stage refusal and the row that explains it always agree verbatim.
+const OUT_OF_SYNC_MESSAGE: &str = "contract/ and scripts/demo/contract.gen.sh out of sync \
+     (contract edited without regen, or the generated file was hand-edited)";
+const OUT_OF_SYNC_REMEDY: &str = "scripts/dev/parity.sh --regen";
+
+/// Message for the "checkout is self-consistent but this binary was compiled
+/// from a different contract" case (round-1 finding A1-1).
+const STALE_BINARY_MESSAGE: &str = "this Sabrage binary was built from a different contract \
+     than the checkout it's pointed at";
+const STALE_BINARY_REMEDY: &str = "rebuild it from this checkout (cd sabrage && cargo build) or \
+     point Settings \u{203a} Repository at the checkout it was built from";
+
+/// Sabrage-only compiled-vs-checkout identity guard, factored out of
+/// [`meta_contract_sync`] so that callers *other* than Doctor can refuse to
+/// act on a mismatch instead of merely reporting it. Round-1 finding A1-1: the
+/// Doctor row for this existed, but Setup/Build/Install/Run dispatched
+/// regardless of it — only the launch preflight (which runs this whole check
+/// group) actually stopped anything. This packet's cross-area half
+/// (`stages::run_stage` / `run_stage_holding_lock` calling this before
+/// dispatch, owned by area A4) closes that gap; this function is the reusable
+/// predicate those call sites need, kept here so its message/remedy strings
+/// can never drift from the Doctor row's.
+///
+/// Returns `Err((message, remedy))` — never a `CheckOutcome`, so this has no
+/// [`CheckCtx`] dependency and callers outside `checks::` don't need one just
+/// to ask "is it safe to mutate?". Fails closed (`Err`) when `contract/`
+/// itself can't be read/hashed under `root`, using the same message the
+/// Doctor row would show in that case; a self-consistent checkout that
+/// disagrees with [`crate::contract::COMPILED_CONTRACT_SHA256`] is the other
+/// `Err` case. `Ok(())` only when `root`'s `contract/` hashes to exactly what
+/// this binary was compiled from.
+pub fn assert_binary_matches_checkout(root: &std::path::Path) -> Result<(), (String, String)> {
+    let Some(want) = util::contract_hash(root).ok() else {
+        return Err((
+            OUT_OF_SYNC_MESSAGE.to_string(),
+            OUT_OF_SYNC_REMEDY.to_string(),
+        ));
+    };
+    let compiled = &*crate::contract::COMPILED_CONTRACT_SHA256;
+    if &want != compiled {
+        return Err((
+            STALE_BINARY_MESSAGE.to_string(),
+            STALE_BINARY_REMEDY.to_string(),
+        ));
+    }
+    Ok(())
 }
 
 /// Evaluators this module binds, keyed by contract slug.
@@ -234,5 +281,51 @@ mod tests {
         let root = repo_root();
         let checkout_hash = util::contract_hash(&root).expect("contract files readable");
         assert_eq!(checkout_hash, *crate::contract::COMPILED_CONTRACT_SHA256);
+    }
+
+    /// [`assert_binary_matches_checkout`] is the reusable predicate area A4's
+    /// `stages::run_stage` / `run_stage_holding_lock` call before dispatching a
+    /// mutating stage (packet counterpart of A1-1). `Ok(())` against the live
+    /// checkout, with the same message/remedy strings `meta_contract_sync`
+    /// uses for its two `Err` shapes.
+    #[test]
+    fn assert_binary_matches_checkout_passes_against_the_live_checkout() {
+        assert!(assert_binary_matches_checkout(&repo_root()).is_ok());
+    }
+
+    #[test]
+    fn assert_binary_matches_checkout_fails_closed_when_contract_is_unreadable() {
+        let err =
+            assert_binary_matches_checkout(std::path::Path::new("/nonexistent/sabrage-meta-probe"))
+                .expect_err("unreadable contract/ must fail closed, not pass by omission");
+        assert_eq!(err.0, OUT_OF_SYNC_MESSAGE);
+        assert_eq!(err.1, OUT_OF_SYNC_REMEDY);
+    }
+
+    #[test]
+    fn assert_binary_matches_checkout_fails_on_a_foreign_but_self_consistent_checkout() {
+        use crate::contract::CONTRACT_FILES;
+
+        let root = std::env::temp_dir().join(format!(
+            "sabrage-meta-test-{}-assert-binary-matches",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("contract")).expect("mkdir contract/");
+        for rel in CONTRACT_FILES {
+            std::fs::write(
+                root.join(rel),
+                b"not-the-contract-this-binary-was-built-from\n",
+            )
+            .expect("write fake contract file");
+        }
+
+        let err = assert_binary_matches_checkout(&root)
+            .expect_err("a self-consistent but foreign checkout must not be Ok");
+
+        let _ = std::fs::remove_dir_all(&root);
+
+        assert_eq!(err.0, STALE_BINARY_MESSAGE);
+        assert_eq!(err.1, STALE_BINARY_REMEDY);
     }
 }

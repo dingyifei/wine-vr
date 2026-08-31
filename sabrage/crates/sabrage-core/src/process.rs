@@ -422,7 +422,9 @@ async fn spawn_streamed_inner(
         _ = cancel.cancelled() => {
             cancelled = true;
             let _ = killpg(pgid, Signal::SIGTERM);
-            match tokio::time::timeout(spec.kill_grace, child.wait()).await {
+            let deadline = tokio::time::Instant::now() + spec.kill_grace;
+            // Reap the leader first, within the same grace period.
+            let st = match tokio::time::timeout_at(deadline, child.wait()).await {
                 Ok(Ok(st)) => st,
                 _ => {
                     let _ = killpg(pgid, Signal::SIGKILL);
@@ -431,7 +433,22 @@ async fn spawn_streamed_inner(
                         .await
                         .map_err(|e| SabrageError::io(PathBuf::from(&spec.program), e))?
                 }
+            };
+            // The leader exiting is not the tree exiting, and the pipes are no
+            // witness either: a descendant that ignored the SIGTERM *and*
+            // redirected its own stdout/stderr lets both pumps reach EOF while
+            // it keeps running, so an escalation conditioned on the drain
+            // timing out never fires. Cancellation means the whole tool tree
+            // stops — so liveness is measured on the **group**, for the
+            // configured `kill_grace`, and whatever is still in it at the
+            // deadline is SIGKILLed unconditionally.
+            while group_alive(pgid) && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(GROUP_POLL_INTERVAL).await;
             }
+            if group_alive(pgid) {
+                let _ = killpg(pgid, Signal::SIGKILL);
+            }
+            st
         }
     };
 
@@ -439,13 +456,13 @@ async fn spawn_streamed_inner(
     // gone — which is not the same thing as the leader being reaped. A build
     // tool that leaves a daemon behind (wine's `reg add` starts wineserver), or
     // a descendant that ignored the SIGTERM the leader obeyed, keeps the write
-    // end open; waiting for EOF unconditionally hangs the stage — and, on the
-    // cancelled path, hangs it *after* the SIGKILL escalation was skipped
-    // because the leader had already exited.
+    // end open; waiting for EOF unconditionally hangs the stage.
     if !drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await {
         if cancelled {
-            // Escalate on the group, not on the leader: cancellation means the
-            // whole tool tree stops.
+            // Belt and braces: the cancelled arm above already SIGKILLed the
+            // group at the `kill_grace` deadline, so reaching here means the
+            // group looked empty (or unsignalable) while something still holds
+            // the pipe. Escalate on the group once more, not on the leader.
             let _ = killpg(pgid, Signal::SIGKILL);
             let _ = drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await;
         }
@@ -471,6 +488,23 @@ async fn spawn_streamed_inner(
 /// How long to wait for the output pipes to reach EOF once the leader is gone,
 /// before concluding that a surviving descendant is holding them.
 const PUMP_DRAIN_GRACE: Duration = Duration::from_secs(2);
+
+/// How often the cancelled path re-asks whether anything is left in the child's
+/// process group. Short enough that the common case (the whole tree obeys the
+/// SIGTERM) costs one poll, cheap enough that the worst case is a few dozen
+/// `kill(2)`s over the whole `kill_grace`.
+const GROUP_POLL_INTERVAL: Duration = Duration::from_millis(25);
+
+/// Does the child's process group still have a member?
+///
+/// `kill(-pgid, 0)` succeeds while at least one process remains in the group
+/// and fails with `ESRCH` once it is empty — the liveness signal the cancelled
+/// path needs, because neither the leader's exit status nor pipe EOF says
+/// anything about a descendant that ignored the SIGTERM. `EPERM` (a group we
+/// could not signal anyway) counts as gone, since escalating on it is a no-op.
+fn group_alive(pgid: Pid) -> bool {
+    killpg(pgid, None).is_ok()
+}
 
 /// Await the pipe pumps with a deadline. `true` when they all finished.
 ///
@@ -1166,6 +1200,60 @@ mod tests {
         );
     }
 
+    /// The descendant that *releases* the pipes is the harder half of the same
+    /// hazard: both pumps reach EOF, so an escalation conditioned on the drain
+    /// timing out never fires and a TERM-ignoring process survives Cancel while
+    /// still doing its work. Group liveness, not pipe EOF, is what decides.
+    #[tokio::test]
+    async fn cancellation_kills_a_descendant_that_ignored_term_and_released_the_pipes() {
+        let dir = std::env::temp_dir().join(format!(
+            "sabrage-proc-escalate-{}-{}",
+            std::process::id(),
+            Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let pidfile = dir.join("pid");
+        let run_id = Uuid::new_v4();
+        let (sink, _seen) = collecting_sink();
+        let cancel = CancellationToken::new();
+        let s = spec("/bin/sh", run_id)
+            .arg("-c")
+            .arg(format!(
+                "( trap '' TERM; exec >/dev/null 2>&1; exec sleep 30 ) & echo $! > {}; sleep 30",
+                pidfile.display()
+            ))
+            .kill_grace(Duration::from_millis(300));
+        let token = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            token.cancel();
+        });
+        let err = tokio::time::timeout(Duration::from_secs(10), spawn_streamed(&s, &sink, &cancel))
+            .await
+            .expect("spawn_streamed must not wait for the ignoring descendant")
+            .unwrap_err();
+        assert!(matches!(err, SabrageError::Cancelled));
+
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the child recorded its descendant")
+            .trim()
+            .parse()
+            .expect("a pid");
+        // The SIGKILL is delivered before the call returns; reaping the
+        // reparented corpse is the kernel's own business, so poll briefly.
+        for _ in 0..100 {
+            if !is_alive(pid) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        if is_alive(pid) {
+            let _ = kill_hard(pid);
+            panic!("descendant {pid} survived cancellation");
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Same hazard without any cancellation: a child that backgrounds a
     /// descendant holding stdout returns its status now, not when the orphan
     /// finally exits. Nothing is killed — the surviving process is often one the
@@ -1254,15 +1342,39 @@ mod tests {
     #[test]
     fn process_scan_agrees_with_the_single_needle_convenience_functions() {
         let exe = std::env::current_exe().expect("test binary path");
-        let scan = ProcessScan::scan();
-        assert_eq!(scan.by_exe(&exe), find_processes_by_exe(&exe));
-        assert!(scan
+        let name = exe.file_name().and_then(|n| n.to_str()).unwrap();
+        let needle = &name[name.len().saturating_sub(6)..];
+
+        assert!(ProcessScan::scan()
             .by_exe(Path::new("/nonexistent/sabrage/helper"))
             .is_empty());
 
-        let name = exe.file_name().and_then(|n| n.to_str()).unwrap();
-        let needle = &name[name.len().saturating_sub(6)..];
-        assert_eq!(scan.by_cmdline(needle), find_processes_by_cmdline(needle));
+        // The convenience functions run their **own** scan, so any difference
+        // is either a filter disagreement (what this test is about) or the
+        // process table having changed between the two walks (what it is not).
+        // The second is routine under `cargo test`: every child a concurrent
+        // test spawns is briefly a copy of *this* exe, between the fork and the
+        // exec, and a handful of those come and go inside one scan's duration.
+        // So the comparison is only made across a window the table sat still
+        // for — bracketed by two scans that agree — and inside that window the
+        // filters must agree exactly.
+        for _ in 0..50 {
+            let before = ProcessScan::scan();
+            let fresh_exe = find_processes_by_exe(&exe);
+            let fresh_cmd = find_processes_by_cmdline(needle);
+            let after = ProcessScan::scan();
+
+            if before.by_exe(&exe) != after.by_exe(&exe)
+                || before.by_cmdline(needle) != after.by_cmdline(needle)
+            {
+                std::thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+            assert_eq!(before.by_exe(&exe), fresh_exe);
+            assert_eq!(before.by_cmdline(needle), fresh_cmd);
+            return;
+        }
+        panic!("the process table never sat still long enough to compare the two scans");
     }
 
     #[test]
