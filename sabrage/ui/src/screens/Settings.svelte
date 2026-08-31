@@ -16,6 +16,7 @@
   //    instead of a form-wide save button.
   import { onMount } from "svelte";
   import {
+    blocksMutation,
     suggestBsDir,
     getAppState,
     getRepoInfo,
@@ -33,8 +34,17 @@
   } from "../ipc";
   import { demoRunCommand } from "../lib/demo";
   import { configStore } from "../stores/config.svelte";
+  import { sessionStore } from "../stores/session.svelte";
   import { settingsStore } from "../stores/settings.svelte";
   import { stageStore } from "../stores/stage.svelte";
+
+  // The runtime re-reads oxrsys-runtime.toml every 250 ms and rebuilds the
+  // encoder when `encoderProcess`/`videoCodec` move — `write_runtime_config`
+  // fails closed while a session is live rather than deferring to "next
+  // launch" (see that IPC fn's doc comment). Disable Save proactively with an
+  // honest reason instead of only surfacing the backend's refusal after a
+  // click.
+  const sessionBlocksSave = $derived(blocksMutation(sessionStore.status.phase));
 
   // ── bottles (Paths card's default-bottle select) ───────────────────────────
 
@@ -253,7 +263,7 @@
   let lastWriteReport = $state<WriteReport | null>(null);
 
   function requestSave() {
-    if (!isDirty || saving) return;
+    if (!isDirty || saving || sessionBlocksSave) return;
     lastWriteReport = null;
     saveError = null;
     if (!settingsStore.settings?.runtimeConfigEditAcknowledged) {
@@ -633,10 +643,18 @@
           {/if}
 
           <div class="streaming-actions">
-            <span class="text-muted">Values take effect at the next launch.</span>
+            <span class="text-muted">
+              {sessionBlocksSave
+                ? "A session is live — stop it to change these."
+                : "Values take effect at the next launch."}
+            </span>
             <div class="streaming-actions-btns">
               <button class="btn btn-secondary" onclick={revertDraft} disabled={!isDirty || saving}>Revert</button>
-              <button class="btn btn-primary" onclick={requestSave} disabled={!isDirty || saving}>
+              <button
+                class="btn btn-primary"
+                onclick={requestSave}
+                disabled={!isDirty || saving || sessionBlocksSave}
+              >
                 {saving ? "Saving…" : "Save"}
               </button>
             </div>
@@ -657,7 +675,7 @@
               type="checkbox"
               bind:checked={routeAudioChk}
               onchange={onRouteAudioChange}
-              disabled={!settingsStore.loaded || isLegacyProtocol}
+              disabled={!settingsStore.loadOk || isLegacyProtocol}
             />
             <span class="dot toggle-dot"></span>
             <span class="toggle-body">
@@ -672,7 +690,7 @@
               type="checkbox"
               bind:checked={openDashboardChk}
               onchange={onOpenDashboardChange}
-              disabled={!settingsStore.loaded || isLegacyProtocol}
+              disabled={!settingsStore.loadOk || isLegacyProtocol}
             />
             <span class="dot toggle-dot"></span>
             <span class="toggle-body">
@@ -681,7 +699,7 @@
             </span>
           </label>
           <label class="radio toggle-row">
-            <input type="checkbox" bind:checked={wiredChk} onchange={onWiredChange} disabled={!settingsStore.loaded} />
+            <input type="checkbox" bind:checked={wiredChk} onchange={onWiredChange} disabled={!settingsStore.loadOk} />
             <span class="dot toggle-dot"></span>
             <span class="toggle-body">
               <span class="toggle-title">Wired (USB) streaming</span>
@@ -696,7 +714,7 @@
               type="checkbox"
               bind:checked={verboseChk}
               onchange={onVerboseChange}
-              disabled={!settingsStore.loaded}
+              disabled={!settingsStore.loadOk}
             />
             <span class="dot toggle-dot"></span>
             <span class="toggle-body">
@@ -715,7 +733,7 @@
               type="checkbox"
               bind:checked={allowAdbChk}
               onchange={onAllowAdbChange}
-              disabled={!settingsStore.loaded}
+              disabled={!settingsStore.loadOk}
             />
             <span class="dot toggle-dot"></span>
             <span class="toggle-body">
@@ -741,7 +759,7 @@
               class="input"
               bind:value={defaultBottleSel}
               onchange={onDefaultBottleChange}
-              disabled={!settingsStore.loaded}
+              disabled={!settingsStore.loadOk}
             >
               <option value="">— none —</option>
               {#each bottles as b (b)}
@@ -761,9 +779,9 @@
               placeholder={derivedBsDir ? `derived from the bottle: ${derivedBsDir}` : "leave empty to derive from the bottle"}
               bind:value={bsDirInput}
               onchange={onBsDirCommit}
-              disabled={!settingsStore.loaded}
+              disabled={!settingsStore.loadOk}
             />
-            <button class="btn btn-secondary" onclick={browseDefaultBsDir} disabled={!settingsStore.loaded}>
+            <button class="btn btn-secondary" onclick={browseDefaultBsDir} disabled={!settingsStore.loadOk}>
               Browse…
             </button>
           </div>
@@ -829,6 +847,29 @@
                     : "unknown"}
               </span>
             </div>
+            <div class="repo-row">
+              <span class="repo-label">Binary contract</span>
+              <span
+                class="tag {repoInfo.binaryContractMatches === true
+                  ? 'tag-accent'
+                  : repoInfo.binaryContractMatches === false
+                    ? 'tag-outline'
+                    : 'tag-neutral'}"
+              >
+                {repoInfo.binaryContractMatches === true
+                  ? "matches checkout"
+                  : repoInfo.binaryContractMatches === false
+                    ? "mismatched"
+                    : "unknown"}
+              </span>
+            </div>
+            {#if repoInfo.binaryContractMatches === false}
+              <div class="text-muted">
+                This Sabrage binary was compiled against a different <span class="mono">contract/</span> than the
+                checkout at Repo root — different pins, ports, and check registry. Rebuild Sabrage from this
+                checkout, or point Repo root at the checkout it was built from.
+              </div>
+            {/if}
           </div>
         {/if}
 

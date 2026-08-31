@@ -1,6 +1,8 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { getAppState, type Stage } from "../ipc";
+  import { blocksMutation, getAppState, type Stage } from "../ipc";
+  import { shQuote } from "../lib/demo";
+  import { sessionStore } from "../stores/session.svelte";
   import { stageStore } from "../stores/stage.svelte";
 
   interface Props {
@@ -44,6 +46,14 @@
   let selectedBottle = $state("");
   let copiedStage = $state<Stage | null>(null);
 
+  /** Every whole-stage fix here (Setup/Build/Install) is refused by the
+   * backend while a session is live — `deny_stage_while_session_live` in
+   * `stages::run_stage` refuses even a dry run, since it exists to protect
+   * artifacts the live session has open, not to avoid a real mutation. Only
+   * disabling the real Run button (and leaving Dry-run offered) would just
+   * move the failure from "disabled, explained" to "clicked, then refused". */
+  const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
+
   onMount(async () => {
     try {
       const state = await getAppState();
@@ -64,10 +74,10 @@
     // way). A required-but-unselected bottle still shows the `<name>`
     // placeholder so the command reads as a template.
     if (card.needsBottle) {
-      return `./demo.sh ${card.stage} --bottle ${selectedBottle || "<name>"}`;
+      return `./demo.sh ${card.stage} --bottle ${shQuote(selectedBottle || "<name>")}`;
     }
     return selectedBottle
-      ? `./demo.sh ${card.stage} --bottle ${selectedBottle}`
+      ? `./demo.sh ${card.stage} --bottle ${shQuote(selectedBottle)}`
       : `./demo.sh ${card.stage}`;
   }
 
@@ -137,11 +147,18 @@
                 {copiedStage === card.stage ? "Copied" : "Copy"}
               </button>
             </div>
+            {#if sessionLive}
+              <p class="text-muted stage-live-note">
+                A session is live — Setup/Build/Install are refused until it's stopped.
+              </p>
+            {/if}
             <div class="stage-card-actions">
-              <button class="btn btn-secondary" onclick={() => run(card, true)}>Dry-run</button>
+              <button class="btn btn-secondary" disabled={sessionLive} onclick={() => run(card, true)}>
+                Dry-run
+              </button>
               <button
                 class="btn btn-primary"
-                disabled={card.needsBottle && !selectedBottle}
+                disabled={sessionLive || (card.needsBottle && !selectedBottle)}
                 onclick={() => run(card, false)}
               >
                 Run
@@ -227,6 +244,10 @@
     flex: none;
     font-size: 11.5px;
     padding: 2px 8px;
+  }
+  .stage-live-note {
+    font-size: 11.5px;
+    margin: 0;
   }
   .stage-card-actions {
     display: flex;

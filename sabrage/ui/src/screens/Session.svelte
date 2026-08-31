@@ -1,6 +1,12 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import { getAppState, type LaunchOpts, type SessionStatus, type StageEvent } from "../ipc";
+  import {
+    canStop as sessionCanStop,
+    getAppState,
+    type LaunchOpts,
+    type SessionStatus,
+    type StageEvent,
+  } from "../ipc";
   import { demoRunCommand } from "../lib/demo";
   import { sessionStore } from "../stores/session.svelte";
   import { settingsStore } from "../stores/settings.svelte";
@@ -9,8 +15,16 @@
 
   interface Props {
     onNavigate?: (screen: Screen) => void;
+    /** Bumped by App.svelte on every Pipeline ▸ Launch menu firing (⌘R). A
+     * change is picked up by the `$effect` below, which waits for this
+     * screen's own bottle/options load and then calls `doLaunch(false)` —
+     * the exact function the Launch button's own `onclick` calls — rather
+     * than duplicating any launch logic here. `0` (the default) never
+     * triggers anything; only a change away from the last-handled value
+     * does. */
+    launchRequest?: number;
   }
-  let { onNavigate }: Props = $props();
+  let { onNavigate, launchRequest = 0 }: Props = $props();
 
   // ── bottle + launch options ─────────────────────────────────────────────────
 
@@ -146,6 +160,33 @@
     });
   }
 
+  // ── menu-triggered launch (Pipeline ▸ Launch, ⌘R) ───────────────────────────
+  // App.svelte navigates here and bumps `launchRequest`; this effect waits for
+  // this screen's own mount-time bottle/options load (`bottlesLoaded`) and then
+  // calls `doLaunch` — never a second, hand-duplicated launch call — so a
+  // menu-triggered launch behaves exactly like clicking the Launch button
+  // below with whatever bottle/options this screen already has selected.
+
+  let lastHandledLaunchRequest = $state(0);
+  let launchRequestNotice = $state<string | null>(null);
+
+  $effect(() => {
+    const reqId = launchRequest;
+    if (reqId === lastHandledLaunchRequest) return;
+    if (!bottlesLoaded) return; // re-evaluated once the mount-time load settles
+    lastHandledLaunchRequest = reqId;
+    if (busy) {
+      launchRequestNotice = "A launch or stage is already in progress.";
+      return;
+    }
+    if (!selectedBottle) {
+      launchRequestNotice = "No bottle selected — choose one below, then Launch.";
+      return;
+    }
+    launchRequestNotice = null;
+    doLaunch(false);
+  });
+
   // ── reconcile banner ─────────────────────────────────────────────────────────
   // Derived from already-documented sessionStore surface only
   // (`status` + `reconcileRows`) rather than a bespoke "what kind of
@@ -256,6 +297,7 @@
     stopping: "Stopping",
     exited: "Exited",
     detached: "Detached",
+    external: "External",
   };
   const PHASE_CLASS: Record<SessionStatus["phase"], string> = {
     idle: "phase-idle",
@@ -266,6 +308,7 @@
     stopping: "phase-amber",
     exited: "phase-idle",
     detached: "phase-idle",
+    external: "phase-amber",
   };
 
   function formatUptime(ms: number): string {
@@ -289,13 +332,12 @@
   }
 
   const hasSession = $derived(status.phase !== "idle");
-  const canStop = $derived(
-    status.phase === "running" ||
-      status.phase === "stalled" ||
-      status.phase === "launching" ||
-      status.phase === "preflight" ||
-      status.phase === "detached",
-  );
+  // `ipc.ts`'s `canStop` (== `isLivePhase`, every phase but idle/exited) — was
+  // a hand-rolled list here that omitted `"stopping"` and the newer
+  // `"external"` (a session Sabrage didn't start but can still stop; the
+  // recordless `stop` stage handles it). Using the shared predicate is what
+  // keeps this screen in sync with a new `SessionPhase` automatically.
+  const canStop = $derived(sessionCanStop(status.phase));
 </script>
 
 <div class="screen-header">
@@ -383,6 +425,10 @@
         <code class="cmd-text">{equivalentCommand()}</code>
         <button class="btn btn-ghost cmd-copy-btn" onclick={copyCommand}>{copied ? "Copied" : "Copy"}</button>
       </div>
+
+      {#if launchRequestNotice}
+        <p class="text-muted launch-request-notice">{launchRequestNotice}</p>
+      {/if}
 
       <div class="launch-actions">
         <button class="btn btn-secondary" disabled={busy} onclick={() => doLaunch(true)}>Dry-run</button>
@@ -597,6 +643,10 @@
     flex: none;
     font-size: 11.5px;
     padding: 2px 8px;
+  }
+  .launch-request-notice {
+    font-size: 11.5px;
+    margin: 0;
   }
   .launch-actions {
     display: flex;

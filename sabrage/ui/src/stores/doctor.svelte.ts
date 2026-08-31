@@ -26,18 +26,24 @@ function createDoctorStore() {
   let summary = $state<DoctorSummary | null>(null);
   let error = $state<string | null>(null);
   let hasRun = $state(false);
+  /** Wall-clock timestamp of the last run's settlement (success or error) —
+   * lets a screen re-mount skip re-firing a full pass when the last one is
+   * still fresh. `null` until the first run settles. */
+  let lastRunAtMs = $state<number | null>(null);
   let bottles = $state<string[]>([]);
   let bottlesLoaded = $state(false);
   /** `settings.json`'s `defaultBottle` as reported by `get_app_state` (Phase 4)
    * — the Doctor screen's first choice before its hardcoded "Steam" fallback. */
   let defaultBottle = $state<string | null>(null);
 
-  /** The one row (if any) standing in for "currently running". */
-  function runningSlug(): string | null {
+  /** The one row (if any) standing in for "currently running" — `$derived` so
+   * every row's read is an O(1) property access instead of each re-running
+   * its own linear scan over `rows` per render. */
+  const runningSlugValue = $derived.by((): string | null => {
     if (!running) return null;
     const next = rows.find((r) => r.phase === "waiting");
     return next?.slug ?? null;
-  }
+  });
 
   async function loadBottles() {
     try {
@@ -74,9 +80,16 @@ function createDoctorStore() {
       summary = result;
     } catch (e) {
       error = e instanceof Error ? e.message : String(e);
+      // A rerun that rejects before reporting every slug must not leave the
+      // PREVIOUS run's rows sitting dim forever with no explanation — drop
+      // every placeholder this run never got to reporting on. Rows this run
+      // DID report before rejecting (`phase === "done"`, set by the callback
+      // above) stay.
+      rows = rows.filter((r) => r.phase === "done");
     } finally {
       running = false;
       hasRun = true;
+      lastRunAtMs = Date.now();
     }
   }
 
@@ -96,6 +109,9 @@ function createDoctorStore() {
     get hasRun() {
       return hasRun;
     },
+    get lastRunAtMs() {
+      return lastRunAtMs;
+    },
     get bottles() {
       return bottles;
     },
@@ -110,7 +126,7 @@ function createDoctorStore() {
       return summary?.failCount ?? 0;
     },
     get runningSlug() {
-      return runningSlug();
+      return runningSlugValue;
     },
     loadBottles,
     run,

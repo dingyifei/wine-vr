@@ -11,6 +11,7 @@ import {
   detachSession as ipcDetachSession,
   getSessionStatus,
   IDLE_SESSION_STATUS,
+  isLivePhase,
   launch as ipcLaunch,
   onQuitRequested,
   onSessionStatus,
@@ -53,6 +54,28 @@ function createSessionStore() {
    * as the fallback, exactly like the non-run stage path's `invokeError`/
    * `sawFatal` pair. */
   let lastError = $state<string | null>(null);
+  /** The `gameId` this store's own most recent `launch()` call was given
+   * (Library's Run button passes one; the plain Session screen's launches
+   * omit it, leaving this `null`). `SessionStatus` has no `gameId` field —
+   * this is the one place a caller can ask "was THIS session started for
+   * that Library entry" without falling back to bottle-name equality, which
+   * conflates every entry sharing a bottle. Kept (not cleared) once the
+   * session ends, same as `status.bottle` staying populated through
+   * `"exited"` — a consumer comparing against a fresh `launch()` call's own
+   * `gameId` clears the ambiguity on its own. */
+  let launchedGameId = $state<string | null>(null);
+
+  /** The one place `status` is assigned. A session that turns live while no
+   * `launch()` of ours is in flight was started elsewhere (demo.sh, a
+   * re-attach at app start) — it cannot belong to the entry our last
+   * `launch()` was given, so forget that id rather than let a stale value
+   * pin "Running" on the wrong Library row. */
+  function applyStatus(next: SessionStatus): void {
+    if (!launching && isLivePhase(next.phase) && !isLivePhase(status.phase)) {
+      launchedGameId = null;
+    }
+    status = next;
+  }
 
   async function launch(opts: LaunchOpts): Promise<StageOutcome> {
     launching = true;
@@ -60,6 +83,7 @@ function createSessionStore() {
     launchedAt = null;
     lastOutcome = null;
     lastError = null;
+    launchedGameId = opts.gameId ?? null;
     try {
       const outcome = await ipcLaunch(opts, (ev) => {
         launchRows.push(ev);
@@ -130,7 +154,7 @@ function createSessionStore() {
    * already held, same as the mount-time seed below. */
   async function refreshStatus(): Promise<void> {
     try {
-      status = await getSessionStatus();
+      applyStatus(await getSessionStatus());
     } catch {
       // best-effort — see doc comment above
     }
@@ -170,11 +194,11 @@ function createSessionStore() {
   // best-effort mount-time fetch in this codebase.
   void getSessionStatus()
     .then((s) => {
-      status = s;
+      applyStatus(s);
     })
     .catch(() => {});
   void onSessionStatus((s) => {
-    status = s;
+    applyStatus(s);
   });
   void onQuitRequested(() => {
     quitRequested = true;
@@ -198,6 +222,9 @@ function createSessionStore() {
     },
     get lastError() {
       return lastError;
+    },
+    get launchedGameId() {
+      return launchedGameId;
     },
     get reconcileResult() {
       return reconcileResult;

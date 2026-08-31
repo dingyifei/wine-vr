@@ -203,45 +203,90 @@ export interface FixRunOpts {
 
 /** Static metadata about each fix — hand-mirrors `sabrage_core::fixes::fix_defs()`
  * plus `FixAction::as_stage()`. Only `runInstall` needs admin; only
- * `deleteSessionJson` is destructive; `stage` names the whole-stage fixes
- * whose intended UI path is `runStage` directly (see `contractFixIdToAction`'s
- * doc comment) rather than `applyFix`. */
+ * `deleteSessionJson` is destructive (and carries a `consequence` the confirm
+ * dialog must show); `stage` names the whole-stage fixes whose intended UI
+ * path is `runStage` directly (see `contractFixIdToAction`'s doc comment)
+ * rather than `applyFix`.
+ *
+ * Every fix is additionally `forbidden_while_session_live` on the Rust side
+ * and refused by `fixes::apply` before it takes the operation lock, so a Fix
+ * button offered during a live session fails with a remedy rather than
+ * mutating; disable them with `blocksMutation(status.phase)` so the user
+ * learns that before clicking. */
 export const FIX_META: Record<
   FixAction,
-  { title: string; needsAdmin: boolean; destructive: boolean; stage: Stage | null }
+  {
+    title: string;
+    needsAdmin: boolean;
+    destructive: boolean;
+    stage: Stage | null;
+    /** What the user must know *before* confirming, for a remedy whose known
+     * outcome is worse than the row it fixes (`fixes::FixDef::consequence`).
+     * A confirm dialog must render this **instead of** a generic "this cannot
+     * be undone" — the disclosure belongs before the mutation, not in the
+     * report after it. `null` for every ordinary fix. */
+    consequence: string | null;
+  }
 > = {
   "set-graphics-backend": {
     title: "force the bottle's graphics backend to dxmt",
     needsAdmin: false,
     destructive: false,
     stage: null,
+    consequence: null,
   },
   "restage-helper": {
     title: "restage the arm64 encoder helper",
     needsAdmin: false,
     destructive: false,
     stage: null,
+    consequence: null,
   },
   "remove-adb-forwards": {
     title: "remove the stale adb port forwards",
     needsAdmin: false,
     destructive: false,
     stage: null,
+    consequence: null,
   },
   "delete-session-json": {
     title: "delete ALVR's session.json (clears pinned client IPs)",
     needsAdmin: false,
     destructive: true,
     stage: null,
+    consequence:
+      "Known-bad remedy: deleting this file has been observed to leave the client at " +
+      "an 800x900 black screen. The file is copied to Application " +
+      "Support/Sabrage/backups first, and editing the pinned IP in place is the " +
+      "recovery that works.",
   },
-  "run-setup": { title: "run setup", needsAdmin: false, destructive: false, stage: "setup" },
-  "run-build": { title: "run build", needsAdmin: false, destructive: false, stage: "build" },
-  "run-install": { title: "run install", needsAdmin: true, destructive: false, stage: "install" },
+  "run-setup": {
+    title: "run setup",
+    needsAdmin: false,
+    destructive: false,
+    stage: "setup",
+    consequence: null,
+  },
+  "run-build": {
+    title: "run build",
+    needsAdmin: false,
+    destructive: false,
+    stage: "build",
+    consequence: null,
+  },
+  "run-install": {
+    title: "run install",
+    needsAdmin: true,
+    destructive: false,
+    stage: "install",
+    consequence: null,
+  },
   "edit-protocol": {
-    title: 'set protocol = "alvr"',
+    title: 'set protocol = "alvr" in oxrsys-runtime.toml',
     needsAdmin: false,
     destructive: false,
     stage: null,
+    consequence: null,
   },
 };
 
@@ -300,6 +345,11 @@ export async function cancelStage(runId: string): Promise<boolean> {
  * `sessionStore.stop()` is the intended call site for both — it supplies
  * `bottle` from `sessionStore.status.bottle` so callers never need to track
  * one themselves.
+ *
+ * The live-session branch **rejects** when teardown did not actually finish:
+ * it timed out (the session may still be running), or the run detached
+ * instead of stopping. Show that message — it used to resolve `ok: true`
+ * regardless, so "Stopped" could appear over a still-running game.
  */
 export async function stopSession(
   bottle: string | null | undefined,
@@ -340,7 +390,14 @@ export async function applyFix(
 // Mirrors `sabrage_core::session` (via `src-tauri/src/commands.rs`).
 
 /** Mirrors `sabrage_core::session::SessionPhase` (serde camelCase — every
- * word is already lowercase, so this looks like plain lowercase). */
+ * word is already lowercase, so this looks like plain lowercase).
+ *
+ * `"external"` is a session **nothing in Sabrage started** — no live handle,
+ * no `session-state.json`, but a fresh `runtime_status.json` naming a live
+ * pid, i.e. a `./demo.sh run` in another terminal. It is a live session in
+ * every way that matters to this UI (see `isLivePhase`): reporting it as
+ * `"idle"` invites a second launch over a running game. `stopSession()` can
+ * target it — the `stop` stage works recordless. */
 export type SessionPhase =
   | "idle"
   | "preflight"
@@ -349,7 +406,56 @@ export type SessionPhase =
   | "stalled"
   | "stopping"
   | "exited"
-  | "detached";
+  | "detached"
+  | "external";
+
+/** Is something running (or about to be) that a mutating action must not
+ * disturb? The one definition of "a session is live" for the whole UI —
+ * screens used to re-derive their own phase sets, and drifted.
+ *
+ * `"exited"` is not live (the wine child is gone, the row is just the last
+ * session's epitaph) and neither is `"idle"`. Everything else is. */
+export function isLivePhase(phase: SessionPhase): boolean {
+  return phase !== "idle" && phase !== "exited";
+}
+
+/** Is the game actually up (as opposed to starting, stopping, or someone
+ * else's)? `"stalled"` counts: the documented standby freeze is a running
+ * session that stopped streaming. */
+export function isActivePhase(phase: SessionPhase): boolean {
+  return phase === "running" || phase === "stalled";
+}
+
+/** May Sabrage mutate the machine right now (setup/build/install, a Doctor
+ * fix, a config write)? The frontend half of
+ * `sabrage_core::session::ensure_idle` / `stages::live_session_block` — the
+ * backend refuses these too, so this is for disabling buttons with an
+ * explanation rather than for correctness. */
+export function blocksMutation(phase: SessionPhase): boolean {
+  return isLivePhase(phase);
+}
+
+/** Is there something for a Stop button to act on? Same set as `isLivePhase`
+ * — `stopSession()` handles all of them (its own cancel token for a session
+ * this process supervises, the bottle-scoped `stop` stage otherwise). */
+export function canStop(phase: SessionPhase): boolean {
+  return isLivePhase(phase);
+}
+
+/** One phase -> one semantic tone, so every screen's dot/pill/badge agrees.
+ * `satisfies` (not `:`) so a new `SessionPhase` member is a type error here
+ * rather than an `undefined` at runtime. */
+export const PHASE_TONE = {
+  idle: "muted",
+  preflight: "warn",
+  launching: "warn",
+  running: "ok",
+  stalled: "bad",
+  stopping: "warn",
+  exited: "muted",
+  detached: "warn",
+  external: "warn",
+} satisfies Record<SessionPhase, "ok" | "warn" | "bad" | "muted">;
 
 /** Mirrors `sabrage_core::session::EncoderInfo` — the most recent `encoder
  * ready …` log line, when one has been seen. `path` is `"native helper"` or
@@ -511,8 +617,15 @@ export interface SessionState {
 export type Reconciled =
   | { kind: "noSession" }
   | { kind: "live"; state: SessionState }
-  | { kind: "dead"; state: SessionState; restored: string[] }
-  | { kind: "identityMismatch"; state: SessionState; restored: string[] };
+  /** `pending` — a guard could not be released, so the record was kept rather
+   * than cleared; the next launch must not overwrite it blind. */
+  | { kind: "dead"; state: SessionState; restored: string[]; pending: boolean }
+  | { kind: "identityMismatch"; state: SessionState; restored: string[]; pending: boolean }
+  /** The record belongs to somebody — a launch in flight here, another live
+   * front-end, or a newer Sabrage. Reported and nothing else: nothing
+   * restored, nothing signalled, the file untouched. `reason` is the row the
+   * user saw. */
+  | { kind: "busy"; state: SessionState; reason: string };
 
 /** `reconcileSession`'s return: the classification plus every human line
  * emitted while producing it (mirrors `commands::ReconcileReport` — the field
@@ -573,7 +686,9 @@ export async function startLogTail(
   return invoke<number>("start_log_tail", { source, onBatch: channel });
 }
 
-/** Stop a tail started by `startLogTail`. */
+/** Stop a tail started by `startLogTail`. Tails also stop themselves when
+ * their task ends and are all stopped on a webview reload, so an id may
+ * already be gone; that is not an error. */
 export async function stopLogTail(id: number): Promise<void> {
   return invoke("stop_log_tail", { id });
 }
@@ -600,7 +715,15 @@ export type QuitChoice = "stop" | "keep" | "cancel";
 /** Resolve the pending quit-while-live dialog (`onQuitRequested`). `"stop"`/
  * `"keep"` end by exiting the app from the Rust side — do not expect this
  * promise's *settlement* to be observable from the webview either way, only
- * `"cancel"` reliably returns control to the caller. */
+ * `"cancel"` reliably returns control to the caller.
+ *
+ * `"stop"` rejects (while still exiting) when teardown did not finish inside
+ * its 30 s budget: Sabrage then detaches instead — guards disarmed, the
+ * record marked detached, the game left running — rather than exiting with a
+ * half-torn-down session. A quit dialog left unanswered for 20 s is also
+ * given up on: the next quit request is no longer intercepted at all and the
+ * app exits through the same keep-running path, so a webview that died before
+ * subscribing to `onQuitRequested` can never make Sabrage unquittable. */
 export async function resolveQuit(choice: QuitChoice): Promise<void> {
   return invoke("resolve_quit", { choice });
 }
@@ -612,8 +735,35 @@ export async function onSessionStatus(cb: (status: SessionStatus) => void): Prom
   return listen<SessionStatus>("session://status", (event) => cb(event.payload));
 }
 
+/** A run that has an id and a cancellation handle but is still waiting for the
+ * process-wide operation lock — mirrors `commands::QueuedStage`. */
+export interface QueuedStage {
+  runId: string;
+  stage: Stage;
+}
+
+/**
+ * Subscribe to `stage://queued` — fired when a `runStage`/`launch`/
+ * `stopSession` call finds another operation already in flight and has to
+ * wait for it.
+ *
+ * `run_stage` takes the operation lock *before* emitting its first
+ * `stageStarted`, so until this event existed a queued run had no id the UI
+ * could offer Cancel for: the button stayed disabled for the whole wait, and
+ * then the stage mutated the machine when its turn came. Cancelling on this
+ * id works — the executor fails every filesystem primitive once the token
+ * fires, so a run cancelled while queued is a no-op when it finally gets the
+ * lock. Treat it exactly like `stageStarted`'s `runId` (and expect
+ * `stageStarted` for the same run later).
+ */
+export async function onStageQueued(cb: (queued: QueuedStage) => void): Promise<UnlistenFn> {
+  return listen<QueuedStage>("stage://queued", (event) => cb(event.payload));
+}
+
 /** Subscribe to `app://quit-requested` — fired when `ExitRequested`/
- * `CloseRequested` was intercepted because a session is still live. */
+ * `CloseRequested` was intercepted because a session is still live. Answer it
+ * with `resolveQuit` — a dialog left unanswered past 20 s is given up on and
+ * the next quit request exits the app (detaching from the session). */
 export async function onQuitRequested(cb: () => void): Promise<UnlistenFn> {
   return listen("app://quit-requested", () => cb());
 }
@@ -722,6 +872,15 @@ export async function readRuntimeConfig(): Promise<RuntimeConfigView> {
  * when the file has a `parseError` (edits are refused rather than risking an
  * unreadable rewrite — fix the file by hand first) or on a validation/IPC
  * failure. A patch that changes nothing writes no backup and no file.
+ *
+ * **Rejects while a session is live**, with `./demo.sh stop --bottle <name>`
+ * as the remedy. The runtime re-reads this file every 250 ms and rebuilds the
+ * encoder when `encoderProcess`/`videoCodec` move, so a save mid-stream is a
+ * live reconfiguration, not a next-launch setting — disable Save while
+ * `blocksMutation(sessionStore.status.phase)` rather than promising "values
+ * take effect at the next launch". It also serializes against
+ * setup/build/install and the `edit-protocol` fix (the process-wide operation
+ * lock), so a save can block briefly behind one of those.
  */
 export async function writeRuntimeConfig(patch: RuntimeConfigPatch): Promise<WriteReport> {
   return invoke<WriteReport>("write_runtime_config", { patch });
@@ -742,8 +901,17 @@ export interface LaunchDefaults {
   verbose: boolean;
 }
 
-/** Mirrors `store::settings::Settings` (serde camelCase). */
+/** Mirrors `store::settings::Settings` (serde camelCase).
+ *
+ * The index signature is the wire half of the store's `#[serde(flatten)]
+ * extra` map: a newer Sabrage's keys are read and written back verbatim, so
+ * running an older build and toggling one control no longer strips them.
+ * Keep spreading the loaded object (`{ ...settings, ...patch }`) rather than
+ * rebuilding one field by field, or the extras are dropped before they reach
+ * the backend. */
 export interface Settings {
+  /** `store::settings::SETTINGS_VERSION` at write time. */
+  version: number;
   repoRoot: string | null;
   defaultBottle: string | null;
   defaultBsDir: string | null;
@@ -754,6 +922,9 @@ export interface Settings {
    * one-time "Sabrage edits this file in place" dialog; gates that dialog,
    * not the edit itself. */
   runtimeConfigEditAcknowledged: boolean;
+  /** Top-level keys this build has no field for — a newer schema's. Opaque:
+   * pass them through untouched. */
+  [key: string]: unknown;
 }
 
 /** Missing `settings.json` resolves to `Settings` field defaults, not a
@@ -762,8 +933,9 @@ export async function getSettings(): Promise<Settings> {
   return invoke<Settings>("get_settings");
 }
 
-/** Persist `settings` and return it back as saved (unknown-field-stripped,
- * same shape). */
+/** Persist `settings` and return it back as saved (same shape, including any
+ * unknown top-level keys, which now round-trip). Rejects when `$HOME` is
+ * missing/empty/non-absolute rather than writing the store somewhere else. */
 export async function saveSettings(settings: Settings): Promise<Settings> {
   return invoke<Settings>("save_settings", { settings });
 }
@@ -779,6 +951,18 @@ export interface RepoInfo {
   contractSynced: boolean | null;
   hostManifestLibraryPath: string | null;
   hostManifestPointsHere: boolean | null;
+  /** The `contract/` digest this Sabrage **binary** was compiled with. */
+  compiledContractSha256: string;
+  /** The same digest recomputed from the resolved checkout's `contract/`
+   * files; `null` when there is no root to hash. */
+  checkoutContractSha256: string | null;
+  /** Do they agree? `false` means this build is executing a different
+   * contract — different pins, ports, artifact lists and check registry —
+   * than the checkout it is pointed at; rebuild Sabrage from this checkout,
+   * or point `repoRoot` at the one it was built from. `contractSynced`
+   * answers a different question (is `contract.gen.sh` a fresh rendering of
+   * `contract/`) and can be `true` while this is `false`. */
+  binaryContractMatches: boolean | null;
 }
 
 export async function getRepoInfo(): Promise<RepoInfo> {
@@ -824,8 +1008,19 @@ export interface GameEntry {
 
 /** Mirrors `store::library::GoldbergState` (serde camelCase) — whether
  * `steam_api64.dll` in `bsDir` is the Goldberg build Sabrage installs, the
- * untouched Steam original, something else entirely, or absent. */
-export type GoldbergState = "applied" | "original" | "modified" | "noDll";
+ * untouched Steam original, something else entirely, or absent.
+ *
+ * `"appliedUnverified"` is Goldberg installed with **no** `.orig-steam`
+ * backup: this install arrived already Goldberg'd (or the backup was
+ * deleted), so no copy of the real Steam dll exists on this machine at all.
+ * Deliberately not `"original"` — the bytes are provably Goldberg's — and
+ * `revertOriginalSteamDll` has nothing to restore from. */
+export type GoldbergState =
+  | "applied"
+  | "appliedUnverified"
+  | "original"
+  | "modified"
+  | "noDll";
 
 /** Mirrors `store::library::GameStatus` (serde camelCase) — the Library
  * table's status tag. */
@@ -900,13 +1095,27 @@ export interface RevertReport {
 /**
  * Restore `steam_api64.dll.orig-steam` back over `steam_api64.dll` for the
  * library entry named `gameId`. A no-op (`restored: false`, explanatory
- * `message`) when there is no `.orig-steam` to restore from. The next launch
- * re-applies Goldberg regardless — `message` says so
- * (`// DIVERGENCE:` from run.sh, which never restores; see `PARITY.md`).
- * Rejects while a session is live.
+ * `message`) when there is no `.orig-steam` to restore from, or when the
+ * backup is itself the pinned Goldberg dll — nothing here can prove a backup
+ * is the real Steam dll, so the message says "the .orig-steam backup", never
+ * "the original". The next launch re-applies Goldberg regardless — `message`
+ * says so (`// DIVERGENCE:` from run.sh, which never restores; see
+ * `PARITY.md`). Rejects while a session is live.
+ *
+ * `expectedBsDir` is the Beat Saber directory the screen showed and
+ * validated. This command mutates the entry's **saved** `bsDir`, so a form
+ * with an unsaved path edit would otherwise overwrite a dll in a different
+ * installation than the one on screen; pass it and the backend fails closed
+ * on a mismatch. Optional only so a caller that renders no path can omit it.
  */
-export async function revertOriginalSteamDll(gameId: string): Promise<RevertReport> {
-  return invoke<RevertReport>("revert_original_steam_dll", { gameId });
+export async function revertOriginalSteamDll(
+  gameId: string,
+  expectedBsDir?: string | null,
+): Promise<RevertReport> {
+  return invoke<RevertReport>("revert_original_steam_dll", {
+    gameId,
+    expectedBsDir: expectedBsDir ?? null,
+  });
 }
 
 // ── native dialogs ───────────────────────────────────────────────────────────

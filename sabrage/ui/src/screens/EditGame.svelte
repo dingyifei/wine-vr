@@ -9,6 +9,7 @@
 
   import { onMount } from "svelte";
   import {
+    isLivePhase,
     suggestBsDir,
     getAppState,
     newGameTemplate,
@@ -39,6 +40,7 @@
 
   const GOLDBERG_LABEL: Record<GoldbergState, string> = {
     applied: "applied",
+    appliedUnverified: "applied — no .orig-steam backup",
     original: "original steam_api64.dll still present",
     modified: "unrecognized dll — reapplied at next launch",
     noDll: "no steam_api64.dll found yet",
@@ -51,6 +53,12 @@
   /** The working copy — deep-cloned off the store/template so edits here
    * never mutate `libraryStore.rows` before Save. */
   let entry = $state<GameEntry | null>(null);
+  /** `entry.bsDir` as loaded (persisted) — `revertOriginalSteamDll` mutates
+   * the row's *saved* `bsDir`, not this unsaved draft (see `doRevert`'s
+   * `expectedBsDir`, which the backend fails closed against on a mismatch).
+   * `null` for the Add-game path (`gameId === null`), where Revert never
+   * renders at all. */
+  let loadedBsDir = $state<string | null>(null);
 
   let bottles = $state<string[]>([]);
   let bottlesLoaded = $state(false);
@@ -77,6 +85,7 @@
           return;
         }
         entry = structuredClone(row.entry);
+        loadedBsDir = row.entry.bsDir;
       } else {
         entry = await newGameTemplate();
       }
@@ -183,7 +192,19 @@
 
   // ── revert original steam_api64.dll ─────────────────────────────────────
 
-  const canRevert = $derived(!!validity?.origSteamPresent && sessionStore.status.phase === "idle");
+  // The backend deliberately leaves `phase` at `"exited"` after a session
+  // ends until the next launch — `!== "idle"` disabled Revert forever after
+  // one clean run, even though that run is exactly what creates the
+  // `.orig-steam` backup this button restores. `isLivePhase` is the same
+  // shared predicate `blocksMutation`/Session.svelte use, and excludes
+  // `"exited"`.
+  /** Has the draft path diverged from the persisted row Revert would
+   * actually target? Purely advisory — a proactive hint, not the safety
+   * boundary: the backend refuses the mismatch either way (see `doRevert`).
+   */
+  const bsDirDirty = $derived(!!entry && loadedBsDir !== null && entry.bsDir !== loadedBsDir);
+
+  const canRevert = $derived(!!validity?.origSteamPresent && !isLivePhase(sessionStore.status.phase));
 
   let revertConfirm = $state(false);
   let reverting = $state(false);
@@ -191,11 +212,16 @@
   let revertError = $state<string | null>(null);
 
   async function doRevert() {
-    if (!gameId) return;
+    if (!gameId || !entry) return;
     reverting = true;
     revertError = null;
     try {
-      revertReport = await revertOriginalSteamDll(gameId);
+      // `entry.bsDir` is the draft path this form validated and displayed —
+      // pass it as `expectedBsDir` so the backend fails closed if it differs
+      // from the *persisted* row's `bsDir` (what it would actually mutate),
+      // rather than silently reverting a different installation than the one
+      // on screen. See `revertOriginalSteamDll`'s doc comment.
+      revertReport = await revertOriginalSteamDll(gameId, entry.bsDir);
       revertConfirm = false;
       void runValidate();
     } catch (e) {
@@ -219,7 +245,8 @@
     saving = true;
     saveError = null;
     try {
-      await libraryStore.save(entry);
+      const row = await libraryStore.save(entry);
+      loadedBsDir = row.entry.bsDir;
       onDone();
     } catch (e) {
       saveError = e instanceof Error ? e.message : String(e);
@@ -361,8 +388,13 @@
               <button class="btn btn-secondary" disabled={!canRevert} onclick={() => (revertConfirm = true)}>
                 Revert original steam_api64.dll
               </button>
-              {#if validity && !canRevert && validity.origSteamPresent && sessionStore.status.phase !== "idle"}
+              {#if validity && !canRevert && validity.origSteamPresent && isLivePhase(sessionStore.status.phase)}
                 <div class="text-muted revert-note">A session is live — stop it first.</div>
+              {:else if canRevert && bsDirDirty}
+                <div class="text-muted revert-note">
+                  Save your path change first — Revert acts on the saved install dir ({loadedBsDir}), not this
+                  unsaved edit.
+                </div>
               {/if}
             {/if}
             {#if revertReport}

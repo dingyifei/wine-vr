@@ -8,26 +8,46 @@
 import type { LaunchOpts } from "../ipc";
 
 /**
- * Mirrors Session.svelte's original `equivalentCommand()` exactly — same flag
- * order (`--bottle` → `--bs-dir` → `--no-audio` → `--no-dashboard` →
- * `--wired` → `--verbose`) and same quoting (`bsDir` double-quoted verbatim,
- * no escaping; every other flag is a bare switch, no `=value` form, matching
- * `demo.sh`'s own parser).
+ * Single-quote a value for safe use in a copy-pasted zsh command line —
+ * single-quote encoding, embedded apostrophes escaped as `'\''` (close the
+ * quote, an escaped literal apostrophe, reopen the quote). Unlike bare or
+ * double-quoted interpolation, single quotes disable every shell
+ * metacharacter inside them — `$()`/backticks/`$VAR`/`"` all come through
+ * literally, so a pasted path can't expand or execute anything.
+ *
+ * A value already safe bare (matches the allow-list below) is returned
+ * unquoted so the common case still reads like the README's plain examples;
+ * the literal `<name>` placeholder is always returned bare regardless — it
+ * is not a real value the shell will ever see, quoting it would just make
+ * the template read oddly (`'<name>'`).
+ */
+export function shQuote(v: string): string {
+  if (v === "<name>") return v;
+  if (/^[A-Za-z0-9_.\/:@%+=-]+$/.test(v)) return v;
+  return `'${v.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Mirrors Session.svelte's original `equivalentCommand()` — same flag order
+ * (`--bottle` → `--bs-dir` → `--no-audio` → `--no-dashboard` → `--wired` →
+ * `--verbose`); every other flag is a bare switch, no `=value` form, matching
+ * `demo.sh`'s own parser. `bottle`/`bsDir` are now quoted with `shQuote`
+ * (single-quote encoding) rather than bare double quotes — a bottle or
+ * directory containing `$()`, backticks, `"`, `\`, or `'` used to come
+ * through unescaped, so pasting the copied command could execute the
+ * embedded shell syntax instead of passing it through as one argument.
  *
  * `opts.bottle` renders as the literal placeholder `<name>` when falsy (no
  * bottle chosen yet) — not trimmed first, matching the original's
  * `selectedBottle || "<name>"`. `opts.bsDir` is trimmed and the whole
- * `--bs-dir "…"` pair is omitted when that trims to empty. `gameId`/`dryRun`
+ * `--bs-dir …` pair is omitted when that trims to empty. `gameId`/`dryRun`
  * have no `demo.sh run` flag and are ignored.
  */
 export function demoRunCommand(opts: LaunchOpts): string {
   const bottle = opts.bottle || "<name>";
-  // Quote exactly like `--bs-dir` below whenever the shell would otherwise
-  // split it (a bottle named "Beat Saber" is legal in CrossOver) — a bare
-  // name stays bare so the common case reads like the README's examples.
-  const parts = ["./demo.sh", "run", "--bottle", /[^A-Za-z0-9_.<>-]/.test(bottle) ? `"${bottle}"` : bottle];
+  const parts = ["./demo.sh", "run", "--bottle", shQuote(bottle)];
   const bsDir = (opts.bsDir ?? "").trim();
-  if (bsDir) parts.push("--bs-dir", `"${bsDir}"`);
+  if (bsDir) parts.push("--bs-dir", shQuote(bsDir));
   if (opts.noAudio) parts.push("--no-audio");
   if (opts.noDashboard) parts.push("--no-dashboard");
   if (opts.wired) parts.push("--wired");

@@ -23,6 +23,13 @@
    * entry). Only meaningful while `screen === "edit"`; stale otherwise. */
   let editGameId = $state<string | null>(null);
 
+  /** Bumped every time the Pipeline ▸ Launch menu item (⌘R) fires — Session
+   * watches this prop and calls its own `doLaunch(false)` once its bottle/
+   * options have loaded, so a menu-triggered launch runs through the exact
+   * same path as the Session screen's own Launch button rather than a second
+   * copy of the launch logic living here. */
+  let launchRequest = $state(0);
+
   function navigate(next: Screen) {
     screen = next;
   }
@@ -53,8 +60,10 @@
     let unlisten: (() => void) | undefined;
     void onMenu((id: string) => {
       if (id === "doctor") navigate("doctor");
-      else if (id === "launch") navigate("session");
-      else if (id === "stop") void sessionStore.stop();
+      else if (id === "launch") {
+        navigate("session");
+        launchRequest++;
+      } else if (id === "stop") void sessionStore.stop();
     }).then((fn) => {
       unlisten = fn;
     });
@@ -73,7 +82,7 @@
     {:else if screen === "edit"}
       <EditGame gameId={editGameId} onDone={doneEditing} onNavigate={navigate} />
     {:else if screen === "session"}
-      <Session onNavigate={navigate} />
+      <Session onNavigate={navigate} {launchRequest} />
     {:else if screen === "doctor"}
       <Doctor />
     {:else if screen === "logs"}

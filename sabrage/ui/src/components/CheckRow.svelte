@@ -8,12 +8,16 @@
     isRunning?: boolean;
     /** Disables the Fix button — set while a fix for THIS row is in flight. */
     busy?: boolean;
+    /** Non-null disables the Fix button and explains why via its `title`
+     * (e.g. a live session — every fix is refused server-side while one is
+     * running; this is the early, explained version of that refusal). */
+    disabledReason?: string | null;
     /** Present only when `row.fix` resolves to a modelled `FixAction`
      * (`contractFixIdToAction`); omit to render no Fix button at all. */
     onFix?: (fixId: string) => void;
   }
 
-  let { row, isRunning = false, busy = false, onFix }: Props = $props();
+  let { row, isRunning = false, busy = false, disabledReason = null, onFix }: Props = $props();
 
   const spinning = $derived(row.phase === "waiting" && isRunning);
   const placeholder = $derived(row.phase === "waiting" && !isRunning);
@@ -53,7 +57,12 @@
     {/if}
   </div>
   {#if showFix}
-    <button class="btn btn-secondary fix-btn" disabled={busy} onclick={() => onFix?.(row.fix!)}>
+    <button
+      class="btn btn-secondary fix-btn"
+      disabled={busy || !!disabledReason}
+      title={disabledReason ?? undefined}
+      onclick={() => onFix?.(row.fix!)}
+    >
       {busy ? "Fixing…" : "Fix"}
     </button>
   {/if}

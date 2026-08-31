@@ -2,8 +2,13 @@
   import { onMount } from "svelte";
   import CheckRow from "../components/CheckRow.svelte";
   import { doctorStore } from "../stores/doctor.svelte";
+  import { sessionStore } from "../stores/session.svelte";
   import { stageStore } from "../stores/stage.svelte";
-  import { applyFix, contractFixIdToAction, FIX_META, type FixAction } from "../ipc";
+  import { applyFix, blocksMutation, contractFixIdToAction, FIX_META, type FixAction } from "../ipc";
+
+  /** A Doctor run recent enough that re-navigating here shouldn't re-fire a
+   * full check pass — the "Run checks" button remains the forced refresh. */
+  const AUTORUN_STALE_MS = 60_000;
 
   interface FixError {
     slug: string;
@@ -25,8 +30,22 @@
   onMount(async () => {
     await doctorStore.loadBottles();
     selectedBottle = pickDefaultBottle(doctorStore.bottles, doctorStore.defaultBottle);
-    void runChecks();
+    // Skip the automatic pass when the last run is still fresh (e.g. flipping
+    // to another screen and back) — "Run checks" is always available as the
+    // explicit forced refresh.
+    const fresh =
+      doctorStore.hasRun &&
+      doctorStore.lastRunAtMs != null &&
+      Date.now() - doctorStore.lastRunAtMs < AUTORUN_STALE_MS;
+    if (!fresh) void runChecks();
   });
+
+  /** May Doctor mutate the machine right now? Every Fix is refused by the
+   * backend while a session is live (`fixes::apply` -> `deny_if_session_live`)
+   * — this only disables the button early so the user learns why before
+   * clicking, instead of after a failed IPC round trip pulls a live session's
+   * active adb forwards or clobbers a running install. */
+  const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
 
   async function runChecks() {
     await doctorStore.run({ bottle: selectedBottle || null });
@@ -47,6 +66,15 @@
    * button, whose `FixAction` comes straight off a `Fatal` event rather than
    * a contract id string. */
   function dispatchFix(slug: string, action: FixAction) {
+    if (sessionLive) {
+      fixError = {
+        slug,
+        message: "Refusing to run while a session is live — stop the session first.",
+        remedy: null,
+        fix: null,
+      };
+      return;
+    }
     const meta = FIX_META[action];
     if (meta.stage) {
       stageStore.openGate({
@@ -115,6 +143,11 @@
   }
 
   const summaryText = $derived.by(() => {
+    // A rerun that rejected before reporting every slug must not read as
+    // "Running checks…" forever — that text otherwise survives verbatim once
+    // `running` flips false, with nothing else in the header saying doctor
+    // actually failed.
+    if (doctorStore.error && !doctorStore.running) return "Doctor failed to complete";
     const s = doctorStore.summary;
     if (!s) {
       const done = doctorStore.rows.filter((r) => r.phase === "done").length;
@@ -160,16 +193,17 @@
 </div>
 
 <div class="screen-body">
+  {#if doctorStore.error}
+    <div class="blueprint error-card">
+      <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+      <h6>Could not run doctor</h6>
+      <p class="text-muted">{doctorStore.error}</p>
+    </div>
+  {/if}
   {#if doctorStore.rows.length === 0}
-    {#if doctorStore.error}
-      <div class="blueprint error-card">
-        <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
-        <h6>Could not run doctor</h6>
-        <p class="text-muted">{doctorStore.error}</p>
-      </div>
-    {:else if doctorStore.running}
+    {#if doctorStore.running}
       <p class="text-muted">Running checks…</p>
-    {:else}
+    {:else if !doctorStore.error}
       <p class="text-muted">Doctor checks have not run yet.</p>
     {/if}
   {:else}
@@ -182,6 +216,9 @@
           {row}
           isRunning={row.slug === doctorStore.runningSlug}
           busy={fixBusySlug === row.slug}
+          disabledReason={sessionLive
+            ? "Refusing to run while a session is live — stop the session first."
+            : null}
           onFix={(fixId) => handleFixRequest(row.slug, fixId)}
         />
       {/each}
@@ -209,7 +246,9 @@
     <div class="dialog blueprint elev-md confirm-dialog">
       <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
       <div class="dialog-title">{FIX_META[confirmFix.action].title}</div>
-      <p class="dialog-body">This cannot be undone. Continue?</p>
+      <p class="dialog-body">
+        {FIX_META[confirmFix.action].consequence ?? "This cannot be undone."} Continue?
+      </p>
       <div class="dialog-actions">
         <button class="btn btn-secondary" onclick={() => (confirmFix = null)}>Cancel</button>
         <button class="btn btn-primary" onclick={() => runFix(confirmFix!.slug, confirmFix!.action)}>

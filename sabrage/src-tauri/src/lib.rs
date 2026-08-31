@@ -117,6 +117,33 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
     )
 }
 
+/// What to do with one `ExitRequested`/`CloseRequested`
+/// ([`commands::quit_intercept_decision`], with this app's three live inputs).
+///
+/// `Ask` is the ordinary interception. `GiveUp` — a dialog that has gone
+/// unanswered past [`commands::QUIT_DIALOG_TIMEOUT`] and a user asking to quit
+/// again — is handled by *not* intercepting: the exit proceeds, and the
+/// `RunEvent::Exit` arm's `detach_on_terminate` then applies the same
+/// keep-running answer the un-interceptable AppKit `terminate:` path gets. The
+/// app can therefore never become unquittable because the webview died before
+/// it subscribed to `app://quit-requested`.
+fn quit_decision<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) -> commands::QuitIntercept {
+    let quit_approved = app_handle.state::<commands::QuitApproved>();
+    let pending = app_handle.state::<commands::PendingQuit>();
+    commands::quit_intercept_decision(
+        quit_approved.0.load(Ordering::SeqCst),
+        sabrage_core::live_session().is_some(),
+        pending.pending_for(),
+    )
+}
+
+/// Open (or re-open) the "stop / keep / cancel" dialog and start the
+/// unanswered-quit clock if it is not already running.
+fn ask_to_quit<R: tauri::Runtime>(app_handle: &tauri::AppHandle<R>) {
+    app_handle.state::<commands::PendingQuit>().mark();
+    let _ = app_handle.emit("app://quit-requested", ());
+}
+
 /// Builds and runs the app.
 ///
 /// Uses the callback form of `run` (`.build(context)?.run(|app, event| …)`
@@ -125,10 +152,11 @@ fn build_menu<R: tauri::Runtime>(handle: &tauri::AppHandle<R>) -> tauri::Result<
 /// intercepted: this app has exactly one window, and closing it is app-quit
 /// in every way that matters (critique.md, "app-quit semantics for a live
 /// session"), so both are gated by the same rule
-/// ([`commands::should_intercept_quit`]) — only a session this process is
-/// still supervising, and only while the pending quit has not already been
-/// approved, is worth stopping the OS teardown for. When it fires, the
-/// handler calls `prevent_exit`/`prevent_close` and emits
+/// ([`quit_decision`]) — only a session this process is still supervising,
+/// only while the pending quit has not already been approved, and only while
+/// the dialog it opens still has a plausible responder, is worth stopping the
+/// OS teardown for. When it fires, the handler calls
+/// `prevent_exit`/`prevent_close` and emits
 /// `app://quit-requested`; the frontend's dialog resolves that through
 /// `commands::resolve_quit`, whose `Stop`/`Keep` arms flip `QuitApproved`
 /// before calling `app.exit(0)` themselves — which re-enters this same
@@ -178,6 +206,22 @@ pub fn run() {
         .manage(commands::TailRegistry::default())
         .manage(commands::SessionMonitorState::default())
         .manage(commands::QuitApproved::default())
+        .manage(commands::PendingQuit::default())
+        // A webview reload (vite HMR in dev, any navigation) runs no Svelte
+        // `onDestroy`, so the log tails that page started would poll their
+        // files every 250 ms for the rest of the app's life — and they cannot
+        // notice on their own, because a `Channel::send` on macOS is a
+        // `webview.eval` that keeps succeeding after a reload. This app has
+        // exactly one window, so every tail registered before a page load
+        // belongs to the page being replaced.
+        .on_page_load(|webview, payload| {
+            if payload.event() == tauri::webview::PageLoadEvent::Started {
+                webview
+                    .app_handle()
+                    .state::<commands::TailRegistry>()
+                    .stop_all();
+            }
+        })
         .setup(|app| {
             let handle = app.handle();
             let menu = build_menu(handle)?;
@@ -216,13 +260,9 @@ pub fn run() {
     // been approved, is worth stopping the OS from tearing down for.
     app.run(|app_handle, event| match event {
         tauri::RunEvent::ExitRequested { api, .. } => {
-            let quit_approved = app_handle.state::<commands::QuitApproved>();
-            if commands::should_intercept_quit(
-                quit_approved.0.load(Ordering::SeqCst),
-                sabrage_core::live_session().is_some(),
-            ) {
+            if quit_decision(app_handle) == commands::QuitIntercept::Ask {
                 api.prevent_exit();
-                let _ = app_handle.emit("app://quit-requested", ());
+                ask_to_quit(app_handle);
             }
         }
         tauri::RunEvent::WindowEvent {
@@ -230,13 +270,9 @@ pub fn run() {
             event: tauri::WindowEvent::CloseRequested { api, .. },
             ..
         } if label == "main" => {
-            let quit_approved = app_handle.state::<commands::QuitApproved>();
-            if commands::should_intercept_quit(
-                quit_approved.0.load(Ordering::SeqCst),
-                sabrage_core::live_session().is_some(),
-            ) {
+            if quit_decision(app_handle) == commands::QuitIntercept::Ask {
                 api.prevent_close();
-                let _ = app_handle.emit("app://quit-requested", ());
+                ask_to_quit(app_handle);
             }
         }
         // AppKit's `terminate:` (Dock-menu Quit, logout, an AppleScript

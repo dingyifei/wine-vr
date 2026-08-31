@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import {
     runStage,
     cancelStage,
     applyFix,
+    onStageQueued,
     FIX_META,
     type CheckStatus,
     type StageEvent,
@@ -72,6 +74,14 @@
   // ── non-run modes (setup/build/install/stop): this component drives runStage itself ──
 
   let runId = $state<string | null>(null);
+  /** This request's runId announced by `stage://queued` — arrives (if at all)
+   * while the run is still waiting on `OPERATION_LOCK`, before its own
+   * `stageStarted` row exists. Without this, a run queued behind a build had
+   * no id Cancel could act on: the button stayed disabled for the whole wait,
+   * then mutated the machine the moment its turn came with nothing left to
+   * cancel it. See `onStageQueued`'s doc comment — cancelling this id works
+   * even before the stage starts. */
+  let queuedRunId = $state<string | null>(null);
   let rows = $state<Row[]>([]);
   let consoleLines = $state<string[]>([]);
   let consoleOpen = $state(false);
@@ -127,8 +137,26 @@
     if (consoleOpen && consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
   });
 
+  // One modal instance, mounted once at the app root — a `stage://queued`
+  // event always belongs to whichever request is currently open, since the
+  // process-wide operation lock means at most one stage is running or
+  // waiting at a time and every caller (Doctor, StagesPanel, Session) routes
+  // through this same modal to start one.
+  onMount(() => {
+    let unlisten: (() => void) | undefined;
+    void onStageQueued((q) => {
+      if (request && q.stage === request.stage) {
+        queuedRunId = q.runId;
+      }
+    }).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  });
+
   function reset() {
     runId = null;
+    queuedRunId = null;
     rows = [];
     consoleLines = [];
     consoleOpen = false;
@@ -141,6 +169,7 @@
   }
 
   function resetRunModeLocals() {
+    queuedRunId = null;
     confirmFix = null;
     fixError = null;
     fixNotice = null;
@@ -200,7 +229,8 @@
   }
 
   async function cancel() {
-    if (runId) await cancelStage(runId);
+    const id = runId ?? queuedRunId;
+    if (id) await cancelStage(id);
   }
 
   function requestFix(action: FixAction) {
@@ -296,11 +326,17 @@
         await sessionStore.stop();
       } else if (runStartedEv) {
         await cancelStage(runStartedEv.runId);
+      } else if (queuedRunId) {
+        // Queued behind another operation — no `stageStarted` row exists yet,
+        // but `stage://queued` already announced this run's id and cancelling
+        // it works even before the stage starts (see `queuedRunId`'s doc
+        // comment).
+        await cancelStage(queuedRunId);
       }
-      // else: no `stageStarted` row has arrived yet (the invoke() call is
-      // still in flight) and the run hasn't launched either — there is
-      // nothing safe to cancel yet; the button's `disabled` guard below keeps
-      // this branch from being reachable in practice.
+      // else: no `stageStarted`/`stage://queued` event has arrived yet (the
+      // invoke() call is still in flight) and the run hasn't launched either
+      // — there is nothing safe to cancel yet; the button's `disabled` guard
+      // below keeps this branch from being reachable in practice.
     } finally {
       cancelling = false;
     }
@@ -400,12 +436,12 @@
   {:else if row.kind === "needsAdmin"}
     <div class="admin-note">
       {@render lockIcon()}
-      <div>
-        <div>{row.reason}</div>
-        <div class="text-muted">
-          macOS will ask for your password — this writes the host OpenXR registration.
-        </div>
-      </div>
+      <!-- `reason` (privilege.rs's `needs_admin_reason`) already names both the
+           mechanism actually picked (macOS's authorization dialog, or sudo
+           waiting in the terminal that launched Sabrage — the latter can be
+           true for a `cargo tauri dev` GUI, in which case "macOS will ask for
+           your password" would contradict it and read as hung) and why. -->
+      <div>{row.reason}</div>
     </div>
   {:else if row.kind === "check"}
     <div class="gate-row" class:dim={row.outcome.status === "skipped" || row.outcome.status === "not_implemented"}>
@@ -489,7 +525,9 @@
 
       {#if confirmFix}
         <div class="confirm-inline">
-          <div class="text-muted">{FIX_META[confirmFix].title} — this cannot be undone. Continue?</div>
+          <div class="text-muted">
+            {FIX_META[confirmFix].title} — {FIX_META[confirmFix].consequence ?? "this cannot be undone."} Continue?
+          </div>
           <div class="confirm-actions">
             <button class="btn btn-secondary" onclick={() => (confirmFix = null)}>Cancel</button>
             <button class="btn btn-primary" onclick={() => doApplyFix(confirmFix!)}>Yes, continue</button>
@@ -554,14 +592,14 @@
             <button
               class="btn btn-secondary"
               onclick={cancelRun}
-              disabled={cancelling || (!runStartedEv && !runLaunchedEv)}
+              disabled={cancelling || (!runStartedEv && !runLaunchedEv && !queuedRunId)}
             >
               {cancelling ? "Stopping…" : "Cancel"}
             </button>
           {/if}
         {:else if running}
           <button class="btn btn-ghost" onclick={onClose}>Hide</button>
-          <button class="btn btn-secondary" onclick={cancel} disabled={!runId}>Cancel</button>
+          <button class="btn btn-secondary" onclick={cancel} disabled={!runId && !queuedRunId}>Cancel</button>
         {:else}
           <button class="btn btn-primary" onclick={onClose}>Close</button>
         {/if}

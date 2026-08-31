@@ -20,16 +20,45 @@
   ];
 
   const MAX_LINES = 5000;
+  /** How far past `MAX_LINES` the buffer is allowed to grow before it gets
+   * trimmed back down, so the trim (a full array re-slice, done to both
+   * `lines` and `lowerLines`) fires roughly once every 1000 lines instead of
+   * reallocating on every batch once the buffer is at cap. */
+  const TRIM_BLOCK = 1000;
+  /** How long to hold a keystroke before it actually re-runs the filter —
+   * `filteredLines` rescans the whole buffer, and without this every
+   * keystroke (and, while a filter is set, every incoming batch too) paid
+   * that cost immediately. */
+  const FILTER_DEBOUNCE_MS = 150;
 
   let tab = $state<Tab>("wineConsole");
+  /** Tracks the last tab a switch/back navigation was actually requested for
+   * — read instead of `tab` itself by the "already there, no-op" checks below,
+   * since `tab` only updates once the in-flight `stopTail()` resolves. Using
+   * the stale `tab` there let a rapid A -> B -> A get treated as a no-op on
+   * the second click and land on B instead of the user's actual last choice. */
+  let pendingTab = $state<Tab>("wineConsole");
   let follow = $state(true);
+  /** Bound to the filter `<input>` directly — updates every keystroke. */
   let filter = $state("");
+  /** The debounced value `filteredLines` actually filters against. */
+  let filterQuery = $state("");
+  let filterDebounceHandle: ReturnType<typeof setTimeout> | null = null;
   let lines = $state<string[]>([]);
+  /** Parallel to `lines`, each entry already lowercased at push time — so
+   * filtering rescans without re-lowercasing the whole buffer on every pass. */
+  let lowerLines = $state<string[]>([]);
   let rotatedNotice = $state(false);
   let truncatedNotice = $state(false);
   let resolvedPath = $state<string | null>(null);
   let pathError = $state<string | null>(null);
   let tailId: number | null = null;
+  /** Guards against a switchTab/openPastRun/backToPastRuns call whose
+   * `stopTail()` await settles after a later navigation call already
+   * superseded it — without this, an out-of-order resolution could still
+   * assign `tab`/`openedPastRun` and start a tail for the navigation the user
+   * had already moved past. */
+  let navGeneration = 0;
   /**
    * Guards against a leaked tail from two interleaved `startTail`/`stopTail`
    * calls (rapid tab switching): `startTail` captures the generation current
@@ -62,14 +91,17 @@
   function onBatch(b: LogBatch) {
     if (b.rotated) {
       lines = [];
+      lowerLines = [];
       rotatedNotice = true;
     }
     if (b.truncated) truncatedNotice = true;
     resolvedPath = b.path;
     if (b.lines.length > 0) {
       lines.push(...b.lines);
-      if (lines.length > MAX_LINES) {
+      lowerLines.push(...b.lines.map((l) => l.toLowerCase()));
+      if (lines.length > MAX_LINES + TRIM_BLOCK) {
         lines = lines.slice(lines.length - MAX_LINES);
+        lowerLines = lowerLines.slice(lowerLines.length - MAX_LINES);
       }
     }
     if (follow) {
@@ -82,6 +114,7 @@
   async function startTail(source: LogSource) {
     const myGeneration = ++tailGeneration;
     lines = [];
+    lowerLines = [];
     rotatedNotice = false;
     truncatedNotice = false;
     resolvedPath = null;
@@ -146,8 +179,19 @@
   async function switchTab(next: Tab) {
     // Past runs is the one tab worth re-clicking: it refreshes the listing.
     // Everything else is already live-tailing, so re-selecting it is a no-op.
-    if (next === tab && next !== "pastRuns") return;
+    // Compares against `pendingTab` (the last *requested* tab), not `tab`
+    // itself — `tab` only updates once `stopTail()` below resolves, so a
+    // rapid A -> B -> A would otherwise see the second click's `next` (A)
+    // still equal to the still-stale `tab` (A) and treat it as a no-op,
+    // leaving the switch to land on B instead of the user's actual last pick.
+    if (next === pendingTab && next !== "pastRuns") return;
+    pendingTab = next;
+    const myNav = ++navGeneration;
     await stopTail();
+    // A newer switchTab/openPastRun/backToPastRuns call superseded this one
+    // while `stopTail()` was in flight — let that call's own continuation own
+    // `tab`/`openedPastRun` and the resulting tail instead of overwriting it.
+    if (myNav !== navGeneration) return;
     tab = next;
     openedPastRun = null;
     if (next === "pastRuns") {
@@ -158,15 +202,20 @@
   }
 
   async function openPastRun(run: PastRun) {
+    const myNav = ++navGeneration;
     await stopTail();
+    if (myNav !== navGeneration) return;
     openedPastRun = run;
     void startTail({ kind: "file", path: run.path });
   }
 
   async function backToPastRuns() {
+    const myNav = ++navGeneration;
     await stopTail();
+    if (myNav !== navGeneration) return;
     openedPastRun = null;
     lines = [];
+    lowerLines = [];
   }
 
   onMount(() => {
@@ -175,12 +224,26 @@
 
   onDestroy(() => {
     void stopTail();
+    if (filterDebounceHandle) clearTimeout(filterDebounceHandle);
+  });
+
+  $effect(() => {
+    const f = filter;
+    if (filterDebounceHandle) clearTimeout(filterDebounceHandle);
+    filterDebounceHandle = setTimeout(() => {
+      filterDebounceHandle = null;
+      filterQuery = f;
+    }, FILTER_DEBOUNCE_MS);
   });
 
   const filteredLines = $derived.by(() => {
-    const q = filter.trim().toLowerCase();
+    const q = filterQuery.trim().toLowerCase();
     if (!q) return lines;
-    return lines.filter((l) => l.toLowerCase().includes(q));
+    const out: string[] = [];
+    for (let i = 0; i < lines.length; i++) {
+      if (lowerLines[i].includes(q)) out.push(lines[i]);
+    }
+    return out;
   });
 
   const showTailPane = $derived(tab !== "pastRuns" || openedPastRun !== null);

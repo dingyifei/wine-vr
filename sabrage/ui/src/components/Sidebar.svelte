@@ -25,6 +25,7 @@
     stopping: "dot-amber",
     exited: "dot-idle",
     detached: "dot-idle",
+    external: "dot-amber",
   };
 
   function footerLabel(s: SessionStatus): string {
@@ -43,6 +44,8 @@
         return "Stopping…";
       case "detached":
         return "Detached";
+      case "external":
+        return s.bottle ? `External · ${s.bottle}` : "External session";
     }
   }
 </script>

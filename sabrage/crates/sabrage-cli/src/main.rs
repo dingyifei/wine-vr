@@ -146,10 +146,32 @@ async fn main() {
         "stop" => exit(cmd_stage(Stage::Stop, &args[1..]).await),
         "all" => exit(cmd_all(&args[1..]).await),
         _ => {
+            if let Err(msg) = unknown_command_outcome(&args) {
+                eprintln!("{msg}");
+                exit(2);
+            }
             print!("{USAGE}");
             exit(2);
         }
     }
+}
+
+/// Finding A14-4: what the `_` arm above does with an unrecognized first
+/// token, factored into a pure helper so it is testable without `exit`.
+///
+/// `demo.sh` shifts `CMD="${1:-}"` off unconditionally *before* its flag
+/// `while` loop runs (lines 30-42 of this file's module doc), so when the
+/// first token is a flag rather than a real subcommand — `--bottle Steam
+/// run` — the loop parses the *remaining* tokens (`Steam run`) and reports
+/// the first one it does not recognize (`Steam`, since `--bottle`'s value
+/// was consumed as `CMD` instead of by the flag) before ever reaching its
+/// `case "$CMD"` dispatch. Mirror that sequencing: treat `args[0]` as the
+/// shell's `CMD` (already consumed, never re-examined) and parse `args[1..]`
+/// with the same grammar the six flags share. `Ok(())` means the shell would
+/// have fallen through to its unknown-`CMD` `case` arm instead — this file's
+/// usage-text-then-exit-2 fallback.
+fn unknown_command_outcome(args: &[String]) -> Result<(), String> {
+    parse_stage_args(&args[1..]).map(|_| ())
 }
 
 // ── shared bootstrap ─────────────────────────────────────────────────────────
@@ -233,6 +255,40 @@ fn parse_doctor_args(args: &[String]) -> Result<DoctorArgs, String> {
     Ok(out)
 }
 
+/// Merge parsed `doctor` flags onto the env-derived base — `doctor`'s
+/// counterpart of [`merge_stage_options`], same precedence rule
+/// (`WINEVR_*` is the base, flags override), factored out for the same
+/// reason: directly testable without resolving a repo root or building a
+/// [`CheckCtx`].
+///
+/// Finding A14-1: an explicit empty `--bottle`/`--bs-dir` must clear the
+/// env-derived value rather than override it with `Some("")` — see
+/// [`merge_stage_options`]'s matching comment for the full rationale
+/// (`demo.sh`'s `${WINEVR_BOTTLE:-}`/`${WINEVR_BS_DIR:-<default>}` both treat
+/// an empty export as absent).
+fn merge_doctor_options(env_opts: CheckOptions, parsed: &DoctorArgs) -> CheckOptions {
+    let mut opts = env_opts;
+    if let Some(b) = &parsed.bottle {
+        opts.bottle_name = (!b.is_empty()).then(|| b.clone());
+    }
+    if let Some(d) = &parsed.bs_dir {
+        opts.bs_dir_override = (!d.as_os_str().is_empty()).then(|| d.clone());
+    }
+    if parsed.wired {
+        opts.wired = true;
+    }
+    if parsed.no_audio {
+        opts.no_audio = true;
+    }
+    if parsed.no_dashboard {
+        opts.no_dashboard = true;
+    }
+    if parsed.verbose {
+        opts.verbose = true;
+    }
+    opts
+}
+
 fn cmd_doctor(args: &[String]) -> ! {
     let parsed = match parse_doctor_args(args) {
         Ok(p) => p,
@@ -253,28 +309,12 @@ fn cmd_doctor(args: &[String]) -> ! {
     // WINEVR_BOTTLE / WINEVR_BS_DIR (and the other WINEVR_* flags) are the base;
     // CLI flags override — the same precedence `demo.sh` gets from exporting
     // over whatever the caller's shell already had set.
-    let mut opts = CheckOptions::from_env();
-    if let Some(b) = parsed.bottle {
-        opts.bottle_name = Some(b);
-    }
-    if let Some(d) = parsed.bs_dir {
-        opts.bs_dir_override = Some(d);
-    }
-    if parsed.wired {
-        opts.wired = true;
-    }
-    if parsed.no_audio {
-        opts.no_audio = true;
-    }
-    if parsed.no_dashboard {
-        opts.no_dashboard = true;
-    }
-    if parsed.verbose {
-        opts.verbose = true;
-    }
+    let opts = merge_doctor_options(CheckOptions::from_env(), &parsed);
 
     let ctx = CheckCtx::new(Paths::new(&repo_root), opts);
-    let colors = use_colors();
+    // Doctor only ever writes to stdout — no stderr rows exist in its output
+    // — so it keeps using a single bool, the way it always has.
+    let colors = use_colors().stdout;
 
     println!("{BANNER}");
     let report = run_doctor(&ctx, |outcome| {
@@ -462,18 +502,54 @@ fn label(text: &str, color: &str, colors: bool) -> String {
     }
 }
 
-/// isatty(stdout) && !NO_COLOR — the one deliberate divergence from `lib.sh`,
-/// which emits its `$'\e[32m'`-style codes unconditionally. Native output is
-/// more likely to be piped/captured (by the GUI, by `--tap` consumers), so it
-/// earns the gate the shell script never needed. Shared by doctor and the
-/// stage commands; a stage's `Fatal` line goes to stderr rather than stdout,
-/// but is still gated on stdout's terminal-ness for simplicity — the common
-/// case is both streams sharing one terminal.
-fn use_colors() -> bool {
-    if env::var_os("NO_COLOR").is_some() {
-        return false;
+/// Per-stream color eligibility: `isatty(<stream>) && !NO_COLOR`.
+///
+/// Finding A14-5: a stage's `Fatal` row goes to stderr, but coloring it was
+/// gated on *stdout*'s terminal-ness alone — with stdout attached to a
+/// terminal and stderr redirected to a file, ANSI escapes leaked into the
+/// error file; with stdout piped and stderr on a terminal, `Fatal` lost
+/// color it should have had. Each stream now gets its own `is_terminal()`
+/// read, both still short-circuited by `NO_COLOR` (the one deliberate
+/// divergence from `lib.sh`, which emits its `$'\e[32m'`-style codes
+/// unconditionally — native output is more likely to be piped/captured, by
+/// the GUI or a `--tap` consumer, so it earns the gate the shell script
+/// never needed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+struct Colors {
+    stdout: bool,
+    stderr: bool,
+}
+
+impl Colors {
+    /// Both streams uncolored — the shared shorthand every `stage_event_lines`
+    /// test that doesn't care about color uses.
+    #[cfg(test)]
+    const OFF: Colors = Colors {
+        stdout: false,
+        stderr: false,
+    };
+}
+
+/// [`use_colors`]'s rule, as a pure function of the raw inputs — testable
+/// without mutating this process's real environment or terminal state.
+fn colors_from(no_color: bool, stdout_tty: bool, stderr_tty: bool) -> Colors {
+    Colors {
+        stdout: !no_color && stdout_tty,
+        stderr: !no_color && stderr_tty,
     }
-    std::io::stdout().is_terminal()
+}
+
+/// Read both streams' terminal-ness once (`NO_COLOR` disables both at once,
+/// matching every other color gate in this file). Doctor only ever writes to
+/// stdout, so it uses `.stdout` alone; the stage commands thread the whole
+/// struct through so `Fatal` (stderr) and everything else (stdout) each get
+/// the right one.
+fn use_colors() -> Colors {
+    colors_from(
+        env::var_os("NO_COLOR").is_some(),
+        std::io::stdout().is_terminal(),
+        std::io::stderr().is_terminal(),
+    )
 }
 
 // ── `sabrage setup|build|install|stop` ──────────────────────────────────────
@@ -572,7 +648,7 @@ enum RenderedLine {
 fn stage_event_lines(
     ev: &StageEvent,
     bottle_label: &str,
-    colors: bool,
+    colors: Colors,
     quiet: bool,
 ) -> Vec<RenderedLine> {
     match ev {
@@ -589,7 +665,7 @@ fn stage_event_lines(
             *severity,
             text,
             remedy.as_deref(),
-            colors,
+            colors.stdout,
         ))],
         StageEvent::Output { stream, chunk, .. } => {
             if quiet {
@@ -623,7 +699,7 @@ fn stage_event_lines(
         StageEvent::Launched { .. } => vec![],
         StageEvent::Fatal {
             message, remedy, ..
-        } => fatal_lines(message, remedy.as_deref(), colors)
+        } => fatal_lines(message, remedy.as_deref(), colors.stderr)
             .into_iter()
             .map(RenderedLine::Stderr)
             .collect(),
@@ -642,7 +718,7 @@ fn stage_event_lines(
 
 /// Render one [`StageEvent`] exactly the way its `demo.sh` equivalent prints
 /// it, by printing [`stage_event_lines`]'s projection of it.
-fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: bool, quiet: bool) {
+fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: Colors, quiet: bool) {
     for line in stage_event_lines(ev, bottle_label, colors, quiet) {
         match line {
             RenderedLine::Stdout(s) => println!("{s}"),
@@ -665,10 +741,21 @@ fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: bool, quiet: 
 fn merge_stage_options(env_opts: StageOptions, parsed: &StageArgs) -> StageOptions {
     let mut opts = env_opts;
     if let Some(b) = &parsed.bottle {
-        opts.bottle_name = Some(b.clone());
+        // Finding A14-1: an explicit `--bottle ""` (a wrapper that always
+        // interpolates the flag, even when its own variable is unset) must
+        // NOT survive as `Some("")` — that resolves to a different
+        // missing-bottle path than "no override at all". `demo.sh` never
+        // sees this ambiguity: `export WINEVR_BOTTLE=""` then `[ -n
+        // "${WINEVR_BOTTLE:-}" ]` (lib.sh) is false, so the shell treats an
+        // empty export exactly like an unset one. Mirror that here: an empty
+        // CLI value clears whatever `StageOptions::from_env` already put in
+        // `bottle_name`, rather than overriding it with an empty string.
+        opts.bottle_name = (!b.is_empty()).then(|| b.clone());
     }
     if let Some(d) = &parsed.bs_dir {
-        opts.bs_dir_override = Some(d.clone());
+        // Same rule for `--bs-dir`: `${WINEVR_BS_DIR:-<default>}` (lib.sh)
+        // treats an empty value as absent too.
+        opts.bs_dir_override = (!d.as_os_str().is_empty()).then(|| d.clone());
     }
     if parsed.verbose {
         opts.verbose = true;
@@ -696,10 +783,11 @@ fn merge_stage_options(env_opts: StageOptions, parsed: &StageArgs) -> StageOptio
 /// rules: no launching the game, no touching the machine), so `cmd_stage`'s
 /// tests may drive `cmd_stage(Stage::Run, …)` (and the other four stages)
 /// end-to-end **only** up to the point this function resolves a repo root
-/// and builds a [`StageCtx`]: an argument error or a `resolve_repo_root`
-/// failure returns before either happens and is exercised directly; anything
-/// past that boundary is exercised through the pure helpers instead
-/// ([`merge_stage_options`], [`stage_event_lines`], [`report_stage_result`]).
+/// and builds a [`StageCtx`]: an argument error, a `resolve_repo_root`
+/// failure, or a `Paths::new_checked` failure (an unusable `HOME`) returns
+/// before any of that and is exercised directly; anything past that boundary
+/// is exercised through the pure helpers instead ([`merge_stage_options`],
+/// [`stage_event_lines`], [`report_stage_result`]).
 async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     let parsed = match parse_stage_args(args) {
         Ok(p) => p,
@@ -710,6 +798,21 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     };
 
     let repo_root = match resolve_repo_root(None) {
+        Ok(p) => p,
+        Err(e) => {
+            print_bootstrap_error(&e);
+            return e.exit_code();
+        }
+    };
+
+    // Cross-area packet (from A2-8): `setup`/`build`/`install`/`run`/`stop`
+    // all write under `~/Library/Application Support/{OXRSys,Sabrage}` —
+    // an unset, empty, or relative `HOME` must fail closed here, before any
+    // of that, rather than silently redirecting those writes under the
+    // process's working directory (empty `HOME`) or a root-owned path
+    // (unset `HOME`'s `/` fallback, `Paths::new`'s own doc comment). Doctor
+    // keeps `Paths::new` — it only ever reads/probes, never writes.
+    let paths = match Paths::new_checked(&repo_root) {
         Ok(p) => p,
         Err(e) => {
             print_bootstrap_error(&e);
@@ -730,7 +833,7 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
         render_stage_event(&ev, &bottle_label, colors, quiet);
     });
 
-    let ctx = StageCtx::new(Paths::new(&repo_root), opts, sink, Default::default());
+    let ctx = StageCtx::new(paths, opts, sink, Default::default());
     {
         let cancel = ctx.cancel.clone();
         watch_termination_signals(move || cancel.cancel());
@@ -950,6 +1053,17 @@ async fn cmd_all(args: &[String]) -> i32 {
         }
     };
 
+    // See `cmd_stage`'s matching check: `all` chains setup/build/install/run,
+    // every one of which writes into the user store, so it fails closed on
+    // an unusable `HOME` the same way, before any of those stages run.
+    let paths = match Paths::new_checked(&repo_root) {
+        Ok(p) => p,
+        Err(e) => {
+            print_bootstrap_error(&e);
+            return e.exit_code();
+        }
+    };
+
     let opts = merge_stage_options(StageOptions::from_env(), &parsed);
     let bottle_label = opts
         .bottle_name
@@ -961,7 +1075,7 @@ async fn cmd_all(args: &[String]) -> i32 {
         render_stage_event(&ev, &bottle_label, colors, quiet);
     });
 
-    run_all(&Paths::new(&repo_root), &opts, &sink).await
+    run_all(&paths, &opts, &sink).await
 }
 
 // ── Ctrl-C / SIGTERM handling ─────────────────────────────────────────────
@@ -1266,6 +1380,32 @@ mod tests {
         );
     }
 
+    // ── A14-4: flags before the command ──────────────────────────────────────
+
+    #[test]
+    fn unknown_command_outcome_reports_the_first_bad_remaining_token() {
+        // `--bottle Steam run`: demo.sh's `CMD="${1:-}"; shift` consumes
+        // `--bottle` as `CMD` unconditionally, so its flag loop then sees
+        // `Steam run` and reports `Steam` — never routing through `--bottle`'s
+        // "needs a name" branch at all.
+        let a = args(&["--bottle", "Steam", "run"]);
+        assert_eq!(
+            unknown_command_outcome(&a).unwrap_err(),
+            "error: unknown argument 'Steam'"
+        );
+    }
+
+    #[test]
+    fn unknown_command_outcome_is_ok_when_the_remaining_tokens_parse_clean() {
+        // `--verbose --bottle X`: once `--verbose` is consumed as `CMD`, the
+        // remaining `--bottle X` parses fine under the shared six-flag
+        // grammar — the shell's `case "$CMD"` would then fall through to its
+        // own unknown-command text, which this file's usage/exit-2 fallback
+        // mirrors (the caller's `_` arm, not this helper, prints it).
+        let a = args(&["--verbose", "--bottle", "X"]);
+        assert_eq!(unknown_command_outcome(&a), Ok(()));
+    }
+
     // ── doctor rendering ─────────────────────────────────────────────────────
 
     #[test]
@@ -1488,6 +1628,71 @@ mod tests {
         assert!(merge_stage_options(env_opts, &parsed).wired);
     }
 
+    // ── A14-1: empty CLI values clear an env-derived preset ─────────────────
+
+    #[test]
+    fn merge_stage_options_empty_cli_values_clear_a_preset_env_base() {
+        // `--bottle ""`/`--bs-dir ""` (a wrapper that always interpolates the
+        // flag, even with its own variable unset) must behave exactly like
+        // `${WINEVR_BOTTLE:-}`/`${WINEVR_BS_DIR:-<default>}` treating an
+        // empty export as absent — not like an override to the empty string.
+        let env_opts = StageOptions {
+            bottle_name: Some("Steam".to_string()),
+            bs_dir_override: Some(PathBuf::from("/preset")),
+            ..Default::default()
+        };
+        let parsed = StageArgs {
+            bottle: Some(String::new()),
+            bs_dir: Some(PathBuf::new()),
+            ..Default::default()
+        };
+        let opts = merge_stage_options(env_opts, &parsed);
+        assert_eq!(opts.bottle_name, None);
+        assert_eq!(opts.bs_dir_override, None);
+    }
+
+    #[test]
+    fn merge_stage_options_empty_cli_values_stay_none_with_no_preset() {
+        let parsed = StageArgs {
+            bottle: Some(String::new()),
+            bs_dir: Some(PathBuf::new()),
+            ..Default::default()
+        };
+        let opts = merge_stage_options(StageOptions::default(), &parsed);
+        assert_eq!(opts.bottle_name, None);
+        assert_eq!(opts.bs_dir_override, None);
+    }
+
+    #[test]
+    fn merge_doctor_options_empty_cli_values_clear_a_preset_env_base() {
+        // Same rule, doctor's merge path.
+        let env_opts = CheckOptions {
+            bottle_name: Some("Steam".to_string()),
+            bs_dir_override: Some(PathBuf::from("/preset")),
+            ..Default::default()
+        };
+        let parsed = DoctorArgs {
+            bottle: Some(String::new()),
+            bs_dir: Some(PathBuf::new()),
+            ..Default::default()
+        };
+        let opts = merge_doctor_options(env_opts, &parsed);
+        assert_eq!(opts.bottle_name, None);
+        assert_eq!(opts.bs_dir_override, None);
+    }
+
+    #[test]
+    fn merge_doctor_options_empty_cli_values_stay_none_with_no_preset() {
+        let parsed = DoctorArgs {
+            bottle: Some(String::new()),
+            bs_dir: Some(PathBuf::new()),
+            ..Default::default()
+        };
+        let opts = merge_doctor_options(CheckOptions::default(), &parsed);
+        assert_eq!(opts.bottle_name, None);
+        assert_eq!(opts.bs_dir_override, None);
+    }
+
     // ── stage rendering ──────────────────────────────────────────────────────
 
     #[test]
@@ -1633,7 +1838,7 @@ mod tests {
             text: String::new(),
         };
         assert_eq!(
-            stage_event_lines(&empty, "<name>", false, false),
+            stage_event_lines(&empty, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout(String::new())],
             "run.sh's `print \"\"` must still emit its (empty) line"
         );
@@ -1644,7 +1849,7 @@ mod tests {
             text: "   exe: Z:\\Beat Saber.exe".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&indented, "<name>", false, false),
+            stage_event_lines(&indented, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout(
                 "   exe: Z:\\Beat Saber.exe".to_string()
             )],
@@ -1662,7 +1867,10 @@ mod tests {
             outcome: CheckOutcome::pass("run.wine-exec", "wine present"),
             gate: Gate::Block,
         };
-        assert_eq!(stage_event_lines(&check, "<name>", false, false), vec![]);
+        assert_eq!(
+            stage_event_lines(&check, "<name>", Colors::OFF, false),
+            vec![]
+        );
 
         let launched = StageEvent::Launched {
             run_id: Default::default(),
@@ -1671,7 +1879,10 @@ mod tests {
             log_path: "/x/beatsaber-20260829-000000.log".to_string(),
             started_at_unix_ms: 1,
         };
-        assert_eq!(stage_event_lines(&launched, "<name>", false, false), vec![]);
+        assert_eq!(
+            stage_event_lines(&launched, "<name>", Colors::OFF, false),
+            vec![]
+        );
 
         // Every fix already emits its own shell-verbatim `ok`/`warn` `Line` on
         // the same sink; printing this too would double the console row.
@@ -1682,7 +1893,7 @@ mod tests {
             description: "bottle graphics backend forced to dxmt".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&auto_fixed, "<name>", false, false),
+            stage_event_lines(&auto_fixed, "<name>", Colors::OFF, false),
             vec![]
         );
     }
@@ -1696,7 +1907,7 @@ mod tests {
             current: 10,
             total: Some(100),
         };
-        assert_eq!(stage_event_lines(&ev, "<name>", false, false), vec![]);
+        assert_eq!(stage_event_lines(&ev, "<name>", Colors::OFF, false), vec![]);
     }
 
     #[test]
@@ -1707,7 +1918,7 @@ mod tests {
             reason: "macOS will ask for your password".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&ev, "<name>", false, false),
+            stage_event_lines(&ev, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout(
                 "  macOS will ask for your password".to_string()
             )]
@@ -1721,7 +1932,7 @@ mod tests {
             stage: Stage::Run,
         };
         assert_eq!(
-            stage_event_lines(&started, "<name>", false, false),
+            stage_event_lines(&started, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout("== wine-vr demo run ==".to_string())]
         );
 
@@ -1730,7 +1941,7 @@ mod tests {
             title: "Goldberg".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&section, "<name>", false, false),
+            stage_event_lines(&section, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout("-- Goldberg".to_string())]
         );
 
@@ -1742,7 +1953,7 @@ mod tests {
             remedy: None,
         };
         assert_eq!(
-            stage_event_lines(&line, "<name>", false, false),
+            stage_event_lines(&line, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout("  OK   wineserver down".to_string())]
         );
     }
@@ -1756,11 +1967,11 @@ mod tests {
             chunk: "[1/9] cc foo.c".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&out, "<name>", false, false),
+            stage_event_lines(&out, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout("[1/9] cc foo.c".to_string())]
         );
         assert_eq!(
-            stage_event_lines(&out, "<name>", false, true),
+            stage_event_lines(&out, "<name>", Colors::OFF, true),
             vec![],
             "--quiet suppresses a child's own output passthrough"
         );
@@ -1772,7 +1983,7 @@ mod tests {
             chunk: "warning: x".to_string(),
         };
         assert_eq!(
-            stage_event_lines(&err, "<name>", false, false),
+            stage_event_lines(&err, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stderr("warning: x".to_string())]
         );
     }
@@ -1786,7 +1997,7 @@ mod tests {
             fix: None,
         };
         assert_eq!(
-            stage_event_lines(&fatal, "<name>", false, false),
+            stage_event_lines(&fatal, "<name>", Colors::OFF, false),
             vec![
                 RenderedLine::Stderr("FATAL boom".to_string()),
                 RenderedLine::Stderr("       remedy: fix it".to_string()),
@@ -1800,7 +2011,7 @@ mod tests {
             exit_code_equiv: 0,
         };
         assert_eq!(
-            stage_event_lines(&finished_ok, "<name>", false, false),
+            stage_event_lines(&finished_ok, "<name>", Colors::OFF, false),
             vec![RenderedLine::Stdout(
                 "\nsetup complete — next: ./demo.sh build".to_string()
             )]
@@ -1815,7 +2026,7 @@ mod tests {
             exit_code_equiv: 0,
         };
         assert_eq!(
-            stage_event_lines(&finished_run_ok, "<name>", false, false),
+            stage_event_lines(&finished_run_ok, "<name>", Colors::OFF, false),
             vec![]
         );
 
@@ -1826,8 +2037,98 @@ mod tests {
             exit_code_equiv: 1,
         };
         assert_eq!(
-            stage_event_lines(&finished_failed, "<name>", false, false),
+            stage_event_lines(&finished_failed, "<name>", Colors::OFF, false),
             vec![]
+        );
+    }
+
+    // ── A14-5: color gating is per-stream ────────────────────────────────────
+
+    #[test]
+    fn no_color_forces_both_streams_off_regardless_of_tty() {
+        assert_eq!(
+            colors_from(true, true, true),
+            Colors {
+                stdout: false,
+                stderr: false
+            }
+        );
+    }
+
+    #[test]
+    fn colors_from_is_independent_per_stream() {
+        // stdout piped (no color), stderr on a terminal (colored) — the
+        // "stderr redirected to a file, stdout a tty" case inverted: this is
+        // "stdout piped, stderr a tty", the other half of the same bug.
+        assert_eq!(
+            colors_from(false, false, true),
+            Colors {
+                stdout: false,
+                stderr: true
+            }
+        );
+        // The mirrored case: stdout a terminal, stderr redirected to a file.
+        assert_eq!(
+            colors_from(false, true, false),
+            Colors {
+                stdout: true,
+                stderr: false
+            }
+        );
+    }
+
+    #[test]
+    fn fatal_uses_stderr_colors_while_a_line_event_uses_stdout_colors() {
+        // Finding A14-5: `Fatal` rows go to stderr but color was previously
+        // gated on stdout's terminal-ness alone. With stdout piped (no
+        // color) and stderr a terminal (colored), `Fatal` must still come
+        // out colored — and an ordinary `Line` in the same call must stay
+        // uncolored, since it renders on stdout.
+        let colors = Colors {
+            stdout: false,
+            stderr: true,
+        };
+
+        let fatal = StageEvent::Fatal {
+            run_id: Default::default(),
+            message: "boom".to_string(),
+            remedy: None,
+            fix: None,
+        };
+        assert_eq!(
+            stage_event_lines(&fatal, "<name>", colors, false),
+            vec![RenderedLine::Stderr(format!(
+                "{ANSI_RED}FATAL{ANSI_RESET} boom"
+            ))]
+        );
+
+        let line = StageEvent::Line {
+            run_id: Default::default(),
+            step: None,
+            severity: Severity::Fail,
+            text: "copy failed".to_string(),
+            remedy: None,
+        };
+        assert_eq!(
+            stage_event_lines(&line, "<name>", colors, false),
+            vec![RenderedLine::Stdout("  FAIL copy failed".to_string())]
+        );
+
+        // Mirrored: stdout a terminal (colored), stderr piped (no color) —
+        // `Fatal` must lose its color while the `Line` gains it.
+        let mirrored = Colors {
+            stdout: true,
+            stderr: false,
+        };
+        assert_eq!(
+            stage_event_lines(&fatal, "<name>", mirrored, false),
+            vec![RenderedLine::Stderr("FATAL boom".to_string())]
+        );
+        assert_eq!(
+            stage_event_lines(&line, "<name>", mirrored, false),
+            vec![RenderedLine::Stdout(format!(
+                "  {ANSI_RED}FAIL{ANSI_RESET} copy failed"
+            ))]
         );
     }
 
