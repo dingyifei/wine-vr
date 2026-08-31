@@ -3,6 +3,7 @@
 // screen's Streaming card. A plain Svelte 5 rune store — module-scoped
 // `$state`, same shape as doctor.svelte.ts/session.svelte.ts.
 
+import { errMsg } from "../lib/text";
 import {
   readRuntimeConfig as ipcReadRuntimeConfig,
   writeRuntimeConfig as ipcWriteRuntimeConfig,
@@ -25,7 +26,7 @@ function createConfigStore() {
     try {
       view = await ipcReadRuntimeConfig();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
     } finally {
       loading = false;
     }
@@ -48,7 +49,7 @@ function createConfigStore() {
       await load();
       return report;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
       throw e;
     }
   }

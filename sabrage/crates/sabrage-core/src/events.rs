@@ -205,12 +205,19 @@ pub enum StageEvent {
     },
 
     /// A raw chunk of child output — one line, or one `\r`-delimited progress
-    /// segment (curl's bar, cargo's status line). Never newline-terminated.
+    /// segment (curl's bar, cargo's status line). `chunk` never carries its
+    /// own terminator; `end` (A14-3, [`crate::process::ChunkEnd`]) says what
+    /// it was: `\n` (or `\r\n`, reported once), a bare `\r` repaint, or end of
+    /// stream with no delimiter at all. `#[serde(default)]` so a JSONL log or
+    /// an IPC message from before this field existed still deserializes, and
+    /// then reads as the newline every emitter meant at the time.
     Output {
         run_id: RunId,
         step: String,
         stream: Stream,
         chunk: String,
+        #[serde(default)]
+        end: crate::process::ChunkEnd,
     },
 
     /// Quantified progress within a step: bytes for a download, `[n/m]` for
@@ -684,6 +691,7 @@ mod tests {
                 step: step::BUILD_OXRSYS.into(),
                 stream: Stream::Stderr,
                 chunk: "[1/2] cc".into(),
+                end: crate::process::ChunkEnd::Lf,
             },
             StageEvent::Progress {
                 run_id: rid(),

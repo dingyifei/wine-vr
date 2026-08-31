@@ -1,13 +1,10 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
-  import {
-    canStop as sessionCanStop,
-    getAppState,
-    type LaunchOpts,
-    type SessionStatus,
-    type StageEvent,
-  } from "../ipc";
+  import { errMsg } from "../lib/text";
+  import { canStop as sessionCanStop, type LaunchOpts, type SessionStatus, type StageEvent } from "../ipc";
+  import BottleSelect from "../components/BottleSelect.svelte";
   import { demoRunCommand } from "../lib/demo";
+  import { bottlesStore } from "../stores/bottles.svelte";
   import { sessionStore } from "../stores/session.svelte";
   import { settingsStore } from "../stores/settings.svelte";
   import { stageStore } from "../stores/stage.svelte";
@@ -28,8 +25,8 @@
 
   // ── bottle + launch options ─────────────────────────────────────────────────
 
-  let bottles = $state<string[]>([]);
-  let bottlesLoaded = $state(false);
+  const bottles = $derived(bottlesStore.bottles);
+  const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
   let selectedBottle = $state("");
   let bsDir = $state("");
   let noAudio = $state(false);
@@ -56,10 +53,9 @@
     let appDefaultBottle: string | null = null;
     let appDefaultBsDir: string | null = null;
     try {
-      const [state] = await Promise.all([getAppState(), settingsStore.load()]);
-      bottles = state.bottles;
-      appDefaultBottle = state.defaultBottle;
-      appDefaultBsDir = state.defaultBsDir;
+      await Promise.all([bottlesStore.load(), settingsStore.load()]);
+      appDefaultBottle = bottlesStore.defaultBottle;
+      appDefaultBsDir = bottlesStore.defaultBsDir;
       selectedBottle =
         appDefaultBottle && bottles.includes(appDefaultBottle) ? appDefaultBottle : pickDefaultBottle(bottles);
       bsDir = appDefaultBsDir ?? "";
@@ -80,9 +76,7 @@
       );
       prefilledFromSettings = Boolean(appDefaultBottle || appDefaultBsDir || launchTouched);
     } catch {
-      bottles = [];
-    } finally {
-      bottlesLoaded = true;
+      // bottlesStore/settingsStore already fall back to their own empty states
     }
     try {
       // "Previous session did not shut down cleanly" / "running outside this
@@ -261,7 +255,7 @@
         if (text != null) stopRows.push(text);
       });
     } catch (e) {
-      stopError = e instanceof Error ? e.message : String(e);
+      stopError = errMsg(e);
     } finally {
       stopping = false;
     }
@@ -280,7 +274,7 @@
     try {
       await sessionStore.detach();
     } catch (e) {
-      detachError = e instanceof Error ? e.message : String(e);
+      detachError = errMsg(e);
     } finally {
       detaching = false;
     }
@@ -363,15 +357,7 @@
 
       <div class="field">
         <label for="session-bottle">Bottle</label>
-        {#if bottlesLoaded && bottles.length === 0}
-          <span class="text-muted">none found — create one in the CrossOver UI</span>
-        {:else}
-          <select id="session-bottle" class="input" bind:value={selectedBottle} disabled={busy}>
-            {#each bottles as b (b)}
-              <option value={b}>{b}</option>
-            {/each}
-          </select>
-        {/if}
+        <BottleSelect id="session-bottle" {bottles} {bottlesLoaded} bind:value={selectedBottle} disabled={busy} />
       </div>
 
       <div class="field">

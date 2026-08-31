@@ -36,6 +36,20 @@ use crate::util;
 /// `_have` empty (missing header, or the generated file missing entirely) is a
 /// FAIL, same as a hash mismatch — the `[ -n "$_have" ]` guard is load-bearing.
 ///
+/// # A1-4: what this catches, and what it does not
+///
+/// `have` is the `# contract-sha256:` **header line**, never the generated
+/// file's body — this evaluator (like doctor.sh's own `_have` capture) reads
+/// one `sed -n 's/^# contract-sha256: //p'` line and nothing else. A
+/// `contract.gen.sh` whose header is current but whose *body* was hand-edited
+/// (or regenerated from a different `contract/` than the header names) is
+/// therefore invisible to this check at runtime: `have == want` still holds,
+/// because `want` is recomputed from `contract/` on disk and never reads
+/// `contract.gen.sh`'s body either. That drift is caught only by tier-1's
+/// `sabrage-contract-gen::generate() == include_str!("contract.gen.sh")`
+/// test (`scripts/dev/parity.sh`, `.github/workflows/parity.yml`) — a
+/// hand-edited body is a red CI run, not a red doctor row.
+///
 /// This on-disk comparison only verifies that `contract.gen.sh`'s header is
 /// **fresh relative to the checkout** — it says nothing about whether *this
 /// binary* was itself compiled from that same checkout. A Sabrage binary

@@ -6,6 +6,7 @@
 // exactly one session store per app window, so there is nothing to
 // unsubscribe on.
 
+import { errMsg } from "../lib/text";
 import {
   cancelStage as ipcCancelStage,
   detachSession as ipcDetachSession,
@@ -21,7 +22,6 @@ import {
   type LaunchOpts,
   type QuitChoice,
   type ReconcileReport,
-  type Reconciled,
   type SessionStatus,
   type StageEvent,
   type StageOutcome,
@@ -46,6 +46,15 @@ function createSessionStore() {
    * the equivalent value off `status.startedAtUnixMs` instead, once the
    * broadcast catches up — this is the earlier, launch-local signal). */
   let launchedAt = $state<number | null>(null);
+  /** `"launched"`/`"fatal"`/`"stageStarted"` rows off THIS launch's own
+   * `launchRows`, captured as they arrive so a consumer (GateModal) reads an
+   * O(1) field instead of re-scanning the whole array on every single event
+   * — `launchRows` grows by one console/progress row at a time, so a
+   * `.find()` per render was an O(n) scan repeated O(n) times over one
+   * launch. */
+  let launchedEv = $state<Extract<StageEvent, { kind: "launched" }> | null>(null);
+  let fatalEv = $state<Extract<StageEvent, { kind: "fatal" }> | null>(null);
+  let startedEv = $state<Extract<StageEvent, { kind: "stageStarted" }> | null>(null);
   let lastOutcome = $state<StageOutcome | null>(null);
   /** Set only on an `invoke()` rejection — a genuine IPC-layer failure (repo
    * root unresolved, a bad argument) rather than a reported `"fatal"` row,
@@ -81,6 +90,9 @@ function createSessionStore() {
     launching = true;
     launchRows = [];
     launchedAt = null;
+    launchedEv = null;
+    fatalEv = null;
+    startedEv = null;
     lastOutcome = null;
     lastError = null;
     launchedGameId = opts.gameId ?? null;
@@ -89,12 +101,17 @@ function createSessionStore() {
         launchRows.push(ev);
         if (ev.kind === "launched") {
           launchedAt = ev.startedAtUnixMs;
+          launchedEv = ev;
+        } else if (ev.kind === "fatal") {
+          fatalEv = ev;
+        } else if (ev.kind === "stageStarted") {
+          startedEv = ev;
         }
       });
       lastOutcome = outcome;
       return outcome;
     } catch (e) {
-      lastError = e instanceof Error ? e.message : String(e);
+      lastError = errMsg(e);
       throw e;
     } finally {
       launching = false;
@@ -161,13 +178,13 @@ function createSessionStore() {
   }
 
   // ── reconcile ────────────────────────────────────────────────────────────
+  // `report.kind` is intentionally not kept — no consumer has ever read it;
+  // only `rows` (the banner text) is.
 
-  let reconcileResult = $state<Reconciled | null>(null);
   let reconcileRows = $state<string[]>([]);
 
   async function reconcile(bottle: string | null): Promise<ReconcileReport> {
     const report = await ipcReconcileSession(bottle);
-    reconcileResult = report.kind;
     reconcileRows = report.rows;
     return report;
   }
@@ -217,6 +234,19 @@ function createSessionStore() {
     get launchedAt() {
       return launchedAt;
     },
+    /** This launch's own `"launched"` row, once it arrived — O(1); see the
+     * field's doc comment. */
+    get launchedEv() {
+      return launchedEv;
+    },
+    /** This launch's own `"fatal"` row, once it arrived — O(1). */
+    get fatalEv() {
+      return fatalEv;
+    },
+    /** This launch's own `"stageStarted"` row, once it arrived — O(1). */
+    get startedEv() {
+      return startedEv;
+    },
     get lastOutcome() {
       return lastOutcome;
     },
@@ -225,9 +255,6 @@ function createSessionStore() {
     },
     get launchedGameId() {
       return launchedGameId;
-    },
-    get reconcileResult() {
-      return reconcileResult;
     },
     get reconcileRows() {
       return reconcileRows;

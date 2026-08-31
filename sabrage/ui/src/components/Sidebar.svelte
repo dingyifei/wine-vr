@@ -1,9 +1,15 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import NavItem from "./NavItem.svelte";
+  import { bottlesStore } from "../stores/bottles.svelte";
   import { sessionStore } from "../stores/session.svelte";
   import { stageStore } from "../stores/stage.svelte";
   import type { SessionStatus } from "../ipc";
   import type { Screen } from "../types";
+
+  onMount(() => {
+    void bottlesStore.load();
+  });
 
   interface Props {
     screen: Screen;
@@ -118,7 +124,7 @@
     </div>
     <div class="text-muted bottle-line">Bottle · {status.bottle ?? "not selected"}</div>
     <button class="btn btn-ghost setup-btn" onclick={() => stageStore.openStagesPanel()}>Setup</button>
-    <div class="text-muted version-line">BRIDGE — · ALVR v20.14.1</div>
+    <div class="text-muted version-line">BRIDGE — · ALVR {bottlesStore.alvrVersion ?? "v20.14.1"}</div>
   </div>
 </div>
 

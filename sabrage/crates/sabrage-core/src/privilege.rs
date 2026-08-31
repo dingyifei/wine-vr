@@ -519,6 +519,7 @@ async fn elevate_osascript(ctx: &StageCtx, argv: &[OsString]) -> Result<()> {
             step: step::INSTALL_HOST_MANIFEST.into(),
             stream: Stream::Stderr,
             chunk: line.to_string(),
+            end: crate::process::ChunkEnd::Lf,
         });
     }
     Err(ctx.fatal(

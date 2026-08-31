@@ -1965,6 +1965,7 @@ mod tests {
             step: "build.1".to_string(),
             stream: Stream::Stdout,
             chunk: "[1/9] cc foo.c".to_string(),
+            end: sabrage_core::process::ChunkEnd::Lf,
         };
         assert_eq!(
             stage_event_lines(&out, "<name>", Colors::OFF, false),
@@ -1981,6 +1982,7 @@ mod tests {
             step: "build.1".to_string(),
             stream: Stream::Stderr,
             chunk: "warning: x".to_string(),
+            end: sabrage_core::process::ChunkEnd::Lf,
         };
         assert_eq!(
             stage_event_lines(&err, "<name>", Colors::OFF, false),

@@ -15,10 +15,10 @@
   //    local-`$state`-then-store convention), with a small transient "Saved" flash
   //    instead of a form-wide save button.
   import { onMount } from "svelte";
+  import { errMsg } from "../lib/text";
   import {
     blocksMutation,
     suggestBsDir,
-    getAppState,
     getRepoInfo,
     pickFolder,
     type EncoderProcess,
@@ -32,7 +32,9 @@
     type VideoCodec,
     type WriteReport,
   } from "../ipc";
+  import BottleSelect from "../components/BottleSelect.svelte";
   import { demoRunCommand } from "../lib/demo";
+  import { bottlesStore } from "../stores/bottles.svelte";
   import { configStore } from "../stores/config.svelte";
   import { sessionStore } from "../stores/session.svelte";
   import { settingsStore } from "../stores/settings.svelte";
@@ -48,8 +50,8 @@
 
   // ── bottles (Paths card's default-bottle select) ───────────────────────────
 
-  let bottles = $state<string[]>([]);
-  let bottlesLoaded = $state(false);
+  const bottles = $derived(bottlesStore.bottles);
+  const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
 
   // ── settings.json — local mirrors, seeded once settings load, then autosaved ─
 
@@ -99,7 +101,7 @@
       await settingsStore.update(patch);
       flashSaved();
     } catch (e) {
-      settingsSaveError = e instanceof Error ? e.message : String(e);
+      settingsSaveError = errMsg(e);
       seedFromSettings(); // roll the controls back to whatever the store actually kept
     }
   }
@@ -129,7 +131,7 @@
       const suggestion = await suggestBsDir(defaultBottleSel || null, bsDirInput || null);
       dir = await pickFolder("Choose the default Beat Saber install directory", suggestion.browseStart);
     } catch (e) {
-      settingsSaveError = `Could not open the folder picker: ${e instanceof Error ? e.message : String(e)}`;
+      settingsSaveError = `Could not open the folder picker: ${errMsg(e)}`;
       return;
     }
     if (!dir) return;
@@ -291,7 +293,7 @@
       lastWriteReport = await configStore.write(toWrite);
       resetDraft();
     } catch (e) {
-      saveError = e instanceof Error ? e.message : String(e);
+      saveError = errMsg(e);
     } finally {
       saving = false;
     }
@@ -319,7 +321,7 @@
     try {
       repoInfo = await getRepoInfo();
     } catch (e) {
-      repoInfoError = e instanceof Error ? e.message : String(e);
+      repoInfoError = errMsg(e);
     } finally {
       repoInfoLoading = false;
     }
@@ -332,7 +334,7 @@
     try {
       dir = await pickFolder("Choose the wine-vr checkout", settingsStore.settings?.repoRoot ?? null);
     } catch (e) {
-      checkoutError = `Could not open the folder picker: ${e instanceof Error ? e.message : String(e)}`;
+      checkoutError = `Could not open the folder picker: ${errMsg(e)}`;
       return;
     }
     if (!dir) return;
@@ -349,7 +351,7 @@
         hasRevertRoot = false;
       }
     } catch (e) {
-      checkoutError = e instanceof Error ? e.message : String(e);
+      checkoutError = errMsg(e);
     } finally {
       checkoutBusy = false;
     }
@@ -363,7 +365,7 @@
       checkoutError = null;
       hasRevertRoot = false;
     } catch (e) {
-      checkoutError = e instanceof Error ? e.message : String(e);
+      checkoutError = errMsg(e);
     } finally {
       checkoutBusy = false;
     }
@@ -384,17 +386,9 @@
   const footerCommand = $derived(demoRunCommand(footerLaunchOpts));
 
   onMount(async () => {
-    await Promise.all([settingsStore.load(), configStore.load()]);
+    await Promise.all([settingsStore.load(), configStore.load(), bottlesStore.load()]);
     seedFromSettings();
     resetDraft();
-    try {
-      const state = await getAppState();
-      bottles = state.bottles;
-    } catch {
-      bottles = [];
-    } finally {
-      bottlesLoaded = true;
-    }
     void loadRepoInfo();
   });
 </script>
@@ -751,22 +745,15 @@
 
         <div class="field">
           <label for="settings-bottle">Default CrossOver bottle</label>
-          {#if bottlesLoaded && bottles.length === 0}
-            <span class="text-muted">none found — create one in the CrossOver UI</span>
-          {:else}
-            <select
-              id="settings-bottle"
-              class="input"
-              bind:value={defaultBottleSel}
-              onchange={onDefaultBottleChange}
-              disabled={!settingsStore.loadOk}
-            >
-              <option value="">— none —</option>
-              {#each bottles as b (b)}
-                <option value={b}>{b}</option>
-              {/each}
-            </select>
-          {/if}
+          <BottleSelect
+            id="settings-bottle"
+            {bottles}
+            {bottlesLoaded}
+            bind:value={defaultBottleSel}
+            onchange={onDefaultBottleChange}
+            disabled={!settingsStore.loadOk}
+            includeNone
+          />
         </div>
 
         <div class="field">

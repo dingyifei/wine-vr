@@ -6,6 +6,7 @@
 // agent's task brief).
 
 import { getAppState, runDoctor, type DoctorEvent, type DoctorSummary } from "../ipc";
+import { errMsg } from "../lib/text";
 
 /** One row as rendered — a `DoctorEvent` plus its streaming lifecycle. */
 export interface DoctorRow extends DoctorEvent {
@@ -79,7 +80,7 @@ function createDoctorStore() {
       });
       summary = result;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
       // A rerun that rejects before reporting every slug must not leave the
       // PREVIOUS run's rows sitting dim forever with no explanation — drop
       // every placeholder this run never got to reporting on. Rows this run

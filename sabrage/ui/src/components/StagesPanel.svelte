@@ -1,7 +1,9 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { blocksMutation, getAppState, type Stage } from "../ipc";
+  import { blocksMutation, type Stage } from "../ipc";
+  import BottleSelect from "./BottleSelect.svelte";
   import { shQuote } from "../lib/demo";
+  import { bottlesStore } from "../stores/bottles.svelte";
   import { sessionStore } from "../stores/session.svelte";
   import { stageStore } from "../stores/stage.svelte";
 
@@ -41,8 +43,8 @@
     },
   ];
 
-  let bottles = $state<string[]>([]);
-  let bottlesLoaded = $state(false);
+  const bottles = $derived(bottlesStore.bottles);
+  const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
   let selectedBottle = $state("");
   let copiedStage = $state<Stage | null>(null);
 
@@ -55,15 +57,9 @@
   const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
 
   onMount(async () => {
-    try {
-      const state = await getAppState();
-      bottles = state.bottles;
-      selectedBottle = bottles.includes("Steam") ? "Steam" : (bottles[0] ?? "");
-    } catch {
-      bottles = [];
-    } finally {
-      bottlesLoaded = true;
-    }
+    const state = await bottlesStore.load();
+    const loaded = state?.bottles ?? [];
+    selectedBottle = loaded.includes("Steam") ? "Steam" : (loaded[0] ?? "");
   });
 
   function demoCommand(card: Card): string {
@@ -130,15 +126,12 @@
             {#if card.needsBottle}
               <div class="field stage-bottle-field">
                 <label for={`stages-bottle-${card.stage}`}>Bottle</label>
-                {#if bottlesLoaded && bottles.length === 0}
-                  <span class="text-muted">none found — create one in the CrossOver UI</span>
-                {:else}
-                  <select id={`stages-bottle-${card.stage}`} class="input" bind:value={selectedBottle}>
-                    {#each bottles as b (b)}
-                      <option value={b}>{b}</option>
-                    {/each}
-                  </select>
-                {/if}
+                <BottleSelect
+                  id={`stages-bottle-${card.stage}`}
+                  {bottles}
+                  {bottlesLoaded}
+                  bind:value={selectedBottle}
+                />
               </div>
             {/if}
             <div class="stage-card-cmd-row">
@@ -219,7 +212,7 @@
   .stage-bottle-field {
     max-width: 220px;
   }
-  .stage-bottle-field select {
+  .stage-bottle-field :global(select) {
     min-height: 30px;
     padding: 3px 8px;
     font-size: 13px;

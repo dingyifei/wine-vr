@@ -494,7 +494,9 @@ fn protocol_gate(
 /// (`overlay.dxmt-winemetal`, `overlay.woxr-dll`, `overlay.woxr-so`: run.sh
 /// `cmp`s only `d3d11.dll`, the contract records the divergence) and reuse the
 /// sentence shape of the `d3d11` die they extend.
-fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String, Option<String>) {
+/// `pub` (A1-3) so `sabrage-parity` can pin these against `run.sh` by calling
+/// the real renderer instead of copying a substring per slug.
+pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String, Option<String>) {
     let bottle = ctx.bottle_name();
     let install = format!("./demo.sh install --bottle {bottle}");
     let install_remedy = Some(install.clone());
@@ -682,6 +684,7 @@ fn fix_failed(
         step: step::RUN_PREFLIGHT.to_string(),
         stream: crate::events::Stream::Stderr,
         chunk: e.to_string(),
+        end: crate::process::ChunkEnd::Lf,
     });
     let (message, remedy) = post_fix_die(ctx, spec.slug.as_str());
     die(ctx, spec, message, remedy)
@@ -740,7 +743,8 @@ async fn apply_fix(ctx: &StageCtx, spec: &CheckSpec) -> Result<FixReport> {
 
 /// run.sh's die text for "the auto-fix ran and the condition is still there"
 /// (lines 42/46/49 and line 78).
-fn post_fix_die(ctx: &StageCtx, slug: &str) -> (String, Option<String>) {
+/// `pub` (A1-3), same reason as [`block_die`].
+pub fn post_fix_die(ctx: &StageCtx, slug: &str) -> (String, Option<String>) {
     match slug {
         "bottle.gfx-dxmt" => {
             let conf = ctx

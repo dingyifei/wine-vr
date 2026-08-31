@@ -94,6 +94,7 @@ export type Severity = "info" | "ok" | "warn" | "fail";
 /** Mirrors `sabrage_core::Stream` (serde camelCase). Named `StreamKind` here —
  * `Stream` collides with the DOM type. */
 export type StreamKind = "stdout" | "stderr";
+export type ChunkEnd = "lf" | "cr" | "eof";
 
 /** Mirrors `sabrage_core::FixAction` (serde kebab-case — the contract id
  * without its `fix.` prefix). */
@@ -123,7 +124,18 @@ export type StageEvent =
       text: string;
       remedy: string | null;
     }
-  | { kind: "output"; runId: string; step: string; stream: StreamKind; chunk: string }
+  | {
+      kind: "output";
+      runId: string;
+      step: string;
+      stream: StreamKind;
+      chunk: string;
+      /** How the chunk ended (`process::ChunkEnd`, camelCase): `"lf"` a line,
+       * `"cr"` a bare `\r` repaint of the same terminal line, `"eof"` the
+       * stream's unterminated tail. Optional on the wire (`#[serde(default)]`,
+       * default `"lf"`) so an older core is still readable. */
+      end?: ChunkEnd;
+    }
   | {
       kind: "progress";
       runId: string;

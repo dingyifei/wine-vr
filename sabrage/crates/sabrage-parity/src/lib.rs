@@ -1656,13 +1656,7 @@ mod tests {
     /// `stages::run` reproduces a long list of run.sh's `die`/`warn`/`info`/
     /// banner strings verbatim, scattered as `&str` literals across
     /// `preflight.rs`, `actions.rs`, `guards.rs` and `mod.rs` — most of them
-    /// not contract-derived, so nothing above catches one going stale. Several
-    /// of the native functions that own this text are `pub(crate)`
-    /// (`banner_events`, `bs_win_path`), so this crate cannot call them
-    /// directly; instead every fragment below is copied **from the native
-    /// source** (confirmed against the actual `&str` literal at the call site,
-    /// not just the doc comment) and pinned here as a substring of the on-disk
-    /// `run.sh` — this module never calls native code at all.
+    /// not contract-derived, so nothing above catches one going stale.
     ///
     /// # What each half is actually gated by
     ///
@@ -1674,28 +1668,35 @@ mod tests {
     /// `run.sh` — is NOT gated by sabrage-core's own frozen-text unit tests
     /// (`guards::tests::the_guard_texts_are_run_shs_verbatim`,
     /// `mod::tests::the_closing_lines_are_run_shs_verbatim`,
-    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, …), which
-    /// this module's header used to claim: tier 1 selects `sabrage-parity` +
-    /// `sabrage-contract-gen` only (`scripts/dev/parity.sh`,
-    /// `.github/workflows/parity.yml`), and Cargo does not run a
-    /// dev-dependency's `#[cfg(test)]` harness. Those tests exist but nothing
-    /// runs them in the gate, and CI (ubuntu) cannot add `-p sabrage-core`
-    /// because much of that suite is macOS-shaped.
+    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, …): tier 1
+    /// selects `sabrage-parity` + `sabrage-contract-gen` only
+    /// (`scripts/dev/parity.sh`, `.github/workflows/parity.yml`), and Cargo
+    /// does not run a dev-dependency's `#[cfg(test)]` harness. Those tests
+    /// exist but nothing runs them in the gate, and CI (ubuntu) cannot add
+    /// `-p sabrage-core` because much of that suite is macOS-shaped.
     ///
     /// So the native half is pinned **here**, by calling the native renderer
-    /// wherever it is `pub`:
-    /// [`native_run_only_die_text_is_verbatim_in_run_sh`] evaluates the real
-    /// `checks::run_only` evaluators and asserts their own message text is in
-    /// `run.sh`, and modules (5)/(8) do the same for the host manifest, the
-    /// toml template, `win_path`, `wine_env`, `wine_spec` and
-    /// `steam_appid.txt`. What remains substring-only is the text owned by
-    /// `pub(crate)` functions (`stages::run::actions::banner_events`,
-    /// `stages::run::mod`'s exit/teardown lines, `stages::run::guards`'
-    /// audio/dashboard rows, `stages::run::preflight`'s die strings): making
-    /// those `pub` (or adding `pub fn banner_lines()`-shaped accessors) is a
-    /// sabrage-core change this crate cannot make.
+    /// wherever it is `pub`. A1-3 made `pub` every function this module needs
+    /// that was previously `pub(crate)` (`stages::run::actions::banner_events`
+    /// / `bs_win_path`, `stages::run::mod::wine_exit_line` /
+    /// `INT_TEARDOWN_LINE` / `HELPER_REAPED_LINE`, `stages::run::guards`'
+    /// audio/dashboard line constants and functions,
+    /// `stages::run::preflight::block_die` / `post_fix_die`), plus one new
+    /// fixture constructor, [`sabrage_core::stages::StageCtx::for_fixture`],
+    /// so this crate never has to depend on `tokio_util` just to build a
+    /// `StageCtx`. What remains substring-only: `checks::run_only`'s die text
+    /// is covered by [`native_run_only_die_text_is_verbatim_in_run_sh`]
+    /// already; `stages::run::actions::wineserver_reset` / `goldberg_stage` /
+    /// `adb_reverse_cleanup` / `adb_forward_hygiene` and
+    /// `fixes::adb::remove_adb_forwards_at`'s text, and
+    /// `stages::run::preflight::emit_encoder_notice`'s two lines and the
+    /// `game.version` warn row — those functions are not `pub` and are out of
+    /// this pass's scope; their fragments are still copied from source below.
     mod run_sh_text_parity {
         use super::repo_root;
+        use sabrage_core::paths::{Bottle, Paths};
+        use sabrage_core::stages::{StageCtx, StageOptions};
+        use std::path::Path;
 
         fn run_sh() -> String {
             std::fs::read_to_string(repo_root().join("scripts/demo/run.sh"))
@@ -1707,6 +1708,16 @@ mod tests {
                 text.contains(fragment),
                 "run.sh no longer contains {fragment:?}, which {native_site} reproduces verbatim"
             );
+        }
+
+        /// A [`StageCtx`] fixture over a fresh scratch root — never the real
+        /// machine ([`StageCtx::for_fixture`] always picks a `DryRunExecutor`).
+        fn ctx(tag: &str) -> StageCtx {
+            let scratch =
+                std::env::temp_dir().join(format!("sabrage-parity-{tag}-{}", std::process::id()));
+            std::fs::remove_dir_all(&scratch).ok();
+            std::fs::create_dir_all(&scratch).unwrap();
+            StageCtx::for_fixture(Paths::new(&scratch), StageOptions::default())
         }
 
         /// The native half, called for real: `checks::run_only`'s evaluators
@@ -1762,38 +1773,70 @@ mod tests {
         #[test]
         fn preflight_die_and_warn_text_is_verbatim_in_run_sh() {
             let text = run_sh();
+
+            // The two functions this test can call for real: every
+            // `block_die`/`post_fix_die` slug below is evaluated through the
+            // production renderer, over a fixture `CheckOutcome` whose own
+            // message the `_ => (outcome.message.clone(), …)` fallback arms
+            // would otherwise echo — never used by the slugs exercised here.
+            use sabrage_core::checks::CheckOutcome;
+            use sabrage_core::stages::run::preflight::{block_die, post_fix_die};
+            let c = ctx("preflight-die");
+            let unused_outcome = CheckOutcome::fail("x", "unused by these slugs", "unused");
+            for slug in [
+                "dep.goldberg",
+                "overlay.dxmt-d3d11",
+                "bottle.woxr-dll",
+                "bottle.manifest",
+                "bottle.registry",
+                "host.manifest",
+            ] {
+                let (message, _remedy) = block_die(&c, slug, &unused_outcome);
+                assert_verbatim(
+                    &text,
+                    match slug {
+                        "dep.goldberg" => "Goldberg dll missing — ./demo.sh setup",
+                        "overlay.dxmt-d3d11" => "CrossOver DXMT overlay stale (CrossOver update?)",
+                        "bottle.woxr-dll" => "bottle wineopenxr.dll stale/missing",
+                        "bottle.manifest" => "bottle OpenXR manifest missing",
+                        "bottle.registry" => "bottle ActiveRuntime registry key missing",
+                        "host.manifest" => "host OpenXR registration missing",
+                        _ => unreachable!(),
+                    },
+                    "stages::run::preflight::block_die",
+                );
+                // The fragment above must actually be a prefix of what
+                // `block_die` rendered for this slug — not merely present
+                // somewhere in `run.sh` by coincidence.
+                assert!(
+                    message.starts_with(match slug {
+                        "dep.goldberg" => "Goldberg dll missing",
+                        "overlay.dxmt-d3d11" => "CrossOver DXMT overlay stale",
+                        "bottle.woxr-dll" => "bottle wineopenxr.dll stale/missing",
+                        "bottle.manifest" => "bottle OpenXR manifest missing",
+                        "bottle.registry" => "bottle ActiveRuntime registry key missing",
+                        "host.manifest" => "host OpenXR registration missing",
+                        _ => unreachable!(),
+                    }),
+                    "block_die({slug}) rendered {message:?}"
+                );
+            }
+
+            let (post_fix_message, _) = post_fix_die(&c, "bottle.gfx-dxmt");
+            assert!(
+                post_fix_message.starts_with("could not force graphics backend to dxmt in"),
+                "{post_fix_message}"
+            );
+            assert_verbatim(
+                &text,
+                "could not force graphics backend to dxmt in",
+                "stages::run::preflight::post_fix_die",
+            );
+
             for (fragment, site) in [
                 (
                     "bridge not built — ./demo.sh build",
                     "checks::run_only::run_bridge_built",
-                ),
-                (
-                    "Goldberg dll missing — ./demo.sh setup",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "CrossOver DXMT overlay stale (CrossOver update?)",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "bottle wineopenxr.dll stale/missing",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "bottle OpenXR manifest missing",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "bottle ActiveRuntime registry key missing",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "host OpenXR registration missing",
-                    "stages::run::preflight::block_die",
-                ),
-                (
-                    "could not force graphics backend to dxmt in",
-                    "stages::run::preflight::post_fix_die",
                 ),
                 (
                     "the Meta gate may block startup",
@@ -1869,79 +1912,162 @@ mod tests {
                     "cleared stale adb forward",
                     "fixes::adb (fix.remove-adb-forwards)",
                 ),
-                (
-                    "encoder helper: reaped (left over from the runtime)",
-                    "stages::run::mod::HELPER_REAPED_LINE",
-                ),
             ] {
                 assert_verbatim(&text, fragment, site);
             }
+            // The real constant, not a copy.
+            assert_verbatim(
+                &text,
+                sabrage_core::stages::run::HELPER_REAPED_LINE,
+                "stages::run::HELPER_REAPED_LINE",
+            );
         }
 
         #[test]
         fn audio_and_dashboard_guard_text_is_verbatim_in_run_sh() {
+            use sabrage_core::stages::run::guards::{
+                audio_switched_line, blackhole_not_present_line, blackhole_switch_failed_line,
+                AUDIO_DISABLED_LINE, DASHBOARD_CLOSED_LINE, DASHBOARD_DISABLED_LINE,
+                DASHBOARD_NOT_BUILT_LINE, DASHBOARD_OPENING_LINE,
+            };
+
             let text = run_sh();
+            // Every fragment here is the real constant or the real render, not
+            // a copy — `site` names the function that owns it.
             for (fragment, site) in [
                 (
-                    "audio routing disabled (--no-audio) — sound stays on the Mac",
-                    "stages::run::guards",
+                    AUDIO_DISABLED_LINE.to_string(),
+                    "stages::run::guards::AUDIO_DISABLED_LINE",
                 ),
                 (
-                    "could not switch output to BlackHole 2ch — audio stays on the Mac",
-                    "stages::run::guards",
+                    blackhole_switch_failed_line(),
+                    "stages::run::guards::blackhole_switch_failed_line",
                 ),
                 (
-                    "BlackHole 2ch not present (brew install blackhole-2ch + reboot) — audio stays on the Mac",
-                    "stages::run::guards",
+                    blackhole_not_present_line(),
+                    "stages::run::guards::blackhole_not_present_line",
                 ),
                 (
-                    "audio: default output -> BlackHole 2ch (was:",
-                    "stages::run::guards",
+                    DASHBOARD_DISABLED_LINE.to_string(),
+                    "stages::run::guards::DASHBOARD_DISABLED_LINE",
                 ),
                 (
-                    "ALVR dashboard disabled (--no-dashboard)",
-                    "stages::run::guards",
+                    DASHBOARD_OPENING_LINE.to_string(),
+                    "stages::run::guards::DASHBOARD_OPENING_LINE",
                 ),
                 (
-                    "dashboard: ALVR server dashboard opening (connects once the game is up)",
-                    "stages::run::guards",
+                    DASHBOARD_NOT_BUILT_LINE.to_string(),
+                    "stages::run::guards::DASHBOARD_NOT_BUILT_LINE",
                 ),
                 (
-                    "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)",
-                    "stages::run::guards",
+                    DASHBOARD_CLOSED_LINE.to_string(),
+                    "stages::run::guards::DASHBOARD_CLOSED_LINE",
                 ),
-                ("dashboard: closed", "stages::run::guards"),
             ] {
-                assert_verbatim(&text, fragment, site);
+                assert_verbatim(&text, &fragment, site);
             }
+            // `audio_switched_line` interpolates the previous device, so only
+            // its static prefix can be a substring of run.sh's `<dev>`-free
+            // template.
+            let rendered = audio_switched_line("MacBook Pro Speakers");
+            assert!(
+                rendered.starts_with("audio: default output -> BlackHole 2ch (was: "),
+                "{rendered}"
+            );
+            assert_verbatim(
+                &text,
+                "audio: default output -> BlackHole 2ch (was:",
+                "stages::run::guards::audio_switched_line",
+            );
         }
 
         /// run.sh:252-260's six-line banner block.
         #[test]
         fn the_launch_banner_lines_are_verbatim_in_run_sh() {
+            use sabrage_core::events::StageEvent;
+            use sabrage_core::stages::run::actions::{banner_events, bs_win_path};
+
             let text = run_sh();
+            let c = ctx("banner");
+            let bottle = Bottle::unvalidated("Steam");
+            let bs_win = bs_win_path(&c, &bottle);
+            let log = Path::new("/repo/logs/beatsaber-20260829-101112.log");
+            let events = banner_events(c.run_id, &bottle.name, &bs_win, log);
+
+            let mut rendered: Vec<String> = Vec::new();
+            for ev in &events {
+                match ev {
+                    StageEvent::Section { title, .. } => rendered.push(format!("-- {title}")),
+                    StageEvent::Text { text, .. } if !text.is_empty() => {
+                        rendered.push(text.clone())
+                    }
+                    _ => {}
+                }
+            }
+            // The four fully static lines — no interpolation, so the real
+            // rendered string must appear in run.sh verbatim.
             for fragment in [
-                "launching Beat Saber through the bridge",
+                "-- launching Beat Saber through the bridge",
                 "   put the headset ON and open the ALVR client; first frame can take ~30s.",
                 "   pause in-game = X/A button or the Quest system button",
                 "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)",
-                "   stop: Ctrl-C here, or ./demo.sh stop --bottle",
-                "from another shell",
-                "   exe: ",
-                "   log: ",
             ] {
+                assert!(
+                    rendered.iter().any(|r| r == fragment),
+                    "banner_events dropped or reworded {fragment:?}: {rendered:?}"
+                );
                 assert_verbatim(&text, fragment, "stages::run::actions::banner_events");
             }
+            // The three interpolated lines: pin the static prefix/suffix that
+            // survives around whatever `bs_win_path`/the bottle name/the log
+            // path rendered.
+            let stop_line = rendered
+                .iter()
+                .find(|r| r.starts_with("   stop: "))
+                .expect("banner_events emits the stop line");
+            assert!(
+                stop_line.starts_with("   stop: Ctrl-C here, or ./demo.sh stop --bottle Steam")
+                    && stop_line.ends_with("from another shell"),
+                "{stop_line}"
+            );
+            assert_verbatim(
+                &text,
+                "   stop: Ctrl-C here, or ./demo.sh stop --bottle",
+                "stages::run::actions::banner_events",
+            );
+            assert_verbatim(
+                &text,
+                "from another shell",
+                "stages::run::actions::banner_events",
+            );
+            assert!(
+                rendered.iter().any(|r| r == &format!("   exe: {bs_win}")),
+                "{rendered:?}"
+            );
+            assert_verbatim(&text, "   exe: ", "stages::run::actions::banner_events");
+            assert!(
+                rendered
+                    .iter()
+                    .any(|r| r == &format!("   log: {}", log.display())),
+                "{rendered:?}"
+            );
+            assert_verbatim(&text, "   log: ", "stages::run::actions::banner_events");
+
+            // `wine_exit_line` and `INT_TEARDOWN_LINE`, called/read for real.
+            use sabrage_core::stages::run::{wine_exit_line, INT_TEARDOWN_LINE};
+            let exit_line = wine_exit_line(0, log);
+            assert!(
+                exit_line.starts_with("wine exited with status 0 (log: ")
+                    && exit_line.ends_with(')'),
+                "{exit_line}"
+            );
             assert_verbatim(
                 &text,
                 "wine exited with status",
-                "stages::run::mod::wine_exit_line",
+                "stages::run::wine_exit_line",
             );
-            assert_verbatim(
-                &text,
-                "interrupted: stopping wine",
-                "stages::run::mod::run (INT teardown section)",
-            );
+            assert_verbatim(&text, "(log: ", "stages::run::wine_exit_line");
+            assert_verbatim(&text, INT_TEARDOWN_LINE, "stages::run::INT_TEARDOWN_LINE");
         }
     }
     // ── (10) repo-root spelling ──────────────────────────────────────────────

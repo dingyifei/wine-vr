@@ -4,6 +4,7 @@
 // A plain Svelte 5 rune store — module-scoped `$state`, same shape as
 // doctor.svelte.ts/session.svelte.ts.
 
+import { errMsg } from "../lib/text";
 import {
   getSettings as ipcGetSettings,
   saveSettings as ipcSaveSettings,
@@ -49,7 +50,7 @@ function createSettingsStore() {
     } catch (e) {
       settings = null;
       loadOk = false;
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
     } finally {
       loaded = true;
     }
@@ -77,7 +78,7 @@ function createSettingsStore() {
       settings = await ipcSaveSettings(next);
       loadOk = true;
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
       await load();
       throw e;
     }

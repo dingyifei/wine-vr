@@ -242,6 +242,25 @@ impl StageCtx {
         }
     }
 
+    /// A self-contained fixture context: [`null_sink`], a fresh
+    /// [`CancellationToken`], and always a [`DryRunExecutor`] regardless of
+    /// `opts.dry_run` — so a caller can never accidentally mutate the
+    /// machine through it. Forces `opts.dry_run = true` for the same reason
+    /// [`StageOptions::from_env`]'s own doc names: it has no shell
+    /// counterpart, and a fixture that quietly picked [`RealExecutor`] would
+    /// be exactly the kind of test that only fails on someone else's machine.
+    ///
+    /// For a text-rendering function that never touches `ctx.executor` at all
+    /// (`sabrage-parity`'s A1-3 pins over `stages::run::actions::banner_events`,
+    /// `bs_win_path`, `preflight::block_die`, `preflight::post_fix_die`, …),
+    /// so a downstream crate that needs only *a* `StageCtx` — never a
+    /// `tokio_util::sync::CancellationToken` of its own — has one call to
+    /// reach for instead of depending on `tokio_util` just to build a fixture.
+    pub fn for_fixture(paths: Paths, mut opts: StageOptions) -> StageCtx {
+        opts.dry_run = true;
+        StageCtx::new(paths, opts, null_sink(), CancellationToken::new())
+    }
+
     /// A [`CheckCtx`] over the same machine state, for a preflight that reuses
     /// the doctor registry.
     pub fn check_ctx(&self) -> CheckCtx {

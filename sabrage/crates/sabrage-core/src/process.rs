@@ -191,9 +191,17 @@ pub fn default_child_path() -> String {
 /// a repaint with `println!` turns curl's one self-overwriting line into
 /// hundreds of permanent ones, and appending a newline to the final
 /// unterminated chunk invents output the child never wrote.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` with `Lf` as [`Default`] so
+/// [`crate::events::StageEvent::Output::end`] can carry it over IPC with
+/// `#[serde(default)]` — a consumer that has not been taught the field yet
+/// (or an event built before A14-3) reads as a plain newline-terminated line,
+/// which is what every emitter meant before this field existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub enum ChunkEnd {
     /// `\n`, or the `\r\n` pair (which is one terminator, not two).
+    #[default]
     Lf,
     /// A bare `\r`: a repaint of the same terminal line.
     Cr,
@@ -484,11 +492,11 @@ async fn pump<R>(
 {
     let mut splitter = ChunkSplitter::new();
     let mut buf = [0u8; 8192];
-    // `_end` is the chunk's terminator ([`ChunkEnd`]). It is dropped here only
-    // because `StageEvent::Output` has nowhere to carry it yet; the moment that
-    // event gains a terminator field, this is where it gets filled in — the
-    // CLI's `println!` per chunk is what turns curl's repaints into spam.
-    let mut emit = |chunk: String, _end: ChunkEnd| {
+    // A14-3: `end` is the chunk's terminator ([`ChunkEnd`]), carried on the
+    // event so a byte-faithful renderer (the CLI, writing to a real tty) can
+    // repaint a `\r`-terminated chunk in place instead of `println!`-ing it —
+    // which is what turns curl's/cargo's progress repaints into permanent spam.
+    let mut emit = |chunk: String, end: ChunkEnd| {
         if let Ok(mut t) = tail.lock() {
             if t.len() == CHILD_TAIL_LINES {
                 t.pop_front();
@@ -500,6 +508,7 @@ async fn pump<R>(
             step: step.to_string(),
             stream,
             chunk,
+            end,
         });
     };
     loop {
@@ -939,6 +948,7 @@ mod tests {
                     chunk,
                     step,
                     run_id: r,
+                    ..
                 } => {
                     assert_eq!(step, step::BUILD_TOOLS);
                     assert_eq!(*r, run_id);
@@ -955,6 +965,46 @@ mod tests {
                 (Stream::Stdout, "one".to_string()),
                 (Stream::Stdout, "two".to_string()),
             ]
+        );
+    }
+
+    /// A14-3: `pump`'s `emit` closure used to compute each chunk's
+    /// [`ChunkEnd`] and then drop it — `StageEvent::Output` had nowhere to
+    /// carry it. Now the terminator rides the event itself, so a `\r`
+    /// progress repaint, a `\n`-terminated line and the final unterminated
+    /// chunk are all distinguishable downstream (a byte-faithful CLI
+    /// renderer needs exactly this to repaint curl's bar in place instead of
+    /// spamming a `println!` per tick).
+    #[tokio::test]
+    async fn output_events_carry_their_chunk_terminator() {
+        let run_id = Uuid::new_v4();
+        let (sink, seen) = collecting_sink();
+        let cancel = CancellationToken::new();
+        // No trailing newline after "100%" — a real progress bar's last
+        // repaint before the child exits.
+        let s = spec("/bin/sh", run_id)
+            .arg("-c")
+            .arg("printf '10%%\\r50%%\\r100%%'; printf 'done\\n'");
+        let status = spawn_streamed(&s, &sink, &cancel).await.unwrap();
+        assert!(status.success());
+
+        let ends: Vec<(String, ChunkEnd)> = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(|e| match e {
+                StageEvent::Output { chunk, end, .. } => Some((chunk.clone(), *end)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            ends,
+            vec![
+                ("10%".to_string(), ChunkEnd::Cr),
+                ("50%".to_string(), ChunkEnd::Cr),
+                ("100%done".to_string(), ChunkEnd::Lf),
+            ],
+            "{ends:?}"
         );
     }
 

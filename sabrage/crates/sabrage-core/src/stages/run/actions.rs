@@ -28,7 +28,7 @@ use crate::events::{step, StageEvent, StepId};
 use crate::executor::{DetachedChild, DetachedStdio};
 use crate::paths::Bottle;
 use crate::process::{self, ChildSpec, ProcInfo};
-use crate::session::state::WiredForward;
+use crate::session::state::{self, SessionState, WiredForward};
 use crate::stages::{StageCtx, RUN_WINESERVER_WAIT};
 use crate::{logs, util};
 
@@ -106,13 +106,24 @@ fn stream_forward_specs() -> Vec<String> {
         .collect()
 }
 
-/// run.sh:108 — remove **both** ports, ignoring every failure.
+/// run.sh:108 — remove **both** ports, ignoring every failure, then bring the
+/// persisted record back in line (no forwards on the device ⇒ none on disk).
 ///
 /// On a fresh, non-cancelled executor ([`super::teardown_ctx`]): the common
 /// reason to be rolling back is that Stop cancelled the token mid-loop, and
-/// the launch executor refuses every child once it is cancelled — the removal
-/// would be a silent no-op exactly when it matters most.
-async fn rollback_forwards(ctx: &StageCtx, adb: &Path, serial: &str, specs: &[String]) {
+/// the launch executor refuses every child (and every write) once it is
+/// cancelled — the removal and the record fix-up would be silent no-ops
+/// exactly when they matter most. The save is best-effort: a failure here
+/// changes nothing about the error travelling out, and the next reconcile
+/// still finds no live wine child to protect the record.
+async fn rollback_forwards(
+    ctx: &StageCtx,
+    adb: &Path,
+    serial: &str,
+    specs: &[String],
+    sess: &mut SessionState,
+    state_path: &Path,
+) {
     let rb = super::teardown_ctx(ctx);
     for q in specs {
         let undo = rb
@@ -124,6 +135,8 @@ async fn rollback_forwards(ctx: &StageCtx, adb: &Path, serial: &str, specs: &[St
             .arg(q);
         let _ = rb.executor.run_child(&undo).await;
     }
+    sess.wired_forwards.clear();
+    let _ = state::save(&*rb.executor, state_path, sess).await;
 }
 
 /// `launch-action: adb-forward-hygiene` — run.sh lines 93–124.
@@ -135,9 +148,19 @@ async fn rollback_forwards(ctx: &StageCtx, adb: &Path, serial: &str, specs: &[St
 /// knows nothing about (PARITY.md; CLAUDE.md's `--wired` note; the distinction
 /// from `adb reverse --remove-all`, which *is* fine, is deliberate).
 ///
-/// Returns the forwards actually created, for [`crate::session::state`] to
-/// persist so they can be removed even after a crash.
-pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
+/// Persists each intended forward into `sess.wired_forwards` (and saves
+/// `state_path`) **before** running the `adb forward` that creates it —
+/// [`crate::session::state`]'s write-before-mutate invariant, row 3. A crash
+/// between the two ports therefore always leaves the just-attempted forward
+/// named on disk, even when the port itself never actually came up: an
+/// over-recorded forward costs one harmless `adb forward --remove` that finds
+/// nothing to remove, where an under-recorded one is the stale forward that
+/// silently breaks the next WiFi run (CLAUDE.md's `--wired` note).
+pub async fn adb_forward_hygiene(
+    ctx: &StageCtx,
+    sess: &mut SessionState,
+    state_path: &Path,
+) -> Result<()> {
     let st = ctx.step(step::RUN_ADB_FORWARDS);
     let adb = ctx.paths.adb.clone();
 
@@ -153,7 +176,7 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
             crate::fixes::adb::remove_adb_forwards_at(ctx, &ctx.sink, step::RUN_ADB_FORWARDS)
                 .await?;
         }
-        return Ok(Vec::new());
+        return Ok(());
     }
 
     // run.sh:104
@@ -178,8 +201,23 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
     };
 
     let specs = stream_forward_specs();
-    let mut created: Vec<WiredForward> = Vec::new();
     for (port, local) in contract().ports.stream.iter().zip(&specs) {
+        // The record goes down FIRST — before the `adb forward` that could
+        // crash mid-flight, exactly as `AudioGuard::acquire` writes its
+        // `prev_audio_output` before switching the device.
+        sess.wired_forwards.push(WiredForward {
+            serial: serial.clone(),
+            port: *port,
+        });
+        // The save leaves through the same door as a failed forward below: a
+        // Stop (or a disk error) landing here, after the first port is up,
+        // must still take that forward back down — returning through `?`
+        // would leave it on the device with nothing on disk naming it.
+        if let Err(e) = state::save(&*ctx.executor, state_path, sess).await {
+            rollback_forwards(ctx, &adb, &serial, &specs, sess, state_path).await;
+            return Err(e);
+        }
+
         let spec = ctx
             .child(adb.clone(), step::RUN_ADB_FORWARDS)
             .arg("-s")
@@ -199,7 +237,7 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
             Err(e) => Some(Some(e)),
         };
         if let Some(cause) = failure {
-            rollback_forwards(ctx, &adb, &serial, &specs).await;
+            rollback_forwards(ctx, &adb, &serial, &specs, sess, state_path).await;
             // run.sh:109.
             let die = format!(
                 "adb forward {local} {local} failed on {serial} — check the USB connection \
@@ -215,10 +253,6 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
                 None => st.fatal(die, None),
             });
         }
-        created.push(WiredForward {
-            serial: serial.clone(),
-            port: *port,
-        });
     }
     // run.sh:112 — the port list is rendered from the contract so the literal
     // `tcp:9943/tcp:9944` in the shell string cannot drift from `ports.stream`.
@@ -226,7 +260,7 @@ pub async fn adb_forward_hygiene(ctx: &StageCtx) -> Result<Vec<WiredForward>> {
         "wired mode: adb forward {} up on {serial} (a later non-wired run clears these two)",
         specs.join("/")
     ));
-    Ok(created)
+    Ok(())
 }
 
 // ── 2. wineserver reset ───────────────────────────────────────────────────────
@@ -459,6 +493,7 @@ fn die_with_cause(
         step: step_id.to_string(),
         stream: crate::events::Stream::Stderr,
         chunk: cause.to_string(),
+        end: process::ChunkEnd::Lf,
     });
     ctx.fatal(message.to_string(), None)
 }
@@ -543,7 +578,10 @@ pub fn wine_spec(ctx: &StageCtx, bottle: &Bottle) -> ChildSpec {
 }
 
 /// `BS_WIN` — `win_path "$BS_DIR/Beat Saber.exe"`.
-pub(crate) fn bs_win_path(ctx: &StageCtx, bottle: &Bottle) -> String {
+///
+/// `pub` (A1-3) so `sabrage-parity` can pin `run.sh`'s `   exe: <BS_WIN>` line
+/// against the real renderer instead of a copied substring.
+pub fn bs_win_path(ctx: &StageCtx, bottle: &Bottle) -> String {
     util::win_path(Some(&bottle.prefix), &ctx.bs_dir.join("Beat Saber.exe"))
 }
 
@@ -592,7 +630,10 @@ pub fn wine_env(
 /// The `-- launching …` line is a [`StageEvent::Section`] (the CLI renders it
 /// as `-- <title>`); the rest are [`StageEvent::Text`], leading spaces and
 /// empty lines included.
-pub(crate) fn banner_events(
+///
+/// `pub` (A1-3) so `sabrage-parity` can pin this banner against `run.sh` by
+/// calling the real renderer instead of copying a substring per line.
+pub fn banner_events(
     run_id: crate::events::RunId,
     bottle_name: &str,
     bs_win: &str,
@@ -743,6 +784,13 @@ mod tests {
         (ctx, seen)
     }
 
+    /// A fresh [`SessionState`] for `adb_forward_hygiene`'s write-before-mutate
+    /// tests — the run id and paths do not matter to those tests, only that a
+    /// record exists for it to persist forwards into.
+    fn fresh_state() -> SessionState {
+        SessionState::new(Uuid::nil(), "Steam", "/games/bs", "/repo/logs/x.log", 1)
+    }
+
     fn bottle(root: &Path) -> Bottle {
         Bottle {
             name: "Steam".to_string(),
@@ -829,8 +877,12 @@ mod tests {
     async fn a_non_wired_run_without_adb_does_nothing_at_all() {
         let root = scratch("no-adb");
         let (ctx, seen) = dry_ctx(&root, StageOptions::default());
-        let made = adb_forward_hygiene(&ctx).await.unwrap();
-        assert!(made.is_empty());
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap();
+        assert!(sess.wired_forwards.is_empty());
         assert!(seen.lock().unwrap().is_empty());
         assert!(ctx.executor.planned().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
@@ -848,8 +900,15 @@ mod tests {
             "SERIALX tcp:9943 tcp:9943\nSERIALX tcp:5555 tcp:5555\n",
         ));
 
-        let made = adb_forward_hygiene(&ctx).await.unwrap();
-        assert!(made.is_empty(), "a non-wired run creates nothing");
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap();
+        assert!(
+            sess.wired_forwards.is_empty(),
+            "a non-wired run creates nothing"
+        );
 
         let evs = seen.lock().unwrap().clone();
         let rows: Vec<(Option<&str>, String)> = evs
@@ -907,7 +966,11 @@ mod tests {
                 ..Default::default()
             },
         );
-        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
@@ -947,7 +1010,11 @@ mod tests {
             },
         );
         ctx.paths.adb = Some(fake_adb(&root, "List of devices attached\n", 0));
-        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "--wired: no Quest over adb — connect USB and check 'adb devices'"
@@ -971,9 +1038,13 @@ mod tests {
             0,
         ));
 
-        let made = adb_forward_hygiene(&ctx).await.unwrap();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap();
         assert_eq!(
-            made,
+            sess.wired_forwards,
             vec![
                 WiredForward {
                     serial: "1WMHH0X".into(),
@@ -985,11 +1056,18 @@ mod tests {
                 },
             ]
         );
-        // Two planned spawns, never a `--remove-all`.
+        // Two planned spawns, never a `--remove-all` — plus the two
+        // write-before-mutate `session-state.json` saves (one per forward).
         let plan = ctx.executor.planned();
-        assert_eq!(plan.len(), 2);
-        for (p, port) in plan.iter().zip(["tcp:9943", "tcp:9944"]) {
-            assert_eq!(p.kind, PlannedKind::Spawn);
+        assert_eq!(
+            plan.iter().filter(|p| p.kind == PlannedKind::Spawn).count(),
+            2
+        );
+        let spawns: Vec<_> = plan
+            .iter()
+            .filter(|p| p.kind == PlannedKind::Spawn)
+            .collect();
+        for (p, port) in spawns.iter().zip(["tcp:9943", "tcp:9944"]) {
             assert!(
                 p.reason
                     .ends_with(&format!("-s 1WMHH0X forward {port} {port}")),
@@ -1048,7 +1126,11 @@ mod tests {
             1,
         ));
 
-        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
         assert_eq!(
             err.to_string(),
             "adb forward tcp:9943 tcp:9943 failed on 1WMHH0X — check the USB connection \
@@ -1066,6 +1148,10 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("forward --remove tcp:9944")),
             "{calls:?}"
+        );
+        assert!(
+            sess.wired_forwards.is_empty(),
+            "the in-memory record must reflect the rollback"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1089,13 +1175,25 @@ mod tests {
             "List of devices attached\n1WMHH0X\tdevice\n",
         ));
 
+        // Cancel once the fake adb is *inside* the second port's `forward`
+        // (it drops a marker before sleeping) — an event, not a wall-clock
+        // guess: a fixed timer either fires too early under a loaded test run
+        // (before the first forward exists) or wastes real seconds.
         let cancel = ctx.cancel.clone();
+        let marker = root.join("adb.second");
         tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !marker.exists() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             cancel.cancel();
         });
 
-        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
         let calls = adb_calls(&root);
         assert!(
@@ -1103,6 +1201,81 @@ mod tests {
                 .iter()
                 .any(|c| c.contains("forward --remove tcp:9943")),
             "the rollback must run on a fresh executor, not the cancelled one: {calls:?}"
+        );
+        assert!(
+            sess.wired_forwards.is_empty(),
+            "the in-memory record must reflect the rollback"
+        );
+        let on_disk = state::load(&state_path).unwrap().unwrap();
+        assert!(
+            on_disk.wired_forwards.is_empty(),
+            "the persisted record is fixed up on the fresh executor too: {:?}",
+            on_disk.wired_forwards
+        );
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    /// The write-before-mutate save inside the loop leaves through the same
+    /// door as a failed `adb forward`: when the record for the SECOND port
+    /// cannot be written — here the state directory turns read-only the
+    /// moment `tcp:9943` is up — the first forward still comes back down and
+    /// the in-memory record says so, instead of the error returning through
+    /// `?` over a live forward nothing on disk names.
+    #[tokio::test]
+    async fn a_failed_save_between_the_ports_still_rolls_the_first_forward_back() {
+        let root = scratch("wired-save-fail");
+        let (mut ctx, _) = real_ctx(
+            &root,
+            StageOptions {
+                wired: true,
+                ..Default::default()
+            },
+        );
+        let state_path = ctx.paths.session_state_path();
+        let state_dir = state_path.parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&state_dir).unwrap();
+        ctx.paths.adb = Some(readonly_state_dir_after_first_port_adb(
+            &root,
+            "List of devices attached\n1WMHH0X\tdevice\n",
+            &state_dir,
+        ));
+
+        let mut sess = fresh_state();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
+        // Restore before asserting so a failure still cleans up its scratch.
+        std::fs::set_permissions(
+            &state_dir,
+            <std::fs::Permissions as std::os::unix::fs::PermissionsExt>::from_mode(0o755),
+        )
+        .unwrap();
+        assert!(
+            !matches!(err, SabrageError::Cancelled),
+            "a disk error is not a cancellation: {err:?}"
+        );
+        let calls = adb_calls(&root);
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("forward tcp:9943 tcp:9943")),
+            "the first forward must have gone up before the save failed: {calls:?}"
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|c| c.contains("forward tcp:9944 tcp:9944")),
+            "the second forward must never be attempted after its save failed: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c.contains("forward --remove tcp:9943")),
+            "the failed save must roll the first forward back: {calls:?}"
+        );
+        assert!(
+            sess.wired_forwards.is_empty(),
+            "the in-memory record must reflect the rollback"
         );
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1127,7 +1300,11 @@ mod tests {
             cancel.cancel();
         });
 
-        let err = adb_forward_hygiene(&ctx).await.unwrap_err();
+        let mut sess = fresh_state();
+        let state_path = ctx.paths.session_state_path();
+        let err = adb_forward_hygiene(&ctx, &mut sess, &state_path)
+            .await
+            .unwrap_err();
         assert!(matches!(err, SabrageError::Cancelled), "{err:?}");
         std::fs::remove_dir_all(&root).ok();
     }
@@ -1154,7 +1331,36 @@ mod tests {
                  \x20 case \"$a\" in devices) printf '%s' '{devices_stdout}'; exit 0;; esac\n\
                  done\n\
                  echo \"$@\" >> \"$(dirname \"$0\")/adb.calls\"\n\
-                 case \"$*\" in *--remove*) ;; *9944*) sleep 30;; esac\n\
+                 case \"$*\" in *--remove*) ;; *9944*) : > \"$(dirname \"$0\")/adb.second\"; sleep 30;; esac\n\
+                 exit 0\n"
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    /// Like [`slow_second_port_adb`], but instead of sleeping it turns the
+    /// session-state directory read-only as a side effect of the FIRST port's
+    /// `forward`, so the record write for the second port fails while
+    /// `tcp:9943` is live on the "device".
+    fn readonly_state_dir_after_first_port_adb(
+        dir: &Path,
+        devices_stdout: &str,
+        state_dir: &Path,
+    ) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let path = dir.join("adb");
+        let state_dir = state_dir.display();
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\n\
+                 for a in \"$@\"; do\n\
+                 \x20 case \"$a\" in devices) printf '%s' '{devices_stdout}'; exit 0;; esac\n\
+                 done\n\
+                 echo \"$@\" >> \"$(dirname \"$0\")/adb.calls\"\n\
+                 case \"$*\" in *--remove*) ;; *9943*) chmod 0555 '{state_dir}';; esac\n\
                  exit 0\n"
             ),
         )

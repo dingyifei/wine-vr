@@ -106,6 +106,26 @@ pub(crate) fn blackhole_listed(list_stdout: &str) -> bool {
     list_stdout.lines().any(|l| l == BLACKHOLE_DEVICE)
 }
 
+// ── verbatim text (A1-3: `pub` so `sabrage-parity` can pin these against
+// `run.sh` by calling the real renderer rather than copying a substring) ────
+
+/// run.sh:183.
+pub const AUDIO_DISABLED_LINE: &str =
+    "audio routing disabled (--no-audio) — sound stays on the Mac";
+
+/// run.sh:198.
+pub fn blackhole_not_present_line() -> String {
+    format!(
+        "{BLACKHOLE_DEVICE} not present (brew install blackhole-2ch + reboot) — audio stays on \
+         the Mac"
+    )
+}
+
+/// run.sh's failed-switch branch, which clears `PREV_AUDIO_OUT` again.
+pub fn blackhole_switch_failed_line() -> String {
+    format!("could not switch output to {BLACKHOLE_DEVICE} — audio stays on the Mac")
+}
+
 /// `launch-action: audio-route` — run.sh lines 154–200.
 ///
 /// Skipped entirely (an `info` row, no guard state) when `--no-audio`, when
@@ -136,12 +156,16 @@ pub struct AudioGuard {
 }
 
 /// `audio: default output -> BlackHole 2ch (was: <dev>)`
-fn audio_switched_line(previous: &str) -> String {
+///
+/// `pub` (A1-3), same reason as the block above.
+pub fn audio_switched_line(previous: &str) -> String {
     format!("audio: default output -> {BLACKHOLE_DEVICE} (was: {previous})")
 }
 
 /// `audio: restored output -> <dev>`
-fn audio_restored_line(previous: &str) -> String {
+///
+/// `pub` (A1-3), same reason as the block above.
+pub fn audio_restored_line(previous: &str) -> String {
     format!("audio: restored output -> {previous}")
 }
 
@@ -167,8 +191,9 @@ async fn switch_output(ctx: &StageCtx, bin: &Path, device: &str) -> Result<bool>
 }
 
 /// `SwitchAudioSource -a -t output` as one device name per line — read-only,
-/// hence [`crate::process::capture`] rather than the executor (the same
-/// exception `AudioGuard::acquire`'s two probes take).
+/// hence [`crate::process::capture_with`] rather than the executor (the same
+/// exception `AudioGuard::acquire`'s two probes take), carrying `ctx.cancel`
+/// so a Cancel during teardown does not wait out the probe's full timeout.
 ///
 /// An absent or failing binary yields an empty list, which simply means "no
 /// fallback": the caller then prints the remedy.
@@ -179,7 +204,7 @@ async fn list_output_devices(ctx: &StageCtx, bin: &Path) -> Vec<String> {
         .arg("-t")
         .arg("output")
         .env_path(process::default_child_path());
-    match process::capture(&spec).await {
+    match process::capture_with(&spec, &ctx.cancel, process::DEFAULT_PROBE_TIMEOUT).await {
         Ok(out) if out.status.success() => out
             .stdout
             .lines()
@@ -243,7 +268,7 @@ impl AudioGuard {
         ) {
             // run.sh:183
             AudioEligibility::Disabled => {
-                st.info("audio routing disabled (--no-audio) — sound stays on the Mac");
+                st.info(AUDIO_DISABLED_LINE);
                 return Ok(guard);
             }
             AudioEligibility::Skip => return Ok(guard),
@@ -253,28 +278,30 @@ impl AudioGuard {
 
         // Read-only probes: they bypass the executor and therefore run under a
         // dry run too, so the plan is accurate rather than optimistic.
-        let listing = process::capture(
+        let listing = process::capture_with(
             &ctx.child(bin.clone(), step::RUN_AUDIO)
                 .arg("-a")
                 .arg("-t")
                 .arg("output")
                 .env_path(process::default_child_path()),
+            &ctx.cancel,
+            process::DEFAULT_PROBE_TIMEOUT,
         )
         .await?;
         if !blackhole_listed(&listing.stdout) {
             // run.sh:198
-            st.warn(format!(
-                "{BLACKHOLE_DEVICE} not present (brew install blackhole-2ch + reboot) — audio stays on the Mac"
-            ));
+            st.warn(blackhole_not_present_line());
             return Ok(guard);
         }
 
-        let current = process::capture(
+        let current = process::capture_with(
             &ctx.child(bin.clone(), step::RUN_AUDIO)
                 .arg("-c")
                 .arg("-t")
                 .arg("output")
                 .env_path(process::default_child_path()),
+            &ctx.cancel,
+            process::DEFAULT_PROBE_TIMEOUT,
         )
         .await?;
         // `$(…)` capture semantics: trailing newlines stripped, nothing else.
@@ -332,9 +359,7 @@ impl AudioGuard {
         } else {
             // run.sh:194-195 — warn, and clear the remembered device again so
             // the exit trap restores nothing.
-            st.warn(format!(
-                "could not switch output to {BLACKHOLE_DEVICE} — audio stays on the Mac"
-            ));
+            st.warn(blackhole_switch_failed_line());
             guard.previous_output = None;
             // …but never clear a device this run only inherited: that record is
             // an EARLIER session's unfinished restore, and this launch failing
@@ -552,9 +577,15 @@ pub struct DashboardGuard {
     disarmed: bool,
 }
 
-const DASHBOARD_OPENING_LINE: &str =
+// `pub` (A1-3): see this file's audio-line block above for why.
+pub const DASHBOARD_OPENING_LINE: &str =
     "dashboard: ALVR server dashboard opening (connects once the game is up)";
-const DASHBOARD_CLOSED_LINE: &str = "dashboard: closed";
+pub const DASHBOARD_CLOSED_LINE: &str = "dashboard: closed";
+/// run.sh:208.
+pub const DASHBOARD_DISABLED_LINE: &str = "ALVR dashboard disabled (--no-dashboard)";
+/// run.sh:216.
+pub const DASHBOARD_NOT_BUILT_LINE: &str =
+    "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)";
 
 impl DashboardGuard {
     fn inert(ctx: &StageCtx) -> DashboardGuard {
@@ -585,16 +616,14 @@ impl DashboardGuard {
         ) {
             // run.sh:208
             DashboardEligibility::Disabled => {
-                st.info("ALVR dashboard disabled (--no-dashboard)");
+                st.info(DASHBOARD_DISABLED_LINE);
                 return Ok(guard);
             }
             // run.sh:209-210 — the bare `:`.
             DashboardEligibility::Skip => return Ok(guard),
             // run.sh:216
             DashboardEligibility::NotBuilt => {
-                st.warn(
-                    "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)",
-                );
+                st.warn(DASHBOARD_NOT_BUILT_LINE);
                 return Ok(guard);
             }
             DashboardEligibility::Spawn => {}
@@ -1222,6 +1251,37 @@ mod tests {
         );
         assert!(state.guards.dashboard_closed);
         assert!(!rows(&seen.lock().unwrap()).contains(&DASHBOARD_CLOSED_LINE.to_string()));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A2-3: `list_output_devices` carries `ctx.cancel` into
+    /// [`crate::process::capture_with`] rather than [`crate::process::capture`],
+    /// so a Cancel during teardown does not have to wait out the probe's full
+    /// [`crate::process::DEFAULT_PROBE_TIMEOUT`]. A wedged `SwitchAudioSource`
+    /// (here, a script that sleeps far longer than the test's own budget) must
+    /// return promptly — with an empty list, exactly as a missing binary
+    /// would — once the token is already cancelled.
+    #[tokio::test]
+    async fn list_output_devices_honors_an_already_cancelled_token() {
+        let root = scratch("audio-list-cancel");
+        let (ctx, _seen) = dry_ctx(&root, StageOptions::default());
+        ctx.cancel.cancel();
+
+        let slow_bin = root.join("SwitchAudioSource-slow.sh");
+        std::fs::write(&slow_bin, "#!/bin/sh\nsleep 30\necho 'BlackHole 2ch'\n").unwrap();
+        std::fs::set_permissions(
+            &slow_bin,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let started = tokio::time::Instant::now();
+        let devices = list_output_devices(&ctx, &slow_bin).await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the probe should abort on the cancelled token instead of running to completion"
+        );
+        assert!(devices.is_empty(), "a cancelled probe yields no devices");
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -6,6 +6,7 @@
 // as the last `refresh()`/`save()`/`remove()` — there is no standing
 // subscription here, unlike session.svelte.ts's status broadcast.
 
+import { errMsg } from "../lib/text";
 import {
   getLibrary as ipcGetLibrary,
   removeGame as ipcRemoveGame,
@@ -26,7 +27,7 @@ function createLibraryStore() {
     try {
       rows = await ipcGetLibrary();
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      error = errMsg(e);
     } finally {
       loading = false;
     }

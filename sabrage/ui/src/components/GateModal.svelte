@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { cap, errMsg } from "../lib/text";
+  import StatusIcon from "./StatusIcon.svelte";
   import {
     runStage,
     cancelStage,
@@ -38,7 +40,7 @@
     | { kind: "autoFixed"; step: string; description: string }
     | { kind: "needsAdmin"; step: string; reason: string }
     | { kind: "fatal"; message: string; remedy: string | null; fix: FixAction | null }
-    | { kind: "check"; outcome: CheckEv["outcome"]; gate: CheckEv["gate"] }
+    | { kind: "check"; outcome: CheckEv["outcome"] }
     | { kind: "launched"; pid: number; logPath: string };
 
   /** One `StageEvent` -> the row it renders as, or `null` for the four kinds
@@ -61,7 +63,7 @@
       case "fatal":
         return { kind: "fatal", message: ev.message, remedy: ev.remedy, fix: ev.fix };
       case "check":
-        return { kind: "check", outcome: ev.outcome, gate: ev.gate };
+        return { kind: "check", outcome: ev.outcome };
       case "launched":
         return { kind: "launched", pid: ev.pid, logPath: ev.logPath };
       default:
@@ -190,7 +192,7 @@
         handleEvent,
       );
     } catch (e) {
-      if (!sawFatal) invokeError = e instanceof Error ? e.message : String(e);
+      if (!sawFatal) invokeError = errMsg(e);
     } finally {
       running = false;
       req.onFinished?.();
@@ -264,14 +266,10 @@
         void start(request);
       }
     } catch (e) {
-      fixError = e instanceof Error ? e.message : String(e);
+      fixError = errMsg(e);
     } finally {
       fixBusy = false;
     }
-  }
-
-  function cap(s: string): string {
-    return s.length ? s[0].toUpperCase() + s.slice(1) : s;
   }
 
   // ── run mode: sessionStore already started the launch, this component only observes ──
@@ -285,16 +283,13 @@
     }
     return out;
   });
-  const runLaunchedEv = $derived.by(() => {
-    if (!isRunMode) return undefined;
-    return sessionStore.launchRows.find(
-      (ev): ev is Extract<StageEvent, { kind: "launched" }> => ev.kind === "launched",
-    );
-  });
-  const runFatalEv = $derived.by(() => {
-    if (!isRunMode) return undefined;
-    return sessionStore.launchRows.find((ev): ev is Extract<StageEvent, { kind: "fatal" }> => ev.kind === "fatal");
-  });
+  // `sessionStore.launchedEv`/`fatalEv`/`startedEv` are O(1) fields the store
+  // itself captures as its own `launch()` callback sees each event — this
+  // used to be a `.find()` scan over the whole `launchRows` array per event
+  // (four of them, including `runRows` above), redone on every single new
+  // row. See that store's doc comments.
+  const runLaunchedEv = $derived(isRunMode ? sessionStore.launchedEv : undefined);
+  const runFatalEv = $derived(isRunMode ? sessionStore.fatalEv : undefined);
   // The launch's own `runId`, off its first `stageStarted` row — the id
   // `cancelStage` takes. `sabrage_core::stages::run_stage` takes
   // `OPERATION_LOCK` for `Stage::Run` from `stageStarted` through `launched`
@@ -304,12 +299,7 @@
   // finishes on its own, and would also race a still-empty `status.bottle`.
   // `cancelStage(runId)` fires the run's own cancel token instead, which
   // needs no lock at all.
-  const runStartedEv = $derived.by(() => {
-    if (!isRunMode) return undefined;
-    return sessionStore.launchRows.find(
-      (ev): ev is Extract<StageEvent, { kind: "stageStarted" }> => ev.kind === "stageStarted",
-    );
-  });
+  const runStartedEv = $derived(isRunMode ? sessionStore.startedEv : undefined);
   // A dry run (or any launch that settles with neither a `launched` nor a
   // `fatal` row) still needs a terminal state once the invocation resolves.
   const runDone = $derived(isRunMode && !sessionStore.launching && !runLaunchedEv && !runFatalEv);
@@ -370,49 +360,26 @@
 </script>
 
 {#snippet okIcon()}
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="2"
-    ><polyline points="20 6 9 17 4 12"></polyline></svg
-  >
-{/snippet}
-{#snippet warnIcon()}
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-neutral-600)" stroke-width="1.5"
-    ><path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"
-    ></path><line x1="12" y1="9" x2="12" y2="13"></line><line x1="12" y1="17" x2="12.01" y2="17"></line></svg
-  >
+  <StatusIcon kind="ok" size={13} />
 {/snippet}
 {#snippet failIcon()}
-  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-900)" stroke-width="2.5"
-    ><line x1="18" y1="6" x2="6" y2="18"></line><line x1="6" y1="6" x2="18" y2="18"></line></svg
-  >
+  <StatusIcon kind="fail" size={13} />
 {/snippet}
 {#snippet lockIcon()}
-  <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="var(--color-accent-700)" stroke-width="1.5"
-    ><rect x="3" y="11" width="18" height="10" rx="2"></rect><path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg
-  >
+  <StatusIcon kind="lock" />
 {/snippet}
 {#snippet lineIcon(severity: Severity)}
-  {#if severity === "ok"}
-    {@render okIcon()}
-  {:else if severity === "warn"}
-    {@render warnIcon()}
-  {:else if severity === "fail"}
-    {@render failIcon()}
-  {:else}
-    <span class="info-dot" aria-hidden="true"></span>
-  {/if}
+  <StatusIcon kind={severity} size={13} />
 {/snippet}
 {#snippet checkIcon(status: CheckStatus)}
-  {#if status === "pass"}
-    {@render okIcon()}
-  {:else if status === "warn"}
-    {@render warnIcon()}
-  {:else if status === "fail"}
-    {@render failIcon()}
-  {:else if status === "info"}
-    <span class="info-dot" aria-hidden="true"></span>
-  {:else}
-    <span class="empty-square" aria-hidden="true"></span>
-  {/if}
+  <StatusIcon
+    kind={status === "pass"
+      ? "ok"
+      : status === "warn" || status === "fail" || status === "info"
+        ? status
+        : "empty"}
+    size={13}
+  />
 {/snippet}
 
 {#snippet renderRow(row: Row)}
@@ -721,21 +688,6 @@
     align-self: center;
     padding: 2px 14px;
     font-size: 12px;
-  }
-  .info-dot {
-    display: block;
-    width: 6px;
-    height: 6px;
-    margin: 6px;
-    border-radius: 50%;
-    background: var(--color-neutral-500);
-  }
-  .empty-square {
-    display: block;
-    width: 11px;
-    height: 11px;
-    margin: 2px;
-    border: 1px solid var(--color-divider);
   }
   .admin-note {
     display: flex;

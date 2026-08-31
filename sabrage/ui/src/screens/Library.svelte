@@ -8,6 +8,7 @@
   // conventions in Doctor.svelte/Session.svelte.
 
   import { onMount } from "svelte";
+  import { errMsg } from "../lib/text";
   import { isLivePhase, type GameEntry, type GameStatus, type GameValidity, type GoldbergState, type LaunchOpts } from "../ipc";
   import { libraryStore } from "../stores/library.svelte";
   import { sessionStore } from "../stores/session.svelte";
@@ -180,7 +181,7 @@
       await libraryStore.remove(id);
       if (expandedId === id) expandedId = null;
     } catch (e) {
-      removeError = e instanceof Error ? e.message : String(e);
+      removeError = errMsg(e);
     } finally {
       removing = false;
       removeConfirmId = null;

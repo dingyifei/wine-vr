@@ -407,6 +407,7 @@ async fn install_if_changed(
                     step: step.to_string(),
                     stream: Stream::Stderr,
                     chunk: other.to_string(),
+                    end: crate::process::ChunkEnd::Lf,
                 });
                 Err(ctx.fatal(
                     format!("copy failed: {} -> {}", src.display(), dst.display()),

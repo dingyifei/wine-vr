@@ -1149,12 +1149,27 @@ pub async fn write(
         return Err(live_session_refusal(toml_path, &bottle));
     }
 
+    // A10-1: serializes this whole read-patch-backup-write sequence across
+    // *processes* — [`Paths::toml_lock_path`]'s own doc names exactly this
+    // call site. Best-effort like [`crate::session::state`]'s record lock: a
+    // machine that cannot lock must still be able to save Settings, and
+    // [`still_safe_to_replace`]'s compare-and-swap is the safety net this only
+    // makes rare rather than relied upon. A dry run takes no lock — it writes
+    // nothing to serialize.
+    let _lock = if executor.is_dry_run() {
+        None
+    } else {
+        lock_toml(toml_path).await
+    };
+
     // The existence probe and the create are two syscalls apart, so the absent
-    // branch is a TOCTOU by construction: `Executor::write_atomic` is a rename
-    // over the destination and there is no no-clobber create to reach for. The
-    // window is narrowed as far as it can be from here — probed again after the
-    // awaited `create_dir_all`, and every path guarded by the compare-and-swap
-    // below — but only an `O_EXCL` create on the executor closes it.
+    // branch is a TOCTOU by construction. The window is narrowed as far as it
+    // can be from here — probed again after the awaited `create_dir_all`, and
+    // every path guarded by the compare-and-swap below — and `A10-1` closes it
+    // the rest of the way: [`Executor::create_new`] (`O_EXCL`) rather than
+    // [`Executor::write_atomic`] (an unconditional rename) for the template
+    // create, so a second writer that created the file in this exact window is
+    // never clobbered by this one.
     let mut exists = toml_path.is_file();
     if !exists {
         if let Some(parent) = toml_path.parent() {
@@ -1166,10 +1181,18 @@ pub async fn write(
         std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?
     } else {
         let template = crate::util::toml_template();
-        executor
-            .write_atomic(toml_path, template.as_bytes())
-            .await?;
-        template.to_string()
+        if executor.create_new(toml_path, template.as_bytes()).await? {
+            template.to_string()
+        } else {
+            // Lost the create race: something else (another Sabrage, `sabrage
+            // setup`) put a file there between the probe above and this call.
+            // Read what it actually wrote instead of overwriting it, and treat
+            // the rest of `write` exactly as the ordinary "file already
+            // existed" path — including the compare-and-swap below, which
+            // still protects against a THIRD writer landing after this read.
+            exists = true;
+            std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?
+        }
     };
 
     let patched = apply_patch(&base, patch)?;
@@ -1197,7 +1220,6 @@ pub async fn write(
     still_safe_to_replace(executor, toml_path, &session_state, &base)?;
 
     if exists {
-        let backup = next_backup_path(backups_dir, unix_secs());
         // The prune list is computed BEFORE the new backup is written: a real
         // run would otherwise see it in the listing and a dry run would not,
         // and the two modes must plan the same set of removals.
@@ -1206,7 +1228,8 @@ pub async fn write(
             .skip(BACKUP_KEEP.saturating_sub(1))
             .collect();
         executor.create_dir_all(backups_dir).await?;
-        executor.write_atomic(&backup, base.as_bytes()).await?;
+        let backup =
+            reserve_backup_path(executor, backups_dir, unix_secs(), base.as_bytes()).await?;
         for old in stale {
             executor.remove_file(Path::new(&old.path)).await?;
         }
@@ -1276,6 +1299,51 @@ fn session_state_beside(backups_dir: &Path) -> PathBuf {
         .join("session-state.json")
 }
 
+/// How long [`lock_toml`] waits for another writer's read-modify-write before
+/// proceeding without the lock — the same shape and budget as
+/// [`crate::session::state`]'s record lock.
+const TOML_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Poll interval inside [`TOML_LOCK_WAIT`].
+const TOML_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Takes the advisory lock at [`Paths::toml_lock_path`] — derived here from
+/// `toml_path`'s parent directory rather than threading a whole [`Paths`]
+/// through, since [`Paths::toml_path`] and [`Paths::toml_lock_path`] always
+/// share one (`<oxr_appsup>`).
+///
+/// A separate dotfile, not a lock on the config itself, so it survives
+/// [`Executor::write_atomic`]'s rename. Held by the returned `File`; dropping
+/// it releases the `flock`. `None` on any failure — including a holder that
+/// will not let go — exactly like [`crate::session::state::lock_record`]:
+/// this narrows the window `still_safe_to_replace` guards, it does not
+/// replace it.
+///
+/// [`Paths`]: crate::paths::Paths
+async fn lock_toml(toml_path: &Path) -> Option<std::fs::File> {
+    let path = toml_path.with_file_name(".oxrsys-runtime.toml.lock");
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).ok()?;
+    }
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)
+        .ok()?;
+    let deadline = tokio::time::Instant::now() + TOML_LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(TOML_LOCK_POLL).await;
+            }
+            _ => return None,
+        }
+    }
+}
+
 /// Compare-and-swap: refuse unless the file is still the bytes `base` was read
 /// from, and still nothing is streaming.
 ///
@@ -1329,6 +1397,30 @@ fn next_backup_path(backups_dir: &Path, secs: u64) -> PathBuf {
         }
     }
     unreachable!("u32 exhausted")
+}
+
+/// A10-1: reserves `<backups_dir>/oxrsys-runtime.toml.<secs>[-n]` and writes
+/// `bytes` into it via [`Executor::create_new`] (`O_EXCL`).
+///
+/// [`next_backup_path`]'s `!exists()` probe is itself a check-then-create race
+/// between two Sabrage processes backing up in the same second — the loser's
+/// `write_atomic` would silently overwrite the winner's backup with `base`
+/// from a different run. Retrying the whole probe on a lost race (rather than
+/// just bumping the suffix locally) is deliberate: the directory listing has
+/// changed underneath, and re-scanning it is what finds the next name that is
+/// actually free.
+async fn reserve_backup_path(
+    executor: &dyn Executor,
+    backups_dir: &Path,
+    secs: u64,
+    bytes: &[u8],
+) -> Result<PathBuf> {
+    loop {
+        let candidate = next_backup_path(backups_dir, secs);
+        if executor.create_new(&candidate, bytes).await? {
+            return Ok(candidate);
+        }
+    }
 }
 
 /// The backups in `backups_dir`, newest first.
@@ -2260,6 +2352,114 @@ mod tests {
         assert_eq!(diff[0].0, "bitrate_mbps = 42");
         assert_eq!(diff[0].1, "bitrate_mbps = 60");
         assert!(!backups.exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A10-1: the absent-file branch used to be `is_file()` then
+    /// `write_atomic` — an unconditional rename that clobbers whatever a
+    /// second writer put there in between. It now goes through
+    /// [`Executor::create_new`] (`O_EXCL`), so a file that appears in that
+    /// exact window is read back instead of overwritten.
+    #[tokio::test]
+    async fn write_never_clobbers_a_file_created_in_the_toctou_window() {
+        let dir = scratch("create-race");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        let ex = real();
+
+        // Simulate the race directly: the file is absent when `write` probes
+        // for it (the scratch dir starts empty), so drive the same primitive
+        // `write` would use and confirm the loser reads the winner's bytes.
+        let winner = "[streaming]\nprotocol = \"alvr\"\nbitrate_mbps = 7\n";
+        assert!(ex.create_new(&path, winner.as_bytes()).await.unwrap());
+        assert!(!ex.create_new(&path, b"loser").await.unwrap());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), winner);
+
+        // `write` itself, called against that now-existing file, must treat it
+        // as pre-existing (never `created_from_template`) and patch the
+        // winner's bytes, not silently discard them.
+        let report = write(&ex, &path, &backups, &patch_bitrate(60))
+            .await
+            .unwrap();
+        assert!(!report.created_from_template);
+        assert!(std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("bitrate_mbps = 60"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A10-1: two writers backing up in the same second must not collide —
+    /// [`reserve_backup_path`] retries the whole probe on a lost `create_new`
+    /// race rather than trusting a stale `!exists()` read, so the loser lands
+    /// on the next free suffix instead of overwriting the winner's backup.
+    #[tokio::test]
+    async fn concurrent_backups_in_the_same_second_each_keep_their_own_bytes() {
+        let dir = scratch("backup-race");
+        let backups = dir.join("backups");
+        std::fs::create_dir_all(&backups).unwrap();
+        let ex = real();
+        let secs = 1_756_500_000u64;
+
+        let first = reserve_backup_path(&ex, &backups, secs, b"first")
+            .await
+            .unwrap();
+        let second = reserve_backup_path(&ex, &backups, secs, b"second")
+            .await
+            .unwrap();
+        assert_ne!(
+            first, second,
+            "the second writer must not overwrite the first"
+        );
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A10-1: [`lock_toml`] is [`Paths::toml_lock_path`]'s doc-promised call
+    /// site, held across a `write` from acquire to release — an in-process
+    /// contender opened as a fresh `File` (a distinct open file description,
+    /// so its own `try_lock` genuinely contends with the held one) must wait
+    /// until the first write finishes rather than interleaving with it.
+    ///
+    /// [`Paths::toml_lock_path`]: crate::paths::Paths::toml_lock_path
+    #[tokio::test]
+    async fn write_takes_the_cross_process_lock_at_the_documented_path() {
+        let dir = scratch("toml-lock");
+        let path = dir.join("oxrsys-runtime.toml");
+        let backups = dir.join("backups");
+        let ex = real();
+        write(&ex, &path, &backups, &patch_bitrate(60))
+            .await
+            .unwrap();
+
+        let lock_path = path.with_file_name(".oxrsys-runtime.toml.lock");
+        assert!(
+            lock_path.is_file(),
+            "write must leave the documented lock file behind: {lock_path:?}"
+        );
+
+        // Hold the lock from a second, independent open — exactly the shape a
+        // concurrent CLI process's `flock` would take.
+        let contender = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        contender.lock().unwrap();
+
+        let started = tokio::time::Instant::now();
+        write(&ex, &path, &backups, &patch_bitrate(72))
+            .await
+            .unwrap();
+        // Best-effort: proceeds without the lock once `TOML_LOCK_WAIT` elapses,
+        // rather than blocking forever — this asserts it actually waited out
+        // (most of) the budget instead of slipping past the held lock.
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(1800),
+            "a held lock must be waited out, not bypassed: {:?}",
+            started.elapsed()
+        );
+        drop(contender);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

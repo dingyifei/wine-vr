@@ -8,10 +8,10 @@
   // load/save/validate state pattern follows Doctor.svelte/Session.svelte.
 
   import { onMount } from "svelte";
+  import { errMsg } from "../lib/text";
   import {
     isLivePhase,
     suggestBsDir,
-    getAppState,
     newGameTemplate,
     pickFolder,
     revertOriginalSteamDll,
@@ -21,6 +21,8 @@
     type GoldbergState,
     type RevertReport,
   } from "../ipc";
+  import BottleSelect from "../components/BottleSelect.svelte";
+  import { bottlesStore } from "../stores/bottles.svelte";
   import { configStore } from "../stores/config.svelte";
   import { libraryStore } from "../stores/library.svelte";
   import { sessionStore } from "../stores/session.svelte";
@@ -60,18 +62,11 @@
    * renders at all. */
   let loadedBsDir = $state<string | null>(null);
 
-  let bottles = $state<string[]>([]);
-  let bottlesLoaded = $state(false);
+  const bottles = $derived(bottlesStore.bottles);
+  const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
 
   onMount(async () => {
-    try {
-      const state = await getAppState();
-      bottles = state.bottles;
-    } catch {
-      bottles = [];
-    } finally {
-      bottlesLoaded = true;
-    }
+    void bottlesStore.load();
 
     try {
       if (gameId) {
@@ -90,7 +85,7 @@
         entry = await newGameTemplate();
       }
     } catch (e) {
-      loadError = e instanceof Error ? e.message : String(e);
+      loadError = errMsg(e);
     } finally {
       loading = false;
     }
@@ -113,7 +108,7 @@
     try {
       validity = await validateGame(entry.bsDir, entry.bottle);
     } catch (e) {
-      validateError = e instanceof Error ? e.message : String(e);
+      validateError = errMsg(e);
     } finally {
       validating = false;
     }
@@ -147,7 +142,7 @@
       const picked = await pickFolder("Choose the Beat Saber install directory", suggestion.browseStart);
       if (picked) entry.bsDir = picked;
     } catch (e) {
-      validateError = e instanceof Error ? e.message : String(e);
+      validateError = errMsg(e);
     }
   }
 
@@ -225,7 +220,7 @@
       revertConfirm = false;
       void runValidate();
     } catch (e) {
-      revertError = e instanceof Error ? e.message : String(e);
+      revertError = errMsg(e);
     } finally {
       reverting = false;
     }
@@ -249,7 +244,7 @@
       loadedBsDir = row.entry.bsDir;
       onDone();
     } catch (e) {
-      saveError = e instanceof Error ? e.message : String(e);
+      saveError = errMsg(e);
     } finally {
       saving = false;
     }
@@ -308,15 +303,7 @@
 
           <div class="field">
             <label for="edit-bottle">CrossOver bottle</label>
-            {#if bottlesLoaded && bottles.length === 0}
-              <span class="text-muted">none found — create one in the CrossOver UI</span>
-            {:else}
-              <select id="edit-bottle" class="input" bind:value={entry.bottle}>
-                {#each bottles as b (b)}
-                  <option value={b}>{b}</option>
-                {/each}
-              </select>
-            {/if}
+            <BottleSelect id="edit-bottle" {bottles} {bottlesLoaded} bind:value={entry.bottle} />
           </div>
 
           <div class="field appid-field">

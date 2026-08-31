@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onDestroy, onMount } from "svelte";
+  import { errMsg } from "../lib/text";
   import {
     getLogSourcePath,
     listPastRuns,
@@ -132,7 +133,7 @@
       resolvedPath = path;
     } catch (e) {
       if (myGeneration !== tailGeneration) return;
-      pathError = e instanceof Error ? e.message : String(e);
+      pathError = errMsg(e);
     }
     try {
       const id = await startLogTail(source, handleBatch);
@@ -146,7 +147,7 @@
       tailId = id;
     } catch (e) {
       if (myGeneration !== tailGeneration) return;
-      pathError = e instanceof Error ? e.message : String(e);
+      pathError = errMsg(e);
     }
   }
 

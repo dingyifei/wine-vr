@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { cap, errMsg, titleCase } from "../lib/text";
+  import BottleSelect from "../components/BottleSelect.svelte";
   import CheckRow from "../components/CheckRow.svelte";
   import { doctorStore } from "../stores/doctor.svelte";
   import { sessionStore } from "../stores/session.svelte";
@@ -91,10 +93,6 @@
     void runFix(slug, action);
   }
 
-  function cap(s: string): string {
-    return s.length ? s[0].toUpperCase() + s.slice(1) : s;
-  }
-
   interface FatalInfo {
     message: string;
     remedy: string | null;
@@ -127,19 +125,11 @@
       const captured = fatal as FatalInfo | null;
       fixError = captured
         ? { slug, message: captured.message, remedy: captured.remedy, fix: captured.fix }
-        : { slug, message: e instanceof Error ? e.message : String(e), remedy: null, fix: null };
+        : { slug, message: errMsg(e), remedy: null, fix: null };
     } finally {
       fixBusySlug = null;
       void runChecks();
     }
-  }
-
-  /** "bottle-bridge" -> "Bottle Bridge" — the contract's `group` field, title-cased. */
-  function titleCase(group: string): string {
-    return group
-      .split("-")
-      .map((w) => (w.length ? w[0].toUpperCase() + w.slice(1) : w))
-      .join(" ");
   }
 
   const summaryText = $derived.by(() => {
@@ -175,20 +165,14 @@
   </div>
   <div class="bottle-row">
     <label class="text-muted" for="doctor-bottle">Bottle</label>
-    {#if doctorStore.bottlesLoaded && doctorStore.bottles.length === 0}
-      <span class="text-muted">none found — create one in the CrossOver UI</span>
-    {:else}
-      <select
-        id="doctor-bottle"
-        class="input bottle-select"
-        bind:value={selectedBottle}
-        disabled={doctorStore.running}
-      >
-        {#each doctorStore.bottles as b (b)}
-          <option value={b}>{b}</option>
-        {/each}
-      </select>
-    {/if}
+    <BottleSelect
+      id="doctor-bottle"
+      class="input bottle-select"
+      bottles={doctorStore.bottles}
+      bottlesLoaded={doctorStore.bottlesLoaded}
+      bind:value={selectedBottle}
+      disabled={doctorStore.running}
+    />
   </div>
 </div>
 
@@ -291,7 +275,7 @@
   .bottle-row label {
     font-size: 12px;
   }
-  .bottle-select {
+  .bottle-row :global(.bottle-select) {
     width: auto;
     min-height: 30px;
     padding: 3px 8px;

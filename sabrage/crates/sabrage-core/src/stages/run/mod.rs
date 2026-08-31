@@ -176,14 +176,11 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     );
     sess.prev_audio_output = carried;
 
-    let forwards = actions::adb_forward_hygiene(ctx).await?;
-    if !forwards.is_empty() {
-        // Recorded as they are made (session::state's invariant table, row 3):
-        // a `--wired` launch that never reaches teardown still leaves the two
-        // forwards on disk for the next reconcile to remove.
-        sess.wired_forwards = forwards;
-        state::save(&*ctx.executor, &state_path, &sess).await?;
-    }
+    // Recorded as each forward is made (session::state's invariant table, row
+    // 3), inside `adb_forward_hygiene` itself: a `--wired` launch that never
+    // reaches teardown still leaves the forwards on disk for the next
+    // reconcile to remove.
+    actions::adb_forward_hygiene(ctx, &mut sess, &state_path).await?;
     checkpoint(ctx)?;
     actions::wineserver_reset(ctx, &bottle).await?;
     checkpoint(ctx)?;
@@ -674,7 +671,7 @@ async fn teardown(
                 Some(step::RUN_TEARDOWN),
                 String::new(),
             ));
-            tctx.section("interrupted: stopping wine");
+            tctx.section(INT_TEARDOWN_LINE);
             stop_wine(&tctx, bottle).await;
             // Best effort, exactly as the `Normal` arm above is (#202): the
             // shell's INT trap runs every one of its commands and only then
@@ -868,10 +865,20 @@ async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Resu
 // ── verbatim text ─────────────────────────────────────────────────────────────
 
 /// run.sh:174.
-const HELPER_REAPED_LINE: &str = "encoder helper: reaped (left over from the runtime)";
+///
+/// `pub` (A1-3) so `sabrage-parity` can pin it against `run.sh` by calling the
+/// real constant rather than copying a substring.
+pub const HELPER_REAPED_LINE: &str = "encoder helper: reaped (left over from the runtime)";
+
+/// run.sh:180 — the INT trap's first line, before `stop_wine` runs.
+///
+/// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
+pub const INT_TEARDOWN_LINE: &str = "interrupted: stopping wine";
 
 /// run.sh:269 — `print -r -- "wine exited with status $rc (log: $LOG)"`.
-fn wine_exit_line(rc: i32, log: &Path) -> String {
+///
+/// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
+pub fn wine_exit_line(rc: i32, log: &Path) -> String {
     format!("wine exited with status {rc} (log: {})", log.display())
 }
 
