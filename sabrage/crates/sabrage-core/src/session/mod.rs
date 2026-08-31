@@ -200,6 +200,24 @@ pub fn set_live_session(handle: LiveSessionHandle) {
     }
 }
 
+/// The live session's run id, without cloning the rest of the handle.
+///
+/// [`LiveSessionHandle`] carries two [`CancellationToken`]s, a [`PathBuf`] and
+/// a [`String`]; a caller that only needs to compare identities — a detach
+/// poll loop, a reconcile that only asks "is this the session I own?" —
+/// should not pay for cloning those on every check.
+pub fn live_session_run_id() -> Option<RunId> {
+    LIVE_SESSION
+        .lock()
+        .ok()
+        .and_then(|g| g.as_ref().map(|h| h.run_id))
+}
+
+/// Is the live session (if any) exactly the one named by `run_id`?
+pub fn live_session_is(run_id: RunId) -> bool {
+    live_session_run_id() == Some(run_id)
+}
+
 /// Clear the live session, **only** when the stored handle belongs to `run_id`.
 ///
 /// The run-id guard is what stops a late teardown from erasing a newer
@@ -289,7 +307,7 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
 /// Why a mutating operation must not start right now, or `None` when nothing on
 /// this machine looks like a live session.
 ///
-/// Five signals, cheapest first, and deliberately **not** just the in-process
+/// Six signals, cheapest first, and deliberately **not** just the in-process
 /// [`live_session`] slot: the session a Settings save or a Doctor button would
 /// break may have been launched by the other front-end, by an earlier run of
 /// this process, or by `./demo.sh run`, none of which publish anything here.
@@ -303,7 +321,9 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
 ///    process that started it;
 /// 4. the same record's `owner_pid`, for the window *before* that front-end's
 ///    launch has spawned anything ([`state::has_live_foreign_owner`]);
-/// 5. a **fresh** `runtime_status.json` — the only one of the five a
+/// 5. that record being present but unparseable — it may be describing a live
+///    session, and nothing here can prove it is not;
+/// 6. a **fresh** `runtime_status.json` — the only one of the six a
 ///    `./demo.sh run` session produces.
 ///
 /// A live CrossOver `wineserver` is deliberately *not* a signal: it is alive for
@@ -311,23 +331,61 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
 /// wrong. The two fixes whose file a CrossOver process really can clobber keep
 /// their own narrower wineserver probes.
 pub fn live_session_reason(paths: &crate::paths::Paths) -> Option<String> {
-    session_reason(
+    live_session_block(paths).map(|b| b.reason)
+}
+
+/// One blocking session, as [`live_session_block`] found it.
+///
+/// The prose *and* the bottle, because the two callers need different halves: a
+/// stage refusal renders the reason, and the config refusal has to name the
+/// bottle in its `./demo.sh stop --bottle <name>` remedy. `bottle` is `None` for
+/// the one signal that cannot know it — a `runtime_status.json` written by a
+/// runtime that was launched by `./demo.sh run`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionBlock {
+    /// Why the machine looks busy, in the voice every refusal renders.
+    pub reason: String,
+    /// The bottle that session belongs to, when the signal carries one.
+    pub bottle: Option<String>,
+}
+
+/// [`live_session_reason`] with the bottle kept.
+///
+/// **The** live-session predicate: every "not while the game is running" door —
+/// [`crate::stages::live_session_block`] (stage refusals and every gated
+/// Doctor fix), [`crate::config::blocking_session`] (the Settings writer) and
+/// `store::goldberg`'s revert — goes through this one function, so a state that
+/// blocks one of them blocks all of them. They used to carry three weaker
+/// copies each missing a different signal, which is how a `./demo.sh run`
+/// session could have its `steam_api64.dll` replaced underneath it.
+pub fn live_session_block(paths: &crate::paths::Paths) -> Option<SessionBlock> {
+    session_block_at(
         &paths.session_state_path(),
         &paths.oxr_appsup.join("runtime_status.json"),
     )
 }
 
-/// [`live_session_reason`] against two explicit paths — what tests use, so no
+/// [`live_session_block`] against two explicit paths — what tests use, so no
 /// test can consult the developer's own machine.
-fn session_reason(
+pub(crate) fn session_block_at(
     state_path: &std::path::Path,
     runtime_status_path: &std::path::Path,
-) -> Option<String> {
+) -> Option<SessionBlock> {
+    fn block(reason: String, bottle: Option<&str>) -> Option<SessionBlock> {
+        Some(SessionBlock {
+            reason,
+            bottle: bottle.map(str::to_string),
+        })
+    }
+
     if let Some(h) = live_session() {
-        return Some(format!(
-            "this Sabrage process is supervising a session for bottle '{}' (wine pid {})",
-            h.bottle, h.identity.pid
-        ));
+        return block(
+            format!(
+                "this Sabrage process is supervising a session for bottle '{}' (wine pid {})",
+                h.bottle, h.identity.pid
+            ),
+            Some(&h.bottle),
+        );
     }
 
     if let Some(info) = run_phase() {
@@ -339,39 +397,71 @@ fn session_reason(
                 | SessionPhase::Stalled
                 | SessionPhase::Stopping
         ) {
-            return Some(format!(
-                "a launch for bottle '{}' is in progress ({:?})",
-                info.bottle, info.phase
-            ));
+            return block(
+                format!(
+                    "a launch for bottle '{}' is in progress ({:?})",
+                    info.bottle, info.phase
+                ),
+                Some(&info.bottle),
+            );
         }
     }
 
-    if let Ok(Some(s)) = state::load(state_path) {
-        if matches!(
-            reconcile::classify(&s),
-            reconcile::Classification::Live | reconcile::Classification::Unverifiable
-        ) {
-            let pid = s.wine.as_ref().map(|w| w.pid).unwrap_or(0);
-            return Some(format!(
-                "a session for bottle '{}' is still running (wine pid {pid})",
-                s.bottle
-            ));
+    match state::load(state_path) {
+        Ok(Some(s)) => {
+            if matches!(
+                reconcile::classify(&s),
+                reconcile::Classification::Live | reconcile::Classification::Unverifiable
+            ) {
+                let pid = s.wine.as_ref().map(|w| w.pid).unwrap_or(0);
+                return block(
+                    format!(
+                        "a session for bottle '{}' is still running (wine pid {pid})",
+                        s.bottle
+                    ),
+                    Some(&s.bottle),
+                );
+            }
+            if state::has_live_foreign_owner(&s) {
+                return block(
+                    format!(
+                        "Sabrage process {} is running a session for bottle '{}'",
+                        s.owner_pid, s.bottle
+                    ),
+                    Some(&s.bottle),
+                );
+            }
         }
-        if state::has_live_foreign_owner(&s) {
-            return Some(format!(
-                "Sabrage process {} is running a session for bottle '{}'",
-                s.owner_pid, s.bottle
-            ));
+        // A record that exists but will not parse is the one case where the
+        // conservative answer is the only safe one: it may still be describing
+        // a live session, and the question every caller is asking is "may I
+        // overwrite something a running game has open". `store::goldberg`'s
+        // predicate always read it this way; folding the predicates together
+        // gives every other door the same conservatism, with a remedy the
+        // `./demo.sh stop` line cannot offer.
+        Err(_) => {
+            return block(
+                format!(
+                    "{} cannot be read, so Sabrage cannot tell whether a session is live \
+                     (delete it if no game is running)",
+                    state_path.display()
+                ),
+                None,
+            )
         }
+        Ok(None) => {}
     }
 
     if let Ok(text) = std::fs::read_to_string(runtime_status_path) {
         if let Some(rs) = watcher::parse_runtime_status(&text) {
             if watcher::is_fresh(rs.updated_at_unix_ms, now_unix_ms()) {
-                return Some(format!(
-                    "the oxrsys runtime is reporting a live session (state '{}')",
-                    rs.state
-                ));
+                return block(
+                    format!(
+                        "the oxrsys runtime is reporting a live session (state '{}')",
+                        rs.state
+                    ),
+                    None,
+                );
             }
         }
     }
@@ -413,7 +503,7 @@ fn ensure_idle_at(
     runtime_status_path: &std::path::Path,
     action: &str,
 ) -> std::result::Result<(), crate::error::SabrageError> {
-    match session_reason(state_path, runtime_status_path) {
+    match session_block_at(state_path, runtime_status_path).map(|b| b.reason) {
         None => Ok(()),
         Some(reason) => Err(crate::error::SabrageError::fatal(
             format!(
@@ -757,7 +847,7 @@ mod tests {
             .spawn()
             .expect("/bin/sleep is on every macOS");
         let mut theirs = state::SessionState::new(Uuid::new_v4(), "Theirs", "/g", "/l", 1);
-        theirs.owner_pid = foreign.id();
+        theirs.set_owner(foreign.id());
         std::fs::write(&path, serde_json::to_vec_pretty(&theirs).unwrap()).unwrap();
         let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
         assert!(
@@ -873,17 +963,39 @@ mod tests {
         }
     }
 
+    /// `live_session_run_id`/`live_session_is` must agree with the
+    /// full-clone `live_session().map(|h| h.run_id)` shape they replace at
+    /// the hot call sites (a detach poll loop, `reconcile`'s ownership
+    /// check) — same answer, without cloning the handle's tokens/paths.
+    #[test]
+    fn live_session_run_id_agrees_with_the_full_handle_clone() {
+        let _g = lock_session_globals();
+        assert_eq!(live_session_run_id(), None);
+        assert!(!live_session_is(Uuid::new_v4()));
+
+        let a = Uuid::new_v4();
+        set_live_session(handle(a));
+        assert_eq!(live_session_run_id(), live_session().map(|h| h.run_id));
+        assert_eq!(live_session_run_id(), Some(a));
+        assert!(live_session_is(a));
+        assert!(!live_session_is(Uuid::new_v4()));
+
+        clear_live_session(a);
+        assert_eq!(live_session_run_id(), None);
+        assert!(!live_session_is(a));
+    }
+
     #[test]
     fn the_live_slot_is_set_and_cleared_by_run_id() {
         let _g = lock_session_globals();
         let a = Uuid::new_v4();
         let b = Uuid::new_v4();
         set_live_session(handle(a));
-        assert_eq!(live_session().map(|h| h.run_id), Some(a));
+        assert!(live_session_is(a));
 
         // A stale teardown for a different run must not clear the current one.
         clear_live_session(b);
-        assert_eq!(live_session().map(|h| h.run_id), Some(a));
+        assert!(live_session_is(a));
 
         clear_live_session(a);
         assert!(live_session().is_none());

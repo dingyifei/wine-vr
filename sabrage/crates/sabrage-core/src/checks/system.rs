@@ -31,9 +31,7 @@ fn run(cmd: &str, args: &[&str]) -> Option<Output> {
 }
 
 fn stdout_trimmed(o: &Output) -> String {
-    String::from_utf8_lossy(&o.stdout)
-        .trim_end_matches('\n')
-        .to_string()
+    crate::util::strip_trailing_newlines(&String::from_utf8_lossy(&o.stdout)).to_string()
 }
 
 /// `$(uname -m)`.

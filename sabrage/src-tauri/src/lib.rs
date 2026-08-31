@@ -207,6 +207,7 @@ pub fn run() {
         .manage(commands::SessionMonitorState::default())
         .manage(commands::QuitApproved::default())
         .manage(commands::PendingQuit::default())
+        .manage(commands::SettingsPathsCache::default())
         // A webview reload (vite HMR in dev, any navigation) runs no Svelte
         // `onDestroy`, so the log tails that page started would poll their
         // files every 250 ms for the rest of the app's life — and they cannot

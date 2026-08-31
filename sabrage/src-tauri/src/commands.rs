@@ -502,24 +502,27 @@ pub struct QueuedStage {
 
 /// Announce a run that is about to queue behind another operation.
 ///
-/// `sabrage_core::run_stage` takes [`sabrage_core::stages::OPERATION_LOCK`]
-/// *before* emitting its first `StageStarted`, and that event is the frontend's
-/// only source of a run id — so a stage started while a build/install is in
-/// flight used to sit with a disabled Cancel button for the whole wait, and
-/// then mutate the machine when its turn came. The run is already registered
-/// with [`RunRegistry`] by this point ([`sabrage_core::executor::RealExecutor`]
-/// fails every filesystem primitive with `Cancelled` once its token fires), so
-/// all the frontend was missing is the id.
+/// A stage that has to wait for the operation lock reaches the frontend twice
+/// over: `sabrage_core::run_stage` now emits its `StageStarted` *before* the
+/// wait (so the run id — and with it Cancel — exists for the whole of it), and
+/// this event names the wait as a wait. The run is already registered with
+/// [`RunRegistry`] by this point ([`sabrage_core::executor::RealExecutor`]
+/// fails every filesystem primitive with `Cancelled` once its token fires, and
+/// the lock wait itself is cancellable), so Cancel during the queue is real.
+///
+/// The probe is [`sabrage_core::stages::operation_in_progress_anywhere`], not
+/// the in-process half alone: the wait this notice exists for is most often the
+/// one behind a `sabrage` CLI build in **another process**, which the
+/// in-process mutex cannot see at all.
 ///
 /// Emitted as an app event rather than on the stage channel because
 /// `StageEvent::StageStarted` is documented as "always the first event of a
 /// run" — a queue notice is not part of the run's own event stream.
-/// Best-effort in both directions: [`sabrage_core::stages::operation_in_progress`]
-/// is a racy probe (it can only over- or under-report a lock that is about to
-/// change hands), and a failed emit is dropped exactly as a failed channel
-/// send is.
+/// Best-effort in both directions: the probe is racy (it can only over- or
+/// under-report a lock that is about to change hands), and a failed emit is
+/// dropped exactly as a failed channel send is.
 fn announce_if_queued(app: &AppHandle, run_id: &str, stage: Stage) {
-    if !sabrage_core::stages::operation_in_progress() {
+    if !sabrage_core::stages::operation_in_progress_anywhere() {
         return;
     }
     let _ = app.emit(
@@ -531,26 +534,13 @@ fn announce_if_queued(app: &AppHandle, run_id: &str, stage: Stage) {
     );
 }
 
-/// Shared body of [`execute_stage`] and [`launch`]: resolve the repo root,
-/// build a [`StageCtx`] from an already-merged [`StageOptions`], register its
-/// cancellation handle, run the stage, and unregister on the way out (success
-/// or failure alike). Wraps `on_event` as a plain [`channel_sink`] and hands
-/// off to [`execute_stage_with_sink`].
-async fn execute_stage_with_options(
-    stage: Stage,
-    stage_opts: StageOptions,
-    on_event: Channel<StageEvent>,
-    registry: &RunRegistry,
-    app: &AppHandle,
-) -> Result<StageOutcome, String> {
-    execute_stage_with_sink(stage, stage_opts, channel_sink(on_event), registry, app).await
-}
-
-/// [`execute_stage_with_options`]'s body, taking an already-built
+/// [`execute_stage`]/[`launch`]'s shared body, taking an already-built
 /// [`EventSink`] rather than a raw `Channel` — the seam [`launch`] uses to
 /// pass a tapped sink ([`channel_sink_tee`]) instead of a plain forwarding
 /// one, so it can observe `StageEvent::Launched` without a second
-/// subscription.
+/// subscription. Resolves the repo root, builds a [`StageCtx`] from an
+/// already-merged [`StageOptions`], registers its cancellation handle, runs
+/// the stage, and unregisters on the way out (success or failure alike).
 ///
 /// settings.repo_root plumbing (Phase 4): resolves through
 /// [`resolve_repo_root_via_settings`] rather than a bare `resolve_repo_root(None)`
@@ -588,7 +578,8 @@ async fn execute_stage_with_sink(
 }
 
 /// [`run_stage`]/[`stop_session`]'s body: merge [`StageRunOpts`] the usual way
-/// and hand off to [`execute_stage_with_options`].
+/// and hand off to [`execute_stage_with_sink`], wrapping `on_event` as a plain
+/// [`channel_sink`] (no Launched-tapping needed, unlike [`launch`]).
 async fn execute_stage(
     stage: Stage,
     opts: StageRunOpts,
@@ -598,7 +589,7 @@ async fn execute_stage(
 ) -> Result<StageOutcome, String> {
     let mut stage_opts = stage_options_from_env_and_gui(opts.bottle, opts.bs_dir);
     stage_opts.dry_run = opts.dry_run.unwrap_or(false);
-    execute_stage_with_options(stage, stage_opts, on_event, registry, app).await
+    execute_stage_with_sink(stage, stage_opts, channel_sink(on_event), registry, app).await
 }
 
 /// Trailing "plan (dry run)" rows, so the GUI's Dry-run button delivers the
@@ -636,7 +627,7 @@ fn emit_dry_run_plan(ctx: &StageCtx) {
 /// — there is no `Fatal` shortcut, that note is Phase-1-era and stale) and
 /// behaves identically to calling [`launch`] below with the same options: both
 /// ultimately call [`sabrage_core::run_stage`] through
-/// [`execute_stage_with_options`]. [`launch`] is still the intended UI entry
+/// [`execute_stage_with_sink`]. [`launch`] is still the intended UI entry
 /// point for `run` — it is named for what it does, and the doc comment a
 /// caller actually reads before awaiting something that can take hours should
 /// say so up front.
@@ -708,7 +699,7 @@ pub async fn launch(
         launched_info.as_ref(),
         result.as_ref().ok(),
     ) {
-        record_last_session(&game_id, session).await;
+        record_last_session(&game_id, session, &app.state::<SettingsPathsCache>()).await;
     }
 
     result
@@ -1542,8 +1533,8 @@ pub fn get_log_source_path(source: LogSource) -> Option<String> {
 // `settings.json`/`library.json`/`oxrsys-runtime.toml` all live under paths
 // derived from `$HOME` alone — [`sabrage_core::paths::sabrage_support_dir`]
 // and `Paths::oxr_appsup`/`toml_path`, never from the repo root — so
-// [`appsup_paths`] tolerates an unresolved repo root (falling back to an
-// empty one; `Paths::new` never fails and does no validation of it) rather
+// [`SettingsPathsCache`] tolerates an unresolved repo root (falling back to
+// an empty one; `Paths::new` never fails and does no validation of it) rather
 // than erroring out: the Settings/Library/Config screens must keep working
 // before a wine-vr checkout is even configured. Only [`get_repo_info`] (and
 // doctor/stage execution, unchanged above) reports whether the repo root
@@ -1582,28 +1573,83 @@ fn resolve_repo_root_via_settings() -> std::result::Result<PathBuf, SabrageError
     resolve_repo_root(load_settings().repo_root.as_deref())
 }
 
-/// A [`Paths`] set for the Phase 4 commands that only ever touch
-/// `$HOME`-derived paths (`toml_path`, `sabrage_appsup`, `oxr_appsup`) — see
-/// this section's module note for why an unresolved repo root is tolerated
-/// (an empty [`PathBuf`]) here rather than propagated as an error.
-fn appsup_paths() -> Paths {
-    Paths::new(resolve_repo_root_via_settings().unwrap_or_default())
-}
-
-/// [`appsup_paths`] for a command that is about to **mutate** something.
+/// Cached `settings.json` + the [`Paths`] derived from it, for the handful of
+/// Phase 4 commands (`read_runtime_config`, `write_runtime_config`,
+/// `save_settings`, `get_repo_info`, `get_library`, `new_game_template`,
+/// `save_game`, `remove_game`, `validate_game`, `revert_original_steam_dll`,
+/// `launch`'s last-session recording) that only ever read `settings.json`
+/// and the `$HOME`-derived halves of [`Paths`] (`sabrage_appsup`,
+/// `oxr_appsup`/`toml_path`) — never the machine-probed halves (`cx_app`,
+/// `wine`, `adb`, …), which stay live-probed by [`run_doctor`]/`get_app_state`
+/// (unchanged, uncached — a doctor row or the sidebar footer must reflect a
+/// CrossOver reinstall or a freshly plugged `adb` without a restart).
 ///
-/// Everything under `~/Library/Application Support` is derived from `$HOME`,
-/// and [`sabrage_core::paths::home_dir`] falls back to `/` when `HOME` is
-/// missing (and accepts an empty one, yielding relative paths under the
-/// working directory) — fine for a read-only probe, a way to write the user's
-/// store into `/Library/…` or into `$PWD` for anything that mutates. Every
-/// mutating command therefore resolves through
-/// [`Paths::new_checked`], which rejects a missing, empty or non-absolute
-/// `HOME` with a Fatal carrying its own remedy. Read-only commands keep
-/// [`appsup_paths`].
-fn appsup_paths_checked() -> std::result::Result<Paths, String> {
-    Paths::new_checked(resolve_repo_root_via_settings().unwrap_or_default())
-        .map_err(|e| e.to_string())
+/// [`Paths::new`] re-probes the machine (three `stat`s and a `$PATH` walk)
+/// and `settings::load` re-reads and re-parses `settings.json` on every call;
+/// finding E-C3-settings-paths-cache measured a single Settings-screen mount
+/// paying that cost four times over. `SessionMonitorState`'s
+/// `Mutex<Option<...>>` is the precedent this follows: empty until first use,
+/// filled on demand, dropped — not eagerly recomputed — by whatever
+/// invalidates it. The only writer of `settings.json` through this app is
+/// [`save_settings`], which calls [`SettingsPathsCache::invalidate`] after
+/// every successful save; an edit from outside this app (or a bottle
+/// added/removed on disk) can still leave this stale until the next save,
+/// same caveat `SessionMonitorState` already accepts for its own
+/// externally-changed case.
+#[derive(Default)]
+pub struct SettingsPathsCache(std::sync::Mutex<Option<(settings::Settings, Paths)>>);
+
+impl SettingsPathsCache {
+    /// The settings/paths pair, loading and probing once and caching the
+    /// result until [`SettingsPathsCache::invalidate`] runs.
+    /// [`settings::load`]'s parse errors are swallowed here exactly as
+    /// [`load_settings`] (this cache's uncached equivalent) already does — a
+    /// corrupt `settings.json` degrades to defaults, never a failure, for
+    /// every command that reads through this cache. [`get_settings`]
+    /// deliberately never uses this cache, so it keeps seeing the raw parse
+    /// error.
+    fn snapshot(&self) -> (settings::Settings, Paths) {
+        let mut guard = self.0.lock().expect("settings/paths cache mutex poisoned");
+        if let Some(cached) = guard.as_ref() {
+            return cached.clone();
+        }
+        let settings = load_settings();
+        let paths =
+            Paths::new(resolve_repo_root(settings.repo_root.as_deref()).unwrap_or_default());
+        let out = (settings, paths);
+        *guard = Some(out.clone());
+        out
+    }
+
+    /// [`load_settings`], through the cache.
+    fn settings(&self) -> settings::Settings {
+        self.snapshot().0
+    }
+
+    /// [`Paths::new`] (given the same `settings.repo_root`-or-empty
+    /// resolution [`SettingsPathsCache::snapshot`] uses), through the cache.
+    fn paths(&self) -> Paths {
+        self.snapshot().1
+    }
+
+    /// [`Paths::new_checked`], through the cache: its
+    /// only failure mode is a missing/empty/non-absolute `HOME`
+    /// ([`sabrage_core::paths::home_dir_checked`]), a plain environment-variable
+    /// read with no filesystem probing of its own — cheap enough to re-check
+    /// on every call rather than caching its (extremely unlikely to change
+    /// mid-process) outcome, so this still refuses exactly like
+    /// [`Paths::new_checked`] would on a broken `HOME`.
+    fn paths_checked(&self) -> std::result::Result<Paths, String> {
+        sabrage_core::paths::home_dir_checked().map_err(|e| e.to_string())?;
+        Ok(self.snapshot().1)
+    }
+
+    /// Drop the cached pair so the next read re-loads `settings.json` and
+    /// re-probes the machine. Called by [`save_settings`] after every
+    /// successful write — the only place this app changes `settings.json`.
+    fn invalidate(&self) {
+        *self.0.lock().expect("settings/paths cache mutex poisoned") = None;
+    }
 }
 
 /// Serializes `settings.json` writes against each other.
@@ -1636,8 +1682,10 @@ fn real_executor() -> RealExecutor {
 /// already assembles. Never fails — an absent or unparseable file are both
 /// *states of the view*, not errors (see that function's own doc comment).
 #[tauri::command]
-pub fn read_runtime_config() -> runtime_config::RuntimeConfigView {
-    runtime_config::read(&appsup_paths().toml_path)
+pub fn read_runtime_config(
+    cache: State<'_, SettingsPathsCache>,
+) -> runtime_config::RuntimeConfigView {
+    runtime_config::read(&cache.paths().toml_path)
 }
 
 /// Patch `oxrsys-runtime.toml`'s six editable keys, creating it from the
@@ -1670,8 +1718,9 @@ pub fn read_runtime_config() -> runtime_config::RuntimeConfigView {
 #[tauri::command]
 pub async fn write_runtime_config(
     patch: runtime_config::RuntimeConfigPatch,
+    cache: State<'_, SettingsPathsCache>,
 ) -> Result<runtime_config::WriteReport, String> {
-    let paths = appsup_paths_checked()?;
+    let paths = cache.paths_checked()?;
     let view = runtime_config::read(&paths.toml_path);
     if let Some(err) = view.parse_error {
         return Err(format!(
@@ -1706,13 +1755,19 @@ pub fn get_settings() -> Result<settings::Settings, String> {
 /// Persist `settings.json`, returning it back as-saved (the brief's `Settings`
 /// return — there is nothing this side derives beyond what was sent).
 #[tauri::command]
-pub async fn save_settings(settings: settings::Settings) -> Result<settings::Settings, String> {
-    let paths = appsup_paths_checked()?;
+pub async fn save_settings(
+    settings: settings::Settings,
+    cache: State<'_, SettingsPathsCache>,
+) -> Result<settings::Settings, String> {
+    let paths = cache.paths_checked()?;
     let path = settings::settings_path(&paths.sabrage_appsup);
     let _lock = SETTINGS_LOCK.lock().await;
     settings::save(&real_executor(), &path, &settings)
         .await
         .map_err(|e| e.to_string())?;
+    // The only writer of `settings.json` through this app — every other
+    // command's cached (settings, Paths) pair is now stale.
+    cache.invalidate();
     Ok(settings)
 }
 
@@ -1846,8 +1901,8 @@ pub fn suggest_bs_dir(bottle: Option<String>, current: Option<String>) -> BsDirS
 }
 
 #[tauri::command]
-pub fn get_repo_info() -> RepoInfo {
-    let settings = load_settings();
+pub fn get_repo_info(cache: State<'_, SettingsPathsCache>) -> RepoInfo {
+    let settings = cache.settings();
     let explicit = settings.repo_root.as_deref().filter(|s| !s.is_empty());
     let env_present = std::env::var(sabrage_core::paths::REPO_ROOT_ENV)
         .ok()
@@ -1931,8 +1986,8 @@ fn game_row(paths: &Paths, entry: library::GameEntry) -> GameRow {
 
 /// Every library entry, each with a freshly computed [`library::GameValidity`].
 #[tauri::command]
-pub fn get_library() -> Result<Vec<GameRow>, String> {
-    let paths = appsup_paths();
+pub fn get_library(cache: State<'_, SettingsPathsCache>) -> Result<Vec<GameRow>, String> {
+    let paths = cache.paths();
     let lib_path = library::library_path(&paths.sabrage_appsup);
     let lib = library::load(&lib_path).map_err(|e| e.to_string())?;
     Ok(lib
@@ -1945,8 +2000,8 @@ pub fn get_library() -> Result<Vec<GameRow>, String> {
 /// A fresh, unsaved [`library::GameEntry`] for the Add-game wizard, seeded
 /// from `settings.json` and the bottles on this machine.
 #[tauri::command]
-pub fn new_game_template() -> library::GameEntry {
-    let settings = load_settings();
+pub fn new_game_template(cache: State<'_, SettingsPathsCache>) -> library::GameEntry {
+    let settings = cache.settings();
     let bottles = sabrage_core::paths::list_bottles();
     let env_bs_dir = std::env::var("WINEVR_BS_DIR").ok();
     library::new_entry_template(&settings, &bottles, env_bs_dir.as_deref())
@@ -1967,8 +2022,11 @@ pub fn new_game_template() -> library::GameEntry {
 ///   Edit-game form that was opened before a session ended cannot delete that
 ///   session when it is finally saved.
 #[tauri::command]
-pub async fn save_game(entry: library::GameEntry) -> Result<GameRow, String> {
-    let paths = appsup_paths_checked()?;
+pub async fn save_game(
+    entry: library::GameEntry,
+    cache: State<'_, SettingsPathsCache>,
+) -> Result<GameRow, String> {
+    let paths = cache.paths_checked()?;
     let lib_path = library::library_path(&paths.sabrage_appsup);
     let saved = library::transact(&real_executor(), &lib_path, |lib| {
         lib.upsert_editable(entry).clone()
@@ -1982,11 +2040,11 @@ pub async fn save_game(entry: library::GameEntry) -> Result<GameRow, String> {
 /// when no entry with that id exists — matches [`library::Library::remove`]'s
 /// own "already gone is not a failure" contract.
 #[tauri::command]
-pub async fn remove_game(id: String) -> Result<bool, String> {
+pub async fn remove_game(id: String, cache: State<'_, SettingsPathsCache>) -> Result<bool, String> {
     let target = id
         .parse()
         .map_err(|e| format!("{id:?} is not a valid game id: {e}"))?;
-    let paths = appsup_paths_checked()?;
+    let paths = cache.paths_checked()?;
     let lib_path = library::library_path(&paths.sabrage_appsup);
     // `transact` writes only when the closure actually changed the library,
     // so a removal that found nothing still mints no `library.json`.
@@ -1999,8 +2057,12 @@ pub async fn remove_game(id: String) -> Result<bool, String> {
 /// Edit-game screen's inline validation, and what [`get_library`]/
 /// [`save_game`] also compute per row.
 #[tauri::command]
-pub fn validate_game(bs_dir: String, bottle: String) -> library::GameValidity {
-    library::validate(&appsup_paths(), Path::new(&bs_dir), &bottle)
+pub fn validate_game(
+    bs_dir: String,
+    bottle: String,
+    cache: State<'_, SettingsPathsCache>,
+) -> library::GameValidity {
+    library::validate(&cache.paths(), Path::new(&bs_dir), &bottle)
 }
 
 /// Restore the real Steam `steam_api64.dll` over the entry named `game_id`'s
@@ -2023,11 +2085,12 @@ pub fn validate_game(bs_dir: String, bottle: String) -> library::GameValidity {
 pub async fn revert_original_steam_dll(
     game_id: String,
     expected_bs_dir: Option<String>,
+    cache: State<'_, SettingsPathsCache>,
 ) -> Result<goldberg::RevertReport, String> {
     let target = game_id
         .parse()
         .map_err(|e| format!("{game_id:?} is not a valid game id: {e}"))?;
-    let paths = appsup_paths_checked()?;
+    let paths = cache.paths_checked()?;
     let lib_path = library::library_path(&paths.sabrage_appsup);
     let lib = library::load(&lib_path).map_err(|e| e.to_string())?;
     let entry = lib
@@ -2090,12 +2153,16 @@ fn last_session_to_record(
 /// file, or a failed write must not turn an otherwise-settled `launch`
 /// promise into a rejected one — logged instead, the same tolerance
 /// [`load_settings`] already applies to a corrupt settings file.
-async fn record_last_session(game_id: &str, session: library::LastSession) {
+async fn record_last_session(
+    game_id: &str,
+    session: library::LastSession,
+    cache: &SettingsPathsCache,
+) {
     let Ok(target) = game_id.parse() else {
         eprintln!("sabrage: launch carried an unparseable gameId {game_id:?}; not recording");
         return;
     };
-    let paths = match appsup_paths_checked() {
+    let paths = match cache.paths_checked() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("sabrage: not recording last session ({e})");
@@ -2648,6 +2715,43 @@ mod tests {
         assert_eq!(row.entry, entry);
         assert_eq!(row.validity.status, library::GameStatus::NotFound);
         assert!(!row.validity.exe_present);
+    }
+
+    // ── E-C3-settings-paths-cache ────────────────────────────────────────────
+
+    #[test]
+    fn cache_hit_returns_the_stored_pair_without_reloading() {
+        // Seeds the cache directly (rather than through `snapshot`'s
+        // load-on-miss path, which would touch the real `settings.json`) so
+        // this stays hermetic: a populated cache must serve exactly what was
+        // stored, proving `snapshot`'s early return is reached before any
+        // reload.
+        let settings = settings::Settings {
+            default_bottle: Some("Steam".to_string()),
+            ..Default::default()
+        };
+        let paths = Paths::new("/nonexistent/sabrage-settings-cache-test");
+        let cache = SettingsPathsCache(std::sync::Mutex::new(Some((
+            settings.clone(),
+            paths.clone(),
+        ))));
+        assert_eq!(cache.settings(), settings);
+        assert_eq!(cache.paths(), paths);
+    }
+
+    #[test]
+    fn invalidate_drops_the_cached_pair() {
+        let paths = Paths::new("/nonexistent/sabrage-settings-cache-test-2");
+        let cache = SettingsPathsCache(std::sync::Mutex::new(Some((
+            settings::Settings::default(),
+            paths,
+        ))));
+        cache.invalidate();
+        assert!(
+            cache.0.lock().unwrap().is_none(),
+            "save_settings's invalidate() must leave the next read to reload, \
+             not keep serving what a just-completed save made stale"
+        );
     }
 
     #[test]

@@ -132,7 +132,7 @@ use std::path::Path;
 use crate::error::{Result, SabrageError};
 use crate::events::{step, StepId};
 use crate::paths::{which, Bottle};
-use crate::process::{self, find_processes_by_cmdline, ProcInfo};
+use crate::process::{self, ProcInfo};
 use crate::stages::{require_bottle, StageCtx};
 
 /// How long to wait for `wineserver -w` to return before giving up on it —
@@ -205,7 +205,11 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
     stop_wine(ctx, bottle).await?;
     checkpoint(ctx)?;
-    report_survivors(ctx);
+    // One scan for every probe below (survivors, both reaps, the foreign-helper
+    // fallback) instead of one fresh full-table walk each — see
+    // `process::ProcessScan`.
+    let scan = process::ProcessScan::scan();
+    report_survivors(ctx, scan.by_cmdline(BEAT_SABER_EXE_SUFFIX));
     checkpoint(ctx)?;
     report_ports(ctx).await;
     checkpoint(ctx)?;
@@ -214,19 +218,19 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     // looking beyond *this* checkout's staged path (see the module docs).
     let helper_matched = reap(
         ctx,
-        &ctx.paths.oxr_helper_staged,
+        scan.by_exe(&ctx.paths.oxr_helper_staged),
         step::STOP_REAP,
         Some(HELPER_REAP_MSG),
         None,
     )
     .await?;
     if !helper_matched {
-        report_foreign_helpers(ctx);
+        report_foreign_helpers(ctx, &ctx.paths.root, scan.by_cmdline(HELPER_BASENAME));
     }
     checkpoint(ctx)?;
     reap(
         ctx,
-        &ctx.paths.alvr_dashboard,
+        scan.by_exe(&ctx.paths.alvr_dashboard),
         step::STOP_REAP,
         Some(DASHBOARD_REAP_MSG),
         None,
@@ -334,9 +338,8 @@ fn format_survivors(procs: &[ProcInfo]) -> String {
 ///   ok "game and wineserver down"
 /// fi
 /// ```
-fn report_survivors(ctx: &StageCtx) {
+fn report_survivors(ctx: &StageCtx, survivors: Vec<ProcInfo>) {
     let st = ctx.step(step::STOP_WINESERVER);
-    let survivors = find_processes_by_cmdline(BEAT_SABER_EXE_SUFFIX);
     if survivors.is_empty() {
         st.ok("game and wineserver down");
     } else {
@@ -437,14 +440,18 @@ async fn report_ports(ctx: &StageCtx) {
 /// Returns `Err(`[`SabrageError::Cancelled`]`)` — skipping any remaining kills
 /// and the closing message — the moment `ctx.cancel` fires after any one kill;
 /// see the module doc's Cancellation section.
+///
+/// `procs` is the caller's already-scanned matches
+/// ([`process::find_processes_by_exe`], or [`process::ProcessScan::by_exe`]
+/// against a snapshot shared with the stage's other probes) — this function
+/// does not scan the process table itself.
 async fn reap(
     ctx: &StageCtx,
-    exe_path: &Path,
+    procs: Vec<ProcInfo>,
     step_id: StepId,
     found_msg: Option<ReapMsg>,
     not_found_msg: Option<&str>,
 ) -> Result<bool> {
-    let procs = process::find_processes_by_exe(exe_path);
     if procs.is_empty() {
         if let Some(msg) = not_found_msg {
             ctx.step(step_id).ok(msg);
@@ -524,14 +531,15 @@ async fn wait_for_exit(procs: &[ProcInfo]) -> Vec<ProcInfo> {
 /// Nothing is signalled: PARITY.md's "Stop" rationale (a mutating kill may not
 /// rely on an argv match) stands, and killing another checkout's helper is that
 /// checkout's `stop` to run.
-fn report_foreign_helpers(ctx: &StageCtx) {
+///
+/// `matches` is the caller's already-scanned [`HELPER_BASENAME`] cmdline
+/// matches ([`process::find_processes_by_cmdline`], or
+/// [`process::ProcessScan::by_cmdline`] against a snapshot shared with the
+/// stage's other probes); this function only narrows them further.
+fn report_foreign_helpers(ctx: &StageCtx, root: &Path, matches: Vec<ProcInfo>) {
     let st = ctx.step(step::STOP_REAP);
-    let root = ctx
-        .paths
-        .root
-        .canonicalize()
-        .unwrap_or_else(|_| ctx.paths.root.clone());
-    let foreign: Vec<ProcInfo> = find_processes_by_cmdline(HELPER_BASENAME)
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let foreign: Vec<ProcInfo> = matches
         .into_iter()
         .filter(|p| {
             if p.exe.file_name().and_then(|n| n.to_str()) != Some(HELPER_BASENAME) {
@@ -758,20 +766,20 @@ mod tests {
         // path — proving this is a *substring-of-cmdline* match, unlike
         // `find_processes_by_exe`'s exact-path equality.
         let needle = &name[name.len().saturating_sub(6)..];
-        let found = find_processes_by_cmdline(needle);
+        let found = process::find_processes_by_cmdline(needle);
         let me = std::process::id();
         assert!(
             found.iter().any(|p| p.pid == me),
             "own pid {me} not found by cmdline needle {needle:?} among {found:?}"
         );
-        assert!(find_processes_by_cmdline("nonexistent-sabrage-needle.exe").is_empty());
+        assert!(process::find_processes_by_cmdline("nonexistent-sabrage-needle.exe").is_empty());
     }
 
     #[test]
     fn report_survivors_matches_a_direct_probe() {
         let (ctx, seen) = test_ctx(StageOptions::default());
-        report_survivors(&ctx);
-        let survivors = find_processes_by_cmdline(BEAT_SABER_EXE_SUFFIX);
+        let survivors = process::find_processes_by_cmdline(BEAT_SABER_EXE_SUFFIX);
+        report_survivors(&ctx, survivors.clone());
         let evs = seen.lock().unwrap().clone();
         let line = evs.last().expect("one row emitted");
         let crate::events::StageEvent::Line {
@@ -906,7 +914,7 @@ mod tests {
         });
         let matched = reap(
             &ctx,
-            Path::new("/nonexistent/sabrage/helper"),
+            process::find_processes_by_exe(Path::new("/nonexistent/sabrage/helper")),
             step::STOP_REAP,
             Some(TEST_REAP_MSG),
             Some("not found"),
@@ -932,7 +940,7 @@ mod tests {
         });
         let matched = reap(
             &ctx,
-            &exe,
+            process::find_processes_by_exe(&exe),
             step::STOP_REAP,
             Some(TEST_REAP_MSG),
             Some("not found"),
@@ -1063,7 +1071,7 @@ mod tests {
 
         let matched = reap(
             &ctx,
-            &sleeper.exe,
+            process::find_processes_by_exe(&sleeper.exe),
             step::STOP_REAP,
             Some(TEST_REAP_MSG),
             None,
@@ -1088,7 +1096,7 @@ mod tests {
 
         reap(
             &ctx,
-            &sleeper.exe,
+            process::find_processes_by_exe(&sleeper.exe),
             step::STOP_REAP,
             Some(TEST_REAP_MSG),
             None,
@@ -1150,7 +1158,11 @@ mod tests {
         ctx.paths.oxr_helper_staged = PathBuf::from("/nonexistent/sabrage/helper");
 
         assert!(process::find_processes_by_exe(&ctx.paths.oxr_helper_staged).is_empty());
-        report_foreign_helpers(&ctx);
+        report_foreign_helpers(
+            &ctx,
+            &ctx.paths.root.clone(),
+            process::find_processes_by_cmdline(HELPER_BASENAME),
+        );
 
         let rows = rows(&seen);
         assert!(
@@ -1172,10 +1184,11 @@ mod tests {
         ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
         // Ground truth is machine state (this file's own testing pattern):
         // only assert the row when nothing on this Mac qualifies as foreign.
-        let any_foreign = find_processes_by_cmdline(HELPER_BASENAME)
-            .into_iter()
+        let matches = process::find_processes_by_cmdline(HELPER_BASENAME);
+        let any_foreign = matches
+            .iter()
             .any(|p| p.exe.file_name().and_then(|n| n.to_str()) == Some(HELPER_BASENAME));
-        report_foreign_helpers(&ctx);
+        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), matches);
         if !any_foreign {
             assert_eq!(
                 rows(&seen),
@@ -1226,7 +1239,7 @@ mod tests {
 
         let err = reap(
             &ctx,
-            &exe,
+            process::find_processes_by_exe(&exe),
             step::STOP_REAP,
             Some(TEST_REAP_MSG),
             Some("not found"),

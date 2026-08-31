@@ -123,6 +123,19 @@ pub struct SessionState {
     /// reconcile must not touch its guards.
     #[serde(default)]
     pub owner_pid: u32,
+    /// The owner's start time (seconds since the epoch), when it could be
+    /// observed at write time.
+    ///
+    /// `owner_pid` alone is a number, and pids are recycled: without this, a
+    /// record written in the pre-spawn window whose owner then died stayed
+    /// "foreign-owned" forever as soon as anything else reused that pid — and
+    /// a foreign-owned record can be neither overwritten nor cleared, so the
+    /// next launch died mid-run with a remedy (`./demo.sh stop`) that could not
+    /// clear it either. Paired with `owner_pid` this is the same recycled-pid
+    /// guard [`ProcInfo::is_same_process`] gives `wine`. `None` in records
+    /// written before this field existed, where the pid alone is all there is.
+    #[serde(default)]
+    pub owner_started_at: Option<u64>,
     /// The wine child's identity. `None` between guard acquisition and the
     /// spawn — a window the file deliberately covers.
     #[serde(default)]
@@ -163,7 +176,10 @@ impl SessionState {
             bs_dir: bs_dir.into(),
             started_at_unix_ms,
             log_path: log_path.into(),
-            owner_pid: std::process::id(),
+            // Overwritten with the identity pair below — `set_owner` is the
+            // one place that writes the two together.
+            owner_pid: 0,
+            owner_started_at: None,
             wine: None,
             dashboard: None,
             prev_audio_output: None,
@@ -171,6 +187,24 @@ impl SessionState {
             guards: GuardFlags::default(),
             detached: false,
         }
+        .owned_by_this_process()
+    }
+
+    /// Stamp this process as the owner, identity and all.
+    fn owned_by_this_process(mut self) -> SessionState {
+        self.set_owner(std::process::id());
+        self
+    }
+
+    /// Point this record's owner at `pid` — the **pair** `owner_pid` +
+    /// [`SessionState::owner_started_at`], which is what
+    /// [`has_live_foreign_owner`] reads. Setting the number alone describes a
+    /// record no writer produces (a pid from one process with another's
+    /// identity), so every fabricator of a foreign-owned record goes through
+    /// this.
+    pub(crate) fn set_owner(&mut self, pid: u32) {
+        self.owner_pid = pid;
+        self.owner_started_at = ProcInfo::observe(pid).map(|p| p.start_time);
     }
 
     /// Was this record written by a Sabrage this one understands?
@@ -227,9 +261,12 @@ pub fn load(path: &Path) -> Result<Option<SessionState>> {
 ///
 /// * `owner_pid` is neither 0 (an older record that never wrote one) nor this
 ///   process — our own records are ours to rewrite;
-/// * that pid is still alive — a crashed owner's record is exactly what
-///   recovery exists for, and refusing to touch it would strand the audio
-///   device forever;
+/// * that pid is still alive **and is still the process that wrote the
+///   record** — a crashed owner's record is exactly what recovery exists for,
+///   and refusing to touch it would strand the audio device forever. The
+///   recorded [`SessionState::owner_started_at`] is what makes the second half
+///   decidable; a record from before that field existed still has to trust the
+///   bare pid;
 /// * the session itself has not visibly ended: either the recorded wine child
 ///   is still that same process, or there is no wine child *yet* — the
 ///   pre-spawn window where the guards are already taken and the record is the
@@ -237,14 +274,24 @@ pub fn load(path: &Path) -> Result<Option<SessionState>> {
 ///
 /// A record whose wine pid is gone is therefore never protected by this, no
 /// matter who wrote it: it is a leftover, and undoing its guards is the whole
-/// job. The residual false positive is a recycled `owner_pid`, which costs one
-/// kept record and one row, never a mutation.
+/// job. The residual false positive is a recycled `owner_pid` in a record
+/// written before `owner_started_at` existed, which costs one kept record and
+/// one row, never a mutation.
 pub fn has_live_foreign_owner(state: &SessionState) -> bool {
     if state.owner_pid == 0 || state.owner_pid == std::process::id() {
         return false;
     }
     if !crate::process::is_alive(state.owner_pid) {
         return false;
+    }
+    if let Some(started_at) = state.owner_started_at {
+        // Alive, but is it the same process? A pid the OS handed to something
+        // else is not an owner, and treating it as one wedges every later
+        // launch behind a record nothing can clear.
+        match ProcInfo::observe(state.owner_pid) {
+            Some(now) if now.start_time == started_at => {}
+            _ => return false,
+        }
     }
     state
         .wine
@@ -542,12 +589,23 @@ mod tests {
 
         // Another live process, and the recorded wine pid is not observably
         // gone — hands off.
-        s.owner_pid = foreign.pid();
+        s.set_owner(foreign.pid());
         s.wine = None;
         assert!(
             has_live_foreign_owner(&s),
             "the pre-spawn window is covered"
         );
+
+        // Same pid, a different process: a recycled `owner_pid` is not an
+        // owner. Without the recorded start time this record could never be
+        // overwritten *or* cleared, and the next launch died on it.
+        let real_start = s.owner_started_at;
+        s.owner_started_at = Some(real_start.unwrap_or(0).wrapping_add(1_000));
+        assert!(
+            !has_live_foreign_owner(&s),
+            "a recycled owner pid must not wedge the record"
+        );
+        s.owner_started_at = real_start;
 
         // Same owner, but the session's wine child is provably gone: a
         // leftover, and undoing its guards is exactly the job.
@@ -560,9 +618,9 @@ mod tests {
 
         // An owner that has itself exited is never protected either.
         s.wine = None;
-        s.owner_pid = u32::MAX - 1;
+        s.set_owner(u32::MAX - 1);
         assert!(!has_live_foreign_owner(&s));
-        s.owner_pid = 0;
+        s.set_owner(0);
         assert!(
             !has_live_foreign_owner(&s),
             "an older record wrote no owner"
@@ -576,7 +634,7 @@ mod tests {
         let foreign = ForeignProcess::spawn();
 
         let mut theirs = sample();
-        theirs.owner_pid = foreign.pid();
+        theirs.set_owner(foreign.pid());
         theirs.wine = None; // mid-launch, guards taken, nothing spawned yet
         save(&real(), &path, &theirs).await.unwrap();
         let bytes = std::fs::read(&path).unwrap();

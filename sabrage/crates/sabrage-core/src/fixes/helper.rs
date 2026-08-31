@@ -82,8 +82,15 @@ fn parse_encoder_process(toml_text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `${ENCODER_PROC:-auto}` — empty (missing key, missing file, unquoted value)
-/// falls back to `"auto"`, exactly like the shell parameter expansion.
+/// `${ENCODER_PROC:-auto}` — empty falls back to `"auto"`, exactly like the
+/// shell parameter expansion.
+///
+/// Empty means: no `encoder_process` key, no file, or a value the *runtime*
+/// would ignore. Not "unquoted": [`crate::config::runtime_toml`]'s reader takes
+/// `encoder_process = native` the way `Config.cpp` does, where doctor.sh's
+/// `awk -F'"'` recipe (and, for tap parity, `checks::config`) reads it as
+/// absent. That divergence is the shell's, and it is recorded in
+/// `sabrage/PARITY.md`, not papered over here.
 fn encoder_process_or_default(toml_text: &str) -> String {
     let raw = parse_encoder_process(toml_text);
     if raw.is_empty() {

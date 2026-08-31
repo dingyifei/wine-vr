@@ -292,7 +292,7 @@
       <div class="notice">log rotated — showing the new file from the start</div>
     {/if}
     {#if truncatedNotice}
-      <div class="notice">older lines were dropped to keep up with the file</div>
+      <div class="notice">the file is growing faster than Sabrage reads it — more lines are on the way</div>
     {/if}
   {/if}
 </div>

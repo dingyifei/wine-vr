@@ -203,56 +203,103 @@ struct DoctorArgs {
     verbose: bool,
 }
 
+/// The six `demo.sh`-verbatim flags every stage script (and `doctor`) shares:
+/// `--bottle`/`--bs-dir`/`--no-audio`/`--no-dashboard`/`--wired`/`--verbose`.
+/// Factored out of [`parse_doctor_args`]/[`parse_stage_args`] (finding
+/// S-C3-cli-ipc: the two hand-rolled loops repeated these six arms
+/// identically, including the exact `demo.sh`-verbatim error text) so each
+/// error string lives in exactly one place.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CommonArgs {
+    bottle: Option<String>,
+    bs_dir: Option<PathBuf>,
+    wired: bool,
+    no_audio: bool,
+    no_dashboard: bool,
+    verbose: bool,
+}
+
+/// Try to consume one of the six [`CommonArgs`] flags at `args[i]`.
+///
+/// `Ok(Some(next_i))` — recognized and consumed, resume the caller's loop at
+/// `next_i`. `Ok(None)` — `args[i]` is not one of the six; the caller tries
+/// its own extra flags (`--tap`, `--dry-run`, `--quiet`) before falling back
+/// to the shared "unknown argument" error. `Err` — a value-taking flag with
+/// no value, the same first-bad-argument-wins short-circuit both callers
+/// already relied on.
+fn parse_common_flag(
+    out: &mut CommonArgs,
+    args: &[String],
+    i: usize,
+) -> Result<Option<usize>, String> {
+    match args[i].as_str() {
+        "--bottle" => {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| "error: --bottle needs a name".to_string())?;
+            out.bottle = Some(v.clone());
+            Ok(Some(i + 2))
+        }
+        "--bs-dir" => {
+            let v = args
+                .get(i + 1)
+                .ok_or_else(|| "error: --bs-dir needs a path".to_string())?;
+            out.bs_dir = Some(PathBuf::from(v));
+            Ok(Some(i + 2))
+        }
+        "--no-audio" => {
+            out.no_audio = true;
+            Ok(Some(i + 1))
+        }
+        "--no-dashboard" => {
+            out.no_dashboard = true;
+            Ok(Some(i + 1))
+        }
+        "--wired" => {
+            out.wired = true;
+            Ok(Some(i + 1))
+        }
+        "--verbose" => {
+            out.verbose = true;
+            Ok(Some(i + 1))
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Parse `doctor`'s argument list. Returns the `demo.sh`-verbatim error message
 /// (sans the `error: ` prefix's destination — the caller decides where it goes)
 /// on the first bad argument, exactly like the shell's `case` loop: no
 /// aggregation, first failure wins.
 fn parse_doctor_args(args: &[String]) -> Result<DoctorArgs, String> {
-    let mut out = DoctorArgs::default();
+    let mut common = CommonArgs::default();
+    let mut tap = None;
     let mut i = 0usize;
     while i < args.len() {
+        if let Some(next) = parse_common_flag(&mut common, args, i)? {
+            i = next;
+            continue;
+        }
         match args[i].as_str() {
-            "--bottle" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or_else(|| "error: --bottle needs a name".to_string())?;
-                out.bottle = Some(v.clone());
-                i += 2;
-            }
-            "--bs-dir" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or_else(|| "error: --bs-dir needs a path".to_string())?;
-                out.bs_dir = Some(PathBuf::from(v));
-                i += 2;
-            }
             "--tap" => {
                 let v = args
                     .get(i + 1)
                     .ok_or_else(|| "error: --tap needs a path".to_string())?;
-                out.tap = Some(PathBuf::from(v));
+                tap = Some(PathBuf::from(v));
                 i += 2;
-            }
-            "--no-audio" => {
-                out.no_audio = true;
-                i += 1;
-            }
-            "--no-dashboard" => {
-                out.no_dashboard = true;
-                i += 1;
-            }
-            "--wired" => {
-                out.wired = true;
-                i += 1;
-            }
-            "--verbose" => {
-                out.verbose = true;
-                i += 1;
             }
             other => return Err(format!("error: unknown argument '{other}'")),
         }
     }
-    Ok(out)
+    Ok(DoctorArgs {
+        bottle: common.bottle,
+        bs_dir: common.bs_dir,
+        tap,
+        wired: common.wired,
+        no_audio: common.no_audio,
+        no_dashboard: common.no_dashboard,
+        verbose: common.verbose,
+    })
 }
 
 /// Merge parsed `doctor` flags onto the env-derived base — `doctor`'s
@@ -518,15 +565,23 @@ fn label(text: &str, color: &str, colors: bool) -> String {
 struct Colors {
     stdout: bool,
     stderr: bool,
+    /// Raw `isatty()`, independent of `NO_COLOR` — A14-3 needs this to decide
+    /// whether a `\r`-terminated [`StageEvent::Output`] chunk repaints the
+    /// terminal line or falls back to newline-per-chunk (a non-tty consumer,
+    /// e.g. a log file or `--tap` pipe, has no "current line" to repaint).
+    stdout_tty: bool,
+    stderr_tty: bool,
 }
 
 impl Colors {
-    /// Both streams uncolored — the shared shorthand every `stage_event_lines`
-    /// test that doesn't care about color uses.
+    /// Both streams uncolored and non-tty — the shared shorthand every
+    /// `stage_event_lines` test that doesn't care about color uses.
     #[cfg(test)]
     const OFF: Colors = Colors {
         stdout: false,
         stderr: false,
+        stdout_tty: false,
+        stderr_tty: false,
     };
 }
 
@@ -536,6 +591,8 @@ fn colors_from(no_color: bool, stdout_tty: bool, stderr_tty: bool) -> Colors {
     Colors {
         stdout: !no_color && stdout_tty,
         stderr: !no_color && stderr_tty,
+        stdout_tty,
+        stderr_tty,
     }
 }
 
@@ -574,52 +631,37 @@ struct StageArgs {
 /// Parse a stage command's argument list — [`parse_doctor_args`]'s sibling,
 /// same first-bad-argument-wins semantics, same error text.
 fn parse_stage_args(args: &[String]) -> Result<StageArgs, String> {
-    let mut out = StageArgs::default();
+    let mut common = CommonArgs::default();
+    let mut dry_run = false;
+    let mut quiet = false;
     let mut i = 0usize;
     while i < args.len() {
+        if let Some(next) = parse_common_flag(&mut common, args, i)? {
+            i = next;
+            continue;
+        }
         match args[i].as_str() {
-            "--bottle" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or_else(|| "error: --bottle needs a name".to_string())?;
-                out.bottle = Some(v.clone());
-                i += 2;
-            }
-            "--bs-dir" => {
-                let v = args
-                    .get(i + 1)
-                    .ok_or_else(|| "error: --bs-dir needs a path".to_string())?;
-                out.bs_dir = Some(PathBuf::from(v));
-                i += 2;
-            }
-            "--no-audio" => {
-                out.no_audio = true;
-                i += 1;
-            }
-            "--no-dashboard" => {
-                out.no_dashboard = true;
-                i += 1;
-            }
-            "--wired" => {
-                out.wired = true;
-                i += 1;
-            }
-            "--verbose" => {
-                out.verbose = true;
-                i += 1;
-            }
             "--dry-run" => {
-                out.dry_run = true;
+                dry_run = true;
                 i += 1;
             }
             "--quiet" => {
-                out.quiet = true;
+                quiet = true;
                 i += 1;
             }
             other => return Err(format!("error: unknown argument '{other}'")),
         }
     }
-    Ok(out)
+    Ok(StageArgs {
+        bottle: common.bottle,
+        bs_dir: common.bs_dir,
+        wired: common.wired,
+        no_audio: common.no_audio,
+        no_dashboard: common.no_dashboard,
+        verbose: common.verbose,
+        dry_run,
+        quiet,
+    })
 }
 
 /// One line [`stage_event_lines`] wants printed, tagged with the stream it
@@ -638,6 +680,11 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, String> {
 enum RenderedLine {
     Stdout(String),
     Stderr(String),
+    /// A `\r`-terminated repaint chunk on a tty (A14-3): written with a
+    /// trailing `\r` and no `\n`, so a curl/ninja-style progress line
+    /// overwrites itself instead of scrolling once per update.
+    StdoutRepaint(String),
+    StderrRepaint(String),
 }
 
 /// The pure projection [`render_stage_event`] prints: exactly the lines
@@ -667,13 +714,27 @@ fn stage_event_lines(
             remedy.as_deref(),
             colors.stdout,
         ))],
-        StageEvent::Output { stream, chunk, .. } => {
+        StageEvent::Output {
+            stream, chunk, end, ..
+        } => {
             if quiet {
                 vec![]
             } else {
-                match stream {
-                    Stream::Stdout => vec![RenderedLine::Stdout(chunk.clone())],
-                    Stream::Stderr => vec![RenderedLine::Stderr(chunk.clone())],
+                // A bare `\r` (a progress-bar repaint) only gets the
+                // no-newline treatment when the destination is a real
+                // terminal; a non-tty consumer (redirected to a file, piped,
+                // or `--tap`) has no "current line" to overwrite, so it keeps
+                // today's one-newline-per-chunk behavior — same as `Lf`/`Eof`.
+                let repaint = matches!(end, sabrage_core::process::ChunkEnd::Cr)
+                    && match stream {
+                        Stream::Stdout => colors.stdout_tty,
+                        Stream::Stderr => colors.stderr_tty,
+                    };
+                match (stream, repaint) {
+                    (Stream::Stdout, true) => vec![RenderedLine::StdoutRepaint(chunk.clone())],
+                    (Stream::Stdout, false) => vec![RenderedLine::Stdout(chunk.clone())],
+                    (Stream::Stderr, true) => vec![RenderedLine::StderrRepaint(chunk.clone())],
+                    (Stream::Stderr, false) => vec![RenderedLine::Stderr(chunk.clone())],
                 }
             }
         }
@@ -719,10 +780,19 @@ fn stage_event_lines(
 /// Render one [`StageEvent`] exactly the way its `demo.sh` equivalent prints
 /// it, by printing [`stage_event_lines`]'s projection of it.
 fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: Colors, quiet: bool) {
+    use std::io::Write as _;
     for line in stage_event_lines(ev, bottle_label, colors, quiet) {
         match line {
             RenderedLine::Stdout(s) => println!("{s}"),
             RenderedLine::Stderr(s) => eprintln!("{s}"),
+            RenderedLine::StdoutRepaint(s) => {
+                print!("{s}\r");
+                let _ = std::io::stdout().flush();
+            }
+            RenderedLine::StderrRepaint(s) => {
+                eprint!("{s}\r");
+                let _ = std::io::stderr().flush();
+            }
         }
     }
 }
@@ -908,14 +978,13 @@ fn report_stage_result(result: std::result::Result<StageOutcome, SabrageError>) 
 /// child simply stops, and `demo.sh` itself prints nothing after its
 /// INT/TERM trap re-raises the signal — a trailing `error: cancelled` would be
 /// the one line the shell never shows. Exit 130 remains the signal.
+///
+/// A thin CLI-flavored name over [`SabrageError::already_reported`], which
+/// carries the actual rule (and its own test) once for both front-ends — the
+/// GUI needs the identical predicate to decide whether a failure banner would
+/// double up the `Fatal` row already in its run log.
 fn error_already_reported_as_fatal(e: &SabrageError) -> bool {
-    matches!(
-        e,
-        SabrageError::Fatal { .. }
-            | SabrageError::TccDenied { .. }
-            | SabrageError::AdminDeclined
-            | SabrageError::Cancelled
-    )
+    e.already_reported()
 }
 
 /// The trailing "-- plan (dry run)" section's lines: the section header (same
@@ -1991,6 +2060,79 @@ mod tests {
     }
 
     #[test]
+    fn cr_chunk_repaints_only_on_a_real_terminal() {
+        // A14-3: a bare `\r` progress-bar segment (curl/ninja-style) repaints
+        // the current terminal line when the destination is a real tty, but
+        // falls back to the ordinary newline-per-chunk treatment (identical
+        // to `Lf`/`Eof`) for a non-tty consumer such as a redirected file or
+        // `--tap` pipe, which has no "current line" to overwrite.
+        let tty = Colors {
+            stdout: false,
+            stderr: false,
+            stdout_tty: true,
+            stderr_tty: true,
+        };
+        let stdout_cr = StageEvent::Output {
+            run_id: Default::default(),
+            step: "install.1".to_string(),
+            stream: Stream::Stdout,
+            chunk: "###### 42%".to_string(),
+            end: sabrage_core::process::ChunkEnd::Cr,
+        };
+        assert_eq!(
+            stage_event_lines(&stdout_cr, "<name>", tty, false),
+            vec![RenderedLine::StdoutRepaint("###### 42%".to_string())],
+            "stdout is a tty: a Cr chunk repaints in place"
+        );
+        assert_eq!(
+            stage_event_lines(&stdout_cr, "<name>", Colors::OFF, false),
+            vec![RenderedLine::Stdout("###### 42%".to_string())],
+            "stdout is not a tty: a Cr chunk falls back to one line per chunk"
+        );
+
+        let stderr_cr = StageEvent::Output {
+            run_id: Default::default(),
+            step: "install.1".to_string(),
+            stream: Stream::Stderr,
+            chunk: "###### 42%".to_string(),
+            end: sabrage_core::process::ChunkEnd::Cr,
+        };
+        assert_eq!(
+            stage_event_lines(&stderr_cr, "<name>", tty, false),
+            vec![RenderedLine::StderrRepaint("###### 42%".to_string())],
+            "stderr is a tty: a Cr chunk repaints in place"
+        );
+        assert_eq!(
+            stage_event_lines(&stderr_cr, "<name>", Colors::OFF, false),
+            vec![RenderedLine::Stderr("###### 42%".to_string())],
+            "stderr is not a tty: a Cr chunk falls back to one line per chunk"
+        );
+
+        // `Eof` (end of stream, no delimiter at all) never repaints, tty or
+        // not — it's a distinct terminator from `Cr`, not a synonym for it.
+        let stdout_eof = StageEvent::Output {
+            run_id: Default::default(),
+            step: "install.1".to_string(),
+            stream: Stream::Stdout,
+            chunk: "done".to_string(),
+            end: sabrage_core::process::ChunkEnd::Eof,
+        };
+        assert_eq!(
+            stage_event_lines(&stdout_eof, "<name>", tty, false),
+            vec![RenderedLine::Stdout("done".to_string())],
+            "Eof never repaints even on a tty"
+        );
+
+        // `--quiet` suppresses a Cr chunk exactly like any other Output,
+        // regardless of tty-ness.
+        assert_eq!(
+            stage_event_lines(&stdout_cr, "<name>", tty, true),
+            vec![],
+            "--quiet suppresses a repaint chunk too"
+        );
+    }
+
+    #[test]
     fn fatal_and_stage_finished_events_compose_through_the_shared_helpers() {
         let fatal = StageEvent::Fatal {
             run_id: Default::default(),
@@ -2052,7 +2194,9 @@ mod tests {
             colors_from(true, true, true),
             Colors {
                 stdout: false,
-                stderr: false
+                stderr: false,
+                stdout_tty: true,
+                stderr_tty: true,
             }
         );
     }
@@ -2066,7 +2210,9 @@ mod tests {
             colors_from(false, false, true),
             Colors {
                 stdout: false,
-                stderr: true
+                stderr: true,
+                stdout_tty: false,
+                stderr_tty: true,
             }
         );
         // The mirrored case: stdout a terminal, stderr redirected to a file.
@@ -2074,7 +2220,9 @@ mod tests {
             colors_from(false, true, false),
             Colors {
                 stdout: true,
-                stderr: false
+                stderr: false,
+                stdout_tty: true,
+                stderr_tty: false,
             }
         );
     }
@@ -2089,6 +2237,8 @@ mod tests {
         let colors = Colors {
             stdout: false,
             stderr: true,
+            stdout_tty: false,
+            stderr_tty: true,
         };
 
         let fatal = StageEvent::Fatal {
@@ -2121,6 +2271,8 @@ mod tests {
         let mirrored = Colors {
             stdout: true,
             stderr: false,
+            stdout_tty: true,
+            stderr_tty: false,
         };
         assert_eq!(
             stage_event_lines(&fatal, "<name>", mirrored, false),

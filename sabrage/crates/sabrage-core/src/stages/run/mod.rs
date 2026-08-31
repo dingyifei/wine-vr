@@ -1116,10 +1116,7 @@ mod tests {
         // No `stop_wine` on the normal path — the bottle's wineserver stays up
         // (demo.sh parity), so nothing was planned at all.
         assert!(ctx.executor.planned().is_empty());
-        assert!(
-            session::live_session().is_none()
-                || session::live_session().unwrap().run_id != ctx.run_id
-        );
+        assert!(!session::live_session_is(ctx.run_id));
         std::fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1950,7 +1947,7 @@ mod tests {
             .planned()
             .iter()
             .any(|p| p.kind == PlannedKind::SpawnDetached));
-        assert!(session::live_session().map(|h| h.run_id) != Some(ctx.run_id));
+        assert!(!session::live_session_is(ctx.run_id));
         assert!(matches!(
             seen.lock().unwrap().first(),
             Some(StageEvent::Line {
@@ -2000,7 +1997,7 @@ mod tests {
         let plan = ctx.executor.planned();
         assert!(plan.iter().any(|p| p.kind == PlannedKind::SpawnDetached));
         // A dry run never publishes a live session and never writes the log.
-        assert!(session::live_session().map(|h| h.run_id) != Some(ctx.run_id));
+        assert!(!session::live_session_is(ctx.run_id));
         assert!(sess.wine.is_none());
         assert!(!ctx.paths.logs_dir().exists(), "no log file, no logs dir");
         std::fs::remove_dir_all(&root).unwrap();

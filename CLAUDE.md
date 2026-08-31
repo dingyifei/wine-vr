@@ -53,7 +53,7 @@ What `build` actually runs (useful for iterating on one component):
 ```sh
 # oxrsys — Debug x86_64 is the live-verified config (game runs under Rosetta, runtime loads in-process)
 cmake -S ext/oxrsys -B ext/oxrsys/build-x64 -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOXRSYS_ENABLE_ALVR=ON
+      -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOXRSYS_ENABLE_ALVR=ON -DOXRSYS_BUILD_ENCODER_HELPER=OFF
 cmake --build ext/oxrsys/build-x64 -j8
 
 # wineopenxr — PE dll via mingw + unix .so

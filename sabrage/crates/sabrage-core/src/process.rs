@@ -301,7 +301,10 @@ pub async fn spawn_streamed(
     sink: &EventSink,
     cancel: &CancellationToken,
 ) -> Result<ExitStatus> {
-    let (status, _tail) = spawn_streamed_inner(spec, sink, cancel).await?;
+    // No caller here reads the tail (see `run_ok`), so the pumps are told not
+    // to clone every chunk into it — real savings on a chatty build tool
+    // (curl's progress bar, cargo's output) whose tail nobody ever looks at.
+    let (status, _tail) = spawn_streamed_inner(spec, sink, cancel, false).await?;
     Ok(status)
 }
 
@@ -314,7 +317,7 @@ pub async fn run_ok(
     sink: &EventSink,
     cancel: &CancellationToken,
 ) -> Result<ExitStatus> {
-    let (status, tail) = spawn_streamed_inner(spec, sink, cancel).await?;
+    let (status, tail) = spawn_streamed_inner(spec, sink, cancel, true).await?;
     if status.success() {
         Ok(status)
     } else {
@@ -347,6 +350,7 @@ async fn spawn_streamed_inner(
     spec: &ChildSpec,
     sink: &EventSink,
     cancel: &CancellationToken,
+    capture_tail: bool,
 ) -> Result<(ExitStatus, Vec<String>)> {
     let mut cmd = tokio::process::Command::new(&spec.program);
     cmd.args(&spec.args)
@@ -382,7 +386,11 @@ async fn spawn_streamed_inner(
             ))
         })?;
 
-    let tail: Tail = Arc::new(Mutex::new(VecDeque::with_capacity(CHILD_TAIL_LINES)));
+    // `run_ok` needs the tail to explain a failure; `spawn_streamed`'s callers
+    // never read it, so a build tool's chatty progress output (curl, cargo)
+    // is not cloned into a buffer nobody looks at.
+    let tail: Option<Tail> =
+        capture_tail.then(|| Arc::new(Mutex::new(VecDeque::with_capacity(CHILD_TAIL_LINES))));
     let mut pumps = Vec::new();
     if let Some(out) = child.stdout.take() {
         pumps.push(tokio::spawn(pump(
@@ -450,8 +458,8 @@ async fn spawn_streamed_inner(
         }
     }
     let tail_lines: Vec<String> = tail
-        .lock()
-        .map(|t| t.iter().cloned().collect())
+        .as_ref()
+        .and_then(|t| t.lock().ok().map(|t| t.iter().cloned().collect()))
         .unwrap_or_default();
 
     if cancelled {
@@ -486,7 +494,7 @@ async fn pump<R>(
     run_id: RunId,
     step: StepId,
     sink: EventSink,
-    tail: Tail,
+    tail: Option<Tail>,
 ) where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -496,12 +504,17 @@ async fn pump<R>(
     // event so a byte-faithful renderer (the CLI, writing to a real tty) can
     // repaint a `\r`-terminated chunk in place instead of `println!`-ing it —
     // which is what turns curl's/cargo's progress repaints into permanent spam.
+    // `tail` is `None` for a caller that never reads it ([`spawn_streamed`]) —
+    // skip the clone-per-chunk entirely rather than fill a buffer nobody
+    // looks at.
     let mut emit = |chunk: String, end: ChunkEnd| {
-        if let Ok(mut t) = tail.lock() {
-            if t.len() == CHILD_TAIL_LINES {
-                t.pop_front();
+        if let Some(tail) = &tail {
+            if let Ok(mut t) = tail.lock() {
+                if t.len() == CHILD_TAIL_LINES {
+                    t.pop_front();
+                }
+                t.push_back(chunk.clone());
             }
-            t.push_back(chunk.clone());
         }
         sink(StageEvent::Output {
             run_id,
@@ -547,12 +560,14 @@ impl ProcInfo {
     /// Refreshes exactly that pid rather than the whole table
     /// ([`find_processes_by_exe`] must scan everything; this must not).
     pub fn observe(pid: u32) -> Option<ProcInfo> {
-        use sysinfo::{
-            Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind,
-        };
+        use sysinfo::{Pid as SysPid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
         let refresh = ProcessRefreshKind::nothing().with_exe(UpdateKind::Always);
-        let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+        // `System::new()` loads nothing: `new_with_specifics` would perform its
+        // own `ProcessesToUpdate::All` scan of the whole table before the
+        // targeted single-pid refresh below ever runs, walking every process on
+        // the machine to observe one pid.
+        let mut sys = System::new();
         let target = SysPid::from_u32(pid);
         sys.refresh_processes_specifics(ProcessesToUpdate::Some(&[target]), true, refresh);
         let proc_ = sys.process(target)?;
@@ -596,30 +611,13 @@ impl ProcInfo {
 /// `/private/var` vs `/var` difference still matches; a path that cannot be
 /// canonicalized falls back to literal equality.
 ///
-/// This replaces `pgrep -f <path>` — see this module's header for why.
+/// This replaces `pgrep -f <path>` — see this module's header for why. A
+/// single-needle convenience over [`ProcessScan::scan`] — a caller that needs
+/// several different needles against the same instant (`stop`'s survivor
+/// probe, its two reap steps, and its foreign-helper scan) should scan once
+/// and call [`ProcessScan::by_exe`]/[`ProcessScan::by_cmdline`] instead.
 pub fn find_processes_by_exe(path: &Path) -> Vec<ProcInfo> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
-
-    let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let refresh = ProcessRefreshKind::nothing().with_exe(UpdateKind::Always);
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
-
-    let mut found: Vec<ProcInfo> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, proc_)| {
-            let exe = proc_.exe()?;
-            let resolved = exe.canonicalize().unwrap_or_else(|_| exe.to_path_buf());
-            (resolved == want).then(|| ProcInfo {
-                pid: pid.as_u32(),
-                start_time: proc_.start_time(),
-                exe: resolved,
-            })
-        })
-        .collect();
-    found.sort_by_key(|p| p.pid);
-    found
+    ProcessScan::scan().by_exe(path)
 }
 
 /// True when any element of `cmd` — or the whitespace-joined command line as a
@@ -642,34 +640,101 @@ pub fn cmdline_contains(cmd: &[String], needle: &str) -> bool {
 /// `needle`, pid-ordered — the argv-based match `pgrep -f` performs, unlike
 /// [`find_processes_by_exe`]'s exact exe-path equality (used by the reap
 /// steps). See this module's header, and PARITY.md "Stop", for why the two
-/// probes make opposite trade-offs on purpose.
+/// probes make opposite trade-offs on purpose. A single-needle convenience
+/// over [`ProcessScan::scan`] — see [`find_processes_by_exe`]'s doc for when a
+/// caller should scan once instead.
 pub fn find_processes_by_cmdline(needle: &str) -> Vec<ProcInfo> {
-    use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+    ProcessScan::scan().by_cmdline(needle)
+}
 
-    let refresh = ProcessRefreshKind::nothing()
-        .with_exe(UpdateKind::Always)
-        .with_cmd(UpdateKind::Always);
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
-    sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+/// One full-table process scan, with both `exe` and `cmd` refreshed, kept
+/// around so a caller that needs several different needles against the same
+/// instant pays for exactly one process walk. `stop` used to run one fresh
+/// scan per probe — the survivor check, each of its two reap steps, and its
+/// foreign-helper scan — four full walks of the process table for one
+/// invocation; they now share one [`ProcessScan`].
+pub struct ProcessScan {
+    procs: Vec<(ProcInfo, Vec<String>)>,
+}
 
-    let mut found: Vec<ProcInfo> = sys
-        .processes()
-        .iter()
-        .filter_map(|(pid, proc_)| {
-            let cmd: Vec<String> = proc_
-                .cmd()
-                .iter()
-                .map(|a| a.to_string_lossy().into_owned())
-                .collect();
-            cmdline_contains(&cmd, needle).then(|| ProcInfo {
-                pid: pid.as_u32(),
-                start_time: proc_.start_time(),
-                exe: proc_.exe().map(Path::to_path_buf).unwrap_or_default(),
+impl ProcessScan {
+    /// Scan every live process once, refreshing both its resolved executable
+    /// and its command line — the union of what [`find_processes_by_exe`] and
+    /// [`find_processes_by_cmdline`] each need.
+    pub fn scan() -> ProcessScan {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
+
+        let refresh = ProcessRefreshKind::nothing()
+            .with_exe(UpdateKind::Always)
+            .with_cmd(UpdateKind::Always);
+        // `System::new()` loads nothing, so the explicit refresh below is the
+        // only full-table scan this performs — `new_with_specifics` would have
+        // performed a second one first (see `ProcInfo::observe`'s comment).
+        let mut sys = System::new();
+        sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
+
+        let mut procs: Vec<(ProcInfo, Vec<String>)> = sys
+            .processes()
+            .iter()
+            .map(|(pid, proc_)| {
+                let exe = proc_.exe().map(Path::to_path_buf).unwrap_or_default();
+                let cmd: Vec<String> = proc_
+                    .cmd()
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect();
+                (
+                    ProcInfo {
+                        pid: pid.as_u32(),
+                        start_time: proc_.start_time(),
+                        exe,
+                    },
+                    cmd,
+                )
             })
-        })
-        .collect();
-    found.sort_by_key(|p| p.pid);
-    found
+            .collect();
+        procs.sort_by_key(|(p, _)| p.pid);
+        ProcessScan { procs }
+    }
+
+    /// [`find_processes_by_cmdline`], against this snapshot instead of a fresh
+    /// scan.
+    pub fn by_cmdline(&self, needle: &str) -> Vec<ProcInfo> {
+        self.procs
+            .iter()
+            .filter(|(_, cmd)| cmdline_contains(cmd, needle))
+            .map(|(p, _)| p.clone())
+            .collect()
+    }
+
+    /// [`find_processes_by_exe`], against this snapshot instead of a fresh
+    /// scan.
+    ///
+    /// `canonicalize()` is a syscall; a process whose exe basename cannot
+    /// possibly match `path` is rejected before paying for it, so only real
+    /// candidates get resolved.
+    pub fn by_exe(&self, path: &Path) -> Vec<ProcInfo> {
+        let want = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        let want_name = want.file_name();
+        let mut found: Vec<ProcInfo> = self
+            .procs
+            .iter()
+            .filter_map(|(p, _)| {
+                if p.exe.file_name() != want_name {
+                    return None;
+                }
+                let resolved = p.exe.canonicalize().unwrap_or_else(|_| p.exe.clone());
+                let matched = resolved == want;
+                matched.then_some(ProcInfo {
+                    pid: p.pid,
+                    start_time: p.start_time,
+                    exe: resolved,
+                })
+            })
+            .collect();
+        found.sort_by_key(|p| p.pid);
+        found
+    }
 }
 
 // ── read-only probes ──────────────────────────────────────────────────────────
@@ -685,7 +750,7 @@ pub struct Captured {
 impl Captured {
     /// `stdout` with trailing newlines stripped, the way `$(…)` capture works.
     pub fn stdout_trimmed(&self) -> &str {
-        self.stdout.trim_end_matches('\n')
+        crate::util::strip_trailing_newlines(&self.stdout)
     }
 }
 
@@ -1033,6 +1098,24 @@ mod tests {
         assert_eq!(err.kind(), "child_failed");
     }
 
+    /// `spawn_streamed` never reads the tail ([`SabrageError::ChildFailed`] is
+    /// `run_ok`'s error, not its), so `spawn_streamed_inner` must not spend a
+    /// clone per output chunk populating one nobody looks at.
+    #[tokio::test]
+    async fn spawn_streamed_does_not_populate_a_tail_nobody_reads() {
+        let run_id = Uuid::new_v4();
+        let (sink, _seen) = collecting_sink();
+        let cancel = CancellationToken::new();
+        let s = spec("/bin/sh", run_id)
+            .arg("-c")
+            .arg("echo boom >&2; exit 3");
+        let (status, tail) = spawn_streamed_inner(&s, &sink, &cancel, false)
+            .await
+            .unwrap();
+        assert_eq!(exit_code_of(status), 3);
+        assert!(tail.is_empty(), "tail should be empty: {tail:?}");
+    }
+
     #[tokio::test]
     async fn cancellation_kills_the_process_group() {
         let run_id = Uuid::new_v4();
@@ -1162,6 +1245,24 @@ mod tests {
         );
         // An exe path nothing runs from matches nothing.
         assert!(find_processes_by_exe(Path::new("/nonexistent/sabrage/helper")).is_empty());
+    }
+
+    /// `find_processes_by_exe`/`find_processes_by_cmdline` are now thin
+    /// wrappers over one [`ProcessScan`]; a caller sharing a scan across
+    /// several needles (`stages::stop`) must see exactly the same matches the
+    /// single-needle convenience functions would.
+    #[test]
+    fn process_scan_agrees_with_the_single_needle_convenience_functions() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let scan = ProcessScan::scan();
+        assert_eq!(scan.by_exe(&exe), find_processes_by_exe(&exe));
+        assert!(scan
+            .by_exe(Path::new("/nonexistent/sabrage/helper"))
+            .is_empty());
+
+        let name = exe.file_name().and_then(|n| n.to_str()).unwrap();
+        let needle = &name[name.len().saturating_sub(6)..];
+        assert_eq!(scan.by_cmdline(needle), find_processes_by_cmdline(needle));
     }
 
     #[test]

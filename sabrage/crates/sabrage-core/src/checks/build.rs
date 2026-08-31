@@ -89,9 +89,9 @@ pub fn lipo_archs_stdout(path: &Path) -> String {
         .arg(path)
         .output()
     {
-        Ok(out) => String::from_utf8_lossy(&out.stdout)
-            .trim_end_matches('\n')
-            .to_string(),
+        Ok(out) => {
+            crate::util::strip_trailing_newlines(&String::from_utf8_lossy(&out.stdout)).to_string()
+        }
         Err(_) => String::new(),
     }
 }

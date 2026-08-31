@@ -15,7 +15,7 @@
 use super::Evaluator;
 use super::{CheckCtx, CheckOutcome};
 use crate::contract::contract;
-use crate::util::{file_sha256_matches, sha256_file, strip_trailing_newlines};
+use crate::util::{sha256_file, strip_trailing_newlines};
 
 /// lib.sh's `dxmt_files_ok()`: every `[dxmt] files` entry present under
 /// `ext/dxmt-artifacts/`.
@@ -58,24 +58,34 @@ fn dep_dxmt(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
+/// One hash pass instead of two: the file used to be hashed once to decide
+/// pass/warn (`file_sha256_matches`) and, on the warn path, hashed *again* to
+/// put the actual digest in the detail — doubling a hash of a multi-megabyte
+/// dll on every doctor/preflight run. `sha256_file` runs exactly once here;
+/// its `Result` decides both the outcome and, when relevant, the detail text.
 fn dep_goldberg(ctx: &CheckCtx) -> CheckOutcome {
     let gbe = &ctx.paths.gbe_dll;
     let expected = &contract().deps.gbe_dll_sha256;
-    if file_sha256_matches(gbe, expected) {
-        return CheckOutcome::pass("dep.goldberg", "Goldberg steam_api64.dll (sha256 verified)");
-    }
-    if gbe.is_file() {
-        let detail = match sha256_file(gbe) {
-            Ok(got) => format!("expected sha256 {expected}, got {got}"),
-            Err(e) => format!("expected sha256 {expected}, but could not re-hash: {e}"),
-        };
-        return CheckOutcome::warn(
+    match sha256_file(gbe) {
+        Ok(got) if got.eq_ignore_ascii_case(expected) => {
+            CheckOutcome::pass("dep.goldberg", "Goldberg steam_api64.dll (sha256 verified)")
+        }
+        Ok(got) => CheckOutcome::warn(
             "dep.goldberg",
             "Goldberg dll present but hash differs from the pinned build",
         )
-        .with_detail(detail);
+        .with_detail(format!("expected sha256 {expected}, got {got}")),
+        Err(_) if !gbe.is_file() => {
+            CheckOutcome::fail("dep.goldberg", "Goldberg dll missing", "./demo.sh setup")
+        }
+        Err(e) => CheckOutcome::warn(
+            "dep.goldberg",
+            "Goldberg dll present but hash differs from the pinned build",
+        )
+        .with_detail(format!(
+            "expected sha256 {expected}, but could not re-hash: {e}"
+        )),
     }
-    CheckOutcome::fail("dep.goldberg", "Goldberg dll missing", "./demo.sh setup")
 }
 
 /// Evaluators this module binds, keyed by contract slug.

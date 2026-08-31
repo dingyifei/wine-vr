@@ -17,16 +17,17 @@
 
 use std::path::Path;
 
-use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, RefreshKind, System, UpdateKind};
+use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
 
 use crate::error::Result;
 use crate::fixes::FixReport;
 use crate::stages::{require_bottle, EventSink, StageCtx};
 
 /// The exact line doctor's `bottle.gfx-dxmt` greps for, anchored at both ends
-/// (`^"CX_GRAPHICS_BACKEND" = "dxmt"$`). Byte-for-byte the same literal
-/// `checks::bottle::bottle_gfx_dxmt` compares against.
-const TARGET_LINE: &str = "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"";
+/// (`^"CX_GRAPHICS_BACKEND" = "dxmt"$`). `pub(crate)` so
+/// `checks::bottle::bottle_gfx_dxmt` compares against this literal instead of
+/// its own copy — one byte-critical string, not two kept in sync by hand.
+pub(crate) const TARGET_LINE: &str = "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"";
 /// `run.sh`'s prefix test for "some `CX_GRAPHICS_BACKEND` line exists, whatever
 /// its value" (`grep -q '^"CX_GRAPHICS_BACKEND"'`).
 const KEY_PREFIX: &str = "\"CX_GRAPHICS_BACKEND\"";
@@ -158,7 +159,10 @@ fn scan_wineservers(wineserver_exe: &Path) -> Vec<WineserverProc> {
     let refresh = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::Always)
         .with_environ(UpdateKind::Always);
-    let mut sys = System::new_with_specifics(RefreshKind::nothing().with_processes(refresh));
+    // `System::new()` loads nothing: `new_with_specifics` would perform its own
+    // `ProcessesToUpdate::All` scan before the explicit one below runs, walking
+    // the whole process table twice for one scan's worth of work.
+    let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
     sys.processes()

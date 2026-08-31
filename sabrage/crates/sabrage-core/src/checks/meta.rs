@@ -59,7 +59,7 @@ use crate::util;
 /// against a contract it silently disagrees with. So, Sabrage-only (the shell
 /// has no compiled-in contract to compare against — see `sabrage/PARITY.md`),
 /// once the checkout is internally consistent this evaluator additionally
-/// compares the checkout's hash against [`compiled_contract_hash`].
+/// compares the checkout's hash against [`crate::contract::COMPILED_CONTRACT_SHA256`].
 fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
     let root = &ctx.paths.root;
     let have = util::contract_gen_recorded_hash(root);
@@ -89,8 +89,8 @@ fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
     // Checkout is internally consistent. Sabrage-only second half: is THIS
     // binary built from that same contract?
     let want = want.expect("in_sync requires want to be Some");
-    let compiled = compiled_contract_hash();
-    if want != compiled {
+    let compiled = &*crate::contract::COMPILED_CONTRACT_SHA256;
+    if &want != compiled {
         return CheckOutcome::fail(
             "meta.contract-sync",
             "this Sabrage binary was built from a different contract than the checkout it's \
@@ -106,24 +106,6 @@ fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
         "contract/ in sync with scripts/demo/contract.gen.sh",
     )
     .with_detail(format!("want={want} have={want}"))
-}
-
-/// The contract hash of the bytes THIS binary was compiled with — same recipe
-/// as [`util::contract_hash`] (sha256 of the three contract files concatenated
-/// in [`crate::contract::CONTRACT_FILES`] order), but over the `include_str!`
-/// constants in [`crate::contract`] rather than files read at runtime. A
-/// mismatch against the checkout's on-disk hash means this binary predates (or
-/// postdates) a contract edit in the checkout `repo_root` points at.
-fn compiled_contract_hash() -> String {
-    let mut concatenated = String::with_capacity(
-        crate::contract::PIPELINE_TOML.len()
-            + crate::contract::RUNTIME_TOML_TEMPLATE.len()
-            + crate::contract::HOST_MANIFEST_TEMPLATE.len(),
-    );
-    concatenated.push_str(crate::contract::PIPELINE_TOML);
-    concatenated.push_str(crate::contract::RUNTIME_TOML_TEMPLATE);
-    concatenated.push_str(crate::contract::HOST_MANIFEST_TEMPLATE);
-    crate::util::sha256_bytes(concatenated.as_bytes())
 }
 
 /// Evaluators this module binds, keyed by contract slug.
@@ -181,7 +163,7 @@ mod tests {
     /// A checkout that is internally consistent (its `contract/` hashes to the
     /// same value `contract.gen.sh`'s header records) but whose contract bytes
     /// differ from the ones this test binary was compiled with — the "stale
-    /// binary" case `compiled_contract_hash` exists to catch. Round-1 finding
+    /// binary" case `contract::COMPILED_CONTRACT_SHA256` exists to catch. Round-1 finding
     /// A1-1.
     #[test]
     fn fails_when_the_binary_was_compiled_from_a_different_contract() {
@@ -236,7 +218,7 @@ mod tests {
             Some(
                 format!(
                     "checkout={checkout_hash} binary={}",
-                    compiled_contract_hash()
+                    *crate::contract::COMPILED_CONTRACT_SHA256
                 )
                 .as_str()
             )
@@ -251,6 +233,6 @@ mod tests {
     fn compiled_hash_matches_the_live_checkout() {
         let root = repo_root();
         let checkout_hash = util::contract_hash(&root).expect("contract files readable");
-        assert_eq!(checkout_hash, compiled_contract_hash());
+        assert_eq!(checkout_hash, *crate::contract::COMPILED_CONTRACT_SHA256);
     }
 }

@@ -96,6 +96,7 @@ pub use session::{
     live_session, EncoderInfo, LiveSessionHandle, SessionPhase, SessionStatus, LIVE_SESSION,
 };
 pub use stages::{
-    null_sink, operation_in_progress, require_bottle, run, run_stage, EventSink, StageCtx,
-    StageOptions, StageOutcome, OPERATION_LOCK, RUN_WINESERVER_WAIT, STOP_WINESERVER_WAIT,
+    null_sink, operation_in_progress, operation_in_progress_anywhere, require_bottle, run,
+    run_stage, EventSink, StageCtx, StageOptions, StageOutcome, OPERATION_LOCK,
+    RUN_WINESERVER_WAIT, STOP_WINESERVER_WAIT,
 };

@@ -436,8 +436,18 @@ impl Executor for RealExecutor {
                 // *not* installed, and rebuilding cannot repair it because the
                 // bytes never change (checks/build.rs requires the bit;
                 // fixes/helper.rs restages through this primitive). Repair the
-                // mode and report it as work done. DIVERGENCE from lib.sh's
-                // `cmp -s`-only `install_if_changed` — PARITY.md, "Install".
+                // mode and report it as work done.
+                //
+                // DIVERGENCE from lib.sh's `install_if_changed`, which compares
+                // with `cmp -s` alone and prints `info "unchanged: $2"` whenever
+                // the bytes match. Consequence, on every destination and not
+                // only the staged helper: a file whose bytes already match but
+                // whose mode does not is chmod'ed here and rendered as
+                // `installed: <dst>` where `./demo.sh install` says
+                // `unchanged: <dst>` — the DXMT dlls (0755 in
+                // `ext/dxmt-artifacts/`, 0644 once installed under
+                // `CrossOver.app`) are exactly that shape. Not yet a row in
+                // PARITY.md's "Install" table; adding it is the open item.
                 return match (mode_of(src), mode_of(dst)) {
                     (Some(want), Some(have)) if want != have => {
                         tokio::fs::set_permissions(dst, permissions(want))

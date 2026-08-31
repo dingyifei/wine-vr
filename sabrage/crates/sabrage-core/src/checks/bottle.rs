@@ -134,10 +134,11 @@ fn bottle_gfx_dxmt(ctx: &CheckCtx) -> CheckOutcome {
     };
     let conf = std::fs::read_to_string(b.conf_path()).unwrap_or_default();
     // `grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$'` — anchored at both ends:
-    // an exact full-line match, unlike bottle.template's prefix match.
+    // an exact full-line match, unlike bottle.template's prefix match. The
+    // same literal `fixes::backend::TARGET_LINE` writes.
     if conf
         .lines()
-        .any(|l| l == "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"")
+        .any(|l| l == crate::fixes::backend::TARGET_LINE)
     {
         CheckOutcome::pass("bottle.gfx-dxmt", "bottle graphics backend = dxmt")
     } else {

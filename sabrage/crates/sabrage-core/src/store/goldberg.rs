@@ -55,41 +55,12 @@ pub(crate) fn orig_steam_path(api: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// Is a session live *anywhere* — this process, or another front-end that got
-/// as far as writing `session-state.json`?
-///
-/// [`session::live_session`] only knows about the session this process owns.
-/// The `sabrage` CLI writes the state file before it spawns wine
-/// ([`crate::session::state`]'s write-before-mutate invariant), so a wine child
-/// recorded there and still running (`is_same_process` rules out a recycled
-/// pid) is a live session even though this process has no handle for it.
-///
-/// A corrupt or unreadable state file counts as "live": the conservative
-/// answer is the only safe one when the question is "may I overwrite a dll
-/// some process may have mapped".
-///
-/// // NOTE: a `./demo.sh run` session is still invisible here — the shell
-/// writes no `session-state.json` at all (that file is Sabrage-only state).
-/// Closing that gap needs a process probe for a wine child under `bs_dir`,
-/// which is a bigger change than this refusal deserves; the operation lock
-/// plus this probe cover both front-ends that Sabrage itself starts.
-pub(crate) fn a_session_is_live(session_state_path: &Path) -> bool {
-    if session::live_session().is_some() {
-        return true;
-    }
-    match session::state::load(session_state_path) {
-        Ok(Some(state)) => state.wine.is_some_and(|w| w.is_same_process()),
-        Ok(None) => false,
-        Err(_) => true,
-    }
-}
-
 /// Restore the Steam `steam_api64.dll` this machine had before Goldberg, from
 /// its `.orig-steam` backup.
 ///
 /// Two refusals, both of them about not lying to the user:
 ///
-/// * **while a session is live** ([`a_session_is_live`]) — the dll is
+/// * **while a session is live** ([`session::live_session_reason`]) — the dll is
 ///   memory-mapped by a running Beat Saber process, and swapping it out from
 ///   under a live game is exactly the kind of "mutate the machine
 ///   mid-session" the operation lock and this check both exist to prevent.
@@ -134,9 +105,15 @@ pub(crate) async fn revert_with_pin(
     // that `live_session()` alone leaves open.
     let _op = crate::stages::acquire_operation_lock().await;
 
-    if a_session_is_live(&paths.session_state_path()) {
+    // The machine-wide predicate, not a local copy: this door used to consult
+    // only the in-process handle and `session-state.json`'s wine pid, so a
+    // `./demo.sh run` session — which writes neither — could have the
+    // `steam_api64.dll` it has mapped replaced underneath it. `live_session_reason`
+    // sees that session through its fresh `runtime_status.json`, and an
+    // unreadable record still counts as live exactly as the local copy had it.
+    if let Some(reason) = session::live_session_reason(paths) {
         return Err(SabrageError::fatal(
-            "cannot revert steam_api64.dll while a session is live",
+            format!("cannot revert steam_api64.dll while a session is live — {reason}"),
             "stop the running session first",
         ));
     }
@@ -216,6 +193,10 @@ mod tests {
     fn test_paths(scratch_dir: &Path) -> Paths {
         let mut p = Paths::new(scratch_dir);
         p.sabrage_appsup = scratch_dir.join("Sabrage");
+        // The liveness predicate reads `runtime_status.json` out of this
+        // directory too, so it has to be scratch as well or a test would
+        // consult the developer's own running session.
+        p.oxr_appsup = scratch_dir.join("OXRSys");
         p
     }
 
@@ -379,6 +360,47 @@ mod tests {
         std::fs::remove_dir_all(&bs_dir).unwrap();
     }
 
+    /// The regression this door was open for: a `./demo.sh run` session writes
+    /// no `session-state.json` and publishes no handle, so the old local
+    /// predicate said "idle" and the revert replaced the `steam_api64.dll` the
+    /// running game has mapped. The fresh `runtime_status.json` the oxrsys
+    /// runtime keeps is the signal that closes it.
+    #[tokio::test]
+    async fn refuses_while_only_the_runtime_reports_a_live_session() {
+        let _g = crate::session::lock_session_globals();
+        let bs_dir = scratch("runtime-status-session");
+        let dir = plugin_dir(&bs_dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("steam_api64.dll"), b"GOLDBERG-BYTES").unwrap();
+        std::fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM-BYTES").unwrap();
+
+        let paths = test_paths(&bs_dir);
+        assert!(
+            !paths.session_state_path().exists(),
+            "the shell pipeline writes no session record"
+        );
+        std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
+        let now = crate::session::now_unix_ms();
+        std::fs::write(
+            paths.oxr_appsup.join("runtime_status.json"),
+            format!(r#"{{"state":"streaming","updated_at_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+
+        let err = revert_with_pin(&real(), &paths, &bs_dir, UNMATCHABLE_PIN)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("session is live"), "{err}");
+        assert!(err.to_string().contains("streaming"), "{err}");
+        assert_eq!(
+            std::fs::read(dir.join("steam_api64.dll")).unwrap(),
+            b"GOLDBERG-BYTES",
+            "the dll the live game has mapped is untouched"
+        );
+
+        std::fs::remove_dir_all(&bs_dir).unwrap();
+    }
+
     #[tokio::test]
     async fn refuses_while_a_persisted_session_records_a_live_wine_child() {
         let bs_dir = scratch("persisted-session");
@@ -459,7 +481,7 @@ mod tests {
     // here: that global is shared with every other test in this binary
     // (`session::lock_session_globals`, which serializes its writers, is
     // `pub(crate)` to the `session` module's own test submodule). The
-    // persisted half above covers the same branch of `a_session_is_live`, and
+    // persisted half above covers the same branch of `live_session_reason`, and
     // `waits_for_the_operation_lock_then_proceeds` covers the window that
     // check alone could not close.
 }

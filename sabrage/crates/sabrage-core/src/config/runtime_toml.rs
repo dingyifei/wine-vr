@@ -73,6 +73,7 @@ use crate::error::{Result, SabrageError};
 use crate::events::{StageEvent, StepId};
 use crate::executor::Executor;
 use crate::fixes::{FixAction, FixReport};
+use crate::session::SessionBlock;
 use crate::stages::{EventSink, StageCtx};
 
 /// The six keys Sabrage is allowed to write, in the order the Settings screen
@@ -1145,8 +1146,8 @@ pub async fn write(
     }
 
     let session_state = session_state_beside(backups_dir);
-    if let Some(bottle) = blocking_session(&session_state) {
-        return Err(live_session_refusal(toml_path, &bottle));
+    if let Some(block) = blocking_session(&session_state, &runtime_status_beside(toml_path)) {
+        return Err(live_session_refusal(toml_path, &block));
     }
 
     // A10-1: serializes this whole read-patch-backup-write sequence across
@@ -1247,39 +1248,48 @@ pub async fn write(
     Ok(report)
 }
 
-/// The bottle of a session that must be stopped before this file may be
-/// rewritten, or `None` when nothing is streaming.
+/// The session that must be stopped before this file may be rewritten, or
+/// `None` when nothing is streaming.
 ///
-/// Two sources, because either alone leaves a hole:
+/// One line, delegating to [`crate::session::session_block_at`]: this used to be
+/// a local predicate over [`crate::session::live_session`] plus
+/// `session-state.json`'s wine pid, which is strictly weaker than the one the
+/// stage and Doctor refusals use — it missed a launch that had not spawned yet,
+/// a record another front-end owns, and the fresh `runtime_status.json` that is
+/// the *only* trace a `./demo.sh run` session leaves. Every "not while the game
+/// is running" door now asks the same question.
 ///
-/// * [`crate::session::live_session`] — this process's own supervised launch;
-/// * `session-state.json` — a launch owned by **another** front-end (the
-///   `sabrage` CLI, or a Sabrage the user told to detach). The record counts
-///   only while the wine process it names is still that same process
-///   ([`crate::process::ProcInfo::is_same_process`], the recycled-pid guard),
-///   so a crashed session's leftover file never wedges the Settings screen.
-///
-/// Why this exists at all: the runtime does **not** read `oxrsys-runtime.toml`
-/// once at game start. `Config::GetValues()` refreshes it whenever the mtime
-/// moved, at most every 250 ms, and `AlvrStreamingBackend::EnsureEncoder` reads
-/// `encoder_process`/`video_codec` per frame and retires the encoder when the
-/// identity drifts — so a Settings save mid-stream rebuilds the encoder, and
-/// selecting `native` with no staged helper drops frames for the rest of the
-/// session.
-pub fn blocking_session(session_state_path: &Path) -> Option<String> {
-    if let Some(live) = crate::session::live_session() {
-        return Some(live.bottle);
-    }
-    let state = crate::session::state::load(session_state_path)
-        .ok()
-        .flatten()?;
-    let wine = state.wine.as_ref()?;
-    (wine.pid != 0 && wine.is_same_process()).then(|| state.bottle.clone())
+/// Why the door exists at all: the runtime does **not** read
+/// `oxrsys-runtime.toml` once at game start. `Config::GetValues()` refreshes it
+/// whenever the mtime moved, at most every 250 ms, and
+/// `AlvrStreamingBackend::EnsureEncoder` reads `encoder_process`/`video_codec`
+/// per frame and retires the encoder when the identity drifts — so a Settings
+/// save mid-stream rebuilds the encoder, and selecting `native` with no staged
+/// helper drops frames for the rest of the session.
+pub fn blocking_session(
+    session_state_path: &Path,
+    runtime_status_path: &Path,
+) -> Option<SessionBlock> {
+    crate::session::session_block_at(session_state_path, runtime_status_path)
 }
 
-fn live_session_refusal(toml_path: &Path, bottle: &str) -> SabrageError {
+/// Where `runtime_status.json` sits, given the config file.
+///
+/// Both live in `<oxr_appsup>` ([`crate::paths::Paths`]), so deriving it keeps
+/// the guard hermetic for the same reason [`session_state_beside`] does: a test
+/// that points `toml_path` at a temp dir gets a temp status path with it.
+fn runtime_status_beside(toml_path: &Path) -> PathBuf {
+    toml_path.with_file_name("runtime_status.json")
+}
+
+fn live_session_refusal(toml_path: &Path, block: &SessionBlock) -> SabrageError {
+    let reason = &block.reason;
+    let bottle = block.bottle.as_deref().unwrap_or("<name>");
     SabrageError::InvalidInput(format!(
-        "refusing to edit {} while a session is live (bottle '{bottle}') — the runtime re-reads          this file every 250 ms and rebuilds the encoder when encoder_process or video_codec          changes, so saving mid-stream drops frames; stop the session first: ./demo.sh stop          --bottle {bottle}",
+        "refusing to edit {} while a session is live — {reason}; the runtime re-reads this \
+         file every 250 ms and rebuilds the encoder when encoder_process or video_codec \
+         changes, so saving mid-stream drops frames; stop the session first: ./demo.sh stop \
+         --bottle {bottle}",
         toml_path.display()
     ))
 }
@@ -1356,8 +1366,8 @@ fn still_safe_to_replace(
     session_state_path: &Path,
     base: &str,
 ) -> Result<()> {
-    if let Some(bottle) = blocking_session(session_state_path) {
-        return Err(live_session_refusal(toml_path, &bottle));
+    if let Some(block) = blocking_session(session_state_path, &runtime_status_beside(toml_path)) {
+        return Err(live_session_refusal(toml_path, &block));
     }
     if executor.is_dry_run() {
         return Ok(());
@@ -1475,14 +1485,22 @@ const EDIT_PROTOCOL_STEP: StepId = "fix.edit-protocol";
 pub async fn edit_protocol(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
     // [`write`] refuses on its own too; this runs first so the refusal arrives as
     // a fix's `fatal` with its remedy attached rather than a bare InvalidInput.
-    if let Some(bottle) = blocking_session(&ctx.paths.session_state_path()) {
+    if let Some(block) = crate::session::live_session_block(&ctx.paths) {
+        let reason = &block.reason;
         return Err(ctx.fatal(
             format!(
-                "refusing to edit {} while a session is live (bottle '{bottle}') — the runtime \
-                 re-reads this file while it streams",
+                "refusing to edit {} while a session is live — {reason}; the runtime re-reads \
+                 this file while it streams",
                 ctx.paths.toml_path.display(),
             ),
-            Some(format!("./demo.sh stop --bottle {bottle}")),
+            Some(format!(
+                "./demo.sh stop --bottle {}",
+                block
+                    .bottle
+                    .as_deref()
+                    .or(ctx.opts.bottle_name.as_deref())
+                    .unwrap_or("<name>")
+            )),
         ));
     }
 
@@ -2740,7 +2758,7 @@ mod tests {
             dir.join("run.log"),
             0,
         );
-        state.owner_pid = owner_pid;
+        state.set_owner(owner_pid);
         state.wine = crate::process::ProcInfo::observe(std::process::id());
         assert!(state.wine.is_some(), "the test process must be observable");
         std::fs::create_dir_all(dir).unwrap();
@@ -2778,6 +2796,54 @@ mod tests {
         );
         assert!(!backups.exists(), "no backup churn from a refused write");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `./demo.sh run` session writes no `session-state.json` and publishes
+    /// no in-process handle: the fresh `runtime_status.json` beside this very
+    /// file is the only trace it leaves, and the old local predicate could not
+    /// see it — so Settings would happily rebuild the encoder mid-stream.
+    #[tokio::test]
+    async fn write_refuses_while_only_the_runtime_reports_a_live_session() {
+        let _g = crate::session::lock_session_globals();
+        let dir = scratch("live-guard-runtime-status");
+        let path = dir.join("oxrsys-runtime.toml");
+        std::fs::write(&path, deployed()).unwrap();
+        assert!(
+            !dir.join("session-state.json").exists(),
+            "the shell pipeline writes no session record"
+        );
+        let now = crate::session::now_unix_ms();
+        std::fs::write(
+            dir.join("runtime_status.json"),
+            format!(r#"{{"state":"streaming","updated_at_unix_ms":{now}}}"#),
+        )
+        .unwrap();
+
+        let err = write(&real(), &path, &dir.join("backups"), &patch_bitrate(60))
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("streaming"), "{err}");
+        // No signal names a bottle here, so the remedy keeps demo.sh's placeholder.
+        assert!(err.contains("./demo.sh stop --bottle <name>"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), deployed());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The refusal is one wrapped literal, not a paragraph with 10-space
+    /// craters in it: the Settings screen renders this string verbatim.
+    #[test]
+    fn the_live_session_refusal_reads_as_prose() {
+        let msg = live_session_refusal(
+            Path::new("/tmp/oxrsys-runtime.toml"),
+            &SessionBlock {
+                reason: "a session for bottle 'Steam' is still running (wine pid 42)".into(),
+                bottle: Some("Steam".into()),
+            },
+        )
+        .to_string();
+        assert!(!msg.contains("  "), "double space in: {msg}");
+        assert!(msg.contains("./demo.sh stop --bottle Steam"), "{msg}");
     }
 
     /// The guard has to be about the *machine*, not this process: a session the

@@ -282,7 +282,7 @@ fn restore_mode(class: Classification) -> Option<RestoreMode> {
 /// teardown owns those guards, and racing it would restore the audio device
 /// twice or clear the record out from under it.
 pub async fn reconcile(ctx: &StageCtx) -> Result<Reconciled> {
-    let live = crate::session::live_session().map(|h| h.run_id);
+    let live = crate::session::live_session_run_id();
     reconcile_with(ctx, live, crate::session::run_phase(), || {
         current_output_device(ctx)
     })
@@ -458,7 +458,7 @@ fn untouchable(
 /// "Failure policy". Every other failure becomes two rows and `Ok(())`, so the
 /// `stop` stage always reaches its ports and audio reports.
 pub(crate) async fn finish_stopped_session(ctx: &StageCtx) -> Result<()> {
-    let live = crate::session::live_session().map(|h| h.run_id);
+    let live = crate::session::live_session_run_id();
     finish_stopped_session_with(ctx, live, crate::session::run_phase(), || {
         current_output_device(ctx)
     })
@@ -579,33 +579,40 @@ struct AudioProbe {
     outputs: Vec<String>,
 }
 
-/// `SwitchAudioSource -c -t output` then `-a -t output`, `$(…)`-trimmed — both
+/// `SwitchAudioSource -c -t output` and `-a -t output`, `$(…)`-trimmed — both
 /// read-only, hence [`crate::process::capture`] rather than the executor.
 ///
-/// `None` when the binary is absent, unrunnable, or `-c` exits non-zero: the
-/// audio guard is then left **pending** rather than flagged, because "we could
-/// not look" is not "there was nothing to do". The device *list* is the softer
-/// of the two — a failed `-a` yields an empty pool, which only costs the
-/// fallback, not the ordinary restore.
+/// `None` when the binary is absent, `-c` is unrunnable, or `-c` exits
+/// non-zero: the audio guard is then left **pending** rather than flagged,
+/// because "we could not look" is not "there was nothing to do". The device
+/// *list* is the softer of the two — a failed `-a` yields an empty pool, which
+/// only costs the fallback, not the ordinary restore.
 ///
 /// Both captures happen up front rather than lazily so the whole probe stays
 /// one injection point (see [`reconcile_with`]); they run only when a record
-/// actually has an unreleased audio guard.
+/// actually has an unreleased audio guard. They are two independent read-only
+/// probes, so they run **concurrently** ([`tokio::join!`]) rather than one
+/// after the other — `-a`'s answer is read only by
+/// [`crate::session::fallback_output_device`]'s not-connected branch, so most
+/// restores pay for it without using it either way; concurrency at least
+/// keeps that from costing two probes' latency in series.
 async fn current_output_device(ctx: &StageCtx) -> Option<AudioProbe> {
     let bin = which("SwitchAudioSource")?;
-    let spec = ctx.child(bin.clone(), STEP).args(["-c", "-t", "output"]);
-    let out = probe_capture(&spec).await?;
-    if !out.status.success() {
+    let current_spec = ctx.child(bin.clone(), STEP).args(["-c", "-t", "output"]);
+    let listing_spec = ctx.child(bin.clone(), STEP).args(["-a", "-t", "output"]);
+    let (current, listing) =
+        tokio::join!(probe_capture(&current_spec), probe_capture(&listing_spec));
+    let current = current?;
+    if !current.status.success() {
         return None;
     }
-    let listing = ctx.child(bin.clone(), STEP).args(["-a", "-t", "output"]);
-    let outputs = match probe_capture(&listing).await {
+    let outputs = match listing {
         Some(l) if l.status.success() => output_device_names(&l.stdout),
         _ => Vec::new(),
     };
     Some(AudioProbe {
         bin,
-        current: out.stdout_trimmed().to_string(),
+        current: current.stdout_trimmed().to_string(),
         outputs,
     })
 }
@@ -1033,7 +1040,7 @@ pub async fn detach(ctx_paths: &Paths, handle: &LiveSessionHandle) -> Result<()>
 
     let deadline = tokio::time::Instant::now() + DETACH_WAIT;
     while tokio::time::Instant::now() < deadline {
-        if !crate::session::live_session().is_some_and(|h| h.run_id == handle.run_id) {
+        if !crate::session::live_session_is(handle.run_id) {
             break;
         }
         tokio::time::sleep(DETACH_POLL).await;
@@ -1712,7 +1719,7 @@ mod tests {
         let (ctx, seen) = test_ctx(&dir, true);
         let foreign = ForeignProcess::spawn();
         let mut state = pending(None, Some(me()));
-        state.owner_pid = foreign.pid();
+        state.set_owner(foreign.pid());
         write_state(&ctx, &state);
 
         let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
