@@ -251,16 +251,6 @@ mod tests {
     // ── A4-4 / A3b packet: a failed adb probe must not read as "clean" ────────
 
     #[test]
-    fn adb_forward_local_specs_reports_spawn_failure_as_err() {
-        let bogus = Path::new("/nonexistent/sabrage-network-probe/not-a-real-adb-binary");
-        let err = adb_forward_local_specs(bogus).expect_err("spawn must fail for a missing binary");
-        assert!(
-            err.contains("failed to run"),
-            "unexpected error text: {err}"
-        );
-    }
-
-    #[test]
     fn net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb() {
         let opts = CheckOptions::new();
         let mut c = CheckCtx::new(Paths::new("/nonexistent/sabrage-network-probe"), opts);
@@ -274,16 +264,24 @@ mod tests {
             "message must say the probe failed, not that forwards are clean: {}",
             o.message
         );
+        assert!(
+            o.message.contains("failed to run"),
+            "the raw spawn-error text must reach the message verbatim: {}",
+            o.message
+        );
         assert_ne!(o.message, "no stale adb port forwards");
     }
 
     #[test]
     fn adb_forward_local_specs_reports_nonzero_exit_as_err() {
         // `false` always exits 1 without touching stdout — exercises the
-        // exit-status branch distinctly from the spawn-failure branch above.
+        // exit-status branch, distinct from the spawn-failure branch that
+        // net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb covers.
         let false_bin = Path::new("/usr/bin/false");
         if !false_bin.is_file() {
-            return; // not present on this machine; the spawn-failure test covers the Result plumbing
+            // not present on this machine; the Result plumbing is covered by
+            // net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb.
+            return;
         }
         let err = adb_forward_local_specs(false_bin).expect_err("non-zero exit must be Err");
         assert!(err.contains("exited with"), "unexpected error text: {err}");
