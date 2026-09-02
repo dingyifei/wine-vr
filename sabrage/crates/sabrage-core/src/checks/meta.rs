@@ -272,17 +272,6 @@ mod tests {
         );
     }
 
-    /// Equal-hash case stays on the existing pass path — same assertions as
-    /// `passes_against_the_live_checkout`, restated here so the "unchanged
-    /// behaviour" half of the A1-1 regression test lives next to the mismatch
-    /// case above rather than only implicitly relying on the older test.
-    #[test]
-    fn compiled_hash_matches_the_live_checkout() {
-        let root = repo_root();
-        let checkout_hash = util::contract_hash(&root).expect("contract files readable");
-        assert_eq!(checkout_hash, *crate::contract::COMPILED_CONTRACT_SHA256);
-    }
-
     /// [`assert_binary_matches_checkout`] is the reusable predicate area A4's
     /// `stages::run_stage` / `run_stage_holding_lock` call before dispatching a
     /// mutating stage (packet counterpart of A1-1). `Ok(())` against the live
