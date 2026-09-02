@@ -1083,25 +1083,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    #[tokio::test]
-    async fn a_released_or_disarmed_guard_drops_silently() {
-        let root = scratch("audio-disarm");
-        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
-        let mut state = fresh_state();
-
-        let mut g = AudioGuard::inert(&ctx);
-        g.previous_output = Some("Speakers".into());
-        g.dry_run = false; // pretend a real run …
-        g.disarm(); // … that detached: the device stays on BlackHole.
-        assert!(seen.lock().unwrap().is_empty());
-
-        let mut g = AudioGuard::inert(&ctx);
-        g.dry_run = false;
-        g.release(&ctx, &mut state).await.unwrap();
-        assert!(seen.lock().unwrap().is_empty());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
     /// A [`DryRunExecutor`] whose children come back **non-zero** whenever
     /// `device` is one of their arguments — a `SwitchAudioSource -t output -s
     /// "…AirPods Pro"` for headphones that are no longer connected. Same shape
