@@ -156,39 +156,36 @@ mod tests {
     }
 
     #[test]
-    fn malformed_json_fails_with_the_parse_remedy() {
-        let tmp = scratch("malformed");
-        let host_json = tmp.join("host/active_runtime.x86_64.json");
-        fs::create_dir_all(host_json.parent().unwrap()).unwrap();
-        fs::write(&host_json, b"{not json").unwrap();
-        let ctx = ctx_with(&tmp, host_json.clone(), tmp.join("dylib"));
-        let o = host_manifest(&ctx);
-        assert_eq!(o.status, CheckStatus::Fail);
-        assert_eq!(
-            o.message,
-            format!(
-                "cannot parse {} (broken python3 or malformed JSON)",
-                host_json.display()
-            )
-        );
-        assert_eq!(
-            o.remedy.as_deref(),
-            Some("check 'python3 -V' works (xcode-select --install), then inspect the file")
-        );
-        fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn missing_runtime_key_is_a_parse_failure() {
-        let tmp = scratch("no-runtime-key");
-        let host_json = tmp.join("host/active_runtime.x86_64.json");
-        fs::create_dir_all(host_json.parent().unwrap()).unwrap();
-        fs::write(&host_json, b"{}").unwrap();
-        let ctx = ctx_with(&tmp, host_json.clone(), tmp.join("dylib"));
-        let o = host_manifest(&ctx);
-        assert_eq!(o.status, CheckStatus::Fail);
-        assert!(o.message.starts_with("cannot parse "));
-        fs::remove_dir_all(&tmp).ok();
+    fn invalid_manifest_bytes_fail_with_the_parse_remedy() {
+        // Both rows reach the same None arm by different hops: bytes serde
+        // cannot parse, and valid JSON with no "runtime" key.
+        const CASES: &[(&str, &[u8])] = &[
+            ("malformed json", b"{not json"),
+            ("missing runtime key", b"{}"),
+        ];
+        for &(label, bytes) in CASES {
+            let tmp = scratch(&label.replace(' ', "-"));
+            let host_json = tmp.join("host/active_runtime.x86_64.json");
+            fs::create_dir_all(host_json.parent().unwrap()).unwrap();
+            fs::write(&host_json, bytes).unwrap();
+            let ctx = ctx_with(&tmp, host_json.clone(), tmp.join("dylib"));
+            let o = host_manifest(&ctx);
+            assert_eq!(o.status, CheckStatus::Fail, "{label}");
+            assert_eq!(
+                o.message,
+                format!(
+                    "cannot parse {} (broken python3 or malformed JSON)",
+                    host_json.display()
+                ),
+                "{label}"
+            );
+            assert_eq!(
+                o.remedy.as_deref(),
+                Some("check 'python3 -V' works (xcode-select --install), then inspect the file"),
+                "{label}"
+            );
+            fs::remove_dir_all(&tmp).ok();
+        }
     }
 
     #[test]
