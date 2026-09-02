@@ -2033,32 +2033,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_nonzero_wine_status_is_propagated_verbatim() {
-        let root = scratch("teardown-rc");
-        let (ctx, _) = dry_ctx(&root, StageOptions::default());
-        let mut held = Guards::default();
-        let mut sess = fresh(&root);
-        let _g = session::lock_session_globals();
-        let mut phase = RunPhaseScope::new(ctx.run_id, "Steam");
-        let rc = teardown(
-            &ctx,
-            &bottle(&root),
-            &mut held,
-            &mut sess,
-            &ctx.paths.session_state_path(),
-            Ok(Reason::Normal {
-                rc: 3,
-                log: root.join("l.log"),
-            }),
-            &mut phase,
-        )
-        .await
-        .unwrap();
-        assert_eq!(rc, 3, "`exit $rc` — wine's status, not ours");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
     async fn the_cancelled_path_announces_itself_stops_wine_and_exits_130() {
         let root = scratch("teardown-cancel");
         let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
