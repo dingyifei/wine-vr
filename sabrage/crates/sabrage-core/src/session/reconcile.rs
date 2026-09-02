@@ -2453,35 +2453,6 @@ mod tests {
     // ── restore_with ─────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn a_device_the_user_already_switched_back_is_flagged_not_switched() {
-        let dir = scratch("already-back");
-        let (ctx, seen) = test_ctx(&dir, true);
-        let mut state = pending(Some(dead()), None);
-        state.wired_forwards.clear();
-
-        let restored = restore_with(
-            &ctx,
-            &mut state,
-            RestoreMode::Full,
-            probing("MacBook Pro Speakers"),
-        )
-        .await
-        .unwrap();
-
-        assert!(
-            restored.is_empty(),
-            "nothing was performed, so nothing is reported"
-        );
-        assert!(
-            state.guards.audio_restored,
-            "still flagged — the work is done"
-        );
-        assert!(spawns(&ctx.executor.planned()).is_empty());
-        assert!(sections(&seen).is_empty(), "no banner for a silent pass");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
     async fn a_missing_switchaudiosource_leaves_the_audio_guard_pending() {
         let dir = scratch("no-tool");
         let (ctx, _seen) = test_ctx(&dir, true);
@@ -2562,14 +2533,14 @@ mod tests {
     #[tokio::test]
     async fn each_flag_reaches_disk_as_its_guard_is_released() {
         let dir = scratch("persist");
-        let (ctx, _seen) = test_ctx(&dir, false);
+        let (ctx, seen) = test_ctx(&dir, false);
         assert!(!ctx.executor.is_dry_run());
 
         let mut state = pending(Some(dead()), None);
         state.wired_forwards.clear();
         write_state(&ctx, &state);
 
-        restore_with(
+        let restored = restore_with(
             &ctx,
             &mut state,
             RestoreMode::Full,
@@ -2577,6 +2548,11 @@ mod tests {
         )
         .await
         .unwrap();
+        assert!(
+            restored.is_empty(),
+            "nothing was performed, so nothing is reported"
+        );
+        assert!(sections(&seen).is_empty(), "no banner for a silent pass");
 
         let path = ctx.paths.session_state_path();
         let on_disk = state::load(&path).unwrap().expect("record still present");
