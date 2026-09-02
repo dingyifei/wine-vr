@@ -133,25 +133,30 @@ mod tests {
     // ── pure parsing ─────────────────────────────────────────────────────────
 
     #[test]
-    fn first_connected_serial_skips_the_header_and_non_device_states() {
-        let out = "List of devices attached\nemulator-5554\toffline\n1A2B3C4D\tdevice\n";
-        assert_eq!(first_connected_serial(out).as_deref(), Some("1A2B3C4D"));
-    }
-
-    #[test]
-    fn first_connected_serial_none_when_nothing_qualifies() {
-        assert_eq!(first_connected_serial("List of devices attached\n"), None);
-        assert_eq!(
-            first_connected_serial("List of devices attached\n1A2B3C4D\tunauthorized\n"),
-            None
-        );
-        assert_eq!(first_connected_serial(""), None);
-    }
-
-    #[test]
-    fn first_connected_serial_takes_the_first_qualifying_row() {
-        let out = "List of devices attached\nAAA\tdevice\nBBB\tdevice\n";
-        assert_eq!(first_connected_serial(out).as_deref(), Some("AAA"));
+    fn first_connected_serial_takes_the_first_device_row_or_none() {
+        let cases: &[(&str, &str, Option<&str>)] = &[
+            (
+                "skips the header and an offline row",
+                "List of devices attached\nemulator-5554\toffline\n1A2B3C4D\tdevice\n",
+                Some("1A2B3C4D"),
+            ),
+            ("header only", "List of devices attached\n", None),
+            (
+                "unauthorized only",
+                "List of devices attached\n1A2B3C4D\tunauthorized\n",
+                None,
+            ),
+            ("empty output", "", None),
+            (
+                "first qualifying row wins",
+                "List of devices attached\nAAA\tdevice\nBBB\tdevice\n",
+                Some("AAA"),
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let got = first_connected_serial(input);
+            assert_eq!(got.as_deref(), *expected, "{label}");
+        }
     }
 
     // ── evaluator shape (machine-independent) ──────────────────────────────
