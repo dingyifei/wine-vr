@@ -1735,34 +1735,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A9-2: only an *unfinished* restore is carried into the next launch.
-    #[test]
-    fn only_an_unfinished_restore_is_carried_into_the_next_launch() {
-        let root = scratch("carried-audio");
-        let mut unfinished = fresh(&root);
-        unfinished.prev_audio_output = Some("Yifei\u{2019}s AirPods Pro".into());
-        assert_eq!(
-            unfinished_audio_restore(&unfinished),
-            Some("Yifei\u{2019}s AirPods Pro".to_string()),
-            "the device the kept record was kept FOR"
-        );
-
-        let mut done = unfinished.clone();
-        done.guards.audio_restored = true;
-        assert_eq!(
-            unfinished_audio_restore(&done),
-            None,
-            "a completed restore carries nothing"
-        );
-
-        assert_eq!(
-            unfinished_audio_restore(&fresh(&root)),
-            None,
-            "and a session that never touched audio carries nothing either"
-        );
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
     /// A7-1: PARITY.md promises a launch refused for a live session changed
     /// nothing. Reconciliation therefore runs BEFORE `preflight::run`, whose
     /// two auto-fixes (the `cxbottle.conf` backend line, the helper restage)
@@ -1977,6 +1949,14 @@ mod tests {
         done.guards.forwards_cleared = true;
         done.guards.audio_restored = true;
         assert_eq!(carry_forward(&done), Carried::default());
+
+        // The other end of the same rule: a session that never touched
+        // audio or forwards has nothing to hand on.
+        assert_eq!(
+            carry_forward(&fresh(&root)),
+            Carried::default(),
+            "r1:A9-2 regression: a session that never touched audio carries nothing"
+        );
 
         // This launch's own hygiene records the same pair again; one removal
         // is enough.
