@@ -624,15 +624,35 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
     }
 
-    /// `forbidden_while_session_live` used to be metadata nothing read: every
-    /// fix was applicable mid-session, including the one that removes the
-    /// `--wired` forwards the stream is running over. The registry drives the
-    /// test, so a new fix cannot slip through unenforced.
+    /// r1:A4-1 regression: `forbidden_while_session_live` used to be metadata
+    /// nothing read: every fix was applicable mid-session, including the one
+    /// that removes the `--wired` forwards the stream is running over. The
+    /// registry drives the test, so a new fix cannot slip through unenforced,
+    /// and the recording fake `adb` proves the refusal lands before the fix
+    /// ever spawns `adb`.
     #[tokio::test]
     async fn apply_refuses_every_session_forbidden_fix_while_a_session_is_live() {
         let _g = crate::session::lock_session_globals();
-        let ctx = scratch_ctx("live-refusal", Some("FixtureBottle"));
+        let mut ctx = scratch_ctx("live-refusal", Some("FixtureBottle"));
         record_a_live_session(&ctx);
+
+        // A fake adb that records every invocation; the refusal means the log
+        // is never created.
+        let adb = ctx.paths.root.join("adb.sh");
+        let log = ctx.paths.root.join("adb-invoked.log");
+        std::fs::write(
+            &adb,
+            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
+        )
+        .unwrap();
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&adb).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&adb, perms).unwrap();
+        }
+        ctx.paths.adb = Some(adb);
+
         let sink = null_sink();
 
         for action in FixAction::EVERY {
@@ -652,6 +672,11 @@ mod tests {
             );
             assert!(msg.contains("FixtureBottle"), "{msg}");
         }
+
+        assert!(
+            !log.exists(),
+            "adb must never be spawned while a session runs"
+        );
 
         std::fs::remove_dir_all(&ctx.paths.root).ok();
     }
@@ -674,45 +699,6 @@ mod tests {
             .expect("the preflight door is not gated");
         assert!(!report.changed);
         drop(guard);
-
-        std::fs::remove_dir_all(&ctx.paths.root).ok();
-    }
-
-    /// The wired-session case the refusal exists for: the fix must not reach
-    /// `adb` at all, so the stream's own forwards survive.
-    #[tokio::test]
-    async fn a_live_session_stops_the_adb_forward_removal_before_it_spawns_adb() {
-        let _g = crate::session::lock_session_globals();
-        let mut ctx = scratch_ctx("live-adb", Some("FixtureBottle"));
-        record_a_live_session(&ctx);
-
-        // A fake adb that records every invocation; the refusal means the log
-        // is never created.
-        let adb = ctx.paths.root.join("adb.sh");
-        std::fs::create_dir_all(&ctx.paths.root).unwrap();
-        let log = ctx.paths.root.join("adb-invoked.log");
-        std::fs::write(
-            &adb,
-            format!("#!/bin/sh\necho \"$@\" >> {}\nexit 0\n", log.display()),
-        )
-        .unwrap();
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mut perms = std::fs::metadata(&adb).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&adb, perms).unwrap();
-        }
-        ctx.paths.adb = Some(adb);
-
-        let sink = null_sink();
-        let err = apply(FixAction::RemoveAdbForwards, &ctx, &sink)
-            .await
-            .unwrap_err();
-        assert!(err.to_string().contains("while a session is live"), "{err}");
-        assert!(
-            !log.exists(),
-            "adb must never be spawned while a session runs"
-        );
 
         std::fs::remove_dir_all(&ctx.paths.root).ok();
     }
