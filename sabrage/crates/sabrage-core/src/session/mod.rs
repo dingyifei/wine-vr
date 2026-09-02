@@ -900,6 +900,13 @@ mod tests {
         let _ = foreign.wait();
         std::fs::remove_file(&path).unwrap();
 
+        // 4b: a record that exists but will not parse — the conservative
+        // answer, because it may still be describing a live session.
+        std::fs::write(&path, b"{ not json").unwrap();
+        let err = ensure_idle_at(&path, &status, "rebuild").unwrap_err();
+        assert!(err.to_string().contains("cannot be read"), "{err}");
+        std::fs::remove_file(&path).unwrap();
+
         // 5: a `demo.sh run` session — nothing of ours anywhere, but the
         // runtime is reporting in right now, naming a process that is alive.
         // Both halves, because this is `watcher::runtime_status_live`, the

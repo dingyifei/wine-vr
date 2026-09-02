@@ -1328,53 +1328,6 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
     }
 
-    /// The stage/fix gate is the *same* predicate the session layer publishes,
-    /// not a weaker copy of it: it used to miss the pre-spawn foreign-owner
-    /// window and an unreadable record, so `build`/`install` and every Doctor
-    /// fix could mutate under a session the Settings screen refused to touch.
-    #[test]
-    fn live_session_block_sees_every_signal_the_session_layer_sees() {
-        let _g = crate::session::lock_session_globals();
-        let root =
-            std::env::temp_dir().join(format!("sabrage-live-foreign-{}", std::process::id()));
-        let ctx = ctx_at(&root, None);
-        let path = ctx.paths.session_state_path();
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-
-        // The pre-spawn window: a record with no wine child yet, owned by a
-        // process that is alive and is not this one.
-        let owner = std::os::unix::process::parent_id();
-        let mut state = crate::session::state::SessionState::new(
-            Uuid::new_v4(),
-            "FixtureBottle",
-            "/bs",
-            "/log",
-            0,
-        );
-        state.set_owner(owner);
-        state.wine = None;
-        std::fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
-        assert_eq!(
-            live_session_block(&ctx.paths),
-            crate::session::live_session_reason(&ctx.paths),
-            "the stage gate must be the session layer's predicate, verbatim"
-        );
-        assert!(
-            live_session_block(&ctx.paths)
-                .is_some_and(|r| r.contains(&format!("Sabrage process {owner}"))),
-            "a live foreign owner blocks"
-        );
-
-        // A record that exists but will not parse: the conservative answer.
-        std::fs::write(&path, b"{ not json").unwrap();
-        assert!(
-            live_session_block(&ctx.paths).is_some_and(|r| r.contains("cannot be read")),
-            "an unreadable record blocks"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// setup/build/install replace what a running session has open, so they are
     /// refused outright; `stop` (the way out) and `run` (which reconciles for
     /// itself) are not.
