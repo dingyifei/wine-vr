@@ -989,26 +989,9 @@ mod tests {
 
     // ── build-x64 configure arguments ────────────────────────────────────────
 
-    #[test]
-    fn the_x64_configure_forces_the_encoder_helper_option_off() {
-        // CLAUDE.md's arch gate requires `OXRSYS_BUILD_ENCODER_HELPER:BOOL=OFF`
-        // in build-x64's cache; CMake `option()` cannot establish that against a
-        // tree already cached with ON, so the flag has to be passed explicitly.
-        let args = oxrsys_x64_configure_args();
-        assert_eq!(
-            args,
-            vec![
-                "-G",
-                "Ninja",
-                "-DCMAKE_BUILD_TYPE=Debug",
-                "-DCMAKE_OSX_ARCHITECTURES=x86_64",
-                "-DOXRSYS_ENABLE_ALVR=ON",
-                "-DOXRSYS_BUILD_ENCODER_HELPER=OFF",
-            ],
-            "build.sh's argument list, in build.sh's order"
-        );
-    }
-
+    /// r1:A5-2 regression: the build-x64 configure passes the whole of build.sh's
+    /// argument list, ending in `-DOXRSYS_BUILD_ENCODER_HELPER=OFF` — CMake
+    /// `option()` cannot clear a cache already holding ON.
     #[tokio::test]
     async fn the_x64_configure_spec_renders_the_helper_off_flag() {
         let ctx = dry_run_ctx();
@@ -1021,13 +1004,14 @@ mod tests {
             &ctx.paths.oxr_build,
             &oxrsys_x64_configure_args(),
         );
-        assert!(
-            spec.display().ends_with(
-                "-G Ninja -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 \
-                 -DOXRSYS_ENABLE_ALVR=ON -DOXRSYS_BUILD_ENCODER_HELPER=OFF"
-            ),
-            "{}",
-            spec.display()
+        assert_eq!(
+            spec.display(),
+            "/opt/homebrew/bin/cmake -S /nonexistent/sabrage-build-test/ext/oxrsys \
+             -B /nonexistent/sabrage-build-test/ext/oxrsys/build-x64 -G Ninja \
+             -DCMAKE_BUILD_TYPE=Debug -DCMAKE_OSX_ARCHITECTURES=x86_64 \
+             -DOXRSYS_ENABLE_ALVR=ON -DOXRSYS_BUILD_ENCODER_HELPER=OFF",
+            "the whole configure command line; the tail is build.sh's argument list, in build.sh's \
+             order"
         );
     }
 
