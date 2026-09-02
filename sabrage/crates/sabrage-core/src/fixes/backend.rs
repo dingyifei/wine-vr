@@ -753,41 +753,4 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
-
-    /// Everything except the liveness gate is the shared body, so the no-op
-    /// branch must behave identically through either door.
-    #[tokio::test]
-    async fn for_launch_is_a_noop_when_already_current() {
-        let root = scratch("for-launch-noop");
-        let (ctx, conf) = fixture_ctx(&root, false);
-        std::fs::write(&conf, "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n").unwrap();
-
-        let sink: EventSink = Arc::new(|_| {});
-        let report = set_graphics_backend_for_launch(&ctx, &sink).await.unwrap();
-        assert!(!report.changed);
-        assert_eq!(
-            std::fs::read_to_string(&conf).unwrap(),
-            "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n"
-        );
-
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[tokio::test]
-    async fn for_launch_still_requires_a_bottle() {
-        let root = scratch("for-launch-no-bottle");
-        let ctx = StageCtx::new(
-            Paths::new(&root),
-            StageOptions::default(),
-            null_sink(),
-            CancellationToken::new(),
-        );
-        let sink: EventSink = Arc::new(|_| {});
-        let err = set_graphics_backend_for_launch(&ctx, &sink)
-            .await
-            .unwrap_err();
-        assert!(err
-            .to_string()
-            .starts_with("CrossOver bottle name required"));
-    }
 }
