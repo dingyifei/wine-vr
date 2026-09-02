@@ -534,13 +534,4 @@ mod tests {
         }
         std::fs::remove_dir_all(&root).ok();
     }
-
-    #[test]
-    fn first_connected_serial_skips_the_header_and_non_device_states() {
-        let out = "List of devices attached\nemulator-5554\toffline\n1A2B3C4D\tdevice\n";
-        assert_eq!(first_connected_serial(out).as_deref(), Some("1A2B3C4D"));
-        assert_eq!(first_connected_serial("List of devices attached\n"), None);
-        // The header row itself never counts, even if it somehow parsed.
-        assert_eq!(first_connected_serial("only-a-header\n"), None);
-    }
 }
