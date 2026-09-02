@@ -644,7 +644,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
 
     /// A fresh scratch directory. `name` alone is not unique enough: several
-    /// tests in this module call `scratch("full")` / `scratch("ctx")`, and
+    /// tests in this module share `scratch("full")` via `full_fixture`, and
     /// `cargo test` runs them concurrently by default — a shared path would
     /// have one test's `remove_file` race another's assertions on the same
     /// fixture tree. The atomic counter makes every call unique regardless of
@@ -963,64 +963,6 @@ mod tests {
         assert!(system_reg_contains(&reg, "ActiveRuntime"));
         assert!(!system_reg_contains(&reg, "nope"));
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    // ── backup-once logic (layer 1), fixture dirs via DryRun ────────────────
-
-    fn fixture_ctx(
-        dry_run: bool,
-    ) -> (StageCtx, std::path::PathBuf, Arc<StdMutex<Vec<StageEvent>>>) {
-        let root = scratch("ctx");
-        let (sink, seen) = collecting_sink();
-        let run_id: RunId = uuid::Uuid::new_v4();
-        let cancel = CancellationToken::new();
-        let executor: Arc<dyn Executor> = if dry_run {
-            Arc::new(DryRunExecutor::new(run_id, sink.clone(), cancel.clone()))
-        } else {
-            Arc::new(crate::executor::RealExecutor::new(
-                run_id,
-                sink.clone(),
-                cancel.clone(),
-            ))
-        };
-        let paths = Paths::new(&root);
-        let ctx = StageCtx {
-            paths,
-            bottle: None,
-            bs_dir: std::path::PathBuf::new(),
-            opts: StageOptions::default(),
-            executor,
-            run_id,
-            cancel,
-            sink,
-        };
-        (ctx, root, seen)
-    }
-
-    #[tokio::test]
-    async fn dxmt_backup_is_planned_once_then_skipped_when_present() {
-        let (ctx, root, seen) = fixture_ctx(true);
-        let cx = root.join("CrossOver.app/Contents/SharedSupport/CrossOver");
-        std::fs::create_dir_all(cx.join("lib/dxmt")).unwrap();
-        let dxmt_dir = cx.join("lib/dxmt");
-        let backup = cx.join("lib/dxmt.stock-backup");
-
-        // No backup yet: dir_copy is planned, an `ok` row is emitted.
-        assert!(!backup.is_dir());
-        ctx.executor.dir_copy(&dxmt_dir, &backup).await.unwrap();
-        ctx.step(step::INSTALL_DXMT_OVERLAY)
-            .ok(format!("backed up stock DXMT -> {}", backup.display()));
-        let planned = ctx.executor.planned();
-        assert_eq!(planned.len(), 1);
-        assert_eq!(planned[0].kind, crate::executor::PlannedKind::DirCopy);
-        assert_eq!(planned[0].src.as_deref(), Some(dxmt_dir.as_path()));
-        assert_eq!(planned[0].dst.as_deref(), Some(backup.as_path()));
-        let evs = seen.lock().unwrap();
-        assert!(evs.iter().any(|e| matches!(
-            e,
-            StageEvent::Line { severity: Severity::Ok, text, .. }
-                if text.starts_with("backed up stock DXMT -> ")
-        )));
     }
 
     // ── layer ordering, full `run()` under DryRun ────────────────────────────
@@ -1648,56 +1590,6 @@ mod tests {
         (ctx, seen)
     }
 
-    /// wine flushes `system.reg` lazily, and the launch preflight blocks on
-    /// exactly that file — so a flush that lands a moment after `reg add`
-    /// returns must not produce a warning contradicted by the `OK` row right
-    /// under it.
-    #[tokio::test]
-    async fn a_late_system_reg_flush_is_waited_for_instead_of_warned_about() {
-        let (ctx, seen) = real_seeming_fixture();
-        let reg = ctx.bottle.as_ref().unwrap().system_reg();
-        std::fs::create_dir_all(reg.parent().unwrap()).unwrap();
-        // A value that is present but not ours, so the stage deterministically
-        // takes the `reg add` branch rather than the "already set" one — the
-        // race this fixture has to rule out. The flush then lands *inside* the
-        // window: a half-written `"ActiveRuntime"=` line would satisfy the
-        // shell's bare grep but never `registry_current`, and the wait no
-        // longer settles for that (a stale bottle reported as registered is
-        // the false green the timeout arm's own test covers).
-        std::fs::write(
-            &reg,
-            "[Software\\Khronos\\OpenXR\\1]\n\"ActiveRuntime\"=\"C:\\\\other\\\\someruntime.json\"\n",
-        )
-        .unwrap();
-        assert!(!registry_current(&reg));
-        let writer = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(150));
-            let mut text = std::fs::read_to_string(&reg).unwrap();
-            text.push_str("\"ActiveRuntime\"=\"C:\\\\openxr\\\\wineopenxr64.json\"\n");
-            std::fs::write(&reg, text).unwrap();
-        });
-
-        run(&ctx).await.expect("install completes");
-        writer.join().unwrap();
-
-        let evs = seen.lock().unwrap();
-        assert!(
-            !evs.iter().any(|e| matches!(
-                e,
-                StageEvent::Line {
-                    severity: Severity::Warn,
-                    ..
-                }
-            )),
-            "the flush landed inside the window: {evs:#?}"
-        );
-        assert!(evs.iter().any(|e| matches!(
-            e,
-            StageEvent::Line { severity: Severity::Ok, text, .. }
-                if text == "ActiveRuntime registered"
-        )));
-    }
-
     /// The other side of the bound: a flush that never lands still warns —
     /// once — and the stage still succeeds (Warn, never Fail).
     #[tokio::test]
@@ -1907,11 +1799,15 @@ mod tests {
         );
     }
 
-    /// The wait's predicate is the launch gate's, not the shell's looser grep: a
-    /// bottle still holding a *stale* `ActiveRuntime` value satisfies
-    /// `grep -q ActiveRuntime` on the first probe, so waiting on that ended the
-    /// poll instantly and install reported success against a file the very next
-    /// launch preflight (`bottle.registry`) blocks on.
+    /// r1:A6-4 regression: a late `system.reg` flush is waited for, not warned about.
+    /// wine flushes `system.reg` lazily, and the launch preflight blocks on
+    /// exactly that file — so a flush that lands a moment after `reg add`
+    /// returns must not produce a warning contradicted by the `OK` row right
+    /// under it. The wait's predicate is the launch gate's, not the shell's
+    /// looser grep: a bottle still holding a *stale* `ActiveRuntime` value
+    /// satisfies `grep -q ActiveRuntime` on the first probe, so waiting on that
+    /// ended the poll instantly and install reported success against a file the
+    /// very next launch preflight (`bottle.registry`) blocks on.
     #[tokio::test]
     async fn a_stale_active_runtime_value_does_not_end_the_flush_wait() {
         let (ctx, seen) = real_seeming_fixture();

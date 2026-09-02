@@ -1718,6 +1718,13 @@ mod tests {
         ex.remove_file(&existing).await.unwrap();
         ex.remove_dir_all(&sub).await.unwrap();
         ex.dir_copy(&sub, &dir.join("sub-copy")).await.unwrap();
+        let dir_copy = ex.planned().last().expect("dir_copy recorded").clone();
+        assert_eq!(dir_copy.kind, PlannedKind::DirCopy, "{dir_copy:#?}");
+        assert_eq!(dir_copy.src.as_deref(), Some(sub.as_path()));
+        assert_eq!(
+            dir_copy.dst.as_deref(),
+            Some(dir.join("sub-copy").as_path())
+        );
         ex.hard_link(&existing, &absent).await.unwrap();
         ex.remove_dir_all_rollback(&sub).await.unwrap();
         ex.touch(&absent).await.unwrap();
