@@ -81,7 +81,7 @@ pub mod tap;
 pub mod util;
 
 pub use contract::{contract, Contract, Gate, CONTRACT};
-pub use error::{ErrorPayload, Result, SabrageError};
+pub use error::{Result, SabrageError};
 pub use events::{step, Severity, Stage, StageEvent, StepId, Stream};
 pub use executor::{
     dry_run_plan_body, BoxFuture, Copied, DetachedChild, DetachedStdio, DryRunExecutor, Executor,

@@ -156,16 +156,6 @@ impl SabrageError {
         )
     }
 
-    /// This error as the flat, serializable shape a front-end renders.
-    pub fn payload(&self) -> ErrorPayload {
-        ErrorPayload {
-            kind: self.kind(),
-            message: self.to_string(),
-            remedy: self.remedy().map(str::to_string),
-            already_reported: self.already_reported(),
-        }
-    }
-
     /// The remedy line, when this error carries one.
     pub fn remedy(&self) -> Option<&str> {
         match self {
@@ -191,29 +181,6 @@ impl SabrageError {
             _ => &[],
         }
     }
-}
-
-/// One error, flattened for a front-end: the machine-readable discriminant, the
-/// prose, the remedy, and whether the user has already been told.
-///
-/// The GUI must never parse message text ([`SabrageError::kind`]'s whole
-/// reason), and both front-ends need the same four fields — the CLI for its
-/// `--json` output and its final `error:` line, the GUI for the failure banner
-/// it puts over a run log. camelCase because `ui/src/ipc.ts` mirrors these
-/// types by hand, like every other serialized shape in this crate.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct ErrorPayload {
-    /// [`SabrageError::kind`].
-    pub kind: &'static str,
-    /// The `Display` text — `die()`-verbatim where the shell has a counterpart.
-    pub message: String,
-    /// [`SabrageError::remedy`], the one-line fix.
-    pub remedy: Option<String>,
-    /// [`SabrageError::already_reported`]: true when the prose is already in
-    /// the event stream as a `Fatal` row, so rendering it again would double
-    /// it up.
-    pub already_reported: bool,
 }
 
 #[cfg(test)]
@@ -254,27 +221,5 @@ mod tests {
         ] {
             assert!(!e.already_reported(), "{e:?}");
         }
-    }
-
-    #[test]
-    fn payload_carries_kind_message_remedy_and_the_reported_flag() {
-        let p = SabrageError::fatal("bottle 'Steam' not found", "create it in the CrossOver UI")
-            .payload();
-        assert_eq!(p.kind, "fatal");
-        assert_eq!(p.message, "bottle 'Steam' not found");
-        assert_eq!(p.remedy.as_deref(), Some("create it in the CrossOver UI"));
-        assert!(p.already_reported);
-
-        let io = SabrageError::io("/x", std::io::Error::from(std::io::ErrorKind::NotFound));
-        let p = io.payload();
-        assert_eq!(p.kind, "io");
-        assert_eq!(p.message, io.to_string());
-        assert_eq!(p.remedy, None);
-        assert!(!p.already_reported);
-
-        // camelCase on the wire: `ui/src/ipc.ts` mirrors this by hand.
-        let j = serde_json::to_value(&p).unwrap();
-        assert_eq!(j["kind"], "io");
-        assert_eq!(j["alreadyReported"], false);
     }
 }
