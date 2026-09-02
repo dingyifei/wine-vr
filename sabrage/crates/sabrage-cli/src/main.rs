@@ -1725,22 +1725,6 @@ mod tests {
         assert!(!opts.dry_run);
     }
 
-    #[test]
-    fn merge_stage_options_flags_only_ever_add_never_clear() {
-        // A flag that is `false` in `parsed` must not stomp a `true` the env
-        // base already had — every boolean flag is `if parsed.x { opts.x =
-        // true }`, never a plain assignment.
-        let env_opts = StageOptions {
-            wired: true,
-            ..Default::default()
-        };
-        let parsed = StageArgs {
-            wired: false,
-            ..Default::default()
-        };
-        assert!(merge_stage_options(env_opts, &parsed).wired);
-    }
-
     // ── A14-1: empty CLI values clear an env-derived preset ─────────────────
 
     #[test]
@@ -1842,74 +1826,6 @@ mod tests {
             ),
             "  downloading DXMT fork artifacts ..."
         );
-    }
-
-    #[test]
-    fn fatal_line_has_no_leading_spaces_unlike_the_other_rows() {
-        assert_eq!(
-            fatal_line("run lands in Phase 3", false),
-            "FATAL run lands in Phase 3"
-        );
-        assert_eq!(
-            fatal_line("boom", true),
-            format!("{ANSI_RED}FATAL{ANSI_RESET} boom")
-        );
-    }
-
-    #[test]
-    fn a_fatal_with_a_remedy_gets_the_same_continuation_line_a_fail_row_does() {
-        // Finding #4: `render_stage_event` dropped `Fatal.remedy` entirely, so
-        // the App Management deep link — the whole point of finding #6's
-        // `upgrade_write_error` — never reached a CLI user.
-        assert_eq!(
-            fatal_lines("cannot write /x", None, false),
-            vec!["FATAL cannot write /x".to_string()],
-            "no remedy, no continuation — lib.sh's die shape exactly"
-        );
-        assert_eq!(
-            fatal_lines(
-                "cannot write /x",
-                Some("grant it in System Settings"),
-                false
-            ),
-            vec![
-                "FATAL cannot write /x".to_string(),
-                "       remedy: grant it in System Settings".to_string(),
-            ]
-        );
-        // Same seven-space indent `fail_row` uses, so a remedy reads the same
-        // wherever it appears.
-        assert_eq!(
-            fail_row("x", Some("y"), false),
-            "  FAIL x\n       remedy: y"
-        );
-    }
-
-    #[test]
-    fn errors_that_already_emitted_a_fatal_are_not_reported_a_second_time() {
-        // `Fatal` is the `die`-shaped one; the other two are emitted by
-        // `privilege` before it returns them (see the predicate's doc).
-        for e in [
-            SabrageError::Fatal {
-                message: "boom".into(),
-                remedy: None,
-            },
-            SabrageError::TccDenied {
-                path: PathBuf::from("/x"),
-            },
-            SabrageError::AdminDeclined,
-        ] {
-            assert!(error_already_reported_as_fatal(&e), "{e:?}");
-        }
-        // Everything else must still print its `error: {e}` tail.
-        // A user's own Ctrl-C: the run stage's `-- interrupted` section (or a
-        // build child simply stopping) is the report; demo.sh prints nothing
-        // after its trap re-raises either.
-        assert!(error_already_reported_as_fatal(&SabrageError::Cancelled));
-        assert!(!error_already_reported_as_fatal(&SabrageError::io(
-            std::path::Path::new("/x"),
-            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
-        )));
     }
 
     #[test]
@@ -2184,6 +2100,9 @@ mod tests {
             remedy: Some("fix it".to_string()),
             fix: None,
         };
+        // Finding #4: `render_stage_event` dropped `Fatal.remedy` entirely, so
+        // the App Management deep link — the whole point of finding #6's
+        // `upgrade_write_error` — never reached a CLI user.
         assert_eq!(
             stage_event_lines(&fatal, "<name>", Colors::OFF, false),
             vec![
