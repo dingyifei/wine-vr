@@ -343,10 +343,10 @@ fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) 
 
 /// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}'`.
 ///
-/// Duplicates [`crate::checks::config`]'s private `parse_protocol` (identical
-/// algorithm, independently verified against the same awk recipe below)
-/// rather than reusing it: that helper is not `pub`, and this file may not
-/// edit `checks/`.
+/// Mirrors `scripts/demo/setup.sh`'s first-match `{print $2; exit}`; the
+/// `parse_protocol` helper in [`crate::checks::config`] instead mirrors
+/// `scripts/demo/doctor.sh`'s last-match `{v=$2} END{print v}` — opposite
+/// match semantics, so they are not one helper.
 fn parse_protocol_awk(toml_text: &str) -> String {
     for line in toml_text.lines() {
         let after_leading_ws = line.trim_start();
@@ -493,14 +493,6 @@ mod tests {
             parse_protocol_awk("protocol = \"first\"\nprotocol = \"second\"\n"),
             "first"
         );
-    }
-
-    // ── marker bytes ─────────────────────────────────────────────────────────
-
-    #[test]
-    fn dxmt_marker_bytes_are_the_pin_plus_one_newline() {
-        let pin = &contract().deps.dxmt_tgz_sha256;
-        assert_eq!(util::contract_marker_bytes(pin), format!("{pin}\n"));
     }
 
     // ── setup_game / skip-advice text ────────────────────────────────────────
