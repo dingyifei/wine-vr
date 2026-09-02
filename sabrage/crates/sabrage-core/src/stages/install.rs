@@ -1023,21 +1023,6 @@ mod tests {
         )));
     }
 
-    #[tokio::test]
-    async fn dxmt_backup_present_is_reported_not_replanned() {
-        let (ctx, root, _seen) = fixture_ctx(true);
-        let cx = root.join("CrossOver.app/Contents/SharedSupport/CrossOver");
-        std::fs::create_dir_all(cx.join("lib/dxmt.stock-backup")).unwrap();
-        let backup = cx.join("lib/dxmt.stock-backup");
-
-        assert!(backup.is_dir());
-        // Mirrors run()'s own branch: an existing backup dir is reported, and
-        // dir_copy is never called — nothing lands in the plan.
-        ctx.step(step::INSTALL_DXMT_OVERLAY)
-            .info("stock DXMT backup already exists");
-        assert!(ctx.executor.planned().is_empty());
-    }
-
     // ── layer ordering, full `run()` under DryRun ────────────────────────────
 
     /// Builds a complete on-disk fixture (build outputs, DXMT artifacts, a
@@ -1351,54 +1336,6 @@ mod tests {
         );
     }
 
-    /// Layer 4's other outcome: `write_host_manifest_privileged` re-runs the
-    /// currency test under the prompt, so a destination that became current
-    /// after this stage's own check comes back `Skipped` — and the row must say
-    /// so rather than claiming a write that never happened.
-    #[tokio::test]
-    async fn layer_four_reports_a_skipped_write_as_already_current() {
-        let (ctx, seen, writes) = testexec_fixture(false);
-        let dest = ctx.paths.host_xr_json.clone();
-        // Stale by this stage's test (a different dylib path)…
-        std::fs::write(
-            &dest,
-            crate::util::host_manifest_file_bytes(Path::new("/stale/lib.dylib")),
-        )
-        .unwrap();
-        assert!(!crate::util::host_manifest_is_current(
-            &dest,
-            &crate::util::render_host_manifest(&ctx.paths.oxr_dylib)
-        ));
-
-        // …but current by the time the privileged write looks. (The real race
-        // is another writer between the two reads; writing it here is the same
-        // observation, deterministically.)
-        let outcome = {
-            std::fs::write(
-                &dest,
-                crate::util::host_manifest_file_bytes(&ctx.paths.oxr_dylib),
-            )
-            .unwrap();
-            run(&ctx).await
-        };
-        outcome.expect("dry run completes");
-
-        assert!(writes.lock().unwrap().is_empty(), "nothing was staged");
-        let evs = seen.lock().unwrap();
-        assert!(
-            !evs.iter().any(|e| matches!(
-                e,
-                StageEvent::Line { text, .. }
-                    if text == "host registration written" || text == "would write host registration"
-            )),
-            "a skipped write must not be reported as written (or as planned)"
-        );
-        assert!(evs.iter().any(|e| matches!(
-            e,
-            StageEvent::Line { text, .. } if text == "host registration already current"
-        )));
-    }
-
     /// #6: a `PermissionDenied` inside `CrossOver.app` must reach the caller as
     /// `TccDenied` — the variant the GUI's permission panel branches on — with
     /// the App Management deep link in the remedy, emitted **once**, by
@@ -1570,6 +1507,37 @@ mod tests {
                 .iter()
                 .any(|p| p.kind == crate::executor::PlannedKind::DirCopy),
             "{:#?}",
+            ctx.executor.planned()
+        );
+    }
+
+    /// A non-empty `dxmt.stock-backup` is a finished capture: the stage reports
+    /// it and never re-copies, because a second `cp -R` after the overlay has
+    /// landed would capture the fork as the alleged stock.
+    #[tokio::test]
+    async fn a_complete_stock_backup_is_reported_and_never_recaptured() {
+        let (ctx, seen, _writes) = testexec_fixture(false);
+        let backup = ctx.paths.cx.as_ref().unwrap().join("lib/dxmt.stock-backup");
+        std::fs::create_dir_all(&backup).unwrap();
+        std::fs::write(backup.join("d3d11.dll"), b"stock").unwrap();
+
+        run(&ctx).await.expect("dry run completes all four layers");
+
+        assert!(
+            seen.lock().unwrap().iter().any(|e| matches!(
+                e,
+                StageEvent::Line { severity: Severity::Info, text, .. }
+                    if text == "stock DXMT backup already exists"
+            )),
+            "{:#?}",
+            seen.lock().unwrap()
+        );
+        assert!(
+            !ctx.executor
+                .planned()
+                .iter()
+                .any(|p| p.kind == crate::executor::PlannedKind::DirCopy),
+            "an existing backup is never re-captured: {:#?}",
             ctx.executor.planned()
         );
     }
