@@ -1428,139 +1428,162 @@ mod tests {
     }
 
     #[test]
-    fn missing_value_messages_match_demo_sh_verbatim() {
-        assert_eq!(
-            parse_doctor_args(&args(&["--bottle"])).unwrap_err(),
-            "error: --bottle needs a name"
-        );
-        assert_eq!(
-            parse_doctor_args(&args(&["--bs-dir"])).unwrap_err(),
-            "error: --bs-dir needs a path"
-        );
-        assert_eq!(
-            parse_doctor_args(&args(&["--tap"])).unwrap_err(),
-            "error: --tap needs a path"
-        );
-    }
-
-    #[test]
-    fn unknown_argument_message_matches_demo_sh_verbatim() {
-        assert_eq!(
-            parse_doctor_args(&args(&["--nope"])).unwrap_err(),
-            "error: unknown argument '--nope'"
-        );
-        // A bare positional (no leading `--`) hits the same `*)` branch in
-        // demo.sh's case loop.
-        assert_eq!(
-            parse_doctor_args(&args(&["Steam"])).unwrap_err(),
-            "error: unknown argument 'Steam'"
-        );
-    }
-
-    #[test]
-    fn first_bad_argument_wins_no_aggregation() {
-        let a = args(&["--bottle", "Steam", "--nope", "--bs-dir", "/x"]);
-        assert_eq!(
-            parse_doctor_args(&a).unwrap_err(),
-            "error: unknown argument '--nope'"
-        );
+    fn doctor_parse_errors_match_demo_sh_verbatim() {
+        let cases: &[(&str, &[&str], &str)] = &[
+            (
+                "missing --bottle value",
+                &["--bottle"],
+                "error: --bottle needs a name",
+            ),
+            (
+                "missing --bs-dir value",
+                &["--bs-dir"],
+                "error: --bs-dir needs a path",
+            ),
+            (
+                "missing doctor-only --tap value",
+                &["--tap"],
+                "error: --tap needs a path",
+            ),
+            (
+                "unknown flag",
+                &["--nope"],
+                "error: unknown argument '--nope'",
+            ),
+            (
+                "bare positional hits demo.sh's `*)` arm",
+                &["Steam"],
+                "error: unknown argument 'Steam'",
+            ),
+            (
+                "first bad argument wins, no aggregation",
+                &["--bottle", "Steam", "--nope", "--bs-dir", "/x"],
+                "error: unknown argument '--nope'",
+            ),
+        ];
+        for (label, argv, expected) in cases {
+            assert_eq!(
+                parse_doctor_args(&args(argv)).unwrap_err(),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     // ── A14-4: flags before the command ──────────────────────────────────────
 
+    // demo.sh's `CMD="${1:-}"; shift` consumes the first token unconditionally,
+    // so the flag loop only ever sees the tail: `--bottle Steam run` reports
+    // `Steam` and never routes through `--bottle`'s "needs a name" branch. An
+    // `Ok(())` means the shell would have fallen through to its unknown-`CMD`
+    // `case` arm, whose text the caller's `_` arm prints — not this helper.
     #[test]
-    fn unknown_command_outcome_reports_the_first_bad_remaining_token() {
-        // `--bottle Steam run`: demo.sh's `CMD="${1:-}"; shift` consumes
-        // `--bottle` as `CMD` unconditionally, so its flag loop then sees
-        // `Steam run` and reports `Steam` — never routing through `--bottle`'s
-        // "needs a name" branch at all.
-        let a = args(&["--bottle", "Steam", "run"]);
-        assert_eq!(
-            unknown_command_outcome(&a).unwrap_err(),
-            "error: unknown argument 'Steam'"
-        );
-    }
-
-    #[test]
-    fn unknown_command_outcome_is_ok_when_the_remaining_tokens_parse_clean() {
-        // `--verbose --bottle X`: once `--verbose` is consumed as `CMD`, the
-        // remaining `--bottle X` parses fine under the shared six-flag
-        // grammar — the shell's `case "$CMD"` would then fall through to its
-        // own unknown-command text, which this file's usage/exit-2 fallback
-        // mirrors (the caller's `_` arm, not this helper, prints it).
-        let a = args(&["--verbose", "--bottle", "X"]);
-        assert_eq!(unknown_command_outcome(&a), Ok(()));
+    fn unknown_command_outcome_mirrors_the_shells_shift_then_parse() {
+        let cases: &[(&str, &[&str], Result<(), &str>)] = &[
+            (
+                "A14-4 regression: flags before the command report the tail's first bad token",
+                &["--bottle", "Steam", "run"],
+                Err("error: unknown argument 'Steam'"),
+            ),
+            (
+                "A14-4's other case: a clean tail falls through to the caller's usage/exit-2 arm",
+                &["--verbose", "--bottle", "X"],
+                Ok(()),
+            ),
+        ];
+        for (label, argv, expected) in cases {
+            let got = unknown_command_outcome(&args(argv));
+            assert_eq!(
+                got.as_ref().map(|_| ()).map_err(String::as_str),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     // ── doctor rendering ─────────────────────────────────────────────────────
 
     #[test]
-    fn pass_row_has_three_space_gap_like_ok() {
-        let o = CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)");
-        assert_eq!(
-            format_outcome(&o, false, false).as_deref(),
-            Some("  OK   Apple Silicon (Apple M-series)")
-        );
-    }
-
-    #[test]
-    fn warn_row_has_one_space_gap_like_warn() {
-        let o = CheckOutcome::warn("bottle.template", "bottle template is not win11_64");
-        assert_eq!(
-            format_outcome(&o, false, false).as_deref(),
-            Some("  WARN bottle template is not win11_64")
-        );
-    }
-
-    #[test]
-    fn fail_row_with_remedy_aligns_at_column_seven() {
-        let o = CheckOutcome::fail(
-            "cx.version",
-            "CrossOver 26.1 < 26.2",
-            "upgrade CrossOver to 26.2+",
-        );
-        assert_eq!(
-            format_outcome(&o, false, false).as_deref(),
-            Some("  FAIL CrossOver 26.1 < 26.2\n       remedy: upgrade CrossOver to 26.2+")
-        );
-    }
-
-    #[test]
-    fn fail_row_without_remedy_has_no_remedy_line() {
-        let o = CheckOutcome::fail_bare("sys.arch", "not an Apple Silicon Mac (x86_64)");
-        assert_eq!(
-            format_outcome(&o, false, false).as_deref(),
-            Some("  FAIL not an Apple Silicon Mac (x86_64)")
-        );
-    }
-
-    #[test]
-    fn info_row_is_two_space_indent_no_label() {
-        let o = CheckOutcome::info(
-            "game.present",
-            "Beat Saber check skipped (needs --bottle or --bs-dir)",
-        );
-        assert_eq!(
-            format_outcome(&o, false, false).as_deref(),
-            Some("  Beat Saber check skipped (needs --bottle or --bs-dir)")
-        );
-    }
-
-    #[test]
-    fn skipped_and_not_implemented_print_nothing() {
-        let skipped = CheckOutcome::skipped("hs.client", "no adb device".into());
-        assert_eq!(format_outcome(&skipped, false, false), None);
-        let ni = CheckOutcome::not_implemented("dep.dxmt");
-        assert_eq!(format_outcome(&ni, false, false), None);
-    }
-
-    #[test]
-    fn colors_wrap_only_the_label_text() {
-        let o = CheckOutcome::pass("sys.arch", "Apple Silicon");
-        assert_eq!(
-            format_outcome(&o, true, false).as_deref(),
-            Some("  \x1b[32mOK\x1b[0m   Apple Silicon")
-        );
+    fn doctor_outcome_rows_match_lib_sh_verbatim() {
+        let cases: &[(&str, CheckOutcome, bool, bool, Option<&str>)] = &[
+            (
+                "pass, no color: three-space OK gap",
+                CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)"),
+                false,
+                false,
+                Some("  OK   Apple Silicon (Apple M-series)"),
+            ),
+            (
+                "pass, verbose with no detail: nothing extra",
+                CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)"),
+                false,
+                true,
+                Some("  OK   Apple Silicon (Apple M-series)"),
+            ),
+            (
+                "warn, no color: one-space WARN gap",
+                CheckOutcome::warn("bottle.template", "bottle template is not win11_64"),
+                false,
+                false,
+                Some("  WARN bottle template is not win11_64"),
+            ),
+            (
+                "fail with remedy: seven-space remedy continuation",
+                CheckOutcome::fail(
+                    "cx.version",
+                    "CrossOver 26.1 < 26.2",
+                    "upgrade CrossOver to 26.2+",
+                ),
+                false,
+                false,
+                Some("  FAIL CrossOver 26.1 < 26.2\n       remedy: upgrade CrossOver to 26.2+"),
+            ),
+            (
+                "fail without remedy: no remedy continuation",
+                CheckOutcome::fail_bare("sys.arch", "not an Apple Silicon Mac (x86_64)"),
+                false,
+                false,
+                Some("  FAIL not an Apple Silicon Mac (x86_64)"),
+            ),
+            (
+                "info: two-space indent, no status label",
+                CheckOutcome::info(
+                    "game.present",
+                    "Beat Saber check skipped (needs --bottle or --bs-dir)",
+                ),
+                false,
+                false,
+                Some("  Beat Saber check skipped (needs --bottle or --bs-dir)"),
+            ),
+            (
+                "skipped: prints nothing",
+                CheckOutcome::skipped("hs.client", "no adb device".into()),
+                false,
+                false,
+                None,
+            ),
+            (
+                "not implemented: prints nothing",
+                CheckOutcome::not_implemented("dep.dxmt"),
+                false,
+                false,
+                None,
+            ),
+            (
+                "pass with colors: the ANSI pair wraps the label, not the message",
+                CheckOutcome::pass("sys.arch", "Apple Silicon"),
+                true,
+                false,
+                Some("  \x1b[32mOK\x1b[0m   Apple Silicon"),
+            ),
+        ];
+        for (label, outcome, colors, verbose, expected) in cases {
+            assert_eq!(
+                format_outcome(outcome, *colors, *verbose).as_deref(),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     /// A3b-3 (round 2): `detail` is sabrage-only and must never appear in
@@ -1578,15 +1601,6 @@ mod tests {
         assert_eq!(
             format_outcome(&o, false, true).as_deref(),
             Some("  WARN could not inspect session.json: oops\n       detail: read error: oops")
-        );
-    }
-
-    #[test]
-    fn verbose_with_no_detail_prints_nothing_extra() {
-        let o = CheckOutcome::pass("sys.arch", "Apple Silicon (Apple M-series)");
-        assert_eq!(
-            format_outcome(&o, false, true).as_deref(),
-            Some("  OK   Apple Silicon (Apple M-series)")
         );
     }
 
@@ -2152,42 +2166,46 @@ mod tests {
     // ── A14-5: color gating is per-stream ────────────────────────────────────
 
     #[test]
-    fn no_color_forces_both_streams_off_regardless_of_tty() {
-        assert_eq!(
-            colors_from(true, true, true),
-            Colors {
-                stdout: false,
-                stderr: false,
-                stdout_tty: true,
-                stderr_tty: true,
-            }
-        );
-    }
-
-    #[test]
-    fn colors_from_is_independent_per_stream() {
-        // stdout piped (no color), stderr on a terminal (colored) — the
-        // "stderr redirected to a file, stdout a tty" case inverted: this is
-        // "stdout piped, stderr a tty", the other half of the same bug.
-        assert_eq!(
-            colors_from(false, false, true),
-            Colors {
-                stdout: false,
-                stderr: true,
-                stdout_tty: false,
-                stderr_tty: true,
-            }
-        );
-        // The mirrored case: stdout a terminal, stderr redirected to a file.
-        assert_eq!(
-            colors_from(false, true, false),
-            Colors {
-                stdout: true,
-                stderr: false,
-                stdout_tty: true,
-                stderr_tty: false,
-            }
-        );
+    fn colors_from_gates_each_stream_on_its_own_tty_unless_no_color() {
+        let cases: &[(&str, (bool, bool, bool), Colors)] = &[
+            (
+                "NO_COLOR forces both streams off regardless of tty",
+                (true, true, true),
+                Colors {
+                    stdout: false,
+                    stderr: false,
+                    stdout_tty: true,
+                    stderr_tty: true,
+                },
+            ),
+            (
+                "stdout piped, stderr a tty — the other half of the same bug",
+                (false, false, true),
+                Colors {
+                    stdout: false,
+                    stderr: true,
+                    stdout_tty: false,
+                    stderr_tty: true,
+                },
+            ),
+            (
+                "mirrored: stdout a tty, stderr redirected to a file",
+                (false, true, false),
+                Colors {
+                    stdout: true,
+                    stderr: false,
+                    stdout_tty: true,
+                    stderr_tty: false,
+                },
+            ),
+        ];
+        for (label, (no_color, stdout_tty, stderr_tty), expected) in cases {
+            assert_eq!(
+                colors_from(*no_color, *stdout_tty, *stderr_tty),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     #[test]
