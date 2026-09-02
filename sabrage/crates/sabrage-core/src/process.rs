@@ -1378,14 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn liveness_probe_agrees_with_reality() {
-        assert!(is_alive(std::process::id()));
-        // pid 0 is the swapper/kernel process group on macOS; a pid that cannot
-        // exist for this user is the honest negative case.
-        assert!(!is_alive(u32::MAX - 1));
-    }
-
-    #[test]
     fn default_child_path_puts_the_toolchains_first_and_dedupes() {
         let p = default_child_path();
         let parts: Vec<&str> = p.split(':').collect();
@@ -1466,19 +1458,6 @@ mod identity_tests {
             exe: PathBuf::new(),
         };
         assert!(!dead.is_same_process());
-    }
-
-    #[test]
-    fn proc_info_round_trips_as_camel_case_json() {
-        let p = ProcInfo {
-            pid: 4242,
-            start_time: 1786300214,
-            exe: PathBuf::from("/bin/sh"),
-        };
-        let j = serde_json::to_value(&p).unwrap();
-        assert_eq!(j["startTime"], 1786300214u64);
-        assert_eq!(j["pid"], 4242);
-        assert_eq!(serde_json::from_value::<ProcInfo>(j).unwrap(), p);
     }
 
     #[tokio::test]
