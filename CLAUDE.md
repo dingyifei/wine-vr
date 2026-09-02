@@ -158,4 +158,5 @@ artifacts and at `contract/`. Rules:
 
 - Demo runs log to `logs/`; dev/diagnostic scripts write to `evidence/`. Both are gitignored on purpose — docs cite `evidence/` files by name as local artifacts, so don't delete that directory.
 - `.gitignore` blanket-ignores binaries (`*.dll`, `*.dylib`, `build/`, `third_party/`, `ext/dxmt-artifacts/`); a root-level `BeatSaberVersion.txt` is expected runtime junk.
+- Comments and tests follow `docs/code-standards.md`: what a comment may contain, a false comment is rewritten at the source (never appended to), one behaviour per test, the redundant-test definition, the regression-label rule, and which layer owns a byte-fact. Read it before editing tests or comments in `sabrage/` or `scripts/demo/`.
 - Setup/onboarding and user-facing knobs are documented in `README.md`; the frame path in `docs/architecture.md`; failure modes in `docs/troubleshooting.md`. Keep those current when behavior changes rather than duplicating them here.
