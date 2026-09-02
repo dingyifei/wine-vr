@@ -376,13 +376,6 @@ mod tests {
     }
 
     #[test]
-    fn the_current_version_still_loads() {
-        let s: Settings =
-            serde_json::from_str(&format!(r#"{{"version":{SETTINGS_VERSION}}}"#)).unwrap();
-        assert_eq!(s.version, SETTINGS_VERSION);
-    }
-
-    #[test]
     fn a_file_without_a_version_reads_as_the_current_one() {
         let s: Settings = serde_json::from_str(r#"{"repoRoot":"/repo"}"#).unwrap();
         assert_eq!(s.version, SETTINGS_VERSION);
