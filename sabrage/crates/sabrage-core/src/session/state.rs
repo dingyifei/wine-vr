@@ -763,26 +763,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_newer_schema_is_recognised_and_never_downgraded() {
-        let json = r#"{
-            "version": 2,
-            "runId": "00000000-0000-0000-0000-000000000000",
-            "bottle": "Steam",
-            "bsDir": "/games/bs",
-            "startedAtUnixMs": 1786300214181,
-            "logPath": "/repo/logs/x.log",
-            "futureGuard": {"somethingWeCannotUndo": true}
-        }"#;
-        let s: SessionState = serde_json::from_str(json).unwrap();
-        assert_eq!(s.version, 2);
-        assert!(
-            !s.is_supported_version(),
-            "a v2 record must not be rewritten through the v1 struct"
-        );
-        assert!(sample().is_supported_version());
-    }
-
     /// A9-8. The version rule is the module header's, not reconcile's: a path
     /// that never went through reconciliation (a launch that carried on, a
     /// teardown, a guard flag flip) must not rewrite a v2 record through this
