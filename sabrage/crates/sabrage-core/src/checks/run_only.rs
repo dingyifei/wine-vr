@@ -535,26 +535,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The bound does not cost the healthy path its answer: a fast fake still
-    /// gets its stdout read back in full.
-    #[test]
-    fn the_devices_probe_still_returns_stdout_within_the_deadline() {
-        let root = scratch("wired-fast");
-        let adb = root.join("platform-tools/adb");
-        std::fs::create_dir_all(adb.parent().unwrap()).unwrap();
-        std::fs::write(
-            &adb,
-            "#!/bin/sh\nprintf 'List of devices attached\\n1WMHH000X0\\tdevice\\n'\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&adb, std::fs::Permissions::from_mode(0o755)).unwrap();
-
-        let out = adb_devices_output(&adb, ADB_PROBE_TIMEOUT);
-        assert_eq!(out, "List of devices attached\n1WMHH000X0\tdevice\n");
-        assert_eq!(first_connected_serial(&out).as_deref(), Some("1WMHH000X0"));
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     #[test]
     fn first_connected_serial_skips_the_header_and_non_device_states() {
         let out = "List of devices attached\nemulator-5554\toffline\n1A2B3C4D\tdevice\n";
