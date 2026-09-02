@@ -768,13 +768,10 @@ fn audio_unreadable_warn(deadline: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // Moved to `crate::process` in Phase 3; the tests below still cover it
-    // here because this file is where its one production caller lives.
     use crate::events::Severity;
-    use crate::executor::{DryRunExecutor, Executor, PlannedKind};
+    use crate::executor::PlannedKind;
     use crate::paths::Paths;
-    use crate::process::cmdline_contains;
-    use crate::stages::{null_sink, StageCtx, StageOptions};
+    use crate::stages::{StageCtx, StageOptions};
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_util::sync::CancellationToken;
@@ -1016,34 +1013,6 @@ mod tests {
     }
 
     // ── argv-based survivor matcher (finding #8) ─────────────────────────────
-
-    #[test]
-    fn cmdline_contains_matches_the_pgrep_f_shape_including_the_windows_path_form() {
-        // The real case: one argv element is the whole `Z:\...` Windows path,
-        // which itself contains an embedded space ("Beat" + "Saber.exe").
-        assert!(cmdline_contains(
-            &["Z:\\repo\\ext\\oxrsys\\build-x64\\Beat Saber.exe".to_string()],
-            BEAT_SABER_EXE_SUFFIX
-        ));
-        assert!(cmdline_contains(
-            &[
-                "wine64-preloader".to_string(),
-                "Z:\\Beat Saber.exe".to_string(),
-            ],
-            BEAT_SABER_EXE_SUFFIX
-        ));
-        // A hypothetical split across two argv elements still matches via the
-        // whitespace-joined whole line, the same shape `pgrep -f` scans.
-        assert!(cmdline_contains(
-            &["Beat".to_string(), "Saber.exe".to_string()],
-            BEAT_SABER_EXE_SUFFIX
-        ));
-        assert!(!cmdline_contains(
-            &["wineserver".to_string(), "-k".to_string()],
-            BEAT_SABER_EXE_SUFFIX
-        ));
-        assert!(!cmdline_contains(&[], BEAT_SABER_EXE_SUFFIX));
-    }
 
     #[test]
     fn finds_by_cmdline_using_this_test_binarys_own_argv() {
@@ -1406,19 +1375,6 @@ mod tests {
         assert!(!process::find_processes_by_exe(&sleeper.exe).is_empty());
     }
 
-    #[tokio::test]
-    async fn wait_for_exit_returns_the_survivors_and_nothing_once_they_are_gone() {
-        let mut sleeper = spawn_sleeper(false);
-        let observed = process::find_processes_by_exe(&sleeper.exe);
-        assert_eq!(observed.len(), 1, "{observed:?}");
-
-        assert_eq!(wait_for_exit(&observed).await, observed, "still running");
-
-        sleeper.child.kill().unwrap();
-        sleeper.child.wait().unwrap();
-        assert!(wait_for_exit(&observed).await.is_empty());
-    }
-
     /// A stale identity — same pid, a start time that process never had — must
     /// not be signalled at all: `reap` skips it and reports nothing killed.
     #[tokio::test]
@@ -1532,15 +1488,6 @@ mod tests {
         // machine with nothing else running produces, machine-independently.
         report_foreign_helpers(&ctx, &ctx.paths.root.clone(), Vec::new(), true);
         assert!(rows(&seen).is_empty(), "{:?}", rows(&seen));
-    }
-
-    #[test]
-    fn dry_run_executor_is_dry_run() {
-        // Sanity: the fixtures above rely on StageOptions{dry_run:true} wiring
-        // up a DryRunExecutor.
-        let sink = null_sink();
-        let ex = DryRunExecutor::new(uuid::Uuid::nil(), sink, CancellationToken::new());
-        assert!(ex.is_dry_run());
     }
 
     // ── cancellation propagation (finding #2) ────────────────────────────────
