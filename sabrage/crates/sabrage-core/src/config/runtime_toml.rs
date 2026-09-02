@@ -2426,6 +2426,7 @@ mod tests {
     /// all of them go through.
     #[tokio::test]
     async fn the_multiline_shadow_is_refused_by_apply_patch_write_and_edit_protocol() {
+        let _g = crate::session::lock_session_globals();
         let text = fixture("oxrsys-runtime.multiline-shadow.toml");
         assert_eq!(
             read_lines_like_the_runtime(&text).0.protocol,
@@ -2728,6 +2729,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_creates_from_the_template_byte_identically_then_patches() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("create");
         let path = dir.join("OXRSys/oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2758,6 +2760,7 @@ mod tests {
     /// exact window is read back instead of overwritten.
     #[tokio::test]
     async fn write_never_clobbers_a_file_created_in_the_toctou_window() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("create-race");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2820,6 +2823,7 @@ mod tests {
     /// [`Paths::toml_lock_path`]: crate::paths::Paths::toml_lock_path
     #[tokio::test]
     async fn write_takes_the_cross_process_lock_at_the_documented_path() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("toml-lock");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2861,6 +2865,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_creates_the_template_verbatim_for_an_empty_patch() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("create-empty");
         let path = dir.join("oxrsys-runtime.toml");
         let ex = real();
@@ -2884,6 +2889,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_backs_up_before_overwriting_and_leaves_the_backup_identical() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("backup");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2912,6 +2918,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_unchanged_patch_writes_nothing_and_takes_no_backup() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("noop");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2943,6 +2950,7 @@ mod tests {
     /// exists to prevent.
     #[tokio::test]
     async fn a_no_op_write_leaves_an_unnormalised_file_alone() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("noop-unnormalised");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -2992,6 +3000,7 @@ mod tests {
 
     #[tokio::test]
     async fn backups_are_pruned_to_the_newest_ten() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("prune");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -3027,6 +3036,7 @@ mod tests {
     /// compare-and-swap's "nothing was written" was false for the same reason.
     #[tokio::test]
     async fn a_failed_write_prunes_nothing_and_leaves_no_reservation() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("failed-write-keeps-backups");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -3080,6 +3090,7 @@ mod tests {
     /// showing the old values over a file the runtime had already re-read.
     #[tokio::test]
     async fn an_unprunable_stale_backup_still_reports_a_committed_save() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("unprunable-stale-backup");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -3192,6 +3203,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_refuses_a_file_it_cannot_round_trip() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("write-broken");
         let path = dir.join("oxrsys-runtime.toml");
         std::fs::write(&path, fixture("oxrsys-runtime.broken.toml")).unwrap();
@@ -3209,6 +3221,7 @@ mod tests {
 
     #[tokio::test]
     async fn write_refuses_an_out_of_range_patch_before_touching_disk() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("write-range");
         let path = dir.join("oxrsys-runtime.toml");
         let ex = real();
@@ -3250,6 +3263,7 @@ mod tests {
     /// the file is left untouched down to its mtime.
     #[tokio::test]
     async fn write_refuses_while_a_session_is_live_and_touches_nothing() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("live-guard");
         let path = dir.join("oxrsys-runtime.toml");
         let backups = dir.join("backups");
@@ -3334,6 +3348,7 @@ mod tests {
     /// and its encoder is just as rebuildable.
     #[tokio::test]
     async fn the_live_guard_fires_for_a_session_owned_by_another_process() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("live-guard-other");
         let path = dir.join("oxrsys-runtime.toml");
         std::fs::write(&path, deployed()).unwrap();
@@ -3355,6 +3370,7 @@ mod tests {
     /// must not wedge the Settings screen forever.
     #[tokio::test]
     async fn a_stale_session_record_does_not_block_a_write() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("live-guard-stale");
         let path = dir.join("oxrsys-runtime.toml");
         std::fs::write(&path, deployed()).unwrap();
@@ -3392,6 +3408,7 @@ mod tests {
     /// backup would describe bytes that no longer existed.
     #[test]
     fn the_replacement_refuses_when_the_file_changed_underneath() {
+        let _g = crate::session::lock_session_globals();
         let dir = scratch("cas");
         let path = dir.join("oxrsys-runtime.toml");
         let session = dir.join("session-state.json");
