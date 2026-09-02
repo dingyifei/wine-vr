@@ -2581,6 +2581,11 @@ mod tests {
             QuitIntercept::PassThrough,
             "nothing live to protect"
         );
+        assert_eq!(
+            quit_intercept_decision(true, false, None),
+            QuitIntercept::PassThrough,
+            "an approved quit with nothing live is never intercepted"
+        );
     }
 
     #[test]
@@ -2667,17 +2672,6 @@ mod tests {
         assert!(state.remember_broadcast(&changed));
         assert!(!state.remember_broadcast(&changed));
         assert!(state.remember_broadcast(&idle), "and back again");
-    }
-
-    #[test]
-    fn should_intercept_quit_only_when_unapproved_and_live() {
-        assert!(should_intercept_quit(false, true));
-        assert!(!should_intercept_quit(true, true), "already approved");
-        assert!(
-            !should_intercept_quit(false, false),
-            "nothing live to protect"
-        );
-        assert!(!should_intercept_quit(true, false));
     }
 
     #[test]
