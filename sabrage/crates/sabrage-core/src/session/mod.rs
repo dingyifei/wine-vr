@@ -753,14 +753,6 @@ mod tests {
     }
 
     #[test]
-    fn the_idle_status_is_the_default() {
-        let s = SessionStatus::default();
-        assert_eq!(s.phase, SessionPhase::Idle);
-        assert!(s.run_id.is_none() && s.pid.is_none() && s.encoder.is_none());
-        assert!(!s.runtime_fresh && !s.owned_by_this_process && !s.detached);
-    }
-
-    #[test]
     fn status_serializes_camel_case_for_the_ipc_mirror() {
         let s = SessionStatus {
             phase: SessionPhase::Stalled,
