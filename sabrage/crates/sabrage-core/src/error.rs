@@ -108,8 +108,8 @@ impl SabrageError {
         }
     }
 
-    /// Stable machine-readable discriminant for `--json` output and for the GUI
-    /// (which must never parse message prose).
+    /// Stable machine-readable discriminant of the variant, for callers that
+    /// must not parse message prose; today only the tests key on it.
     pub fn kind(&self) -> &'static str {
         match self {
             SabrageError::Fatal { .. } => "fatal",
