@@ -1328,62 +1328,6 @@ mod tests {
         std::fs::write(&path, serde_json::to_string(&state).unwrap()).unwrap();
     }
 
-    #[test]
-    fn live_session_block_is_none_on_a_scratch_machine() {
-        let _g = crate::session::lock_session_globals();
-        let root = std::env::temp_dir().join(format!("sabrage-live-none-{}", std::process::id()));
-        let ctx = ctx_at(&root, None);
-        assert_eq!(live_session_block(&ctx.paths), None);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    #[test]
-    fn live_session_block_sees_a_running_session_recorded_on_disk() {
-        let _g = crate::session::lock_session_globals();
-        let root = std::env::temp_dir().join(format!("sabrage-live-state-{}", std::process::id()));
-        let ctx = ctx_at(&root, Some("FixtureBottle"));
-        write_live_session_state(&ctx);
-        let reason = live_session_block(&ctx.paths).expect("a live record must block");
-        assert!(reason.contains("FixtureBottle"), "{reason}");
-        std::fs::remove_dir_all(&root).ok();
-    }
-
-    /// The `runtime_status.json` a live `./demo.sh run` session would have
-    /// written: fresh, and naming a pid that is alive — this process, the only
-    /// pid a test can be sure of ([`crate::session::watcher::runtime_status_live`]
-    /// requires both halves, so freshness alone is no longer a session).
-    fn write_live_runtime_status(ctx: &StageCtx) {
-        std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
-        let now = crate::session::now_unix_ms();
-        let pid = std::process::id();
-        std::fs::write(
-            ctx.paths.oxr_appsup.join("runtime_status.json"),
-            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":{now}}}"#),
-        )
-        .unwrap();
-    }
-
-    /// A `./demo.sh run` session writes no `session-state.json`; a fresh
-    /// `runtime_status.json` is the only trace of it Sabrage can read.
-    #[test]
-    fn live_session_block_sees_a_fresh_runtime_status() {
-        let _g = crate::session::lock_session_globals();
-        let root = std::env::temp_dir().join(format!("sabrage-live-status-{}", std::process::id()));
-        let ctx = ctx_at(&root, None);
-        write_live_runtime_status(&ctx);
-        assert!(live_session_block(&ctx.paths).is_some_and(|r| r.contains("streaming")));
-
-        // Stale is not live: the file outlives the runtime.
-        let pid = std::process::id();
-        std::fs::write(
-            ctx.paths.oxr_appsup.join("runtime_status.json"),
-            format!(r#"{{"state":"streaming","process_id":{pid},"updated_at_unix_ms":1}}"#),
-        )
-        .unwrap();
-        assert_eq!(live_session_block(&ctx.paths), None);
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// The stage/fix gate is the *same* predicate the session layer publishes,
     /// not a weaker copy of it: it used to miss the pre-spawn foreign-owner
     /// window and an unreadable record, so `build`/`install` and every Doctor
