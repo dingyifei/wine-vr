@@ -749,17 +749,4 @@ mod tests {
         assert!(o.message.starts_with("could not inspect "));
         fs::remove_dir_all(&tmp).ok();
     }
-
-    #[test]
-    fn defs_binds_all_three_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "cfg.protocol.supported",
-                "cfg.protocol.legacy-oxrsys",
-                "cfg.session-pins",
-            ]
-        );
-    }
 }

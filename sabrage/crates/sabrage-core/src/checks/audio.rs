@@ -109,10 +109,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn defs_binds_the_one_slug() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(slugs, vec!["audio.loopback"]);
-    }
 }

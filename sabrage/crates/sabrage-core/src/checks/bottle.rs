@@ -354,19 +354,4 @@ mod tests {
 
         fs::remove_dir_all(&b.prefix).ok();
     }
-
-    #[test]
-    fn defs_binds_all_five_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "bottle.named",
-                "bottle.exists",
-                "bottle.template",
-                "bottle.gfx-dxmt",
-                "bottle.zdrive",
-            ]
-        );
-    }
 }

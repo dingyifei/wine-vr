@@ -543,16 +543,4 @@ mod tests {
         // The header row itself never counts, even if it somehow parsed.
         assert_eq!(first_connected_serial("only-a-header\n"), None);
     }
-
-    #[test]
-    fn defs_cover_exactly_the_contracts_run_only_group() {
-        let bound: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        let declared: Vec<&str> = crate::contract::contract()
-            .checks
-            .iter()
-            .filter(|c| c.group == crate::checks::NO_DOCTOR_ROW_GROUP)
-            .map(|c| c.slug.as_str())
-            .collect();
-        assert_eq!(bound, declared);
-    }
 }

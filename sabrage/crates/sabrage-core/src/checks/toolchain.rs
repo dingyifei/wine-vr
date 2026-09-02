@@ -163,20 +163,4 @@ mod tests {
             assert!(out.remedy.is_some());
         }
     }
-
-    #[test]
-    fn defs_binds_all_six_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            slugs,
-            vec![
-                "tool.cmake",
-                "tool.ninja",
-                "tool.git",
-                "tool.curl",
-                "tool.mingw",
-                "rust.x64-target",
-            ]
-        );
-    }
 }

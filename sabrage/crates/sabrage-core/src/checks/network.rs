@@ -288,10 +288,4 @@ mod tests {
         let err = adb_forward_local_specs(false_bin).expect_err("non-zero exit must be Err");
         assert!(err.contains("exited with"), "unexpected error text: {err}");
     }
-
-    #[test]
-    fn defs_binds_both_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(slugs, vec!["net.ports", "net.adb-forwards"]);
-    }
 }

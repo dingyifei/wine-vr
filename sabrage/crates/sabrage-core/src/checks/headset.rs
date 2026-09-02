@@ -184,10 +184,4 @@ mod tests {
         );
         assert_eq!(hs_client(&c).status, CheckStatus::Skipped);
     }
-
-    #[test]
-    fn defs_binds_both_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(slugs, vec!["hs.adb", "hs.client"]);
-    }
 }

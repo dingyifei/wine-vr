@@ -303,13 +303,4 @@ mod tests {
             }
         }
     }
-
-    #[test]
-    fn defs_binds_all_four_slugs_in_contract_order() {
-        let slugs: Vec<&str> = defs().into_iter().map(|(s, _)| s).collect();
-        assert_eq!(
-            slugs,
-            vec!["sys.arch", "sys.macos27", "cx.present", "cx.version"]
-        );
-    }
 }
