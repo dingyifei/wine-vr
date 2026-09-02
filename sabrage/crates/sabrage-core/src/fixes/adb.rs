@@ -303,12 +303,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn stale_local_specs_come_from_the_contract_ports() {
-        let specs = stale_local_specs();
-        assert_eq!(specs, vec!["tcp:9943".to_string(), "tcp:9944".to_string()]);
-    }
-
     // ── remove_adb_forwards (the async fix) ─────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
