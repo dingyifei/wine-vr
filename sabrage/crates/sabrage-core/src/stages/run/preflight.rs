@@ -969,41 +969,6 @@ mod tests {
 
     // ── the config reader ───────────────────────────────────────────────────
 
-    #[test]
-    fn effective_string_reads_the_key_the_way_the_runtime_does() {
-        let toml = "  protocol = \"alvr\"\nencoder_process=\"native\"\n";
-        assert_eq!(effective_string(toml, "protocol"), "alvr");
-        assert_eq!(effective_string(toml, "encoder_process"), "native");
-
-        // `protocol_foo` is a different key; a commented line assigns nothing.
-        let toml = "protocol_foo = \"x\"\n# protocol = \"alvr\"\nprotocol = \"oxrsys\"\n";
-        assert_eq!(effective_string(toml, "protocol"), "oxrsys");
-
-        // THE regression: last assignment wins, across table boundaries, which
-        // is what the runtime (and run.sh's `{v=$2} END{print v}`) does.
-        let toml = "[streaming]\nprotocol = \"alvr\"\n\n[tweaks]\nprotocol = \"oxrsys\"\n";
-        assert_eq!(effective_string(toml, "protocol"), "oxrsys");
-        let toml = "[a]\nencoder_process = \"inproc\"\n[b]\nencoder_process = \"native\"\n";
-        assert_eq!(effective_string(toml, "encoder_process"), "native");
-
-        // A trailing comment is stripped; a `#` inside the quoted value is not.
-        assert_eq!(
-            effective_string("protocol = \"alvr\" # was oxrsys\n", "protocol"),
-            "alvr"
-        );
-        assert_eq!(
-            effective_string("protocol = \"al#vr\"\n", "protocol"),
-            "al#vr"
-        );
-
-        // An unquoted value is the runtime's own reading — see the DIVERGENCE
-        // note on `effective_string`; `awk -F\'"\'` would capture nothing here.
-        assert_eq!(effective_string("protocol = alvr\n", "protocol"), "alvr");
-
-        assert_eq!(effective_string("", "protocol"), "");
-        assert_eq!(effective_string("[streaming]\n", "protocol"), "");
-    }
-
     /// The same file, read by this module and by the Settings view, must name
     /// the same backend — the bug was preflight validating `[streaming]`'s
     /// `alvr` while the runtime obeyed a later `oxrsys`.
@@ -1086,23 +1051,6 @@ mod tests {
         assert_eq!(read_toml_facts(&toml).encoder_process, "inproc");
 
         std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn encoder_mode_table() {
-        assert_eq!(encoder_mode("auto"), EncoderMode::HelperRequired);
-        assert_eq!(encoder_mode("native"), EncoderMode::HelperRequired);
-        assert_eq!(encoder_mode("inproc"), EncoderMode::Inproc);
-        assert_eq!(
-            encoder_mode("banana"),
-            EncoderMode::UnrecognizedTreatedAsAuto
-        );
-        assert!(EncoderMode::HelperRequired.needs_helper());
-        assert!(!EncoderMode::Inproc.needs_helper());
-        assert!(
-            EncoderMode::UnrecognizedTreatedAsAuto.needs_helper(),
-            "run.sh falls through to ensure_helper_staged for unknown values"
-        );
     }
 
     // ── fixtures ────────────────────────────────────────────────────────────
@@ -1448,6 +1396,11 @@ mod tests {
             }
         }
         assert!(f.auto_fixed().is_empty(), "nothing needed fixing");
+        assert!(
+            !f.lines().iter().any(|l| l.contains("unrecognized")),
+            "encoder_process=auto is a recognized value — no unrecognized-encoder warn: {:?}",
+            f.lines()
+        );
     }
 
     // ── the contract tripwire ───────────────────────────────────────────────
@@ -1794,10 +1747,11 @@ mod tests {
         );
     }
 
-    /// Neither a staged nor a built arm64 helper: `restage_helper` itself
-    /// dies, with run.sh's two-line `ensure_helper_staged` text.
+    /// Neither a staged nor a built arm64 helper: `restage_helper` itself dies
+    /// with run.sh's two-line `ensure_helper_staged` text, raising exactly one
+    /// `Fatal`, and the slug's Check row is emitted alongside it.
     #[tokio::test]
-    async fn an_unfixable_helper_dies_with_run_shs_ensure_helper_text() {
+    async fn an_unfixable_helper_dies_once_with_run_shs_ensure_helper_text_and_its_check_row() {
         let f = fixture("helper-unfixable", false);
         make_everything_pass(&f);
         std::fs::remove_file(&f.ctx.paths.oxr_helper_staged).unwrap();
@@ -1810,6 +1764,22 @@ mod tests {
             f.ctx.paths.oxr_helper_built.display()
         );
         assert_eq!(err.to_string(), want);
+        let rows = f.checks();
+        assert_eq!(
+            rows.iter()
+                .filter(|(s, _)| s == "build.helper-staged")
+                .count(),
+            1,
+            "the slug's row must still be emitted: {rows:?}"
+        );
+        assert_eq!(
+            f.events()
+                .iter()
+                .filter(|e| matches!(e, StageEvent::Fatal { .. }))
+                .count(),
+            1,
+            "the fix's own Fatal, not a second one"
+        );
     }
 
     /// A2/A7-2 regression: `[streaming] protocol = "alvr"` shadowed by a later
@@ -1862,6 +1832,11 @@ mod tests {
         for slug in HELPER_SLUGS {
             assert_eq!(f.check(slug).unwrap().status, CheckStatus::Pass, "{slug}");
         }
+        assert!(
+            !f.lines().iter().any(|l| l.contains("unrecognized")),
+            "encoder_process=native is a recognized value — no unrecognized-encoder warn: {:?}",
+            f.lines()
+        );
     }
 
     /// A7-1/A3b-1: a valid assignment shadowed by a later INVALID one is the
@@ -2045,39 +2020,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&conf).unwrap(),
             "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n"
-        );
-    }
-
-    /// The other error shape: the fix raised its own `Fatal` (run.sh's
-    /// `ensure_helper_staged` text). That Fatal is not duplicated, and the
-    /// slug's Check is emitted alongside it.
-    #[tokio::test]
-    async fn a_helper_autofix_fatal_is_reported_once_with_its_check_row() {
-        let f = fixture("helper-fatal-row", false);
-        make_everything_pass(&f);
-        std::fs::remove_file(&f.ctx.paths.oxr_helper_staged).unwrap();
-
-        let err = run(&f.ctx).await.unwrap_err();
-        assert!(
-            err.to_string()
-                .starts_with("encoder_process=auto needs the arm64 helper"),
-            "{err}"
-        );
-        let rows = f.checks();
-        assert_eq!(
-            rows.iter()
-                .filter(|(s, _)| s == "build.helper-staged")
-                .count(),
-            1,
-            "the slug's row must still be emitted: {rows:?}"
-        );
-        assert_eq!(
-            f.events()
-                .iter()
-                .filter(|e| matches!(e, StageEvent::Fatal { .. }))
-                .count(),
-            1,
-            "the fix's own Fatal, not a second one"
         );
     }
 

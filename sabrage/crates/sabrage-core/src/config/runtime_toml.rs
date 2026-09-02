@@ -2610,7 +2610,46 @@ mod tests {
             Some("'alvr'".to_string()),
             "literal quotes stay on, so the caller's whitelist rejects them"
         );
+        assert_eq!(
+            effective_string(
+                "  protocol = \"alvr\"\nencoder_process=\"native\"\n",
+                "protocol"
+            ),
+            Some("alvr".to_string()),
+            "an indented assignment is still an assignment"
+        );
+        assert_eq!(
+            effective_string(
+                "  protocol = \"alvr\"\nencoder_process=\"native\"\n",
+                "encoder_process"
+            ),
+            Some("native".to_string()),
+            "no spaces around `=`, and each key answers only for itself"
+        );
+        assert_eq!(
+            effective_string(
+                "protocol_foo = \"x\"\n# protocol = \"alvr\"\nprotocol = \"oxrsys\"\n",
+                "protocol"
+            ),
+            Some("oxrsys".to_string()),
+            "`protocol_foo` is a different key and a commented line is no assignment"
+        );
+        assert_eq!(
+            effective_string("protocol = \"al#vr\"\n", "protocol"),
+            Some("al#vr".to_string()),
+            "a `#` inside the quoted value is part of the value"
+        );
+        assert_eq!(
+            effective_string("protocol = alvr\n", "protocol"),
+            Some("alvr".to_string()),
+            "an unquoted value is read as-is, where run.sh's `awk -F'\"'` captures nothing"
+        );
         assert_eq!(effective_string("[streaming]\n", "protocol"), None);
+        assert_eq!(
+            effective_string("", "protocol"),
+            None,
+            "an empty file assigns nothing"
+        );
         assert_eq!(
             effective_string("# protocol = \"alvr\"\n", "protocol"),
             None,
