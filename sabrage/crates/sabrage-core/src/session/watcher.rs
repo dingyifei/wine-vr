@@ -1082,7 +1082,7 @@ mod tests {
             // (a) older than the session, (b) and (c) written after it started, (d) no timestamp at all.
             for (row, line, want_codec) in [
                 (
-                    "a line from before this session started",
+                    "r1:A9-6 regression: a line from before this session started is never published as this session's chip",
                     log_line(
                         crate::session::now_unix_ms() - 3_600_000,
                         "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
@@ -1098,7 +1098,7 @@ mod tests {
                     Some("H.264"),
                 ),
                 (
-                    "r1:A9-6 regression: a session that predates the monitor keeps the chip it negotiated",
+                    "the fix must not over-correct: a session that predates the monitor keeps the chip it negotiated",
                     log_line(
                         crate::session::now_unix_ms() - 4_000,
                         "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",

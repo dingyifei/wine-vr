@@ -1590,8 +1590,8 @@ mod tests {
         (ctx, seen)
     }
 
-    /// The other side of the bound: a flush that never lands still warns —
-    /// once — and the stage still succeeds (Warn, never Fail).
+    /// A `system.reg` flush that never lands: the wait times out, the stage
+    /// warns exactly once and still succeeds (Warn, never Fail).
     #[tokio::test]
     async fn a_system_reg_that_never_flushes_warns_once_and_still_succeeds() {
         let (ctx, seen) = real_seeming_fixture();

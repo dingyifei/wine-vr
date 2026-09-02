@@ -2526,7 +2526,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The one test with a real executor. It is deliberately shaped so that no
+    /// The one `restore_with` test with a real executor. It is deliberately shaped so that no
     /// child can be spawned: the only pending guard is the audio device, and
     /// the probe reports it is already back — so the whole run is a flag flip
     /// plus one atomic write into the fixture directory.
