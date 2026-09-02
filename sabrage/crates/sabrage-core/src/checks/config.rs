@@ -434,68 +434,6 @@ mod tests {
         assert_eq!(legacy.status, CheckStatus::Skipped);
     }
 
-    #[test]
-    fn alvr_protocol_passes_both_slugs() {
-        let tmp = scratch("alvr");
-        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
-        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
-        fs::write(&toml_path, "protocol = \"alvr\"\n").unwrap();
-        let ctx = ctx_with_toml(&tmp, toml_path);
-
-        assert_eq!(cfg_protocol_supported(&ctx).status, CheckStatus::Pass);
-        assert_eq!(cfg_protocol_legacy_oxrsys(&ctx).status, CheckStatus::Pass);
-        fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn oxrsys_protocol_passes_supported_and_fails_legacy() {
-        let tmp = scratch("oxrsys");
-        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
-        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
-        fs::write(&toml_path, "protocol = \"oxrsys\"\n").unwrap();
-        let ctx = ctx_with_toml(&tmp, toml_path.clone());
-
-        assert_eq!(cfg_protocol_supported(&ctx).status, CheckStatus::Pass);
-
-        let legacy = cfg_protocol_legacy_oxrsys(&ctx);
-        assert_eq!(legacy.status, CheckStatus::Fail);
-        assert_eq!(
-            legacy.message,
-            "oxrsys-runtime.toml protocol='oxrsys' — the demo streams via ALVR"
-        );
-        assert_eq!(
-            legacy.remedy.as_deref(),
-            Some(format!("set protocol = \"alvr\" in {}", toml_path.display()).as_str())
-        );
-        fs::remove_dir_all(&tmp).ok();
-    }
-
-    #[test]
-    fn garbage_protocol_fails_supported_and_skips_legacy() {
-        let tmp = scratch("garbage");
-        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
-        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
-        fs::write(&toml_path, "protocol = \"legacy_usb\"\n").unwrap();
-        let ctx = ctx_with_toml(&tmp, toml_path.clone());
-
-        let supported = cfg_protocol_supported(&ctx);
-        assert_eq!(supported.status, CheckStatus::Fail);
-        assert_eq!(
-            supported.message,
-            "oxrsys-runtime.toml protocol='legacy_usb' — the demo streams via ALVR"
-        );
-        assert_eq!(
-            supported.remedy.as_deref(),
-            Some(format!("set protocol = \"alvr\" in {}", toml_path.display()).as_str())
-        );
-
-        assert_eq!(
-            cfg_protocol_legacy_oxrsys(&ctx).status,
-            CheckStatus::Skipped
-        );
-        fs::remove_dir_all(&tmp).ok();
-    }
-
     /// A3b-1 regression: `protocol = "alvr"` shadowed by a later
     /// `[streaming] protocol = "oxrsys"` must resolve like the runtime (last
     /// assignment wins, table-blind) — Fail on `cfg.protocol.legacy-oxrsys`,
@@ -527,23 +465,95 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
-    /// Same fixture, reverse assignment order: `oxrsys` shadowed by a later
-    /// `alvr` resolves to Pass on both slugs.
+    /// The `cfg.protocol.supported` / `cfg.protocol.legacy-oxrsys` pair for the
+    /// `oxrsys-runtime.toml` bodies that differ only in the protocol value
+    /// doctor.sh's last-match `awk` resolves to. `{toml}` in an expected remedy
+    /// is the row's own scratch toml path. Two cases keep their own functions:
+    /// the absent file (`missing_toml_fails_supported_and_skips_legacy`, which
+    /// writes no toml at all) and the A3b-1 regression
+    /// (`shadowed_protocol_alvr_then_oxrsys_resolves_to_the_last_assignment`).
     #[test]
-    fn shadowed_protocol_oxrsys_then_alvr_resolves_to_the_last_assignment() {
-        let tmp = scratch("shadowed-oxrsys-then-alvr");
-        let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
-        fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
-        fs::write(
-            &toml_path,
-            "[streaming]\nprotocol = \"oxrsys\"\nprotocol = \"alvr\"\n",
-        )
-        .unwrap();
-        let ctx = ctx_with_toml(&tmp, toml_path);
+    fn config_protocol_state_matrix() {
+        // (status, message, remedy) expected from one evaluator.
+        type Expected = (CheckStatus, &'static str, Option<&'static str>);
+        let cases: &[(&str, &str, Expected, Expected)] = &[
+            (
+                "alvr",
+                "protocol = \"alvr\"\n",
+                (CheckStatus::Pass, "oxrsys-runtime.toml: protocol=alvr", None),
+                (
+                    CheckStatus::Pass,
+                    "oxrsys-runtime.toml: protocol=alvr (not the legacy oxrsys path)",
+                    None,
+                ),
+            ),
+            (
+                "oxrsys",
+                "protocol = \"oxrsys\"\n",
+                (
+                    CheckStatus::Pass,
+                    "oxrsys-runtime.toml: protocol=oxrsys (supported; see cfg.protocol.legacy-oxrsys)",
+                    None,
+                ),
+                (
+                    CheckStatus::Fail,
+                    "oxrsys-runtime.toml protocol='oxrsys' — the demo streams via ALVR",
+                    Some("set protocol = \"alvr\" in {toml}"),
+                ),
+            ),
+            (
+                "legacy_usb-unsupported",
+                "protocol = \"legacy_usb\"\n",
+                (
+                    CheckStatus::Fail,
+                    "oxrsys-runtime.toml protocol='legacy_usb' — the demo streams via ALVR",
+                    Some("set protocol = \"alvr\" in {toml}"),
+                ),
+                (
+                    CheckStatus::Skipped,
+                    "protocol is neither alvr nor oxrsys — see cfg.protocol.supported",
+                    None,
+                ),
+            ),
+            (
+                "shadowed-oxrsys-then-alvr",
+                "[streaming]\nprotocol = \"oxrsys\"\nprotocol = \"alvr\"\n",
+                (CheckStatus::Pass, "oxrsys-runtime.toml: protocol=alvr", None),
+                (
+                    CheckStatus::Pass,
+                    "oxrsys-runtime.toml: protocol=alvr (not the legacy oxrsys path)",
+                    None,
+                ),
+            ),
+        ];
 
-        assert_eq!(cfg_protocol_supported(&ctx).status, CheckStatus::Pass);
-        assert_eq!(cfg_protocol_legacy_oxrsys(&ctx).status, CheckStatus::Pass);
-        fs::remove_dir_all(&tmp).ok();
+        for (label, toml_text, supported, legacy) in cases {
+            let tmp = scratch(label);
+            // Removed at entry as well as exit (3.8): a row that panicked on an
+            // earlier run leaves its directory behind.
+            fs::remove_dir_all(&tmp).ok();
+            let toml_path = tmp.join("OXRSys/oxrsys-runtime.toml");
+            fs::create_dir_all(toml_path.parent().unwrap()).unwrap();
+            fs::write(&toml_path, toml_text.as_bytes()).unwrap();
+            let ctx = ctx_with_toml(&tmp, toml_path.clone());
+            let shown = toml_path.display().to_string();
+            let remedy = |r: Option<&str>| r.map(|s| s.replace("{toml}", &shown));
+
+            let got = cfg_protocol_supported(&ctx);
+            assert_eq!(
+                (got.status, got.message, got.remedy),
+                (supported.0, supported.1.to_string(), remedy(supported.2)),
+                "row {label}: cfg.protocol.supported"
+            );
+
+            let got = cfg_protocol_legacy_oxrsys(&ctx);
+            assert_eq!(
+                (got.status, got.message, got.remedy),
+                (legacy.0, legacy.1.to_string(), remedy(legacy.2)),
+                "row {label}: cfg.protocol.legacy-oxrsys"
+            );
+            fs::remove_dir_all(&tmp).ok();
+        }
     }
 
     // ── cfg.session-pins ─────────────────────────────────────────────────────
@@ -648,17 +658,9 @@ mod tests {
         geteuid()
     }
 
-    #[test]
-    fn no_client_connections_key_is_clean() {
-        let tmp = scratch("session-no-cc");
-        let sessjson = tmp.join("OXRSys/alvr/session.json");
-        fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
-        fs::write(&sessjson, b"{}").unwrap();
-        let ctx = ctx_with_session(&tmp, sessjson);
-        assert_eq!(cfg_session_pins(&ctx).status, CheckStatus::Pass);
-        fs::remove_dir_all(&tmp).ok();
-    }
-
+    /// The only fixture whose `manual_ips` is present but falsy: it is the sole
+    /// killer of the `json_falsy` guard on the per-entry `manual_ips` match, so
+    /// it stays out of `session_json_shape_matrix`.
     #[test]
     fn empty_manual_ips_is_clean() {
         let tmp = scratch("session-empty-ips");
@@ -717,36 +719,55 @@ mod tests {
         fs::remove_dir_all(&tmp).ok();
     }
 
+    /// `cfg.session-pins` for the session.json bodies whose shape alone decides
+    /// the verdict. `{session}` in an expected message is the row's own scratch
+    /// session.json path. The missing, unreadable and malformed files, the
+    /// bodies that do carry pins, and the present-but-falsy `manual_ips` body
+    /// (`empty_manual_ips_is_clean`) keep their own functions: their setup,
+    /// their assertions or the mutants they alone kill differ.
     #[test]
-    fn non_object_top_level_is_corrupt() {
-        let tmp = scratch("session-corrupt-top");
-        let sessjson = tmp.join("OXRSys/alvr/session.json");
-        fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
-        fs::write(&sessjson, b"[1,2,3]").unwrap();
-        let ctx = ctx_with_session(&tmp, sessjson.clone());
-        let o = cfg_session_pins(&ctx);
-        assert_eq!(o.status, CheckStatus::Warn);
-        assert_eq!(
-            o.message,
-            format!("could not inspect {} (broken python3?)", sessjson.display())
-        );
-        fs::remove_dir_all(&tmp).ok();
-    }
+    fn session_json_shape_matrix() {
+        let cases: &[(&str, &str, CheckStatus, &str)] = &[
+            (
+                "missing-client-connections",
+                "{}",
+                CheckStatus::Pass,
+                "ALVR session state has no stale manual-IP pins",
+            ),
+            (
+                "non-object-top-level",
+                "[1,2,3]",
+                CheckStatus::Warn,
+                "could not inspect {session} (broken python3?)",
+            ),
+            (
+                "non-object-client-entry",
+                r#"{"client_connections":{"Quest 3":"not-an-object"}}"#,
+                CheckStatus::Warn,
+                "could not inspect {session} (broken python3?)",
+            ),
+        ];
 
-    #[test]
-    fn non_dict_client_connections_entry_is_corrupt() {
-        let tmp = scratch("session-corrupt-entry");
-        let sessjson = tmp.join("OXRSys/alvr/session.json");
-        fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
-        fs::write(
-            &sessjson,
-            br#"{"client_connections":{"Quest 3":"not-an-object"}}"#,
-        )
-        .unwrap();
-        let ctx = ctx_with_session(&tmp, sessjson.clone());
-        let o = cfg_session_pins(&ctx);
-        assert_eq!(o.status, CheckStatus::Warn);
-        assert!(o.message.starts_with("could not inspect "));
-        fs::remove_dir_all(&tmp).ok();
+        for (label, json, status, message) in cases {
+            let tmp = scratch(label);
+            // Removed at entry as well as exit (3.8): a row that panicked on an
+            // earlier run leaves its directory behind.
+            fs::remove_dir_all(&tmp).ok();
+            let sessjson = tmp.join("OXRSys/alvr/session.json");
+            fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
+            fs::write(&sessjson, json.as_bytes()).unwrap();
+            let ctx = ctx_with_session(&tmp, sessjson.clone());
+
+            let o = cfg_session_pins(&ctx);
+            assert_eq!(
+                (o.status, o.message),
+                (
+                    *status,
+                    message.replace("{session}", &sessjson.display().to_string())
+                ),
+                "row {label}"
+            );
+            fs::remove_dir_all(&tmp).ok();
+        }
     }
 }
