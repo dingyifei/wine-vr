@@ -564,98 +564,111 @@ mod tests {
             scan_doctor_slugs(fixture).order
         }
 
+        /// A `#` starts a comment only when it begins a word outside quotes;
+        /// everything before such a `#` is still live shell, and a `#` inside
+        /// an expansion or a quoted string is not one at all.
         #[test]
-        fn a_commented_out_chk_line_contributes_no_slug() {
-            let live = "# 5. rust\nchk ok rust.x64-target \"ok\"\n";
-            let commented = "# 5. rust\n#chk ok rust.x64-target \"ok\"\n";
-            let indented = "# 5. rust\n  # chk ok rust.x64-target \"ok\"\n";
-            assert_eq!(slugs_of(live), vec!["rust.x64-target".to_string()]);
-            assert!(slugs_of(commented).is_empty());
-            assert!(slugs_of(indented).is_empty());
+        fn a_hash_starts_a_comment_only_when_it_begins_an_unquoted_word() {
+            let cases: &[(&str, &str, &[&str])] = &[
+                (
+                    "live chk line",
+                    "# 5. rust\nchk ok rust.x64-target \"ok\"\n",
+                    &["rust.x64-target"],
+                ),
+                (
+                    "r1:A1-7 regression: a full-line #-comment contributes no slug",
+                    "# 5. rust\n#chk ok rust.x64-target \"ok\"\n",
+                    &[],
+                ),
+                (
+                    "r1:A1-7 regression: an indented #-comment contributes no slug",
+                    "# 5. rust\n  # chk ok rust.x64-target \"ok\"\n",
+                    &[],
+                ),
+                (
+                    "a trailing comment does not hide the call before it",
+                    "# 5. rust\nchk ok rust.x64-target \"ok\"  # trailing note\n",
+                    &["rust.x64-target"],
+                ),
+                (
+                    "a hash inside a parameter expansion or a quoted string is not a comment",
+                    "# 9. build\nchk ok build.oxr-dylib \"built: ${_f#$ROOT/} # not a comment\"; chk ok build.woxr-dll \"ok\"\n",
+                    &["build.oxr-dylib", "build.woxr-dll"],
+                ),
+            ];
+            for (label, fixture, expected) in cases {
+                let slugs = slugs_of(fixture);
+                let got: Vec<&str> = slugs.iter().map(String::as_str).collect();
+                assert_eq!(&got[..], *expected, "{label}");
+            }
         }
 
+        /// A loop header's slugs are credited only when the body emits a
+        /// `chk`/`tap` that carries the loop item itself; any other body shape
+        /// leaves the header as a `header_only_loops` entry instead.
         #[test]
-        fn a_trailing_comment_does_not_hide_the_call_before_it() {
-            let fixture = "# 5. rust\nchk ok rust.x64-target \"ok\"  # trailing note\n";
-            assert_eq!(slugs_of(fixture), vec!["rust.x64-target".to_string()]);
-        }
-
-        #[test]
-        fn a_hash_inside_a_parameter_expansion_or_a_string_is_not_a_comment() {
-            let fixture =
-                "# 9. build\nchk ok build.oxr-dylib \"built: ${_f#$ROOT/} # not a comment\"\n";
-            assert_eq!(slugs_of(fixture), vec!["build.oxr-dylib".to_string()]);
-        }
-
-        #[test]
-        fn a_loop_header_whose_body_emits_nothing_covers_no_slug() {
-            let covered = "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  \
-                           chk ok ${_t%%:*} \"${_t#*:}\"\ndone\n";
-            let gutted = "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  \
-                          command -v ${_t#*:} >/dev/null\ndone\n";
-            assert_eq!(
-                slugs_of(covered),
-                vec!["tool.cmake".to_string(), "tool.ninja".to_string()]
-            );
-            let scan = scan_doctor_slugs(gutted);
-            assert!(scan.order.is_empty(), "{:?}", scan.order);
-            assert_eq!(scan.header_only_loops.len(), 1);
-        }
-
-        #[test]
-        fn a_loop_that_extracts_the_slug_into_a_variable_still_counts() {
-            // Section 10's shape: `_slug="${_o%%:*}"` then `chk ok "$_slug" …`.
-            let fixture = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
-                           _slug=\"${_o%%:*}\"\n  chk ok \"$_slug\" \"current\"\ndone\n";
-            assert_eq!(slugs_of(fixture), vec!["overlay.woxr-dll".to_string()]);
-        }
-
-        /// Round-1 finding A1-7: keeping the extraction line and an unrelated
-        /// emission, while deleting the per-item `chk`, must NOT credit the
-        /// header's slugs — the call has to carry the loop item itself.
-        #[test]
-        fn an_unrelated_emission_in_the_loop_body_credits_nothing() {
-            let gutted =
-                "# 10. overlay\nfor _o in overlay.woxr-dll:a:b overlay.woxr-so:c:d; do\n  \
-                          _slug=\"${_o%%:*}\"\n  tap net.ports ok\ndone\n";
-            let scan = scan_doctor_slugs(gutted);
-            assert_eq!(
-                scan.order,
-                vec!["net.ports".to_string()],
-                "only the unrelated static emission is real"
-            );
-            assert_eq!(scan.header_only_loops.len(), 1, "{:?}", scan.order);
-
-            // Same shape, but with the extraction inline in the argument of an
-            // emission for a *different* slug.
-            let decoy = "# 4. toolchain\nfor _t in tool.cmake:cmake; do\n  \
-                         chk ok rust.x64-target \"${_t#*:}\"\n  echo \"${_t%%:*}\"\ndone\n";
-            let scan = scan_doctor_slugs(decoy);
-            assert_eq!(scan.order, vec!["rust.x64-target".to_string()]);
-            assert_eq!(scan.header_only_loops.len(), 1);
-        }
-
-        /// The same line may both extract and emit; and a variable holding
-        /// some *other* part of the loop item (`${_o#*:}`, the value half) is
-        /// not a slug carrier.
-        #[test]
-        fn only_a_call_carrying_the_slug_counts() {
-            let same_line = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
-                             _slug=\"${_o%%:*}\"; chk ok \"$_slug\" \"current\"\ndone\n";
-            assert_eq!(slugs_of(same_line), vec!["overlay.woxr-dll".to_string()]);
-
-            let value_half = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
-                              _pair=\"${_o#*:}\"\n  chk ok \"$_pair\" \"current\"\ndone\n";
-            let scan = scan_doctor_slugs(value_half);
-            assert!(scan.order.is_empty(), "{:?}", scan.order);
-            assert_eq!(scan.header_only_loops.len(), 1);
-
-            // A near-miss variable name must not be mistaken for the carrier.
-            let near_miss = "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  \
-                             _slug=\"${_o%%:*}\"\n  chk ok \"$_slugx\" \"current\"\ndone\n";
-            let scan = scan_doctor_slugs(near_miss);
-            assert!(scan.order.is_empty(), "{:?}", scan.order);
-            assert_eq!(scan.header_only_loops.len(), 1);
+        fn a_loop_credits_its_header_slugs_only_when_the_body_emits_for_them() {
+            let cases: &[(&str, &str, &[&str], usize)] = &[
+                (
+                    "covered loop: inline ${_t%%:*} in the chk argument",
+                    "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  chk ok ${_t%%:*} \"${_t#*:}\"\ndone\n",
+                    &["tool.cmake", "tool.ninja"],
+                    0,
+                ),
+                (
+                    "r1:A1-7 regression: a loop header whose body emits nothing covers no slug",
+                    "# 4. toolchain\nfor _t in tool.cmake:cmake tool.ninja:ninja; do\n  command -v ${_t#*:} >/dev/null\ndone\n",
+                    &[],
+                    1,
+                ),
+                (
+                    "section 10's shape: `_slug=\"${_o%%:*}\"` on its own line, then `chk ok \"$_slug\" …`",
+                    "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  _slug=\"${_o%%:*}\"\n  chk ok \"$_slug\" \"current\"\ndone\n",
+                    &["overlay.woxr-dll"],
+                    0,
+                ),
+                (
+                    "A1-7 / r2:A1-6 regression: extraction line kept and the per-item chk deleted — only the unrelated static emission is real",
+                    "# 10. overlay\nfor _o in overlay.woxr-dll:a:b overlay.woxr-so:c:d; do\n  _slug=\"${_o%%:*}\"\n  tap net.ports ok\ndone\n",
+                    &["net.ports"],
+                    1,
+                ),
+                (
+                    "same shape, but with the extraction inline in the argument of an emission for a *different* slug",
+                    "# 4. toolchain\nfor _t in tool.cmake:cmake; do\n  chk ok rust.x64-target \"${_t#*:}\"\n  echo \"${_t%%:*}\"\ndone\n",
+                    &["rust.x64-target"],
+                    1,
+                ),
+                (
+                    "the same line may both extract and emit",
+                    "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  _slug=\"${_o%%:*}\"; chk ok \"$_slug\" \"current\"\ndone\n",
+                    &["overlay.woxr-dll"],
+                    0,
+                ),
+                (
+                    "a variable holding the value half `${_o#*:}` is not a slug carrier",
+                    "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  _pair=\"${_o#*:}\"\n  chk ok \"$_pair\" \"current\"\ndone\n",
+                    &[],
+                    1,
+                ),
+                (
+                    "near miss: `$_slugx` is not the carrier variable `$_slug` — carriers match whole variable names",
+                    "# 10. overlay\nfor _o in overlay.woxr-dll:a:b; do\n  _slug=\"${_o%%:*}\"\n  chk ok \"$_slugx\" \"current\"\ndone\n",
+                    &[],
+                    1,
+                ),
+            ];
+            for (label, fixture, expected_order, expected_header_only) in cases {
+                let scan = scan_doctor_slugs(fixture);
+                let order: Vec<&str> = scan.order.iter().map(String::as_str).collect();
+                assert_eq!(&order[..], *expected_order, "{label}");
+                assert_eq!(
+                    scan.header_only_loops.len(),
+                    *expected_header_only,
+                    "{label}: {:?}",
+                    scan.header_only_loops
+                );
+            }
         }
 
         #[test]
