@@ -280,27 +280,32 @@ mod tests {
     // ── pure parsing ─────────────────────────────────────────────────────────
 
     #[test]
-    fn parse_forward_list_splits_serial_and_local() {
-        let rows = parse_forward_list(
-            "192.168.1.5:5555 tcp:9943 tcp:9943\n192.168.1.5:5555 tcp:9944 tcp:9944\n",
-        );
-        assert_eq!(
-            rows,
-            vec![
-                ("192.168.1.5:5555".to_string(), "tcp:9943".to_string()),
-                ("192.168.1.5:5555".to_string(), "tcp:9944".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn parse_forward_list_ignores_blank_and_short_lines() {
-        assert_eq!(parse_forward_list(""), Vec::<(String, String)>::new());
-        assert_eq!(parse_forward_list("\n\n"), Vec::<(String, String)>::new());
-        assert_eq!(
-            parse_forward_list("onlyone\nser tcp:1 tcp:2\n"),
-            vec![("ser".to_string(), "tcp:1".to_string())]
-        );
+    fn parse_forward_list_takes_serial_and_local_and_skips_unusable_lines() {
+        type Expected = &'static [(&'static str, &'static str)];
+        let cases: &[(&str, &str, Expected)] = &[
+            (
+                "serial and local kept, the remote field dropped",
+                "192.168.1.5:5555 tcp:9943 tcp:9943\n192.168.1.5:5555 tcp:9944 tcp:9944\n",
+                &[
+                    ("192.168.1.5:5555", "tcp:9943"),
+                    ("192.168.1.5:5555", "tcp:9944"),
+                ],
+            ),
+            ("empty input", "", &[]),
+            ("blank lines only", "\n\n", &[]),
+            (
+                "short line is skipped, the next row still parses",
+                "onlyone\nser tcp:1 tcp:2\n",
+                &[("ser", "tcp:1")],
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let expected: Vec<(String, String)> = expected
+                .iter()
+                .map(|(serial, local)| ((*serial).to_string(), (*local).to_string()))
+                .collect();
+            assert_eq!(parse_forward_list(input), expected, "{label}");
+        }
     }
 
     // ── remove_adb_forwards (the async fix) ─────────────────────────────────
