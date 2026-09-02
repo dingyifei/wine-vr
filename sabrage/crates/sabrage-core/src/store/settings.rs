@@ -269,22 +269,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn unknown_fields_load_into_extra_instead_of_failing() {
-        let dir = scratch("unknown-fields");
-        let path = dir.join("settings.json");
-        std::fs::write(
-            &path,
-            r#"{"repoRoot":"/repo","futureField":{"nested":true},"anotherOne":42}"#,
-        )
-        .unwrap();
-        let s = load(&path).unwrap();
-        assert_eq!(s.repo_root.as_deref(), Some("/repo"));
-        assert_eq!(s.extra.len(), 2, "{:?}", s.extra);
-        assert_eq!(s.extra["anotherOne"], serde_json::json!(42));
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[tokio::test]
     async fn unknown_fields_survive_a_load_save_round_trip() {
         // The downgrade case: an older binary loads a newer file, the user
@@ -298,12 +282,16 @@ mod tests {
         .unwrap();
 
         let mut s = load(&path).unwrap();
+        assert_eq!(
+            s.version, SETTINGS_VERSION,
+            "a file with no `version` key reads as the current one"
+        );
+        assert_eq!(s.repo_root.as_deref(), Some("/repo"));
+        assert_eq!(s.extra.len(), 2, "{:?}", s.extra);
+        assert_eq!(s.extra["futureFlag"], serde_json::json!(false));
         s.allow_adb_probes = false; // the one control the old build knows
         save(&real(), &path, &s).await.unwrap();
 
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"futureSetting\""), "{text}");
-        assert!(text.contains("\"futureFlag\""), "{text}");
         let reread = load(&path).unwrap();
         assert!(!reread.allow_adb_probes);
         assert_eq!(reread.extra, s.extra);
@@ -375,13 +363,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    #[test]
-    fn a_file_without_a_version_reads_as_the_current_one() {
-        let s: Settings = serde_json::from_str(r#"{"repoRoot":"/repo"}"#).unwrap();
-        assert_eq!(s.version, SETTINGS_VERSION);
-        assert!(s.extra.is_empty());
-    }
-
     #[tokio::test]
     async fn an_ordinary_settings_file_carries_no_extra_keys() {
         let dir = scratch("no-extra");
@@ -389,19 +370,25 @@ mod tests {
         save(&real(), &path, &Settings::default()).await.unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
-        let keys: Vec<&String> = parsed.as_object().unwrap().keys().collect();
+        let obj = parsed.as_object().unwrap();
+        for key in [
+            "version",
+            "repoRoot",
+            "defaultBottle",
+            "defaultBsDir",
+            "launch",
+            "allowAdbProbes",
+            "runtimeConfigEditAcknowledged",
+        ] {
+            assert!(
+                obj.contains_key(key),
+                "a defaults-only file must still carry `{key}`: {text}"
+            );
+        }
         assert_eq!(
-            keys,
-            vec![
-                "version",
-                "repoRoot",
-                "defaultBottle",
-                "defaultBsDir",
-                "launch",
-                "allowAdbProbes",
-                "runtimeConfigEditAcknowledged"
-            ],
-            "an empty `extra` must add nothing to the file"
+            obj.len(),
+            7,
+            "an empty `extra` must add nothing to the file: {text}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
