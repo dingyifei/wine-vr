@@ -1775,22 +1775,6 @@ mod tests {
 
     // ── rule 6: identity ─────────────────────────────────────────────────────
 
-    #[test]
-    fn an_empty_patch_is_the_identity_on_the_deployed_file() {
-        let text = deployed();
-        let out = apply_patch(&text, &RuntimeConfigPatch::default()).unwrap();
-        assert_eq!(out.text, text, "empty patch must be byte-identical");
-        assert!(out.changed_keys.is_empty());
-        assert!(out.shadowed.is_empty());
-    }
-
-    #[test]
-    fn the_shared_template_round_trips_unchanged() {
-        let text = crate::util::toml_template();
-        let out = apply_patch(text, &RuntimeConfigPatch::default()).unwrap();
-        assert_eq!(out.text, text);
-    }
-
     /// Re-setting every key to what the file already says must not move a byte —
     /// this is what makes "Save with nothing dirty writes nothing" true even
     /// when the UI sends the whole value set.
@@ -1806,20 +1790,30 @@ mod tests {
     /// Regression: `toml_edit` normalises CRLF to LF, drops a BOM and appends a
     /// missing final newline, so a re-render is NOT the identity on a file that
     /// is not already LF + newline-terminated. An empty patch must never go
-    /// through the renderer at all.
+    /// through the renderer at all — not for those shapes, and not for the
+    /// deployed file or the shared template, which must come back byte-for-byte
+    /// too.
     #[test]
-    fn an_empty_patch_is_the_identity_on_text_toml_edit_would_normalise() {
-        for text in [
-            // no trailing newline
-            "[streaming]\nbitrate_mbps = 42",
-            // CRLF throughout
-            "# hdr\r\n[streaming]\r\nprotocol = \"alvr\"\r\nbitrate_mbps = 42\r\n",
-            // leading BOM
-            "\u{feff}[streaming]\nbitrate_mbps = 42\n",
+    fn an_empty_patch_is_the_identity_on_every_input_shape() {
+        let deployed_text = deployed();
+        for (label, text) in [
+            ("no trailing newline", "[streaming]\nbitrate_mbps = 42"),
+            (
+                "crlf throughout",
+                "# hdr\r\n[streaming]\r\nprotocol = \"alvr\"\r\nbitrate_mbps = 42\r\n",
+            ),
+            ("leading bom", "\u{feff}[streaming]\nbitrate_mbps = 42\n"),
+            ("deployed", deployed_text.as_str()),
+            ("shared-template", crate::util::toml_template()),
         ] {
             let out = apply_patch(text, &RuntimeConfigPatch::default()).unwrap();
-            assert_eq!(out.text, text, "empty patch rewrote {text:?}");
-            assert!(out.changed_keys.is_empty());
+            assert_eq!(out.text, text, "{label}: empty patch rewrote {text:?}");
+            assert!(
+                out.changed_keys.is_empty(),
+                "{label}: {:?}",
+                out.changed_keys
+            );
+            assert!(out.shadowed.is_empty(), "{label}: {:?}", out.shadowed);
         }
     }
 
@@ -2003,20 +1997,8 @@ mod tests {
     #[test]
     fn an_absent_key_is_inserted_under_streaming_after_its_last_key() {
         let text = deployed();
-        let out = apply_patch(
-            &text,
-            &RuntimeConfigPatch {
-                video_codec: None,
-                bitrate_mbps: None,
-                ..RuntimeConfigPatch::default()
-            },
-        )
-        .unwrap();
-        assert_eq!(out.text, text, "guard: that patch is empty");
-
         // `abr_mode` is not editable; use a key the deployed file lacks.
         let stripped = text.replace("refresh_rate_hz = 90\n", "");
-        assert!(!stripped.contains("refresh_rate_hz"));
         let out = apply_patch(
             &stripped,
             &RuntimeConfigPatch {
@@ -3316,7 +3298,10 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("beatsaber"), "{err}");
-        assert!(err.contains("./demo.sh stop"), "{err}");
+        // The Settings screen renders this string verbatim: one wrapped literal
+        // with the bottle spliced into the remedy, no 10-space craters in it.
+        assert!(err.contains("./demo.sh stop --bottle beatsaber"), "{err}");
+        assert!(!err.contains("  "), "double space in: {err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), deployed());
         assert_eq!(
             std::fs::metadata(&path).unwrap().modified().unwrap(),
@@ -3364,22 +3349,6 @@ mod tests {
         assert!(err.contains("./demo.sh stop --bottle <name>"), "{err}");
         assert_eq!(std::fs::read_to_string(&path).unwrap(), deployed());
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// The refusal is one wrapped literal, not a paragraph with 10-space
-    /// craters in it: the Settings screen renders this string verbatim.
-    #[test]
-    fn the_live_session_refusal_reads_as_prose() {
-        let msg = live_session_refusal(
-            Path::new("/tmp/oxrsys-runtime.toml"),
-            &SessionBlock {
-                reason: "a session for bottle 'Steam' is still running (wine pid 42)".into(),
-                bottle: Some("Steam".into()),
-            },
-        )
-        .to_string();
-        assert!(!msg.contains("  "), "double space in: {msg}");
-        assert!(msg.contains("./demo.sh stop --bottle Steam"), "{msg}");
     }
 
     /// The guard has to be about the *machine*, not this process: a session the
