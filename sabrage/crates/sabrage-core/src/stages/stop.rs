@@ -1015,26 +1015,6 @@ mod tests {
     // ── argv-based survivor matcher (finding #8) ─────────────────────────────
 
     #[test]
-    fn finds_by_cmdline_using_this_test_binarys_own_argv() {
-        let exe = std::env::current_exe().expect("test binary path");
-        let name = exe
-            .file_name()
-            .and_then(|n| n.to_str())
-            .expect("utf8 test binary name");
-        // A short, distinctive suffix of the real binary name, not the whole
-        // path — proving this is a *substring-of-cmdline* match, unlike
-        // `find_processes_by_exe`'s exact-path equality.
-        let needle = &name[name.len().saturating_sub(6)..];
-        let found = process::find_processes_by_cmdline(needle);
-        let me = std::process::id();
-        assert!(
-            found.iter().any(|p| p.pid == me),
-            "own pid {me} not found by cmdline needle {needle:?} among {found:?}"
-        );
-        assert!(process::find_processes_by_cmdline("nonexistent-sabrage-needle.exe").is_empty());
-    }
-
-    #[test]
     fn report_survivors_matches_a_direct_probe() {
         let (ctx, seen) = test_ctx(StageOptions::default());
         let survivors = process::find_processes_by_cmdline(BEAT_SABER_EXE_SUFFIX);

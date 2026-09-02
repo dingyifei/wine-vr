@@ -1489,15 +1489,29 @@ mod identity_tests {
         ));
         assert!(!cmdline_contains(&["wineserver".into()], "Beat Saber.exe"));
         assert!(!cmdline_contains(&[], "Beat Saber.exe"));
-        // The scan itself finds this test binary, whose argv carries the
-        // filter name — the same false-positive class `pgrep -f` has, which is
-        // why the reap steps match on the exe path instead (module header).
+    }
+
+    /// The cmdline scan matches a substring of the joined command line, so it
+    /// finds this very test binary — the same false-positive class `pgrep -f`
+    /// has, which is why the reap steps match on the exe path instead (module
+    /// header).
+    #[test]
+    fn find_processes_by_cmdline_finds_this_test_binary_by_a_name_suffix() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let name = exe
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("utf8 test binary name");
+        // A short, distinctive suffix of the real binary name, not the whole
+        // path — proving this is a *substring-of-cmdline* match, unlike
+        // `find_processes_by_exe`'s exact-path equality.
+        let needle = &name[name.len().saturating_sub(6)..];
+        let found = find_processes_by_cmdline(needle);
         let me = std::process::id();
-        let filter = std::env::args().nth(1).unwrap_or_default();
-        if !filter.is_empty() {
-            assert!(find_processes_by_cmdline(&filter)
-                .iter()
-                .any(|p| p.pid == me));
-        }
+        assert!(
+            found.iter().any(|p| p.pid == me),
+            "own pid {me} not found by cmdline needle {needle:?} among {found:?}"
+        );
+        assert!(find_processes_by_cmdline("nonexistent-sabrage-needle.exe").is_empty());
     }
 }
