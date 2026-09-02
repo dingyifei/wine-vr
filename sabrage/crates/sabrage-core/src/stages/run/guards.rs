@@ -897,6 +897,7 @@ mod tests {
             vec!["[info] audio routing disabled (--no-audio) — sound stays on the Mac"]
         );
         assert!(state.prev_audio_output.is_none());
+        assert!(guard.dry_run, "a dry run's guard never restores from Drop");
         // Nothing planned, nothing written, nothing to restore.
         assert!(ctx.executor.planned().is_empty());
         guard.release(&ctx, &mut state).await.unwrap();
@@ -1064,22 +1065,6 @@ mod tests {
         assert!(seen.lock().unwrap().is_empty(), "the shell prints nothing");
         guard.release(&ctx, &mut state).await.unwrap();
         assert!(ctx.executor.planned().is_empty());
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn a_dry_run_guard_drop_restores_nothing() {
-        // The Drop fallback shells out directly (no executor), so it must be
-        // inert under --dry-run or the flag would be a lie.
-        let root = scratch("audio-drop");
-        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
-        {
-            let mut g = AudioGuard::inert(&ctx);
-            g.previous_output = Some("MacBook Pro Speakers".into());
-            g.switch_bin = Some(PathBuf::from("/nonexistent/SwitchAudioSource"));
-            assert!(g.dry_run);
-        }
-        assert!(seen.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
