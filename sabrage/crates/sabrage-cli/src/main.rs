@@ -1887,7 +1887,7 @@ mod tests {
     }
 
     #[test]
-    fn check_launched_and_auto_fixed_events_render_to_nothing() {
+    fn structured_only_events_render_no_console_line() {
         use sabrage_core::{FixAction, Gate};
 
         let check = StageEvent::Check {
@@ -1925,18 +1925,18 @@ mod tests {
             stage_event_lines(&auto_fixed, "<name>", Colors::OFF, false),
             vec![]
         );
-    }
 
-    #[test]
-    fn progress_event_renders_to_nothing() {
-        let ev = StageEvent::Progress {
+        let progress = StageEvent::Progress {
             run_id: Default::default(),
             step: "setup.1".to_string(),
             label: "curl".to_string(),
             current: 10,
             total: Some(100),
         };
-        assert_eq!(stage_event_lines(&ev, "<name>", Colors::OFF, false), vec![]);
+        assert_eq!(
+            stage_event_lines(&progress, "<name>", Colors::OFF, false),
+            vec![]
+        );
     }
 
     #[test]
