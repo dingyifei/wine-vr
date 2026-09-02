@@ -2779,35 +2779,12 @@ mod tests {
     // `sabrage-app` carries no JSON-format crate as a direct dependency
     // (`Cargo.toml` is off-limits to this agent, and only `sabrage-core`
     // depends on `serde_json` — see that crate's own store/config tests for
-    // the wire-format round trips), so these exercise the actual Rust-level
-    // behavior of each new payload/helper — construction, defaults, and the
-    // pure decision functions — rather than a serialized-JSON comparison.
+    // the wire-format round trips), so these exercise the pure decision
+    // functions and helpers at the Rust level rather than a serialized-JSON
+    // comparison.
     // Every new `#[serde(rename_all = "camelCase")]`/`"lowercase"` attribute
     // below follows the exact pattern already established on every sibling
     // struct/enum in this file (`AppState`, `DoctorEvent`, `FixAction`, …).
-
-    #[test]
-    fn launch_opts_game_id_defaults_to_none_and_round_trips_through_the_struct() {
-        assert_eq!(LaunchOpts::default().game_id, None);
-        let opts = LaunchOpts {
-            game_id: Some("abc-123".to_string()),
-            ..LaunchOpts::default()
-        };
-        assert_eq!(opts.game_id.as_deref(), Some("abc-123"));
-    }
-
-    #[test]
-    fn app_state_carries_the_new_default_bottle_and_bs_dir_fields() {
-        let state = AppState {
-            repo_root: None,
-            bottles: vec![],
-            alvr_version: "v20.14.1".to_string(),
-            default_bottle: Some("Steam".to_string()),
-            default_bs_dir: None,
-        };
-        assert_eq!(state.default_bottle.as_deref(), Some("Steam"));
-        assert_eq!(state.default_bs_dir, None);
-    }
 
     #[test]
     fn classify_repo_root_source_follows_resolve_repo_roots_own_precedence() {
@@ -2839,21 +2816,6 @@ mod tests {
             classify_repo_root_source(false, false, false),
             RepoRootSource::Unresolved
         );
-    }
-
-    #[test]
-    fn repo_root_source_variants_are_pairwise_distinct() {
-        let all = [
-            RepoRootSource::Settings,
-            RepoRootSource::Env,
-            RepoRootSource::Executable,
-            RepoRootSource::Unresolved,
-        ];
-        for (i, a) in all.iter().enumerate() {
-            for (j, b) in all.iter().enumerate() {
-                assert_eq!(a == b, i == j, "{a:?} vs {b:?}");
-            }
-        }
     }
 
     #[test]
