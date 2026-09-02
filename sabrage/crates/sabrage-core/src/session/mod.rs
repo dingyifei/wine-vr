@@ -1067,28 +1067,12 @@ mod tests {
         }
     }
 
-    /// `live_session_run_id`/`live_session_is` must agree with the
-    /// full-clone `live_session().map(|h| h.run_id)` shape they replace at
-    /// the hot call sites (a detach poll loop, `reconcile`'s ownership
-    /// check) — same answer, without cloning the handle's tokens/paths.
-    #[test]
-    fn live_session_run_id_agrees_with_the_full_handle_clone() {
-        let _g = lock_session_globals();
-        assert_eq!(live_session_run_id(), None);
-        assert!(!live_session_is(Uuid::new_v4()));
-
-        let a = Uuid::new_v4();
-        set_live_session(handle(a));
-        assert_eq!(live_session_run_id(), live_session().map(|h| h.run_id));
-        assert_eq!(live_session_run_id(), Some(a));
-        assert!(live_session_is(a));
-        assert!(!live_session_is(Uuid::new_v4()));
-
-        clear_live_session(a);
-        assert_eq!(live_session_run_id(), None);
-        assert!(!live_session_is(a));
-    }
-
+    /// The slot is owned by its run id: a teardown for another run must not
+    /// erase it, and its own clear is idempotent. The cheap
+    /// `live_session_run_id` projection must give the same answer as the
+    /// full-clone `live_session().map(|h| h.run_id)` it replaces at the hot
+    /// call sites (a detach poll loop, `reconcile`'s ownership check) —
+    /// two independent bodies, so the agreement is asserted, not assumed.
     #[test]
     fn the_live_slot_is_set_and_cleared_by_run_id() {
         let _g = lock_session_globals();
@@ -1096,6 +1080,9 @@ mod tests {
         let b = Uuid::new_v4();
         set_live_session(handle(a));
         assert!(live_session_is(a));
+        assert_eq!(live_session_run_id(), Some(a));
+        assert_eq!(live_session_run_id(), live_session().map(|h| h.run_id));
+        assert!(!live_session_is(b));
 
         // A stale teardown for a different run must not clear the current one.
         clear_live_session(b);
@@ -1103,6 +1090,8 @@ mod tests {
 
         clear_live_session(a);
         assert!(live_session().is_none());
+        assert_eq!(live_session_run_id(), None);
+        assert!(!live_session_is(a));
         // Idempotent.
         clear_live_session(a);
         assert!(live_session().is_none());
