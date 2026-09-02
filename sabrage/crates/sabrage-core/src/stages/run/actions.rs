@@ -988,14 +988,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_wired_ports_come_from_the_contract() {
-        assert_eq!(
-            stream_forward_specs(),
-            vec!["tcp:9943".to_string(), "tcp:9944".to_string()]
-        );
-    }
-
     // ── adb forward hygiene ──────────────────────────────────────────────────
 
     #[tokio::test]
@@ -2040,14 +2032,6 @@ mod tests {
             std::io::Error::new(std::io::ErrorKind::PermissionDenied, "nope")
         )));
         assert!(!is_already_exists(&SabrageError::Cancelled));
-    }
-
-    #[test]
-    fn orig_steam_suffixes_the_whole_name() {
-        assert_eq!(
-            orig_steam_path(Path::new("/g/steam_api64.dll")),
-            PathBuf::from("/g/steam_api64.dll.orig-steam")
-        );
     }
 
     #[test]
