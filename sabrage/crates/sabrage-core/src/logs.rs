@@ -766,33 +766,41 @@ mod tests {
 
     #[test]
     fn wine_log_candidate_delegates_to_the_stamped_form_byte_for_byte() {
-        // The chrono-typed convenience wrapper must produce exactly what a
-        // caller building the same stamp by hand (no chrono in sight) gets
-        // from `wine_log_candidate_stamped` — proving the split introduced no
-        // drift between the two.
+        // Two facts about the same names: `wine_log_candidate_stamped` emits
+        // these exact paths for a hand-built stamp with no chrono in sight —
+        // the whole point of the split (F16) — and the chrono-typed
+        // convenience wrapper delegates to it byte for byte, so neither entry
+        // point can drift alone.
         let now = chrono::Local
             .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
             .unwrap();
-        for attempt in [0, 1, 3] {
+        let cases: &[(&str, u32, &str)] = &[
+            (
+                "attempt 0: bare stamp, no suffix",
+                0,
+                "/repo/logs/beatsaber-20260829-101112.log",
+            ),
+            (
+                "attempt 1: first collision gets -2",
+                1,
+                "/repo/logs/beatsaber-20260829-101112-2.log",
+            ),
+            (
+                "attempt 3: fourth candidate gets -4",
+                3,
+                "/repo/logs/beatsaber-20260829-101112-4.log",
+            ),
+        ];
+        for (label, attempt, expected) in cases {
+            let stamped =
+                wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", *attempt);
+            assert_eq!(stamped, PathBuf::from(*expected), "{label}");
             assert_eq!(
-                wine_log_candidate(Path::new("/repo/logs"), now, attempt),
-                wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", attempt)
+                wine_log_candidate(Path::new("/repo/logs"), now, *attempt),
+                stamped,
+                "{label}"
             );
         }
-    }
-
-    #[test]
-    fn wine_log_candidate_stamped_takes_no_date_time_type_at_all() {
-        // The whole point of the split (F16): a caller — including test code
-        // in another crate — never needs to know chrono exists.
-        assert_eq!(
-            wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", 0),
-            PathBuf::from("/repo/logs/beatsaber-20260829-101112.log")
-        );
-        assert_eq!(
-            wine_log_candidate_stamped(Path::new("/repo/logs"), "20260829-101112", 1),
-            PathBuf::from("/repo/logs/beatsaber-20260829-101112-2.log")
-        );
     }
 
     // ── LogSource wire shape ─────────────────────────────────────────────────
