@@ -687,24 +687,22 @@ mod tests {
     }
 
     #[test]
-    fn runtime_status_ignores_unknown_fields_and_optional_ones() {
+    fn parse_runtime_status_accepts_the_observed_and_minimal_documents_and_rejects_a_half_written_one(
+    ) {
         // The observed file, verbatim — `transport` is not modelled.
         let json = r#"{"state":"idle","transport":"","process_id":59004,
                        "application_name":"Beat Saber","updated_at_unix_ms":1786300214181}"#;
-        let s: RuntimeStatus = serde_json::from_str(json).unwrap();
+        let s = parse_runtime_status(json).expect("the observed document parses");
         assert_eq!(s.state, "idle");
         assert_eq!(s.process_id, Some(59004));
         assert_eq!(s.application_name.as_deref(), Some("Beat Saber"));
         assert_eq!(s.updated_at_unix_ms, 1786300214181);
 
         // Only `state` + `updated_at_unix_ms` are required.
-        let bare: RuntimeStatus =
-            serde_json::from_str(r#"{"state":"idle","updated_at_unix_ms":1}"#).unwrap();
+        let bare = parse_runtime_status(r#"{"state":"idle","updated_at_unix_ms":1}"#)
+            .expect("the minimal document parses");
         assert!(bare.process_id.is_none() && bare.application_name.is_none());
-    }
 
-    #[test]
-    fn parse_runtime_status_returns_none_for_a_half_written_file() {
         assert!(parse_runtime_status(r#"{"state":"idle","updated_at_"#).is_none());
         assert!(parse_runtime_status("").is_none());
     }
@@ -1070,66 +1068,18 @@ mod tests {
             )
         }
 
-        /// The other half: preload exists so that a Sabrage opened *onto* a
-        /// running session still shows the chip that session already
-        /// negotiated. A session that predates the monitor keeps it — as long
-        /// as the line itself was written after that session started (A9-6:
-        /// the log is one appending sink shared by every session that ever
-        /// ran, so the line's own stamp is the only thing that can say whose
-        /// it is).
-        #[tokio::test]
-        async fn a_session_that_predates_the_monitor_keeps_its_encoder_chip() {
-            let _g = lock_session_globals();
-            force_idle();
-
-            let dir = scratch("encoder-adopted");
-            let paths = fixture_paths(&dir);
-            std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
-            let started = crate::session::now_unix_ms() - 5_000;
-            std::fs::write(
-                paths.oxr_appsup.join("oxrsys-runtime.log"),
-                log_line(
-                    started + 1_000,
-                    "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
-                ),
-            )
-            .unwrap();
-
-            let run_id = Uuid::new_v4();
-            set_live_session(LiveSessionHandle {
-                run_id,
-                bottle: "Steam".into(),
-                identity: ProcInfo::observe(std::process::id()).unwrap(),
-                log_path: PathBuf::from("/repo/logs/x.log"),
-                started_at_unix_ms: started,
-                cancel: CancellationToken::new(),
-                detach: CancellationToken::new(),
-            });
-            let mut m = SessionMonitor::new(paths);
-            let s = m.snapshot().await;
-            clear_live_session(run_id);
-
-            assert_eq!(s.phase, SessionPhase::Running);
-            assert_eq!(
-                s.encoder.map(|e| e.codec),
-                Some("HEVC".to_string()),
-                "the session was already running when the monitor opened"
-            );
-            std::fs::remove_dir_all(&dir).ok();
-        }
-
-        /// A9-6, the half `created_at_unix_ms` alone could not decide: an
-        /// *adopted* session (started before the monitor) is exactly the case
-        /// where the preload window is believed — and the 200 lines it reads
-        /// span every session that ever ran. A line written before this
-        /// session started is a previous session's, and publishing it puts a
-        /// healthy `(HEVC, native helper)` chip where "waiting for encoder…"
-        /// belongs.
+        /// A9-6, both halves. The preload window is believed for an *adopted*
+        /// session — one that started before the monitor — and the 200 lines it
+        /// reads span every session that ever ran. A line stamped after this
+        /// session started is its own, and the chip it negotiated is published;
+        /// a line stamped before it belongs to a previous session, and
+        /// publishing that one puts a healthy `(HEVC, native helper)` chip where
+        /// "waiting for encoder…" belongs.
         #[tokio::test]
         async fn an_adopted_session_only_inherits_lines_written_after_it_started() {
             let _g = lock_session_globals();
 
-            // (a) older than the session, (b) newer, (c) no timestamp at all.
+            // (a) older than the session, (b) and (c) written after it started, (d) no timestamp at all.
             for (row, line, want_codec) in [
                 (
                     "a line from before this session started",
@@ -1146,6 +1096,14 @@ mod tests {
                         "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (H.264, in-process)",
                     ),
                     Some("H.264"),
+                ),
+                (
+                    "r1:A9-6 regression: a session that predates the monitor keeps the chip it negotiated",
+                    log_line(
+                        crate::session::now_unix_ms() - 4_000,
+                        "OXRSys/ALVR: encoder ready 3008x1664 @72Hz 80Mbps (HEVC, native helper)",
+                    ),
+                    Some("HEVC"),
                 ),
                 (
                     "an undated line proves nothing",
