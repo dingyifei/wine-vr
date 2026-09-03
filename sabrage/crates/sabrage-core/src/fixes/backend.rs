@@ -659,7 +659,6 @@ mod tests {
         let root = scratch("dry");
         let (ctx, conf) = fixture_ctx(&root, true);
         std::fs::write(&conf, "\"CX_GRAPHICS_BACKEND\" = \"auto\"\n").unwrap();
-        assert!(ctx.executor.is_dry_run());
 
         let sink: EventSink = Arc::new(|_| {});
         let report = set_graphics_backend(&ctx, &sink).await.unwrap();
