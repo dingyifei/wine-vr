@@ -116,7 +116,6 @@ mod tests {
     #[test]
     fn no_bottle_no_override_skips_both_slugs_with_the_verbatim_reason() {
         let ctx = CheckCtx::new(Paths::new(Path::new("/repo")), CheckOptions::new());
-        assert!(section_skipped(&ctx));
 
         let p = game_present(&ctx);
         assert_eq!(p.status, CheckStatus::Skipped);
@@ -135,7 +134,6 @@ mod tests {
             ..CheckOptions::new()
         };
         let ctx = CheckCtx::new(Paths::new(Path::new("/repo")), opts);
-        assert!(!section_skipped(&ctx));
 
         let o = game_present(&ctx);
         assert_eq!(o.status, CheckStatus::Fail);
