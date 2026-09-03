@@ -222,4 +222,31 @@ mod tests {
             assert!(!e.already_reported(), "{e:?}");
         }
     }
+
+    /// `Display` for `Download` and `HashMismatch` is byte-identical to
+    /// lib.sh fetch_pinned's die text (report row B0712).
+    #[test]
+    fn display_matches_lib_sh_die_text() {
+        let cases: &[(&str, SabrageError, &str)] = &[
+            (
+                "Download",
+                SabrageError::Download {
+                    url: "https://example.invalid/x.dylib".into(),
+                    detail: None,
+                },
+                "download failed: https://example.invalid/x.dylib",
+            ),
+            (
+                "HashMismatch",
+                SabrageError::HashMismatch {
+                    label: "dxmt".into(),
+                    got: "deadbeef".into(),
+                },
+                "sha256 mismatch for dxmt (got deadbeef)",
+            ),
+        ];
+        for (tag, err, expected) in cases {
+            assert_eq!(err.to_string(), *expected, "{tag}");
+        }
+    }
 }
