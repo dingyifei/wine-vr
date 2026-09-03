@@ -648,38 +648,6 @@ mod tests {
         );
     }
 
-    /// The spelling contract with `demo.sh`: `.`/`..` folded lexically,
-    /// symlinks kept. A canonicalizing root made a symlinked checkout embed a
-    /// different dylib path than the shell for the same file, so each
-    /// front-end saw the other's host manifest as stale (one sudo prompt per
-    /// alternation).
-    #[test]
-    fn a_symlinked_root_keeps_the_shells_logical_spelling() {
-        let base = std::env::temp_dir().join(format!("sabrage-root-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&base);
-        let real = base.join("real");
-        std::fs::create_dir_all(real.join("scripts/demo")).unwrap();
-        let link = base.join("link");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        // The symlink spelling survives, exactly as `cd link && pwd` prints it.
-        let via_link = resolve_repo_root(Some(&link.display().to_string())).unwrap();
-        assert_eq!(via_link, link);
-        assert_ne!(via_link, real);
-        // And the dylib path the host manifest embeds is derived from it.
-        assert!(Paths::new(&via_link).oxr_dylib.starts_with(&link));
-
-        // `..` is still folded away — lexically, so it does not escape the
-        // symlink the way a physical `..` would.
-        let messy = format!("{}/scripts/../scripts/./demo/..", link.display());
-        assert_eq!(
-            resolve_repo_root(Some(&messy)).unwrap(),
-            link.join("scripts")
-        );
-
-        std::fs::remove_dir_all(&base).unwrap();
-    }
-
     #[test]
     fn a_relative_root_becomes_absolute_without_resolving_symlinks() {
         let cwd = std::env::current_dir().unwrap();

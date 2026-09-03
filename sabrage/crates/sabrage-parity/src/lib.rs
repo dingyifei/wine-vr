@@ -2346,6 +2346,9 @@ mod tests {
             );
         }
 
+        /// r1:A2-6 regression: the resolver returns the symlink spelling, and
+        /// `Paths` derives the host-manifest dylib path from that spelling
+        /// rather than the physical target — the thrash this module documents.
         #[test]
         fn the_native_resolver_preserves_a_symlinked_spelling_and_folds_dotdot() {
             let base = std::env::temp_dir().join(format!(
@@ -2364,6 +2367,15 @@ mod tests {
                 spelled, link,
                 "a symlinked checkout keeps its symlink spelling, exactly as `cd <link> && pwd` \
                  reports it"
+            );
+            assert_ne!(
+                spelled, physical,
+                "the physical target of the symlink is explicitly not what comes back"
+            );
+            let manifest_dylib = sabrage_core::Paths::new(&spelled).oxr_dylib;
+            assert!(
+                manifest_dylib.starts_with(&link),
+                "the dylib path the host manifest embeds is derived from the symlinked spelling"
             );
 
             // `..` is folded textually, so `<link>/anything/..` is `<link>` —
