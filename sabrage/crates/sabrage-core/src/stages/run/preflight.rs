@@ -1542,27 +1542,47 @@ mod tests {
         );
     }
 
+    // Both spellings reach the same gate: the runtime obeys the last
+    // `protocol` assignment it would accept, whatever table it sits under.
+    // The shadowed row is finding A7-2 of the round-1 review; its label carries
+    // the round because round 2 reuses the id for an unrelated finding.
     #[tokio::test]
-    async fn protocol_oxrsys_blocks_natively_with_both_lines() {
-        let f = fixture("proto-legacy", true);
-        make_everything_pass(&f);
-        write(&f.ctx.paths.toml_path, b"protocol = \"oxrsys\"\n");
+    async fn an_oxrsys_protocol_blocks_the_launch_with_both_lines() {
+        let rows: &[(&str, &[u8])] = &[
+            ("direct oxrsys", b"protocol = \"oxrsys\"\n"),
+            (
+                "r1:A7-2 shadowed alvr then oxrsys",
+                b"[streaming]\nprotocol = \"alvr\"\n\n[tweaks]\nprotocol = \"oxrsys\"\n",
+            ),
+        ];
+        for &(label, toml) in rows {
+            let tag = format!(
+                "proto-{}",
+                label.replace(|c: char| !c.is_ascii_alphanumeric(), "-")
+            );
+            let f = fixture(&tag, true);
+            make_everything_pass(&f);
+            write(&f.ctx.paths.toml_path, toml);
 
-        let err = run(&f.ctx).await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
-             Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle FixtureBottle"
-        );
-        // The supported-set row passed; the legacy row is the one that blocked.
-        assert_eq!(
-            f.check("cfg.protocol.supported").unwrap().status,
-            CheckStatus::Pass
-        );
-        assert_eq!(
-            f.check("cfg.protocol.legacy-oxrsys").unwrap().status,
-            CheckStatus::Fail
-        );
+            let err = run(&f.ctx).await.expect_err(label);
+            assert_eq!(
+                err.to_string(),
+                "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
+                 Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle FixtureBottle",
+                "{label}"
+            );
+            // The supported-set row passed; the legacy row is the one that blocked.
+            assert_eq!(
+                f.check("cfg.protocol.supported").unwrap().status,
+                CheckStatus::Pass,
+                "{label}"
+            );
+            assert_eq!(
+                f.check("cfg.protocol.legacy-oxrsys").unwrap().status,
+                CheckStatus::Fail,
+                "{label}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1779,27 +1799,6 @@ mod tests {
                 .count(),
             1,
             "the fix's own Fatal, not a second one"
-        );
-    }
-
-    /// A2/A7-2 regression: `[streaming] protocol = "alvr"` shadowed by a later
-    /// `protocol = "oxrsys"` used to pass every ALVR gate and then launch the
-    /// legacy backend. The last assignment is the one the runtime obeys, so it
-    /// is the one the preflight must judge.
-    #[tokio::test]
-    async fn a_shadowed_protocol_is_judged_on_the_value_the_runtime_will_use() {
-        let f = fixture("proto-shadowed", true);
-        make_everything_pass(&f);
-        write(
-            &f.ctx.paths.toml_path,
-            b"[streaming]\nprotocol = \"alvr\"\n\n[tweaks]\nprotocol = \"oxrsys\"\n",
-        );
-
-        let err = run(&f.ctx).await.unwrap_err();
-        assert_eq!(
-            err.to_string(),
-            "protocol=oxrsys (legacy USB path) — the demo path is alvr\n       \
-             Sabrage does not launch the legacy protocol — use ./demo.sh run --bottle FixtureBottle"
         );
     }
 
