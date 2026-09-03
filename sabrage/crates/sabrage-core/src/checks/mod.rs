@@ -412,15 +412,6 @@ impl Registry {
         self.checks.iter().find(|c| c.slug() == slug)
     }
 
-    /// Slugs with no evaluator yet.
-    pub fn unbound(&self) -> Vec<&'static str> {
-        self.checks
-            .iter()
-            .filter(|c| c.eval.is_none())
-            .map(|c| c.slug())
-            .collect()
-    }
-
     /// The subset the native launch preflight runs, in contract order.
     ///
     /// Order note: run.sh's preflight order differs from doctor's. This returns
@@ -621,16 +612,11 @@ mod tests {
     }
 
     #[test]
-    fn unknown_and_duplicate_registrations_are_errors_even_leniently() {
-        // Every contract slug is bound, so BOTH builds must succeed and
-        // strictness now exempts nothing at all.
+    fn complete_registry_builds_leniently() {
+        // The lenient path is exercised nowhere else. The strict build and
+        // "no contract slug is unbound" are pinned by sabrage-parity's
+        // strict_registry_builds_and_covers_the_contract_in_order, the layer CI runs.
         assert!(build_registry(false).is_ok());
-        assert!(build_registry(true).is_ok());
-        assert!(
-            registry().unbound().is_empty(),
-            "unbound slugs: {:?}",
-            registry().unbound()
-        );
     }
 
     #[test]
