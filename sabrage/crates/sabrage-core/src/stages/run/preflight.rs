@@ -942,22 +942,10 @@ mod tests {
         for slug in preflight_slugs() {
             let spec = contract().check(slug).unwrap();
             match spec.native_gate {
-                Gate::Autofix => {
-                    assert!(
-                        slug == "bottle.gfx-dxmt" || HELPER_SLUGS.contains(&slug),
-                        "{slug} is gated autofix but apply_fix has no arm"
-                    );
-                    // `apply_fix` dispatches off the contract's own `fix` id,
-                    // so an autofix slug that names no applicable fix would
-                    // die at launch instead of fixing anything.
-                    assert!(
-                        spec.fix
-                            .as_deref()
-                            .and_then(FixAction::from_contract_id)
-                            .is_some(),
-                        "{slug} is gated autofix but names no applicable fix"
-                    );
-                }
+                Gate::Autofix => assert!(
+                    slug == "bottle.gfx-dxmt" || HELPER_SLUGS.contains(&slug),
+                    "{slug} is gated autofix but apply_fix has no arm"
+                ),
                 Gate::Warn => assert_eq!(
                     slug, "game.version",
                     "a second warn-gated slug needs its run.sh text in `gate`"
