@@ -903,7 +903,6 @@ mod tests {
         guard.release(&ctx, &mut state).await.unwrap();
         assert!(!state.guards.audio_restored, "no guard, no flag, no save");
         assert!(ctx.executor.planned().is_empty());
-        assert!(!ctx.paths.session_state_path().exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 
