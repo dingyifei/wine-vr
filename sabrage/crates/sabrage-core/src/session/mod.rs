@@ -1162,65 +1162,82 @@ mod tests {
         names.iter().map(|n| n.to_string()).collect()
     }
 
+    /// Every case of the two-tier fallback policy in one table: tier 1 (a
+    /// built-in output wherever it sits in the list, in all four Mac naming
+    /// shapes plus `Built-in Output`), tier 2 (the first non-virtual device),
+    /// and `None` when every candidate is virtual or there are none — `None`
+    /// is what makes the caller print the remedy instead of switching the Mac
+    /// to something that stays silent.
     #[test]
-    fn the_fallback_prefers_the_built_in_speakers() {
-        // The live list from the 2026-08-29 finding, in `SwitchAudioSource -a
-        // -t output` order: the recorded AirPods are simply not on it any more.
-        assert_eq!(
-            fallback_output_device(&devices(&[
-                "BlackHole 2ch",
-                "MacBook Pro Speakers",
-                "Steam Streaming Microphone",
-                "Steam Streaming Speakers",
-                "Virtual Desktop Mic",
-                "Virtual Desktop Speakers",
-            ])),
-            Some("MacBook Pro Speakers".to_string())
-        );
-        // Every Mac naming the pattern has to cover, built-in first even when
-        // it is listed last.
-        assert_eq!(
-            fallback_output_device(&devices(&["BlackHole 2ch", "MacBook Air Speakers"])),
-            Some("MacBook Air Speakers".to_string())
-        );
-        assert_eq!(
-            fallback_output_device(&devices(&["Mac Studio Speakers"])),
-            Some("Mac Studio Speakers".to_string())
-        );
-        assert_eq!(
-            fallback_output_device(&devices(&["Mac mini Speakers"])),
-            Some("Mac mini Speakers".to_string())
-        );
-        assert_eq!(
-            fallback_output_device(&devices(&["Steam Streaming Speakers", "Built-in Output"])),
-            Some("Built-in Output".to_string()),
-            "the built-in output outranks anything earlier in the list"
-        );
-    }
-
-    #[test]
-    fn a_real_device_beats_no_device_but_a_virtual_one_never_wins() {
-        // No built-in on the list: the first device that is not virtual.
-        assert_eq!(
-            fallback_output_device(&devices(&[
-                "BlackHole 2ch",
-                "Virtual Desktop Speakers",
-                "Studio Display Speakers",
-            ])),
-            Some("Studio Display Speakers".to_string())
-        );
-        // Only the loopback and the streaming virtuals: switching to any of
-        // them is still silence, so the caller must say so instead.
-        assert_eq!(
-            fallback_output_device(&devices(&[
-                "BlackHole 2ch",
-                "Virtual Desktop Mic",
-                "Virtual Desktop Speakers",
-            ])),
-            None
-        );
-        assert_eq!(fallback_output_device(&devices(&["BlackHole 16ch"])), None);
-        assert_eq!(fallback_output_device(&[]), None);
+    fn the_fallback_picks_the_built_in_output_then_any_real_one() {
+        let cases: &[(&str, &[&str], Option<&str>)] = &[
+            (
+                // The live `SwitchAudioSource -a -t output` list of the
+                // 2026-08-29 finding, in its own order: the recorded AirPods
+                // are simply not on it any more.
+                "observed 2026-08-29 list: built-in among the virtuals",
+                &[
+                    "BlackHole 2ch",
+                    "MacBook Pro Speakers",
+                    "Steam Streaming Microphone",
+                    "Steam Streaming Speakers",
+                    "Virtual Desktop Mic",
+                    "Virtual Desktop Speakers",
+                ],
+                Some("MacBook Pro Speakers"),
+            ),
+            (
+                "MacBook Air Speakers, listed last, still wins",
+                &["BlackHole 2ch", "MacBook Air Speakers"],
+                Some("MacBook Air Speakers"),
+            ),
+            (
+                "Mac Studio Speakers",
+                &["Mac Studio Speakers"],
+                Some("Mac Studio Speakers"),
+            ),
+            (
+                "Mac mini Speakers",
+                &["Mac mini Speakers"],
+                Some("Mac mini Speakers"),
+            ),
+            (
+                "the built-in output outranks anything earlier in the list",
+                &["Steam Streaming Speakers", "Built-in Output"],
+                Some("Built-in Output"),
+            ),
+            (
+                "no built-in on the list: the first device that is not virtual",
+                &[
+                    "BlackHole 2ch",
+                    "Virtual Desktop Speakers",
+                    "Studio Display Speakers",
+                ],
+                Some("Studio Display Speakers"),
+            ),
+            (
+                "every candidate is virtual: switching to any of them is still silence",
+                &[
+                    "BlackHole 2ch",
+                    "Virtual Desktop Mic",
+                    "Virtual Desktop Speakers",
+                ],
+                None,
+            ),
+            (
+                "the marker matches as a substring, so BlackHole 16ch is virtual too",
+                &["BlackHole 16ch"],
+                None,
+            ),
+            ("empty list", &[], None),
+        ];
+        for (label, list, expected) in cases {
+            assert_eq!(
+                fallback_output_device(&devices(list)),
+                expected.map(str::to_string),
+                "{label}"
+            );
+        }
     }
 
     #[test]
