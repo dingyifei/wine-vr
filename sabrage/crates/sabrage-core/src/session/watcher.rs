@@ -1521,8 +1521,14 @@ mod tests {
         }
 
         /// #2/#100: the precedence table in [`SessionMonitor::snapshot`]'s doc
-        /// comment, row by row. Consolidated into one test for the same reason
-        /// `snapshot_phase_transitions` is — these all read the same
+        /// comment — every row where two sources disagree, plus the live-only
+        /// and persisted-only baselines those conflicts are measured against.
+        /// The unopposed rows live with their carriers:
+        /// `snapshot_phase_transitions` pins published Preflight/Launching/
+        /// Stopping over the Idle fallthrough and the bare Idle case, and
+        /// `snapshot_identity_and_exit_code_sources` pins published `Exited`
+        /// over an empty fixture. Consolidated into one test for the same
+        /// reason `snapshot_phase_transitions` is — these all read the same
         /// process-global slots.
         #[tokio::test]
         async fn snapshot_phase_precedence_table() {
@@ -1595,27 +1601,6 @@ mod tests {
                     None,
                     SessionPhase::Exited,
                 ),
-                (
-                    "published Preflight beats the Idle fallthrough",
-                    false,
-                    None,
-                    Some(SessionPhase::Preflight),
-                    SessionPhase::Preflight,
-                ),
-                (
-                    "published Exited beats the Idle fallthrough",
-                    false,
-                    None,
-                    Some(SessionPhase::Exited),
-                    SessionPhase::Exited,
-                ),
-                (
-                    "nothing at all is Idle",
-                    false,
-                    None,
-                    None,
-                    SessionPhase::Idle,
-                ),
             ] {
                 let dir = scratch(&format!("prec-{}", want as u8));
                 let paths = fixture_paths(&dir);
@@ -1641,7 +1626,7 @@ mod tests {
                 publish_run_phase(None);
 
                 assert_eq!(got.phase, want, "{row}");
-                assert!(got.bottle.is_some() || want == SessionPhase::Idle, "{row}");
+                assert!(got.bottle.is_some(), "{row}");
                 std::fs::remove_dir_all(&dir).ok();
             }
         }
