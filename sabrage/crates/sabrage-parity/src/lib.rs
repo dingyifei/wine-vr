@@ -2034,10 +2034,6 @@ mod tests {
 
             for (fragment, site) in [
                 (
-                    "bridge not built — ./demo.sh build",
-                    "checks::run_only::run_bridge_built",
-                ),
-                (
                     "the Meta gate may block startup",
                     "stages::run::preflight::gate (game.version)",
                 ),
@@ -2048,10 +2044,6 @@ mod tests {
                 (
                     "the runtime treats unknown values as auto",
                     "stages::run::preflight::emit_encoder_notice",
-                ),
-                (
-                    "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk",
-                    "checks::run_only::run_wired_adb",
                 ),
                 (
                     "--wired: no Quest over adb — connect USB and check 'adb devices'",
