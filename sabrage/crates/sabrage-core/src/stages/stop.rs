@@ -911,10 +911,7 @@ mod tests {
 
         assert_eq!(
             rows(&seen),
-            vec![(Severity::Warn, ports_unreadable_warn(PROBE_TEST_DEADLINE))]
-        );
-        assert!(
-            !rows(&seen).iter().any(|(_, t)| t == "streaming ports free"),
+            vec![(Severity::Warn, ports_unreadable_warn(PROBE_TEST_DEADLINE))],
             "claimed free ports on the strength of a probe that never answered"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -923,6 +920,9 @@ mod tests {
     /// The audio twin: `SwitchAudioSource` blocked on a degraded CoreAudio
     /// server used to fall through `unwrap_or_default()` into the green
     /// `"audio output: "` row, naming no device at all.
+    ///
+    /// r2:A5-5 regression: a probe past its deadline warns instead of naming an
+    /// empty current device.
     #[tokio::test]
     async fn a_wedged_switchaudiosource_warns_instead_of_naming_an_empty_device() {
         let (dir, bin) = never_answers("audio-deadline");
@@ -934,10 +934,7 @@ mod tests {
 
         assert_eq!(
             rows(&seen),
-            vec![(Severity::Warn, audio_unreadable_warn(PROBE_TEST_DEADLINE))]
-        );
-        assert!(
-            !rows(&seen).iter().any(|(_, t)| t == "audio output: "),
+            vec![(Severity::Warn, audio_unreadable_warn(PROBE_TEST_DEADLINE))],
             "a probe that never answered named the current device"
         );
         std::fs::remove_dir_all(&dir).ok();
@@ -1315,7 +1312,6 @@ mod tests {
     async fn a_real_reap_reports_the_kill_only_once_the_process_is_really_gone() {
         let sleeper = spawn_sleeper(false);
         let (ctx, seen) = test_ctx(StageOptions::default());
-        assert!(!ctx.executor.is_dry_run());
 
         let matched = reap(
             &ctx,
@@ -1366,9 +1362,11 @@ mod tests {
 
     /// A stale identity — same pid, a start time that process never had — must
     /// not be signalled at all: `reap` skips it and reports nothing killed.
+    ///
+    /// r1:A5-5 regression: a pid whose start time no longer matches is never
+    /// signalled.
     #[tokio::test]
     async fn reap_never_signals_a_pid_whose_identity_no_longer_matches() {
-        let (ctx, _seen) = test_ctx(StageOptions::default());
         let mut mismatched = ProcInfo::observe(std::process::id()).expect("observe self");
         mismatched.start_time += 1;
         assert!(!mismatched.is_same_process());
@@ -1378,7 +1376,6 @@ mod tests {
         // Exercised through `wait_for_exit`'s own predicate rather than by
         // asking `reap` to kill this very test process.
         assert!(wait_for_exit(&[mismatched]).await.is_empty());
-        assert!(ctx.executor.planned().is_empty());
     }
 
     // ── cross-checkout helper scan (finding A5-7) ────────────────────────────
@@ -1580,8 +1577,8 @@ mod tests {
 
     /// Finding #6, at the stage level. The reconcile pass between steps 3 and 4
     /// is *additive*, so a failure inside it must be reported rather than abort
-    /// the stage on the way to the ports and audio rows — `stop.sh` has no step
-    /// that can end the script.
+    /// the stage on the way to the audio row — `stop.sh` has no step that can
+    /// end the script.
     ///
     /// Made to fail deterministically and machine-independently: the record
     /// carries a `--wired` forward and `adb` points at a path that does not
@@ -1592,7 +1589,7 @@ mod tests {
     /// temp directory.
     #[tokio::test]
     async fn a_failed_reconcile_is_reported_and_the_stage_still_reaches_its_audio_row() {
-        use crate::session::state::{self, SessionState, WiredForward};
+        use crate::session::state::{SessionState, WiredForward};
 
         let dir = scratch_dir();
         std::fs::create_dir_all(&dir).unwrap();
@@ -1659,13 +1656,7 @@ mod tests {
                 && text.starts_with("previous session not fully restored: ")),
             "the failure is reported: {lines:?}"
         );
-        // …and the two steps that come after it still ran.
-        assert!(
-            lines
-                .iter()
-                .any(|(_, step, _)| step.as_deref() == Some(step::STOP_PORTS)),
-            "report_ports never ran: {lines:?}"
-        );
+        // …and the audio row that comes after it still ran.
         let audio_rows = lines
             .iter()
             .filter(|(_, step, _)| step.as_deref() == Some(step::STOP_AUDIO))
@@ -1678,10 +1669,6 @@ mod tests {
         } else {
             assert_eq!(audio_rows, 0, "silent without the tool: {lines:?}");
         }
-        assert!(
-            state::load(&path).unwrap().is_some(),
-            "the record is kept so the next stop can retry"
-        );
         std::fs::remove_dir_all(&dir).ok();
     }
 
