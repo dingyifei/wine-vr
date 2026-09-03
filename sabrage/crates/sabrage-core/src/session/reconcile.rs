@@ -1605,24 +1605,47 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Every live-shaped record is adopted untouched, whatever kind of live it is.
     #[tokio::test]
-    async fn a_live_session_is_adopted_without_touching_anything() {
-        let dir = scratch("live");
-        let (ctx, seen) = test_ctx(&dir, true);
-        let state = pending(Some(me()), Some(me()));
-        write_state(&ctx, &state);
+    async fn live_records_are_adopted_without_touching_anything() {
+        let unobserved = ProcInfo {
+            start_time: 0,
+            ..me()
+        };
+        let cases: &[(&str, ProcInfo, Option<ProcInfo>, Classification)] = &[
+            ("live", me(), Some(me()), Classification::Live),
+            (
+                "unverifiable [r1:A9-5]",
+                unobserved,
+                None,
+                Classification::Unverifiable,
+            ),
+        ];
+        for (i, (label, wine, dashboard, class)) in cases.iter().enumerate() {
+            let dir = scratch(&format!("live-reconcile-{i}"));
+            let (ctx, seen) = test_ctx(&dir, true);
+            let state = pending(Some(wine.clone()), dashboard.clone());
+            assert_eq!(classify(&state), *class, "{label}: classification");
+            write_state(&ctx, &state);
 
-        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
-            .await
-            .unwrap();
-        assert_eq!(out, Reconciled::Live { state });
-        assert!(seen.lock().unwrap().is_empty(), "the happy path is silent");
-        assert!(ctx.executor.planned().is_empty());
-        assert!(
-            ctx.paths.session_state_path().exists(),
-            "a live session's record must survive"
-        );
-        std::fs::remove_dir_all(&dir).ok();
+            let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
+                .await
+                .unwrap();
+            assert_eq!(out, Reconciled::Live { state }, "{label}");
+            assert!(
+                seen.lock().unwrap().is_empty(),
+                "{label}: adoption is silent"
+            );
+            assert!(
+                ctx.executor.planned().is_empty(),
+                "{label}: no SwitchAudioSource, no adb forward --remove, no clear"
+            );
+            assert!(
+                ctx.paths.session_state_path().exists(),
+                "{label}: a live session's record must survive"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]
@@ -2001,70 +2024,6 @@ mod tests {
         );
 
         assert!(ctx.executor.planned().is_empty(), "nothing was touched");
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn a_live_pid_with_no_observed_start_time_is_never_dismantled() {
-        let dir = scratch("unverifiable");
-        let (ctx, seen) = test_ctx(&dir, true);
-        let unobserved = ProcInfo {
-            start_time: 0,
-            ..me()
-        };
-        assert_eq!(
-            classify(&pending(Some(unobserved.clone()), None)),
-            Classification::Unverifiable
-        );
-        let state = pending(Some(unobserved), None);
-        write_state(&ctx, &state);
-
-        let out = reconcile_with(&ctx, None, None, probing(BLACKHOLE))
-            .await
-            .unwrap();
-
-        assert_eq!(out, Reconciled::Live { state });
-        assert!(
-            ctx.executor.planned().is_empty(),
-            "no SwitchAudioSource, no adb forward --remove, no clear"
-        );
-        assert!(seen.lock().unwrap().is_empty());
-        assert!(ctx.paths.session_state_path().exists());
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// …and `stop` says so rather than silently keeping the record.
-    #[tokio::test]
-    async fn stop_names_an_unverifiable_pid_in_its_own_words() {
-        let dir = scratch("stop-unverifiable");
-        let (ctx, seen) = stop_ctx(&dir, true);
-        write_state(
-            &ctx,
-            &pending(
-                Some(ProcInfo {
-                    start_time: 0,
-                    ..me()
-                }),
-                None,
-            ),
-        );
-
-        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            rows(&seen),
-            vec![(
-                Severity::Warn,
-                format!(
-                    "previous session state kept: wine pid {} is alive but could not be identified",
-                    std::process::id()
-                )
-            )]
-        );
-        assert!(ctx.executor.planned().is_empty());
-        assert!(ctx.paths.session_state_path().exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -2657,32 +2616,52 @@ mod tests {
         (ctx, seen)
     }
 
+    /// `stop` names a surviving wine pid in its own words — one sentence per
+    /// live classification — and keeps the record either way.
     #[tokio::test]
-    async fn stop_warns_and_keeps_the_record_when_the_wine_pid_survived() {
-        let dir = scratch("stop-alive");
-        let (ctx, seen) = stop_ctx(&dir, true);
-        write_state(&ctx, &pending(Some(me()), None));
-
-        finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            rows(&seen),
-            vec![(
-                Severity::Warn,
+    async fn stop_names_a_surviving_wine_pid_and_keeps_the_record() {
+        let pid = std::process::id();
+        let cases: &[(&str, ProcInfo, String)] = &[
+            (
+                "live",
+                me(),
+                format!("previous session state kept: wine pid {pid} still alive"),
+            ),
+            (
+                "unverifiable",
+                ProcInfo {
+                    start_time: 0,
+                    ..me()
+                },
                 format!(
-                    "previous session state kept: wine pid {} still alive",
-                    std::process::id()
-                )
-            )]
-        );
-        assert!(
-            ctx.executor.planned().is_empty(),
-            "nothing restored while it lives"
-        );
-        assert!(ctx.paths.session_state_path().exists());
-        std::fs::remove_dir_all(&dir).ok();
+                    "previous session state kept: wine pid {pid} is alive but could not be identified"
+                ),
+            ),
+        ];
+        for (i, (label, wine, warning)) in cases.iter().enumerate() {
+            let dir = scratch(&format!("stop-alive-{i}"));
+            let (ctx, seen) = stop_ctx(&dir, true);
+            write_state(&ctx, &pending(Some(wine.clone()), None));
+
+            finish_stopped_session_with(&ctx, None, None, probing(BLACKHOLE))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                rows(&seen),
+                vec![(Severity::Warn, warning.clone())],
+                "{label}"
+            );
+            assert!(
+                ctx.executor.planned().is_empty(),
+                "{label}: nothing restored while it lives"
+            );
+            assert!(
+                ctx.paths.session_state_path().exists(),
+                "{label}: the record survives"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]
