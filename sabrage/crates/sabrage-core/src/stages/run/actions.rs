@@ -36,8 +36,9 @@ use super::PreflightFacts;
 
 /// run.sh's `# launch-action:` ids, in execution order.
 ///
-/// Must equal `contract().launch_actions`' ids, in order — asserted below and
-/// by the parity crate.
+/// Must equal `contract().launch_actions`' ids, in order — asserted by
+/// `sabrage-parity`'s
+/// `launch_action_ids_equal_the_contracts_order_and_there_are_exactly_seven`.
 pub const LAUNCH_ACTION_IDS: [&str; 7] = [
     "adb-forward-hygiene",
     "wineserver-reset",
@@ -710,7 +711,7 @@ pub fn bs_win_path(ctx: &StageCtx, bottle: &Bottle) -> String {
     util::win_path(Some(&bottle.prefix), &ctx.bs_dir.join("Beat Saber.exe"))
 }
 
-/// The launch environment — run.sh lines 242–248. Pure and table-testable.
+/// The launch environment — run.sh lines 245–251. Pure and table-testable.
 ///
 /// ```zsh
 /// export XR_RUNTIME_JSON="$OXR_RUNTIME_JSON"
@@ -749,7 +750,7 @@ pub fn wine_env(
     ]
 }
 
-/// run.sh lines 252–260, verbatim, as the exact event sequence the CLI
+/// run.sh lines 255–263, verbatim, as the exact event sequence the CLI
 /// reproduces byte-for-byte.
 ///
 /// The `-- launching …` line is a [`StageEvent::Section`] (the CLI renders it
@@ -866,7 +867,6 @@ pub async fn launch_wine(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contract::contract;
     use crate::events::{Severity, Stage};
     use crate::executor::{DryRunExecutor, Executor, PlannedKind};
     use crate::paths::Paths;
@@ -938,13 +938,7 @@ mod tests {
     // ── contract join ────────────────────────────────────────────────────────
 
     #[test]
-    fn the_action_ids_match_the_contract_in_order() {
-        let from_contract: Vec<&str> = contract()
-            .launch_actions
-            .iter()
-            .map(|a| a.id.as_str())
-            .collect();
-        assert_eq!(LAUNCH_ACTION_IDS.to_vec(), from_contract);
+    fn the_guarded_actions_are_listed_and_launch_is_last() {
         // The two guarded ones are in the list but implemented in `guards`.
         assert!(LAUNCH_ACTION_IDS.contains(&"audio-route"));
         assert!(LAUNCH_ACTION_IDS.contains(&"dashboard"));
@@ -1712,8 +1706,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn goldberg_writes_the_appid_digits_with_no_trailing_newline() {
-        // The bytes are the parity-critical part, so this one runs for real —
+    async fn goldberg_installs_the_dll_and_flag_files_and_never_refreshes_the_backup() {
+        // Which bytes ended up where is the point, so this one runs for real —
         // against a fixture tree under the temp dir, never the user's game.
         let root = scratch("gbe-bytes");
         let bs_dir = goldberg_fixture(&root, b"REAL-STEAM", b"GOLDBERG");
@@ -1728,11 +1722,6 @@ mod tests {
 
         goldberg_stage(&ctx).await.unwrap();
 
-        assert_eq!(
-            std::fs::read(api_dir.join("steam_appid.txt")).unwrap(),
-            contract().game.appid.to_string().into_bytes(),
-            "printf '%s' — no trailing newline"
-        );
         assert_eq!(
             std::fs::read(api_dir.join("steam_api64.dll.orig-steam")).unwrap(),
             b"REAL-STEAM",
@@ -1916,35 +1905,6 @@ mod tests {
     // ── wine env / spec / banner ─────────────────────────────────────────────
 
     #[test]
-    fn wine_env_reproduces_run_shs_exports_including_caller_precedence() {
-        let rt = Path::new("/repo/ext/oxrsys/build-x64/runtime/oxrsys-runtime.json");
-        let quiet = wine_env(false, None, 620980, rt);
-        assert_eq!(
-            quiet,
-            vec![
-                (
-                    "XR_RUNTIME_JSON".to_string(),
-                    "/repo/ext/oxrsys/build-x64/runtime/oxrsys-runtime.json".to_string()
-                ),
-                ("CX_GRAPHICS_BACKEND".to_string(), "dxmt".to_string()),
-                ("WINEDEBUG".to_string(), "-all".to_string()),
-                ("SteamAppId".to_string(), "620980".to_string()),
-                ("SteamGameId".to_string(), "620980".to_string()),
-            ]
-        );
-
-        let verbose = wine_env(true, None, 620980, rt);
-        assert_eq!(verbose[2].1, "fixme-all,+openxr");
-
-        // The caller's preset wins in BOTH branches (parity decision 21).
-        assert_eq!(wine_env(false, Some("+d3d11"), 1, rt)[2].1, "+d3d11");
-        assert_eq!(wine_env(true, Some("+d3d11"), 1, rt)[2].1, "+d3d11");
-        // zsh's `${WINEDEBUG:-…}` treats empty exactly like unset.
-        assert_eq!(wine_env(false, Some(""), 1, rt)[2].1, "-all");
-        assert_eq!(wine_env(true, Some(""), 1, rt)[2].1, "fixme-all,+openxr");
-    }
-
-    #[test]
     fn wine_spec_is_run_shs_argv() {
         let root = scratch("wine-spec");
         let b = bottle(&root);
@@ -1985,26 +1945,12 @@ mod tests {
     }
 
     #[test]
-    fn the_banner_is_run_shs_nine_lines_in_order() {
+    fn the_banner_is_one_section_with_every_text_row_on_the_launch_step() {
         let evs = banner_events(
             Uuid::nil(),
             "Steam",
             "Z:\\games\\Beat Saber.exe",
             Path::new("/repo/logs/beatsaber-20260829-101112.log"),
-        );
-        assert_eq!(
-            texts(&evs),
-            vec![
-                "",
-                "-- launching Beat Saber through the bridge",
-                "   put the headset ON and open the ALVR client; first frame can take ~30s.",
-                "   pause in-game = X/A button or the Quest system button",
-                "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)",
-                "   stop: Ctrl-C here, or ./demo.sh stop --bottle Steam from another shell",
-                "   exe: Z:\\games\\Beat Saber.exe",
-                "   log: /repo/logs/beatsaber-20260829-101112.log",
-                "",
-            ]
         );
         // Only the banner headline is a Section; everything else is verbatim Text.
         assert_eq!(

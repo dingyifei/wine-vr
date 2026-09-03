@@ -1767,7 +1767,7 @@ mod tests {
 
         // ── wine_env ─────────────────────────────────────────────────────────
 
-        /// run.sh:242-248, table form. The load-bearing branch is `WINEDEBUG`:
+        /// run.sh:245-251, table form. The load-bearing branch is `WINEDEBUG`:
         /// the caller's preset wins in **both** the verbose and non-verbose
         /// arms (`${WINEDEBUG:-…}`), and an inherited empty string is treated
         /// like unset (zsh's `:-`, not `-`).
@@ -1785,15 +1785,20 @@ mod tests {
                     .clone()
             }
 
-            let env = wine_env(false, None, appid, runtime_json);
-            assert_eq!(get(&env, "WINEDEBUG"), "-all");
             assert_eq!(
-                get(&env, "XR_RUNTIME_JSON"),
-                runtime_json.display().to_string()
+                wine_env(false, None, appid, runtime_json),
+                vec![
+                    (
+                        "XR_RUNTIME_JSON".to_string(),
+                        "/repo/ext/oxrsys/build-x64/runtime/oxrsys-runtime.json".to_string()
+                    ),
+                    ("CX_GRAPHICS_BACKEND".to_string(), "dxmt".to_string()),
+                    ("WINEDEBUG".to_string(), "-all".to_string()),
+                    ("SteamAppId".to_string(), "620980".to_string()),
+                    ("SteamGameId".to_string(), "620980".to_string()),
+                ],
+                "wine_env's quiet form is exactly run.sh's five exports, in this order"
             );
-            assert_eq!(get(&env, "CX_GRAPHICS_BACKEND"), "dxmt");
-            assert_eq!(get(&env, "SteamAppId"), "620980");
-            assert_eq!(get(&env, "SteamGameId"), "620980");
 
             assert_eq!(
                 get(&wine_env(true, None, appid, runtime_json), "WINEDEBUG"),
@@ -1909,8 +1914,7 @@ mod tests {
     /// The other direction — editing a native literal without touching
     /// `run.sh` — is NOT gated by sabrage-core's own frozen-text unit tests
     /// (`guards::tests::the_guard_texts_are_run_shs_verbatim`,
-    /// `mod::tests::the_closing_lines_are_run_shs_verbatim`,
-    /// `actions::tests::the_banner_is_run_shs_nine_lines_in_order`, …): tier 1
+    /// `mod::tests::the_closing_lines_are_run_shs_verbatim`, …): tier 1
     /// selects `sabrage-parity` + `sabrage-contract-gen` only
     /// (`scripts/dev/parity.sh`, `.github/workflows/parity.yml`), and Cargo
     /// does not run a dev-dependency's `#[cfg(test)]` harness. Those tests
@@ -2221,7 +2225,8 @@ mod tests {
             );
         }
 
-        /// run.sh:252-260's six-line banner block.
+        /// run.sh:255-263's nine-line banner block — every line, in order,
+        /// including the two blank lines that frame it.
         #[test]
         fn the_launch_banner_lines_are_verbatim_in_run_sh() {
             use sabrage_core::events::StageEvent;
@@ -2238,12 +2243,28 @@ mod tests {
             for ev in &events {
                 match ev {
                     StageEvent::Section { title, .. } => rendered.push(format!("-- {title}")),
-                    StageEvent::Text { text, .. } if !text.is_empty() => {
-                        rendered.push(text.clone())
-                    }
+                    StageEvent::Text { text, .. } => rendered.push(text.clone()),
                     _ => {}
                 }
             }
+            assert_eq!(
+                rendered,
+                vec![
+                    "".to_string(),
+                    "-- launching Beat Saber through the bridge".to_string(),
+                    "   put the headset ON and open the ALVR client; first frame can take ~30s."
+                        .to_string(),
+                    "   pause in-game = X/A button or the Quest system button".to_string(),
+                    "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)"
+                        .to_string(),
+                    "   stop: Ctrl-C here, or ./demo.sh stop --bottle Steam from another shell"
+                        .to_string(),
+                    format!("   exe: {bs_win}"),
+                    format!("   log: {}", log.display()),
+                    "".to_string(),
+                ],
+                "banner_events must emit run.sh's nine lines in order, blank line first and last"
+            );
             // The four fully static lines — no interpolation, so the real
             // rendered string must appear in run.sh verbatim.
             for fragment in [
