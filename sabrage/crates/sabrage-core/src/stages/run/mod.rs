@@ -1010,18 +1010,18 @@ async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Resu
 
 // ── verbatim text ─────────────────────────────────────────────────────────────
 
-/// run.sh:174.
+/// run.sh:177.
 ///
 /// `pub` (A1-3) so `sabrage-parity` can pin it against `run.sh` by calling the
 /// real constant rather than copying a substring.
 pub const HELPER_REAPED_LINE: &str = "encoder helper: reaped (left over from the runtime)";
 
-/// run.sh:180 — the INT trap's first line, before `stop_wine` runs.
+/// run.sh:183 — the INT trap's first line, before `stop_wine` runs.
 ///
 /// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
 pub const INT_TEARDOWN_LINE: &str = "interrupted: stopping wine";
 
-/// run.sh:269 — `print -r -- "wine exited with status $rc (log: $LOG)"`.
+/// run.sh:272 — `print -r -- "wine exited with status $rc (log: $LOG)"`.
 ///
 /// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
 pub fn wine_exit_line(rc: i32, log: &Path) -> String {

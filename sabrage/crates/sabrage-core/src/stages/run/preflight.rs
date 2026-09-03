@@ -924,6 +924,7 @@ mod tests {
         // The run-only slugs exist only here — they have no doctor row at all.
         assert!(slugs.contains(&"run.wine-exec"));
         assert!(slugs.contains(&"run.bridge-built"));
+        assert!(slugs.contains(&"run.wired-adb"));
     }
 
     /// Every `autofix`-gated slug must have an arm in [`apply_fix`], and every

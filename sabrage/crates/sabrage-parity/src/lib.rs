@@ -10,10 +10,14 @@
 //! `scripts/dev/parity.sh`'s job, not this crate's.
 //!
 //! Every test reads its shell/contract inputs from the **working checkout on
-//! disk** via [`tests::repo_root`], never from a compiled-in copy: the whole
-//! point of this crate is to catch "the checkout and the generated/compiled
-//! artifact disagree," which comparing two compiled-in copies of the same
-//! `include_str!` would defeat by construction.
+//! disk** via [`tests::repo_root`], never from a compiled-in copy — with one
+//! deliberate exception: the contract-gen parity test also compiles in its
+//! own `include_str!` of the committed `scripts/demo/contract.gen.sh`, so the
+//! compiled generator is compared against the checked-in bytes (the one place
+//! those bytes are pinned). Everywhere else the point of this crate is to
+//! catch "the checkout and the generated/compiled artifact disagree," which
+//! comparing two compiled-in copies of the same `include_str!` would defeat
+//! by construction.
 
 #[cfg(test)]
 mod tests {
@@ -1098,13 +1102,16 @@ mod tests {
     // ── (5) artifact goldens ─────────────────────────────────────────────────
 
     /// Byte-exact rendering checks, each built from the template/contract
-    /// file read fresh off disk rather than sabrage-core's compiled-in copy.
-    /// No sabrage-core test compares a *rendered* artifact against those
-    /// on-disk bytes — it pins the compiled-in templates' shape
-    /// (`contract::tests::templates_are_the_bytes_the_shell_writes`) and the
-    /// host manifest's two forms against each other — so a stale
-    /// `include_str!` (edited the on-disk template, forgot to rebuild) shows
-    /// up here as a byte diff on the rendered artifact itself.
+    /// file read fresh off disk rather than sabrage-core's compiled-in copy
+    /// — plus the pure pins that live here per 3.5 (`win_path_table` and the write-signature shim),
+    /// which read nothing. sabrage-core pins the compiled-in templates' shape
+    /// (`contract::tests::templates_are_the_bytes_the_shell_writes`), the
+    /// host manifest's two forms against each other, and the compiled-in
+    /// bytes against the on-disk files by digest
+    /// (`contract::tests::compiled_contract_sha256_matches_the_checkout_it_was_built_from`);
+    /// this module is where a *rendered* artifact is compared against those
+    /// on-disk bytes, so a stale `include_str!` (edited the on-disk template,
+    /// forgot to rebuild) shows up here as a byte diff on the artifact itself.
     mod artifact_goldens {
         use super::repo_root;
         use std::path::{Path, PathBuf};
@@ -2090,9 +2097,11 @@ mod tests {
                 assert_eq!(block_die(&c, slug, &outcome).0, rendered, "{slug}");
             }
 
-            // Native-only rows: run.sh `cmp`s only `d3d11.dll`, so these two
-            // sentences exist on this side alone (the divergence is contract
-            // data) — there is nothing in run.sh to match them against.
+            // Native-only rows: run.sh `cmp`s only `d3d11.dll`, so neither slug
+            // has a shell counterpart (the divergence is contract data).
+            // `overlay.dxmt-winemetal` shares the d3d11 arm's sentence, already
+            // matched against run.sh above; only `overlay.woxr-dll`'s sentence
+            // exists on this side alone.
             for (slug, rendered) in [
                 (
                     "overlay.dxmt-winemetal",
@@ -2213,10 +2222,14 @@ mod tests {
             ] {
                 assert_verbatim(&text, fragment, site);
             }
-            // The real constant, not a copy.
+            // The real constant, not a copy — anchored as the whole `print`
+            // argument so a truncated constant cannot pass as a substring.
             assert_verbatim(
                 &text,
-                sabrage_core::stages::run::HELPER_REAPED_LINE,
+                &format!(
+                    "print \"{}\"",
+                    sabrage_core::stages::run::HELPER_REAPED_LINE
+                ),
                 "stages::run::HELPER_REAPED_LINE",
             );
         }
@@ -2327,24 +2340,10 @@ mod tests {
                 "   pause in-game = X/A button or the Quest system button",
                 "   (the left-menu-button pause is a Beat Saber/Unity limitation on every OpenXR runtime)",
             ] {
-                assert!(
-                    rendered.iter().any(|r| r == fragment),
-                    "banner_events dropped or reworded {fragment:?}: {rendered:?}"
-                );
                 assert_verbatim(&text, fragment, "stages::run::actions::banner_events");
             }
-            // The three interpolated lines: pin the static prefix/suffix that
-            // survives around whatever `bs_win_path`/the bottle name/the log
-            // path rendered.
-            let stop_line = rendered
-                .iter()
-                .find(|r| r.starts_with("   stop: "))
-                .expect("banner_events emits the stop line");
-            assert!(
-                stop_line.starts_with("   stop: Ctrl-C here, or ./demo.sh stop --bottle Steam")
-                    && stop_line.ends_with("from another shell"),
-                "{stop_line}"
-            );
+            // The three interpolated lines are pinned in full by the equality
+            // above; only their static fragments can be matched against run.sh.
             assert_verbatim(
                 &text,
                 "   stop: Ctrl-C here, or ./demo.sh stop --bottle",
@@ -2355,17 +2354,7 @@ mod tests {
                 "from another shell",
                 "stages::run::actions::banner_events",
             );
-            assert!(
-                rendered.iter().any(|r| r == &format!("   exe: {bs_win}")),
-                "{rendered:?}"
-            );
             assert_verbatim(&text, "   exe: ", "stages::run::actions::banner_events");
-            assert!(
-                rendered
-                    .iter()
-                    .any(|r| r == &format!("   log: {}", log.display())),
-                "{rendered:?}"
-            );
             assert_verbatim(&text, "   log: ", "stages::run::actions::banner_events");
 
             // `wine_exit_line` and `INT_TEARDOWN_LINE`, called/read for real.
