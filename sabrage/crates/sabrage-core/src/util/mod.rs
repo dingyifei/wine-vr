@@ -416,47 +416,6 @@ mod tests {
     }
 
     #[test]
-    fn host_manifest_is_template_minus_trailing_newline() {
-        let want = render_host_manifest(Path::new("/repo/ext/oxrsys/build-x64/runtime/lib.dylib"));
-        assert!(!want.ends_with('\n'));
-        assert!(!want.contains(HOST_MANIFEST_PLACEHOLDER));
-        assert!(want.contains("/repo/ext/oxrsys/build-x64/runtime/lib.dylib"));
-        assert_eq!(
-            host_manifest_file_bytes(Path::new("/repo/ext/oxrsys/build-x64/runtime/lib.dylib")),
-            format!("{want}\n")
-        );
-    }
-
-    /// A path inside a JSON string literal must be escaped, and an ordinary
-    /// path must still render byte-identically to the unescaped form (the
-    /// golden every deployed host manifest was written with).
-    #[test]
-    fn host_manifest_json_escapes_the_dylib_path() {
-        let plain = Path::new("/repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib");
-        assert_eq!(
-            render_host_manifest(plain),
-            strip_trailing_newlines(crate::contract::HOST_MANIFEST_TEMPLATE)
-                .replace(HOST_MANIFEST_PLACEHOLDER, &plain.to_string_lossy()),
-            "ordinary paths must render exactly as they did before escaping existed"
-        );
-
-        for raw in [
-            "/Users/me/my \"vr\" repo/ext/oxrsys/build-x64/runtime/lib.dylib",
-            "/Users/me/a\\b/ext/oxrsys/build-x64/runtime/lib.dylib",
-            "/Users/me/\"\\\"/lib.dylib",
-        ] {
-            let rendered = render_host_manifest(Path::new(raw));
-            let parsed: serde_json::Value =
-                serde_json::from_str(&rendered).unwrap_or_else(|e| panic!("{rendered}: {e}"));
-            assert_eq!(
-                parsed["runtime"]["library_path"].as_str(),
-                Some(raw),
-                "the decoded library_path must be the path we were given"
-            );
-        }
-    }
-
-    #[test]
     fn json_escape_string_is_install_shs_two_substitutions() {
         assert_eq!(json_escape_string("/plain/path"), "/plain/path");
         assert_eq!(json_escape_string(r#"a"b"#), r#"a\"b"#);

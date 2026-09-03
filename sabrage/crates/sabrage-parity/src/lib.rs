@@ -1098,10 +1098,13 @@ mod tests {
     // ── (5) artifact goldens ─────────────────────────────────────────────────
 
     /// Byte-exact rendering checks, each built from the template/contract
-    /// file read fresh off disk rather than sabrage-core's compiled-in copy —
-    /// sabrage-core's own unit tests already cover the compiled-in-vs-itself
-    /// case; this crate's job is to also catch a stale `include_str!` (edited
-    /// the on-disk template, forgot to rebuild).
+    /// file read fresh off disk rather than sabrage-core's compiled-in copy.
+    /// No sabrage-core test compares a *rendered* artifact against those
+    /// on-disk bytes — it pins the compiled-in templates' shape
+    /// (`contract::tests::templates_are_the_bytes_the_shell_writes`) and the
+    /// host manifest's two forms against each other — so a stale
+    /// `include_str!` (edited the on-disk template, forgot to rebuild) shows
+    /// up here as a byte diff on the rendered artifact itself.
     mod artifact_goldens {
         use super::repo_root;
         use std::path::{Path, PathBuf};
@@ -1124,6 +1127,9 @@ mod tests {
             );
         }
 
+        /// r1:A1-8 regression: the dylib path is JSON-escaped, so a path
+        /// containing `"` or `\` decodes back to itself.
+        ///
         /// The dylib path lands inside a JSON string literal, so both
         /// front-ends escape it (`util::json_escape_string` here,
         /// `${OXR_DYLIB//\\/\\\\}` + `${.../\"/\\\"}` in install.sh) before the
