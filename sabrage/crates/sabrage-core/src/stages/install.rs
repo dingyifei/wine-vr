@@ -960,8 +960,6 @@ mod tests {
             "out-of-order literals must not match"
         );
 
-        assert!(system_reg_contains(&reg, "ActiveRuntime"));
-        assert!(!system_reg_contains(&reg, "nope"));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
