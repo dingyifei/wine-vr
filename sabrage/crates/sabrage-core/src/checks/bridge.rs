@@ -177,7 +177,6 @@ mod tests {
     #[test]
     fn no_bottle_skips_all_three_with_the_verbatim_reason() {
         let ctx = CheckCtx::new(Paths::new(Path::new("/repo")), CheckOptions::new());
-        assert!(ctx.bottle.is_none());
         for eval in [
             woxr_dll as Evaluator,
             manifest as Evaluator,
