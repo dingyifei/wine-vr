@@ -78,11 +78,13 @@ says what is true now and cites the id for the rest.
 
 **1.8 Some comments are code.** A comment that a program reads or prints is load-bearing and is
 changed only together with its reader; §1 and 2.4 do not apply to it, 2.2 does. In this repository:
-the `# preflight:` / `# preflight-warn:` / `# preflight-autofix:` / `# launch_action:` tags in
+the `# preflight:` / `# preflight-warn:` / `# preflight-autofix:` / `# launch-action:` tags in
 `scripts/demo/run.sh` (parsed by `sabrage-parity` `run_sh_tags`), the `# N. <section>` headers in
 `scripts/demo/doctor.sh` (parsed by `slug_coverage::section_header`), generated-file headers
-(`# GENERATED …`, `# contract-sha256:`), `contract/pipeline.toml`'s per-row comments, and the header
-block of `scripts/dev/parity.sh` (printed verbatim by `usage()`). *House rule.*
+(`# GENERATED …`, `# contract-sha256:`), `contract/pipeline.toml`'s per-row comments, the header
+block of `scripts/dev/parity.sh` (printed verbatim by `usage()`), and lines 2–22 of `demo.sh` (2–20
+printed verbatim by the unknown-command branch's `sed -n '2,20p'`; 21–22 cited by the PARITY.md row on
+`--wired`/`--verbose`). *House rule.*
 
 ## 2. False or stale comments
 
