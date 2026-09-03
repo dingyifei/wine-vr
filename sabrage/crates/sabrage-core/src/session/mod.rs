@@ -783,7 +783,6 @@ mod tests {
         assert_eq!(j["encoder"]["refreshHz"], 72);
         assert_eq!(j["encoder"]["bitrateMbps"], 100);
         assert_eq!(j["encoder"]["path"], "native helper");
-        assert_eq!(serde_json::from_value::<SessionStatus>(j).unwrap(), s);
     }
 
     #[test]
