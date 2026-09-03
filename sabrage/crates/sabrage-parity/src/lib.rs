@@ -1090,7 +1090,7 @@ mod tests {
     /// the on-disk template, forgot to rebuild).
     mod artifact_goldens {
         use super::repo_root;
-        use std::path::Path;
+        use std::path::{Path, PathBuf};
 
         #[test]
         fn render_host_manifest_matches_the_on_disk_template() {
@@ -1220,36 +1220,65 @@ mod tests {
             use sabrage_core::util::win_path;
             let prefix = Path::new("/Users/me/Library/Application Support/CrossOver/Bottles/Steam");
 
-            // Inside drive_c -> C:\, separators flipped.
-            assert_eq!(
-                win_path(
+            // The `drive_c` match is a string prefix ending in a slash, not
+            // path-component containment (design-core §10 parity decision 22):
+            // the bare `drive_c` directory falls through to Z:, and a sibling
+            // whose name merely starts with "drive_c" is never inside it.
+            let cases: &[(&str, Option<&Path>, PathBuf, &str)] = &[
+                (
+                    "inside drive_c -> C: with separators flipped",
                     Some(prefix),
-                    &prefix.join("drive_c/windows/system32/wineopenxr.dll")
+                    prefix.join("drive_c/windows/system32/wineopenxr.dll"),
+                    "C:\\windows\\system32\\wineopenxr.dll",
                 ),
-                "C:\\windows\\system32\\wineopenxr.dll"
-            );
-            assert_eq!(
-                win_path(Some(prefix), &prefix.join("drive_c/openxr")),
-                "C:\\openxr"
-            );
-
-            // The literal `drive_c` directory (no trailing slash / nothing
-            // after it) does NOT match the trailing-slash glob and falls
-            // through to Z: — this is string matching, not path-component
-            // matching (design-core §10 parity decision 22).
-            let dc = prefix.join("drive_c");
-            assert_eq!(
-                win_path(Some(prefix), &dc),
-                format!("Z:{}", dc.display().to_string().replace('/', "\\"))
-            );
-
-            // Outside the bottle -> Z: + the whole path.
-            assert_eq!(
-                win_path(Some(prefix), Path::new("/games/Beat Saber 1294")),
-                "Z:\\games\\Beat Saber 1294"
-            );
-            // No prefix at all -> Z:.
-            assert_eq!(win_path(None, Path::new("/games/bs")), "Z:\\games\\bs");
+                (
+                    "spaces and parentheses survive on the C: branch",
+                    Some(prefix),
+                    prefix.join(
+                        "drive_c/Program Files (x86)/Steam/steamapps/common/Beat Saber 1294",
+                    ),
+                    "C:\\Program Files (x86)\\Steam\\steamapps\\common\\Beat Saber 1294",
+                ),
+                (
+                    "immediate child of drive_c",
+                    Some(prefix),
+                    prefix.join("drive_c/openxr"),
+                    "C:\\openxr",
+                ),
+                (
+                    "the literal drive_c directory misses the trailing-slash glob",
+                    Some(prefix),
+                    prefix.join("drive_c"),
+                    "Z:\\Users\\me\\Library\\Application Support\\CrossOver\\Bottles\\Steam\\drive_c",
+                ),
+                (
+                    "a drive_cache sibling is not inside drive_c",
+                    Some(prefix),
+                    prefix.join("drive_cache/x"),
+                    "Z:\\Users\\me\\Library\\Application Support\\CrossOver\\Bottles\\Steam\\drive_cache\\x",
+                ),
+                (
+                    "outside the bottle -> Z: plus the whole path",
+                    Some(prefix),
+                    PathBuf::from("/games/Beat Saber 1294"),
+                    "Z:\\games\\Beat Saber 1294",
+                ),
+                (
+                    "no prefix at all -> Z:",
+                    None,
+                    PathBuf::from("/games/bs"),
+                    "Z:\\games\\bs",
+                ),
+                (
+                    "empty prefix behaves like no prefix (zsh `[ -n \"${PREFIX:-}\" ]`)",
+                    Some(Path::new("")),
+                    PathBuf::from("/games/bs"),
+                    "Z:\\games\\bs",
+                ),
+            ];
+            for (label, pre, input, want) in cases {
+                assert_eq!(win_path(*pre, input), *want, "{label}");
+            }
         }
 
         #[test]
