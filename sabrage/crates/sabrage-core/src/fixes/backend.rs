@@ -81,8 +81,9 @@ pub enum Branch {
 /// `[EnvironmentVariables]"CX_GRAPHICS_BACKEND" = "dxmt"` — and still adds a
 /// trailing newline to the file sed never had. This implementation always
 /// inserts a real line break between the header and the new line and
-/// preserves the absence of a trailing newline exactly (see
-/// `branch_insert_preserves_absence_of_a_trailing_newline` below): strictly
+/// preserves the absence of a trailing newline exactly (pinned by the
+/// `header and inserted line must be joined by a real newline …` row of
+/// `branch_rewrite_cases` below): strictly
 /// better than `sed` in that one cell, not byte-parity with it. Every other
 /// cell measured — the header mid-file with no trailing newline, the rewrite
 /// branch with no trailing newline, and the append branch — is sed-identical.
@@ -315,7 +316,7 @@ async fn rewrite(ctx: &StageCtx, sink: &EventSink, policy: WineserverPolicy) -> 
     // without the target line: a `"CX_GRAPHICS_BACKEND"` line whose value is
     // unquoted (or spaced differently) starts with the key but does not match
     // the anchored substitution, so nothing is replaced
-    // (`branch_rewrite_leaves_a_malformed_key_line_untouched_like_sed_would`).
+    // (the `an unquoted value must not be touched …` row of `branch_rewrite_cases`).
     // Writing those bytes back and reporting "forced to dxmt" would be a fix
     // claiming a success doctor still fails on. Verify the postcondition the
     // caller cares about — the line doctor greps for — before writing anything,
@@ -360,115 +361,89 @@ mod tests {
 
     // ── rewrite_graphics_backend: the three branches, byte-exact ────────────
 
+    /// Every branch of `rewrite_graphics_backend` over literal `cxbottle.conf`
+    /// bodies: (label, input, expected branch, expected bytes out, whether the
+    /// result contains the line doctor greps for).
+    ///
+    /// Two rows carry measured shell behaviour. The unquoted-value row is
+    /// sed-faithful: a line that starts with the key but is not shaped
+    /// `"CX_GRAPHICS_BACKEND" = "..."` is left alone, so the file can come out
+    /// without the target line (anchor `false`). The header-with-no-trailing-
+    /// newline row is a deliberate improvement over BSD sed
+    /// (review finding #10; measured table in the review), which in that one
+    /// cell concatenates the appended text straight onto the header and adds
+    /// a trailing newline
+    /// the file never had; this implementation joins them with a real `\n` and
+    /// preserves the missing trailing newline.
     #[test]
-    fn branch_rewrites_an_existing_key_line_in_place() {
-        let conf =
-            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n\"Other\" = \"1\"\n";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::Rewrote);
-        assert_eq!(
-            out,
-            "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n\"Other\" = \"1\"\n"
-        );
-        assert!(matches_doctor_anchor(&out));
-    }
+    fn branch_rewrite_cases() {
+        let cases: &[(&str, &str, Branch, &str, bool)] = &[
+            (
+                "rewrites an existing key line in place",
+                "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n\"Other\" = \"1\"\n",
+                Branch::Rewrote,
+                "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n\"Other\" = \"1\"\n",
+                true,
+            ),
+            (
+                "empty existing value is still rewritten",
+                "\"CX_GRAPHICS_BACKEND\" = \"\"\n",
+                Branch::Rewrote,
+                "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+                true,
+            ),
+            (
+                "no trailing newline is preserved on rewrite",
+                "\"CX_GRAPHICS_BACKEND\" = \"auto\"",
+                Branch::Rewrote,
+                "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"",
+                true,
+            ),
+            (
+                "an unquoted value must not be touched, exactly as sed's anchored s/// would skip it",
+                "\"CX_GRAPHICS_BACKEND\" = auto\n",
+                Branch::Rewrote,
+                "\"CX_GRAPHICS_BACKEND\" = auto\n",
+                false,
+            ),
+            (
+                "inserts immediately after the [EnvironmentVariables] header",
+                "[EnvironmentVariables]\n\"SOME_OTHER\" = \"1\"\n",
+                Branch::InsertedAfterEnvSection,
+                "[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n\"SOME_OTHER\" = \"1\"\n",
+                true,
+            ),
+            (
+                "header and inserted line must be joined by a real newline, not concatenated the \
+                 way BSD sed's `a\\` mangles this exact case, and must not gain a trailing newline \
+                 the original file never had",
+                "[EnvironmentVariables]",
+                Branch::InsertedAfterEnvSection,
+                "[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"",
+                true,
+            ),
+            (
+                "appends a new section when neither exists",
+                "\"Template\" = \"win11_64\"\n",
+                Branch::AppendedSection,
+                "\"Template\" = \"win11_64\"\n\n[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+                true,
+            ),
+            (
+                "append does not care whether the original had a trailing newline (input has none)",
+                "\"Template\" = \"win11_64\"",
+                Branch::AppendedSection,
+                "\"Template\" = \"win11_64\"\n[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n",
+                true,
+            ),
+        ];
 
-    #[test]
-    fn branch_rewrite_handles_an_empty_existing_value() {
-        let conf = "\"CX_GRAPHICS_BACKEND\" = \"\"\n";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::Rewrote);
-        assert_eq!(out, "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n");
-        assert!(matches_doctor_anchor(&out));
-    }
-
-    #[test]
-    fn branch_rewrite_preserves_absence_of_a_trailing_newline() {
-        let conf = "\"CX_GRAPHICS_BACKEND\" = \"auto\"";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::Rewrote);
-        assert_eq!(out, "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"");
-        assert!(!out.ends_with('\n'));
-    }
-
-    #[test]
-    fn branch_rewrite_leaves_a_malformed_key_line_untouched_like_sed_would() {
-        // Starts with the key (enters the Rewrote branch overall) but is not
-        // shaped `"CX_GRAPHICS_BACKEND" = "..."`, so sed's anchored `s///`
-        // would not match it either. Faithfully reproduced: the line survives
-        // unmodified and the file does NOT end up containing the target line.
-        let conf = "\"CX_GRAPHICS_BACKEND\" = auto\n";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::Rewrote);
-        assert_eq!(out, conf, "an unquoted value must not be touched");
-        assert!(!matches_doctor_anchor(&out));
-    }
-
-    #[test]
-    fn branch_inserts_immediately_after_the_environment_variables_header() {
-        let conf = "[EnvironmentVariables]\n\"SOME_OTHER\" = \"1\"\n";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::InsertedAfterEnvSection);
-        assert_eq!(
-            out,
-            "[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n\"SOME_OTHER\" = \"1\"\n"
-        );
-        assert!(matches_doctor_anchor(&out));
-    }
-
-    /// Documented improvement over BSD `sed`, not parity with it (review
-    /// finding #10; measured table in the review). Run for real against this
-    /// exact input,
-    /// `sed -i '' '/^\[EnvironmentVariables\]$/a\"CX_GRAPHICS_BACKEND" = "dxmt"'`
-    /// mangles the header — because `[EnvironmentVariables]` is both the match
-    /// for `a\` *and* the file's last line with no trailing newline, sed has
-    /// nothing to append "after" and instead concatenates the appended text
-    /// straight onto the header, producing
-    /// `[EnvironmentVariables]"CX_GRAPHICS_BACKEND" = "dxmt"\n` (header
-    /// corrupted, and a trailing newline appears that the original file never
-    /// had). This implementation never does that: the header and the new line
-    /// are always joined by a real `\n`, and the file's own trailing-newline
-    /// state is preserved exactly, as asserted below. Real `cxbottle.conf`
-    /// files always end in a newline, so the sed-mangled case never arises in
-    /// practice — but the byte-exact assertion here is what would catch a
-    /// regression toward it.
-    #[test]
-    fn branch_insert_preserves_absence_of_a_trailing_newline() {
-        let conf = "[EnvironmentVariables]";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::InsertedAfterEnvSection);
-        assert_eq!(
-            out, "[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"",
-            "header and inserted line must be joined by a real newline, not \
-             concatenated the way BSD sed's `a\\` mangles this exact case"
-        );
-        assert!(
-            !out.ends_with('\n'),
-            "must not gain a trailing newline the original file never had"
-        );
-    }
-
-    #[test]
-    fn branch_appends_a_new_section_when_neither_exists() {
-        let conf = "\"Template\" = \"win11_64\"\n";
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::AppendedSection);
-        assert_eq!(
-            out,
-            "\"Template\" = \"win11_64\"\n\n[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n"
-        );
-        assert!(matches_doctor_anchor(&out));
-    }
-
-    #[test]
-    fn branch_append_does_not_care_whether_the_original_had_a_trailing_newline() {
-        let conf = "\"Template\" = \"win11_64\""; // no trailing newline
-        let (out, branch) = rewrite_graphics_backend(conf);
-        assert_eq!(branch, Branch::AppendedSection);
-        assert_eq!(
-            out,
-            "\"Template\" = \"win11_64\"\n[EnvironmentVariables]\n\"CX_GRAPHICS_BACKEND\" = \"dxmt\"\n"
-        );
+        for (label, conf, expected_branch, expected_out, expected_anchor) in cases {
+            let (out, branch) = rewrite_graphics_backend(conf);
+            assert_eq!(branch, *expected_branch, "{label}");
+            assert_eq!(out.as_str(), *expected_out, "{label}");
+            assert_eq!(matches_doctor_anchor(&out), *expected_anchor, "{label}");
+        }
     }
 
     // ── wineserver liveness: the pure decision, unit-tested directly ────────
@@ -485,37 +460,51 @@ mod tests {
     // below, which takes the same shape `scan_wineservers` produces.
 
     #[test]
-    fn wineservers_indicate_live_matches_by_exact_wineprefix() {
-        let observed = vec![Some("/bottles/A".to_string())];
-        assert!(wineservers_indicate_live(&observed, "/bottles/A"));
-        assert!(!wineservers_indicate_live(&observed, "/bottles/B"));
-    }
-
-    #[test]
-    fn wineservers_indicate_live_refuses_when_a_match_cannot_be_ruled_out() {
-        // No WINEPREFIX readable on a live wineserver at all: cannot tell
-        // which bottle it belongs to -> refuse (true) for every candidate.
-        let observed = vec![None];
-        assert!(wineservers_indicate_live(&observed, "/anything"));
-
-        // One process for a different bottle AND one unreadable: still
-        // refuses, because the unreadable one might be this bottle's.
-        let observed = vec![Some("/bottles/Other".to_string()), None];
-        assert!(wineservers_indicate_live(&observed, "/bottles/A"));
-    }
-
-    #[test]
-    fn wineservers_indicate_live_is_false_when_nothing_is_running() {
-        assert!(!wineservers_indicate_live(&[], "/anything"));
-    }
-
-    #[test]
-    fn wineservers_indicate_live_is_false_when_every_match_is_a_different_bottle() {
-        let observed = vec![
-            Some("/bottles/Other1".to_string()),
-            Some("/bottles/Other2".to_string()),
+    fn wineservers_indicate_live_decides_by_wineprefix() {
+        let cases: &[(&str, &[Option<&str>], &str, bool)] = &[
+            (
+                "exact prefix matches",
+                &[Some("/bottles/A")],
+                "/bottles/A",
+                true,
+            ),
+            (
+                "same observation, a different candidate bottle",
+                &[Some("/bottles/A")],
+                "/bottles/B",
+                false,
+            ),
+            (
+                "an unreadable WINEPREFIX alone refuses: cannot tell which bottle it belongs to",
+                &[None],
+                "/anything",
+                true,
+            ),
+            (
+                "a different bottle plus one unreadable still refuses: the unreadable one might \
+                 be this bottle's",
+                &[Some("/bottles/Other"), None],
+                "/bottles/A",
+                true,
+            ),
+            ("nothing running", &[], "/anything", false),
+            (
+                "every match is a different bottle",
+                &[Some("/bottles/Other1"), Some("/bottles/Other2")],
+                "/bottles/A",
+                false,
+            ),
         ];
-        assert!(!wineservers_indicate_live(&observed, "/bottles/A"));
+
+        for (label, observed, want_prefix, expected) in cases {
+            let observed: Vec<Option<String>> =
+                observed.iter().map(|p| p.map(str::to_string)).collect();
+            assert_eq!(
+                wineservers_indicate_live(&observed, want_prefix),
+                *expected,
+                "{label}"
+            );
+        }
     }
 
     /// Sanity check for the sysinfo-backed plumbing itself: a path nothing on

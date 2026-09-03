@@ -318,6 +318,7 @@ mod tests {
 
     #[tokio::test]
     async fn no_backup_reports_restored_false_with_a_says_why_message() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("no-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -340,6 +341,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_present_backup_is_restored_and_left_in_place() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("with-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -375,6 +377,7 @@ mod tests {
 
     #[tokio::test]
     async fn reverting_twice_is_idempotent() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("idempotent");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -395,6 +398,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_when_the_backup_is_itself_the_pinned_goldberg_dll() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("goldberg-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -442,6 +446,7 @@ mod tests {
     /// `.orig-steam`. A pin-only test called that backup "the original".
     #[tokio::test]
     async fn refuses_when_the_backup_is_an_unpinned_goldberg_build() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("unpinned-goldberg-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -486,6 +491,7 @@ mod tests {
     /// under a "restored" claim.
     #[tokio::test]
     async fn refuses_when_a_launch_recorded_the_backup_as_goldberg() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("recorded-goldberg-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -526,6 +532,7 @@ mod tests {
     /// test must not swallow the ordinary case.
     #[tokio::test]
     async fn a_backup_unlike_the_payload_is_still_restored() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("payload-unlike-backup");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -553,6 +560,7 @@ mod tests {
     /// starting a game.
     #[tokio::test]
     async fn refuses_while_a_matching_game_process_is_running() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("running-game");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -592,6 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_success_message_never_claims_the_original_was_restored() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("honest-message");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -664,6 +673,7 @@ mod tests {
 
     #[tokio::test]
     async fn refuses_while_a_persisted_session_records_a_live_wine_child() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("persisted-session");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -701,6 +711,7 @@ mod tests {
 
     #[tokio::test]
     async fn waits_for_the_operation_lock_then_proceeds() {
+        let _g = crate::session::lock_session_globals();
         let bs_dir = scratch("operation-lock");
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
@@ -733,12 +744,17 @@ mod tests {
         std::fs::remove_dir_all(&bs_dir).unwrap();
     }
 
+    // Every test above holds `session::lock_session_globals()`, because
+    // `revert_probed` reads the published run phase and the run-stage tests
+    // publish it: without the guard a `RunPhaseScope` alive on another harness
+    // thread makes this module's reverts fail with "a launch for bottle
+    // 'Steam' is in progress".
+    //
     // The in-process half of the liveness rule — a `LiveSessionHandle`
-    // published through `session::set_live_session` — is still not faked
-    // here: that global is shared with every other test in this binary
-    // (`session::lock_session_globals`, which serializes its writers, is
-    // `pub(crate)` to the `session` module's own test submodule). The
-    // persisted half above covers the same branch of `live_session_reason`, and
-    // `waits_for_the_operation_lock_then_proceeds` covers the window that
-    // check alone could not close.
+    // published through `session::set_live_session` — is still not faked here:
+    // that guard deliberately does not reset `LIVE_SESSION` (tests in other
+    // modules set it without holding the guard), so a fake published here would
+    // leak into them. The persisted half above covers the same branch of
+    // `live_session_reason`, and `waits_for_the_operation_lock_then_proceeds`
+    // covers the window that check alone could not close.
 }
