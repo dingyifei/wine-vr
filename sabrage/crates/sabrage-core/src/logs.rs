@@ -1227,7 +1227,8 @@ mod tests {
     /// reading.
     #[test]
     fn truncate_and_regrow_past_the_cursor_between_polls_reports_rotation() {
-        for regrow in ["equal", "larger"] {
+        let cases: &[(&str, usize)] = &[("equal", 10), ("larger", 30)];
+        for (regrow, new_lines) in cases {
             let dir = scratch(&format!("rewrite-{regrow}"));
             let path = dir.join("a.log");
             let old: String = (1..=10)
@@ -1240,14 +1241,9 @@ mod tests {
             let mut t = Tailer::open(&path, true, 5).unwrap();
             let _ = t.poll().unwrap();
 
-            let new: String = match regrow {
-                "equal" => (1..=10)
-                    .map(|n| format!("NEW session line {n}\n"))
-                    .collect(),
-                _ => (1..=30)
-                    .map(|n| format!("NEW session line {n}\n"))
-                    .collect(),
-            };
+            let new: String = (1..=*new_lines)
+                .map(|n| format!("NEW session line {n}\n"))
+                .collect();
             // In place, same inode — `OpenOptions::truncate`, not remove+create.
             {
                 use std::io::Write;
