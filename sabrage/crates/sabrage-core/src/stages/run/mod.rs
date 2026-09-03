@@ -1152,10 +1152,6 @@ mod tests {
             "wine exited with status 139 (log: /l.log)"
         );
         assert_eq!(
-            HELPER_REAPED_LINE,
-            "encoder helper: reaped (left over from the runtime)"
-        );
-        assert_eq!(
             detached_line(Path::new("/l.log")),
             "-- detached: leaving the session running (log: /l.log)"
         );
