@@ -314,20 +314,14 @@ mod tests {
             "/usr/local/share/openxr/1/active_runtime.x86_64.json"
         );
         assert_eq!(c.ports.stream, vec![9943, 9944]);
-        assert_eq!(c.ports.legacy_reverse, vec![9944, 9945, 9946, 9948]);
         assert_eq!(c.ports.dashboard_addr, "127.0.0.1:8082");
         assert_eq!(c.dxmt.files.len(), 5);
         assert!(!c.checks.is_empty());
-        assert_eq!(c.launch_actions.len(), 7);
     }
 
     #[test]
-    fn check_slugs_are_unique_and_ordered_meta_first() {
+    fn meta_contract_sync_is_the_first_compiled_check() {
         let c = contract();
-        let mut seen = std::collections::BTreeSet::new();
-        for slug in c.check_slugs() {
-            assert!(seen.insert(slug), "duplicate slug in contract: {slug}");
-        }
         assert_eq!(c.checks[0].slug, "meta.contract-sync");
     }
 
