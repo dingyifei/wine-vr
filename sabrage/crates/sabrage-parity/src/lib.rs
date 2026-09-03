@@ -1901,6 +1901,8 @@ mod tests {
 
             let p1 = sabrage_core::logs::wine_log_candidate(logs_dir, now, 1);
             assert_eq!(p1, logs_dir.join("beatsaber-20260829-101112-2.log"));
+            let p3 = sabrage_core::logs::wine_log_candidate(logs_dir, now, 3);
+            assert_eq!(p3, logs_dir.join("beatsaber-20260829-101112-4.log"));
         }
     }
 

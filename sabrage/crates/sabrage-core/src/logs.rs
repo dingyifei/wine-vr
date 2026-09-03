@@ -741,30 +741,6 @@ mod tests {
     // ── wine_log_candidate ───────────────────────────────────────────────────
 
     #[test]
-    fn attempt_zero_matches_the_shells_date_stamp() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
-            .unwrap();
-        let p = wine_log_candidate(Path::new("/repo/logs"), now, 0);
-        assert_eq!(p, PathBuf::from("/repo/logs/beatsaber-20260829-101112.log"));
-    }
-
-    #[test]
-    fn collisions_get_a_dash_n_plus_one_suffix() {
-        let now = chrono::Local
-            .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
-            .unwrap();
-        assert_eq!(
-            wine_log_candidate(Path::new("/repo/logs"), now, 1),
-            PathBuf::from("/repo/logs/beatsaber-20260829-101112-2.log")
-        );
-        assert_eq!(
-            wine_log_candidate(Path::new("/repo/logs"), now, 3),
-            PathBuf::from("/repo/logs/beatsaber-20260829-101112-4.log")
-        );
-    }
-
-    #[test]
     fn wine_log_candidate_delegates_to_the_stamped_form_byte_for_byte() {
         // Two facts about the same names: `wine_log_candidate_stamped` emits
         // these exact paths for a hand-built stamp with no chrono in sight —
