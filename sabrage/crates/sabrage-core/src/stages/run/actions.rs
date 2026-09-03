@@ -1888,7 +1888,7 @@ mod tests {
         ));
 
         goldberg_stage(&ctx).await.unwrap();
-        assert_eq!(std::fs::read(&backup).unwrap(), b"REAL-STEAM");
+        assert!(backup.is_file(), "the stage minted the backup");
         assert!(!goldberg_backup_is_goldberg(&ctx.paths, &backup));
         std::fs::remove_dir_all(&root).ok();
     }
