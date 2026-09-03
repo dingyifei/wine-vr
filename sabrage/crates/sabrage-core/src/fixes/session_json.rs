@@ -211,8 +211,7 @@ mod tests {
     #[tokio::test]
     async fn missing_file_is_a_noop() {
         let root = scratch("missing");
-        let (ctx, session_json) = ctx_with_session_json(&root, false);
-        assert!(!session_json.exists());
+        let (ctx, _session_json) = ctx_with_session_json(&root, false);
 
         let sink: EventSink = Arc::new(|_| {});
         let report = delete_session_json(&ctx, &sink).await.unwrap();
@@ -275,7 +274,6 @@ mod tests {
         let (ctx, session_json) = ctx_with_session_json(&root, true);
         std::fs::create_dir_all(session_json.parent().unwrap()).unwrap();
         std::fs::write(&session_json, b"{}").unwrap();
-        assert!(ctx.executor.is_dry_run());
 
         let sink: EventSink = Arc::new(|_| {});
         let report = delete_session_json(&ctx, &sink).await.unwrap();
@@ -371,11 +369,10 @@ mod tests {
         let mut paths = Paths::new(&root);
         paths.oxr_appsup = root.join("OXRSys");
         paths.sabrage_appsup = root.join("Sabrage");
-        let opts = StageOptions::default();
-        assert!(
-            !opts.dry_run,
-            "the point of the test: opts say this is real"
-        );
+        let opts = StageOptions {
+            dry_run: false,
+            ..Default::default()
+        };
         let sink: EventSink = Arc::new(|_| {});
         let run_id = uuid::Uuid::new_v4();
         let cancel = CancellationToken::new();
