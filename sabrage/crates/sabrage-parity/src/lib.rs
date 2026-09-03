@@ -492,7 +492,7 @@ mod tests {
             sabrage_core::contract()
                 .checks
                 .iter()
-                .filter(|c| c.group != "run-only")
+                .filter(|c| c.group != sabrage_core::checks::NO_DOCTOR_ROW_GROUP)
                 .map(|c| c.slug.clone())
                 .collect()
         }

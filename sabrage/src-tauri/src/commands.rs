@@ -2720,25 +2720,6 @@ mod tests {
     }
 
     #[test]
-    fn no_doctor_row_group_matches_the_contracts_run_only_slugs() {
-        use sabrage_core::checks::NO_DOCTOR_ROW_GROUP;
-        let c = contract();
-        assert_eq!(
-            c.check("run.wine-exec").expect("slug present").group,
-            NO_DOCTOR_ROW_GROUP
-        );
-        assert_eq!(
-            c.check("run.bridge-built").expect("slug present").group,
-            NO_DOCTOR_ROW_GROUP
-        );
-        // A doctor-visible slug, for contrast.
-        assert_ne!(
-            c.check("sys.arch").expect("slug present").group,
-            NO_DOCTOR_ROW_GROUP
-        );
-    }
-
-    #[test]
     fn run_registry_cancel_is_idempotent_and_reports_whether_a_run_was_found() {
         let registry = RunRegistry::default();
         let fired = Arc::new(AtomicBool::new(false));
