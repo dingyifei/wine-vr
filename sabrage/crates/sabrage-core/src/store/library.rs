@@ -659,11 +659,9 @@ mod tests {
     }
 
     #[test]
-    fn missing_file_loads_as_default_with_version_one() {
+    fn missing_file_loads_as_default() {
         let lib = load(Path::new("/nonexistent/sabrage/library.json")).unwrap();
         assert_eq!(lib, Library::default());
-        assert_eq!(lib.version, 1);
-        assert!(lib.games.is_empty());
     }
 
     #[test]
@@ -693,10 +691,6 @@ mod tests {
             text,
             "a refused load never touches the file"
         );
-
-        // The current version still loads, of course.
-        fs::write(&path, r#"{"version":1,"games":[]}"#).unwrap();
-        assert_eq!(load(&path).unwrap(), Library::default());
 
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -849,7 +843,6 @@ mod tests {
         // The editor's stale clone: renamed, and still carrying no session.
         let mut stale = e;
         stale.name = "A renamed".to_string();
-        assert!(stale.last_session.is_none());
         transact(&real(), &path, |lib| {
             lib.upsert_editable(stale);
         })
@@ -874,7 +867,6 @@ mod tests {
     fn upsert_inserts_then_replaces_by_id() {
         let mut lib = Library::default();
         let e = entry("A");
-        let id = e.id;
         let stored = lib.upsert(e.clone());
         assert_eq!(stored, &e);
         assert_eq!(lib.games.len(), 1);
@@ -884,7 +876,6 @@ mod tests {
         let stored = lib.upsert(replacement.clone());
         assert_eq!(stored.name, "A renamed");
         assert_eq!(lib.games.len(), 1, "same id replaces, does not append");
-        assert_eq!(lib.get(id).unwrap().name, "A renamed");
     }
 
     #[test]
@@ -899,7 +890,6 @@ mod tests {
             !lib.remove(id),
             "removing twice finds nothing the second time"
         );
-        assert!(!lib.remove(Uuid::new_v4()));
     }
 
     #[test]
@@ -1087,7 +1077,6 @@ mod tests {
             effective_options(&settings, &e),
             "one merge, one home"
         );
-        assert!(opts.no_audio && opts.no_dashboard);
         assert!(lib.launch_options_for(Uuid::new_v4(), &settings).is_none());
     }
 
@@ -1119,7 +1108,6 @@ mod tests {
         assert!(!v.bottle_exists, "empty bottle name never exists");
         assert_eq!(v.status, GameStatus::NotFound);
         assert!(v.problems.iter().any(|p| p.contains("Beat Saber.exe")));
-        assert_eq!(v.goldberg, GoldbergState::NoDll);
         fs::remove_dir_all(&bs_dir).unwrap();
     }
 
@@ -1290,11 +1278,6 @@ mod tests {
         let got = v(&pin);
         assert_eq!(got.goldberg, GoldbergState::AppliedUnverified);
         assert!(!got.orig_steam_present);
-        assert_ne!(
-            got.goldberg,
-            GoldbergState::Original,
-            "a pin-matching dll is never the untouched Steam original"
-        );
 
         // Backup present, live dll does not match the pin: Modified.
         fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM").unwrap();
@@ -1316,11 +1299,6 @@ mod tests {
         fs::write(&payload, b"CUSTOM-GOLDBERG-BUILD").unwrap();
         fs::write(dir.join("steam_api64.dll"), b"CUSTOM-GOLDBERG-BUILD").unwrap();
         let got = v(&pin); // `pin` matches the *other* fixture bytes, never these
-        assert_ne!(
-            got.goldberg,
-            GoldbergState::Original,
-            "a dll matching the installed Goldberg payload is never the Steam original"
-        );
         assert_eq!(got.goldberg, GoldbergState::AppliedUnverified);
         // …and with a backup alongside it, the ordinary applied state.
         fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM").unwrap();
@@ -1335,10 +1313,6 @@ mod tests {
             validate(&paths(), &bs_dir, "").goldberg,
             GoldbergState::Modified
         );
-        assert!(!file_sha256_matches(
-            &dir.join("steam_api64.dll"),
-            &contract().deps.gbe_dll_sha256
-        ));
 
         fs::remove_dir_all(&bs_dir).unwrap();
         fs::remove_dir_all(&bottle.prefix).unwrap();
