@@ -906,6 +906,41 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Dropping an armed guard built over a dry-run context runs no child process and emits no restore row.
+    #[tokio::test]
+    async fn a_dry_runs_guard_restores_nothing_when_dropped() {
+        let root = scratch("dry-drop");
+        let marker = root.join("should-not-exist.marker");
+        let script = root.join("fake-switch");
+        std::fs::write(
+            &script,
+            format!("#!/bin/sh\ntouch '{}'\n", marker.display()),
+        )
+        .unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+
+        let (ctx, seen) = dry_ctx(&root, StageOptions::default());
+        let guard = AudioGuard::armed_for_test(&ctx, "MacBook Pro Speakers", &script);
+        drop(guard);
+
+        assert!(
+            !marker.exists(),
+            "dry-run Drop must not spawn the restore child"
+        );
+        let restore_count = seen
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|e| matches!(e, StageEvent::Text { text, .. } if text.contains("restored")))
+            .count();
+        assert_eq!(restore_count, 0, "dry-run Drop must emit no restore row");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// An [`Executor`] that reports [`SabrageError::Cancelled`] for every
     /// child — a Stop landing on the `SwitchAudioSource` call. Everything else
     /// delegates, so nothing here reaches the machine.
