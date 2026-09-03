@@ -708,41 +708,71 @@ mod tests {
     }
 
     #[test]
-    fn the_staleness_budget_is_three_seconds() {
-        assert_eq!(RUNTIME_STATUS_MAX_AGE, Duration::from_secs(3));
+    fn the_watcher_duration_budgets() {
+        let cases: &[(&str, Duration, Duration)] = &[
+            (
+                "runtime status maximum age",
+                RUNTIME_STATUS_MAX_AGE,
+                Duration::from_secs(3),
+            ),
+            (
+                "startup grace",
+                SESSION_STARTUP_GRACE,
+                Duration::from_secs(30),
+            ),
+            (
+                "post-fresh stall grace",
+                STALL_GRACE_AFTER_FRESH,
+                Duration::from_secs(10),
+            ),
+        ];
+        for (label, actual, expected) in cases {
+            assert_eq!(*actual, *expected, "{label}");
+        }
     }
 
     #[test]
-    fn the_startup_and_stall_grace_budgets() {
-        assert_eq!(SESSION_STARTUP_GRACE, Duration::from_secs(30));
-        assert_eq!(STALL_GRACE_AFTER_FRESH, Duration::from_secs(10));
-    }
-
-    #[test]
-    fn is_fresh_tolerates_a_clock_skewed_slightly_into_the_future() {
-        assert!(is_fresh(1_000, 1_000)); // exactly now
-        assert!(is_fresh(1_000, 900)); // "updated" is in the future — clock skew, not staleness
-        assert!(is_fresh(1_000, 1_000 + 3_000)); // exactly at the budget
-        assert!(!is_fresh(1_000, 1_000 + 3_001)); // one ms past it
-    }
-
-    #[test]
-    fn a_stamp_far_in_the_future_is_wrong_not_fresh() {
+    fn is_fresh_accepts_only_stamps_inside_both_budgets() {
         let now = 1_786_300_214_181u64;
-        assert!(
-            is_fresh(now + 1_000, now),
-            "ordinary skew is still believed"
-        );
-        assert!(
-            is_fresh(now + MAX_FUTURE_SKEW.as_millis() as u64, now),
-            "exactly at the allowance"
-        );
-        assert!(!is_fresh(now + 2_001, now), "one ms past it");
-        assert!(
-            !is_fresh(now + 3_600_000, now),
-            "an hour ahead is a clock correction or a corrupt number — and it would \
-             otherwise read as fresh for that whole hour, suppressing Stalled"
-        );
+        let cases: &[(&str, u64, u64, bool)] = &[
+            ("exactly now", 1_000, 1_000, true),
+            (
+                "a slightly future stamp is skew, not staleness",
+                1_000,
+                900,
+                true,
+            ),
+            (
+                "exactly at the staleness budget",
+                1_000,
+                1_000 + 3_000,
+                true,
+            ),
+            (
+                "one ms past the staleness budget",
+                1_000,
+                1_000 + 3_001,
+                false,
+            ),
+            ("ordinary skew is still believed", now + 1_000, now, true),
+            (
+                "exactly at the allowance",
+                now + MAX_FUTURE_SKEW.as_millis() as u64,
+                now,
+                true,
+            ),
+            ("one ms past the future allowance", now + 2_001, now, false),
+            (
+                "r1:A9-7 regression: an hour ahead is a clock correction or a corrupt \
+                 number, and believing it would suppress Stalled for that whole hour",
+                now + 3_600_000,
+                now,
+                false,
+            ),
+        ];
+        for (label, updated, now_ms, expected) in cases {
+            assert_eq!(is_fresh(*updated, *now_ms), *expected, "{label}");
+        }
     }
 
     /// A10-8. One predicate, two readers: the `External` phase the Session
@@ -814,35 +844,49 @@ mod tests {
     }
 
     #[test]
-    fn parse_encoder_ready_reads_the_hevc_native_helper_form_from_the_fixture() {
+    fn parse_encoder_ready_reads_both_encoder_forms_from_the_fixture() {
+        let cases = &[
+            (
+                "the HEVC native-helper form",
+                "(HEVC, native helper)",
+                "HEVC",
+                "native helper",
+                3008,
+                1664,
+                72,
+                80,
+            ),
+            (
+                "the H.264 in-process downgrade",
+                "(H.264, in-process)",
+                "H.264",
+                "in-process",
+                3008,
+                1664,
+                72,
+                80,
+            ),
+        ];
         let lines = fixture_log_lines();
-        let line = lines
-            .iter()
-            .find(|l| l.contains("(HEVC, native helper)"))
-            .expect("fixture has a HEVC/native-helper encoder-ready line");
-        let info = parse_encoder_ready(line).expect("parses");
-        assert_eq!(info.codec, "HEVC");
-        assert_eq!(info.path, "native helper");
-        assert_eq!(info.width, 3008);
-        assert_eq!(info.height, 1664);
-        assert_eq!(info.refresh_hz, 72);
-        assert_eq!(info.bitrate_mbps, 80);
-    }
-
-    #[test]
-    fn parse_encoder_ready_reads_the_h264_in_process_downgrade_form_from_the_fixture() {
-        let lines = fixture_log_lines();
-        let line = lines
-            .iter()
-            .find(|l| l.contains("(H.264, in-process)"))
-            .expect("fixture has the downgrade form");
-        let info = parse_encoder_ready(line).expect("parses");
-        assert_eq!(info.codec, "H.264");
-        assert_eq!(info.path, "in-process");
-        assert_eq!(info.width, 3008);
-        assert_eq!(info.height, 1664);
-        assert_eq!(info.refresh_hz, 72);
-        assert_eq!(info.bitrate_mbps, 80);
+        for (label, needle, codec, path, width, height, refresh_hz, bitrate_mbps) in cases {
+            let line = lines
+                .iter()
+                .find(|l| l.contains(*needle))
+                .unwrap_or_else(|| panic!("fixture has no line for {label}"));
+            let info = parse_encoder_ready(line).expect("parses");
+            assert_eq!(
+                (
+                    info.codec.as_str(),
+                    info.path.as_str(),
+                    info.width,
+                    info.height,
+                    info.refresh_hz,
+                    info.bitrate_mbps,
+                ),
+                (*codec, *path, *width, *height, *refresh_hz, *bitrate_mbps),
+                "{label}"
+            );
+        }
     }
 
     #[test]
