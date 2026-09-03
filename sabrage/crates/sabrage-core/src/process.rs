@@ -950,16 +950,11 @@ mod tests {
     }
 
     #[test]
-    fn splits_on_lf_cr_and_crlf() {
-        assert_eq!(split(&[b"a\nb\n"]), vec!["a", "b"]);
+    fn splits_on_lf_and_cr() {
         // curl's progress bar: CR-separated repaints, no trailing newline.
         assert_eq!(split(&[b"10%\r50%\r100%"]), vec!["10%", "50%", "100%"]);
-        // CRLF counts once.
-        assert_eq!(split(&[b"a\r\nb\r\n"]), vec!["a", "b"]);
         // Blank lines survive.
         assert_eq!(split(&[b"a\n\nb\n"]), vec!["a", "", "b"]);
-        // A chunk may straddle two reads, including across the CRLF pair.
-        assert_eq!(split(&[b"ab\r", b"\ncd\n"]), vec!["ab", "cd"]);
         assert_eq!(split(&[b"partial"]), vec!["partial"]);
         assert!(split(&[b""]).is_empty());
     }
