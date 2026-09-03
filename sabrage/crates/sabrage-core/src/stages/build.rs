@@ -694,36 +694,51 @@ mod tests {
 
     // ── ninja progress parser ────────────────────────────────────────────────
 
+    /// Row of the ninja-progress table: (label, input line, expected parse).
+    type NinjaCase = (&'static str, &'static str, Option<(u64, u64)>);
+
     #[test]
-    fn parse_ninja_progress_matches_the_default_status_prefix() {
-        assert_eq!(
-            parse_ninja_progress("[12/340] Building CXX object foo.cpp.o"),
-            Some((12, 340))
-        );
-        // Leading whitespace tolerated (a chunk boundary could land mid-line
-        // padding in principle; harmless either way).
-        assert_eq!(
-            parse_ninja_progress("  [1/2] Linking CXX foo"),
-            Some((1, 2))
-        );
-        // A configure line, a compiler warning, wineopenxr's Makefiles-style
-        // `[ 50%]` — none of these are ninja's shape.
-        assert_eq!(parse_ninja_progress("-- Configuring done"), None);
-        assert_eq!(
-            parse_ninja_progress("foo.cpp:12:3: warning: unused variable"),
-            None
-        );
-        assert_eq!(parse_ninja_progress("[ 50%] Building CXX object foo"), None);
-        assert_eq!(parse_ninja_progress(""), None);
-        assert_eq!(parse_ninja_progress("[1/]"), None);
-        assert_eq!(parse_ninja_progress("[/2]"), None);
-        assert_eq!(parse_ninja_progress("[abc/2]"), None);
-        assert_eq!(parse_ninja_progress("no brackets at all"), None);
-        // ninja's final summary line.
-        assert_eq!(
-            parse_ninja_progress("[340/340] Linking CXX executable oxrsys-runtime"),
-            Some((340, 340))
-        );
+    fn parse_ninja_progress_maps_status_lines_and_rejects_other_shapes() {
+        let cases: &[NinjaCase] = &[
+            (
+                "default status prefix",
+                "[12/340] Building CXX object foo.cpp.o",
+                Some((12, 340)),
+            ),
+            (
+                "leading whitespace tolerated — a chunk boundary can land mid-line padding",
+                "  [1/2] Linking CXX foo",
+                Some((1, 2)),
+            ),
+            (
+                "a cmake configure line is not ninja's shape",
+                "-- Configuring done",
+                None,
+            ),
+            (
+                "a compiler warning is not ninja's shape",
+                "foo.cpp:12:3: warning: unused variable",
+                None,
+            ),
+            (
+                "wineopenxr's Makefiles-style `[ 50%]` is not ninja's shape",
+                "[ 50%] Building CXX object foo",
+                None,
+            ),
+            ("empty line", "", None),
+            ("missing denominator", "[1/]", None),
+            ("missing numerator", "[/2]", None),
+            ("non-numeric numerator", "[abc/2]", None),
+            ("no brackets at all", "no brackets at all", None),
+            (
+                "ninja's final summary line",
+                "[340/340] Linking CXX executable oxrsys-runtime",
+                Some((340, 340)),
+            ),
+        ];
+        for (label, line, expected) in cases {
+            assert_eq!(parse_ninja_progress(line), *expected, "{label}");
+        }
     }
 
     // ── tool gate, fake PATH dir ─────────────────────────────────────────────
@@ -788,84 +803,98 @@ mod tests {
 
     #[test]
     fn missing_tool_message_is_verbatim() {
-        assert_eq!(
-            missing_tool_message("cmake"),
-            "cmake missing — brew install cmake ninja mingw-w64"
-        );
-        assert_eq!(
-            missing_tool_message("ninja"),
-            "ninja missing — brew install cmake ninja mingw-w64"
-        );
-        assert_eq!(
-            missing_tool_message("x86_64-w64-mingw32-gcc"),
-            "x86_64-w64-mingw32-gcc missing — brew install cmake ninja mingw-w64"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "cmake",
+                "cmake",
+                "cmake missing — brew install cmake ninja mingw-w64",
+            ),
+            (
+                "ninja",
+                "ninja",
+                "ninja missing — brew install cmake ninja mingw-w64",
+            ),
+            (
+                "mingw gcc",
+                "x86_64-w64-mingw32-gcc",
+                "x86_64-w64-mingw32-gcc missing — brew install cmake ninja mingw-w64",
+            ),
+        ];
+        for (label, tool, expected) in cases {
+            assert_eq!(missing_tool_message(tool), *expected, "{label}");
+        }
     }
 
     #[test]
     fn fixed_die_texts_are_verbatim() {
-        assert_eq!(
-            RUSTUP_TARGET_MISSING_MESSAGE,
-            "rustup x86_64-apple-darwin target missing — install rustup via https://rustup.rs \
-             and source ~/.cargo/env, then: rustup toolchain install stable && rustup target \
-             add x86_64-apple-darwin"
-        );
-        assert_eq!(
-            SUBMODULES_NOT_INITIALIZED_MESSAGE,
-            "submodules not initialized — ./demo.sh setup"
-        );
-        assert_eq!(
-            DASHBOARD_BUILD_FAILED_MESSAGE,
-            "alvr_dashboard build failed — retry with: (cd ext/ALVR && cargo build -p \
-             alvr_dashboard --release)"
-        );
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "rustup target missing",
+                RUSTUP_TARGET_MISSING_MESSAGE,
+                "rustup x86_64-apple-darwin target missing — install rustup via https://rustup.rs \
+                 and source ~/.cargo/env, then: rustup toolchain install stable && rustup target \
+                 add x86_64-apple-darwin",
+            ),
+            (
+                "submodules not initialized",
+                SUBMODULES_NOT_INITIALIZED_MESSAGE,
+                "submodules not initialized — ./demo.sh setup",
+            ),
+            (
+                "alvr_dashboard build failed",
+                DASHBOARD_BUILD_FAILED_MESSAGE,
+                "alvr_dashboard build failed — retry with: (cd ext/ALVR && cargo build -p \
+                 alvr_dashboard --release)",
+            ),
+        ];
+        for (label, actual, expected) in cases {
+            assert_eq!(actual, expected, "{label}");
+        }
     }
 
     // ── rustup gate ───────────────────────────────────────────────────────────
 
     #[tokio::test]
-    async fn rustup_gate_missing_binary_dies() {
-        let dir = scratch("rustup-absent");
-        let search_path = dir.display().to_string();
-        assert_eq!(
-            rustup_gate_message(&search_path, &CancellationToken::new())
-                .await
-                .unwrap(),
-            Some(RUSTUP_TARGET_MISSING_MESSAGE)
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn rustup_gate_missing_target_dies() {
-        let dir = scratch("rustup-no-target");
-        write_fake_tool(&dir, "rustup", "#!/bin/sh\necho aarch64-apple-darwin\n");
-        let search_path = dir.display().to_string();
-        assert_eq!(
-            rustup_gate_message(&search_path, &CancellationToken::new())
-                .await
-                .unwrap(),
-            Some(RUSTUP_TARGET_MISSING_MESSAGE)
-        );
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[tokio::test]
-    async fn rustup_gate_passes_when_the_target_is_installed() {
-        let dir = scratch("rustup-present");
-        write_fake_tool(
-            &dir,
-            "rustup",
-            "#!/bin/sh\necho aarch64-apple-darwin\necho x86_64-apple-darwin\n",
-        );
-        let search_path = dir.display().to_string();
-        assert_eq!(
-            rustup_gate_message(&search_path, &CancellationToken::new())
-                .await
-                .unwrap(),
-            None
-        );
-        std::fs::remove_dir_all(&dir).ok();
+    async fn rustup_gate_dies_unless_the_x86_64_target_is_installed() {
+        // (label, scratch tag, fake tool filename, script, expected). Row 1's
+        // tool is deliberately misnamed so `resolve_tool("rustup", ..)` misses
+        // it: that is the absent-binary path, reached without a branch.
+        let cases: &[(&str, &str, &str, &str, Option<&str>)] = &[
+            (
+                "rustup binary absent",
+                "rustup-absent",
+                "not-rustup",
+                "#!/bin/sh\n",
+                Some(RUSTUP_TARGET_MISSING_MESSAGE),
+            ),
+            (
+                "target not installed",
+                "rustup-no-target",
+                "rustup",
+                "#!/bin/sh\necho aarch64-apple-darwin\n",
+                Some(RUSTUP_TARGET_MISSING_MESSAGE),
+            ),
+            (
+                "target installed, not on the first line",
+                "rustup-present",
+                "rustup",
+                "#!/bin/sh\necho aarch64-apple-darwin\necho x86_64-apple-darwin\n",
+                None,
+            ),
+        ];
+        for (label, tag, tool, script, expected) in cases {
+            let dir = scratch(tag);
+            write_fake_tool(&dir, tool, script);
+            let search_path = dir.display().to_string();
+            assert_eq!(
+                rustup_gate_message(&search_path, &CancellationToken::new())
+                    .await
+                    .unwrap(),
+                *expected,
+                "{label}"
+            );
+            std::fs::remove_dir_all(&dir).ok();
+        }
     }
 
     #[tokio::test]
