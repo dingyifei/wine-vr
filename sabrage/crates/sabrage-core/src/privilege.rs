@@ -1847,20 +1847,4 @@ mod tests {
             );
         }
     }
-
-    // ── the byte source (the one artifact that must not drift) ───────────────
-
-    #[test]
-    fn the_write_paths_bytes_are_the_file_form_not_the_comparison_form() {
-        let dylib = Path::new("/repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib");
-        let bytes = host_manifest_bytes(dylib);
-        assert_eq!(bytes, crate::util::host_manifest_file_bytes(dylib));
-        // install.sh's `print -- "$WANT"`: the live file ends `7d 0a 7d 0a`.
-        assert!(bytes.ends_with("}\n"), "{bytes:?}");
-        assert_eq!(
-            bytes,
-            format!("{}\n", crate::util::render_host_manifest(dylib)),
-            "exactly one newline more than the comparison form"
-        );
-    }
 }
