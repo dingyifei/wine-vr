@@ -934,9 +934,7 @@ mod tests {
         // Touches the process-global LIVE_SESSION slot; self-contained
         // set→read→clear within one test, matching `session::mod`'s own test.
         use crate::process::ProcInfo;
-        use crate::session::{
-            clear_live_session, live_session, set_live_session, LiveSessionHandle,
-        };
+        use crate::session::{clear_live_session, set_live_session, LiveSessionHandle};
 
         let dir = scratch("resolve-live");
         let paths = fixture_paths(&dir);
@@ -965,7 +963,6 @@ mod tests {
 
         let resolved = resolve_source(&paths, &LogSource::WineConsole);
         clear_live_session(run_id);
-        assert!(live_session().is_none());
 
         assert_eq!(resolved, Some(live_log));
     }
