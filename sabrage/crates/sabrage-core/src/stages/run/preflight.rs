@@ -909,17 +909,9 @@ mod tests {
     // ── the contract-derived slug list (unchanged from the frame) ───────────
 
     #[test]
-    fn the_slug_list_is_the_contracts_gating_set_in_order() {
+    fn the_slug_list_is_unique_gating_only_and_includes_the_run_only_slugs() {
         let slugs = preflight_slugs();
         assert!(!slugs.is_empty());
-
-        let expected: Vec<&str> = contract()
-            .checks
-            .iter()
-            .filter(|c| c.native_gate.is_gating())
-            .map(|c| c.slug.as_str())
-            .collect();
-        assert_eq!(slugs, expected, "must be contract order, unmodified");
 
         // No duplicates, and nothing gated `none` sneaks in.
         let unique: std::collections::BTreeSet<_> = slugs.iter().collect();
@@ -2007,73 +1999,6 @@ mod tests {
         assert_eq!(
             std::fs::read_to_string(&conf).unwrap(),
             "\"Template\" = \"win11_64\"\n\"CX_GRAPHICS_BACKEND\" = \"auto\"\n"
-        );
-    }
-
-    // ── the die table ───────────────────────────────────────────────────────
-
-    #[test]
-    fn block_die_texts_are_run_shs_strings() {
-        let f = fixture("die-table", true);
-        let ctx = &f.ctx;
-        let outcome = CheckOutcome::fail_bare("x", "impl message");
-
-        for (slug, want) in [
-            (
-                "overlay.dxmt-d3d11",
-                "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "overlay.dxmt-winemetal",
-                "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "overlay.woxr-dll",
-                "CrossOver wineopenxr overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "bottle.woxr-dll",
-                "bottle wineopenxr.dll stale/missing — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "bottle.manifest",
-                "bottle OpenXR manifest missing — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "bottle.registry",
-                "bottle ActiveRuntime registry key missing — ./demo.sh install --bottle FixtureBottle",
-            ),
-            (
-                "host.manifest",
-                "host OpenXR registration missing — ./demo.sh install --bottle FixtureBottle",
-            ),
-            ("dep.goldberg", "Goldberg dll missing — ./demo.sh setup"),
-        ] {
-            assert_eq!(block_die(ctx, slug, &outcome).0, want, "{slug}");
-        }
-
-        // The three run-only slugs carry run.sh's die whole, in `message`.
-        for slug in ["run.wine-exec", "run.bridge-built", "run.wired-adb"] {
-            assert_eq!(block_die(ctx, slug, &outcome).0, "impl message", "{slug}");
-        }
-    }
-
-    #[test]
-    fn post_fix_die_texts_are_run_shs_strings() {
-        let f = fixture("post-fix", true);
-        assert_eq!(
-            post_fix_die(&f.ctx, "bottle.gfx-dxmt").0,
-            format!(
-                "could not force graphics backend to dxmt in {}",
-                f.ctx.bottle.as_ref().unwrap().conf_path().display()
-            )
-        );
-        assert_eq!(
-            post_fix_die(&f.ctx, "build.helper-staged").0,
-            format!(
-                "encoder helper restage failed validation at {} — ./demo.sh build",
-                f.ctx.paths.oxr_helper_staged.display()
-            )
         );
     }
 }

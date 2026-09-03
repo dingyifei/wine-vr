@@ -2026,62 +2026,108 @@ mod tests {
         fn preflight_die_and_warn_text_is_verbatim_in_run_sh() {
             let text = run_sh();
 
-            // The two functions this test can call for real: every
-            // `block_die`/`post_fix_die` slug below is evaluated through the
-            // production renderer, over a fixture `CheckOutcome` whose own
-            // message the `_ => (outcome.message.clone(), …)` fallback arms
-            // would otherwise echo — never used by the slugs exercised here.
+            // `block_die` and `post_fix_die` are called for real. The fixture
+            // outcome's message is what `block_die`'s run-only arm (and its
+            // `_ =>` fallback) echo, so it doubles as the expected text for the
+            // three run-only slugs below.
             use sabrage_core::checks::CheckOutcome;
             use sabrage_core::stages::run::preflight::{block_die, post_fix_die};
-            let c = ctx("preflight-die");
-            let unused_outcome = CheckOutcome::fail("x", "unused by these slugs", "unused");
-            for slug in [
-                "dep.goldberg",
-                "overlay.dxmt-d3d11",
-                "bottle.woxr-dll",
-                "bottle.manifest",
-                "bottle.registry",
-                "host.manifest",
+            let mut c = ctx("preflight-die");
+            // `block_die`'s install remedy interpolates `opts.bottle_name`, and
+            // `post_fix_die`'s `bottle.gfx-dxmt` arm the bottle's cxbottle.conf
+            // path. With neither set the first renders doctor's `<name>`
+            // placeholder and the second an empty path, and the equalities
+            // below would pin those instead of the interpolations.
+            c.opts.bottle_name = Some("FixtureBottle".to_string());
+            c.bottle = Some(Bottle::unvalidated("FixtureBottle"));
+            let outcome = CheckOutcome::fail_bare("x", "impl message");
+
+            // Shell-backed rows: run.sh carries the sentence and `block_die`
+            // renders it whole. Where run.sh interpolates `$WINEVR_BOTTLE` into
+            // the tail, the fragment matched against the file stops where the
+            // interpolation starts.
+            for (slug, fragment, rendered) in [
+                (
+                    "dep.goldberg",
+                    "Goldberg dll missing — ./demo.sh setup",
+                    "Goldberg dll missing — ./demo.sh setup",
+                ),
+                (
+                    "overlay.dxmt-d3d11",
+                    "CrossOver DXMT overlay stale (CrossOver update?)",
+                    "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
+                ),
+                (
+                    "bottle.woxr-dll",
+                    "bottle wineopenxr.dll stale/missing",
+                    "bottle wineopenxr.dll stale/missing — ./demo.sh install --bottle FixtureBottle",
+                ),
+                (
+                    "bottle.manifest",
+                    "bottle OpenXR manifest missing",
+                    "bottle OpenXR manifest missing — ./demo.sh install --bottle FixtureBottle",
+                ),
+                (
+                    "bottle.registry",
+                    "bottle ActiveRuntime registry key missing",
+                    "bottle ActiveRuntime registry key missing — ./demo.sh install --bottle FixtureBottle",
+                ),
+                (
+                    "host.manifest",
+                    "host OpenXR registration missing",
+                    "host OpenXR registration missing — ./demo.sh install --bottle FixtureBottle",
+                ),
             ] {
-                let (message, _remedy) = block_die(&c, slug, &unused_outcome);
-                assert_verbatim(
-                    &text,
-                    match slug {
-                        "dep.goldberg" => "Goldberg dll missing — ./demo.sh setup",
-                        "overlay.dxmt-d3d11" => "CrossOver DXMT overlay stale (CrossOver update?)",
-                        "bottle.woxr-dll" => "bottle wineopenxr.dll stale/missing",
-                        "bottle.manifest" => "bottle OpenXR manifest missing",
-                        "bottle.registry" => "bottle ActiveRuntime registry key missing",
-                        "host.manifest" => "host OpenXR registration missing",
-                        _ => unreachable!(),
-                    },
-                    "stages::run::preflight::block_die",
-                );
-                // The fragment above must actually be a prefix of what
-                // `block_die` rendered for this slug — not merely present
-                // somewhere in `run.sh` by coincidence.
-                assert!(
-                    message.starts_with(match slug {
-                        "dep.goldberg" => "Goldberg dll missing",
-                        "overlay.dxmt-d3d11" => "CrossOver DXMT overlay stale",
-                        "bottle.woxr-dll" => "bottle wineopenxr.dll stale/missing",
-                        "bottle.manifest" => "bottle OpenXR manifest missing",
-                        "bottle.registry" => "bottle ActiveRuntime registry key missing",
-                        "host.manifest" => "host OpenXR registration missing",
-                        _ => unreachable!(),
-                    }),
-                    "block_die({slug}) rendered {message:?}"
-                );
+                assert_verbatim(&text, fragment, "stages::run::preflight::block_die");
+                assert_eq!(block_die(&c, slug, &outcome).0, rendered, "{slug}");
             }
 
-            let (post_fix_message, _) = post_fix_die(&c, "bottle.gfx-dxmt");
-            assert!(
-                post_fix_message.starts_with("could not force graphics backend to dxmt in"),
-                "{post_fix_message}"
+            // Native-only rows: run.sh `cmp`s only `d3d11.dll`, so these two
+            // sentences exist on this side alone (the divergence is contract
+            // data) — there is nothing in run.sh to match them against.
+            for (slug, rendered) in [
+                (
+                    "overlay.dxmt-winemetal",
+                    "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
+                ),
+                (
+                    "overlay.woxr-dll",
+                    "CrossOver wineopenxr overlay stale (CrossOver update?) — ./demo.sh install --bottle FixtureBottle",
+                ),
+            ] {
+                assert_eq!(block_die(&c, slug, &outcome).0, rendered, "{slug}");
+            }
+
+            // The three run-only slugs have no doctor row, so `block_die`
+            // passes the check's own message through untouched.
+            for slug in ["run.wine-exec", "run.bridge-built", "run.wired-adb"] {
+                assert_eq!(block_die(&c, slug, &outcome).0, "impl message", "{slug}");
+            }
+
+            assert_eq!(
+                post_fix_die(&c, "bottle.gfx-dxmt").0,
+                format!(
+                    "could not force graphics backend to dxmt in {}",
+                    c.bottle.as_ref().unwrap().conf_path().display()
+                ),
+                "bottle.gfx-dxmt"
             );
             assert_verbatim(
                 &text,
                 "could not force graphics backend to dxmt in",
+                "stages::run::preflight::post_fix_die",
+            );
+            assert_eq!(
+                post_fix_die(&c, "build.helper-staged").0,
+                format!(
+                    "encoder helper restage failed validation at {} — ./demo.sh build",
+                    c.paths.oxr_helper_staged.display()
+                ),
+                "build.helper-staged"
+            );
+            assert_verbatim(
+                &text,
+                "encoder helper restage failed validation at",
                 "stages::run::preflight::post_fix_die",
             );
 
