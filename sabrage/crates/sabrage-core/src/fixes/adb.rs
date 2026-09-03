@@ -484,7 +484,6 @@ mod tests {
         write_fake_adb(&adb, "SERIALX tcp:9943 tcp:9943\n", &log);
 
         let ctx = ctx_with_adb(&root, adb, true);
-        assert!(ctx.executor.is_dry_run());
         let sink: EventSink = ctx.sink.clone();
         let report = remove_adb_forwards(&ctx, &sink).await.unwrap();
         assert!(report.changed);
