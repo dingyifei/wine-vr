@@ -981,35 +981,38 @@ mod tests {
 
     // ── survivor-line formatting ──────────────────────────────────────────────
 
-    #[test]
-    fn format_survivors_matches_the_pgrep_lf_shape() {
-        assert_eq!(format_survivors(&[]), "");
-        let procs = vec![
-            ProcInfo {
-                pid: 111,
-                start_time: 0,
-                exe: PathBuf::from("/repo/ext/oxrsys/build-x64/Beat Saber.exe"),
-            },
-            ProcInfo {
-                pid: 222,
-                start_time: 0,
-                exe: PathBuf::from("/other/place/Beat Saber.exe"),
-            },
-        ];
-        assert_eq!(
-            format_survivors(&procs),
-            "111 Beat Saber.exe 222 Beat Saber.exe "
-        );
-    }
+    /// (label, (pid, exe path) per survivor, expected line).
+    type SurvivorCase<'a> = (&'a str, &'a [(u32, &'a str)], &'a str);
 
     #[test]
-    fn format_survivors_falls_back_to_the_suffix_when_a_path_has_no_file_name() {
-        let procs = vec![ProcInfo {
-            pid: 7,
-            start_time: 0,
-            exe: PathBuf::from("/"),
-        }];
-        assert_eq!(format_survivors(&procs), "7 Beat Saber.exe ");
+    fn format_survivors_matches_the_pgrep_lf_shape() {
+        let cases: &[SurvivorCase<'_>] = &[
+            ("no survivors", &[], ""),
+            (
+                "two survivors, pgrep -lf shape",
+                &[
+                    (111, "/repo/ext/oxrsys/build-x64/Beat Saber.exe"),
+                    (222, "/other/place/Beat Saber.exe"),
+                ],
+                "111 Beat Saber.exe 222 Beat Saber.exe ",
+            ),
+            (
+                "path with no file name falls back to the suffix",
+                &[(7, "/")],
+                "7 Beat Saber.exe ",
+            ),
+        ];
+        for (label, input, expected) in cases {
+            let procs: Vec<ProcInfo> = input
+                .iter()
+                .map(|(pid, exe)| ProcInfo {
+                    pid: *pid,
+                    start_time: 0,
+                    exe: PathBuf::from(*exe),
+                })
+                .collect();
+            assert_eq!(format_survivors(&procs), *expected, "{label}");
+        }
     }
 
     // ── argv-based survivor matcher (finding #8) ─────────────────────────────
@@ -1100,41 +1103,47 @@ mod tests {
         ))
     }
 
+    /// (label, `ctx.paths.wineserver`, the WHOLE recorded plan as (kind, reason)).
+    type StopWineCase<'a> = (&'a str, Option<&'a str>, &'a [(PlannedKind, &'a str)]);
+
+    /// Both machines are simulated by overriding `ctx.paths.wineserver`:
+    /// `Paths::new` probes for a real CrossOver.app unconditionally, so neither
+    /// row may depend on whether this Mac has one.
     #[tokio::test]
-    async fn dry_run_stop_wine_never_spawns_a_real_wineserver() {
-        let (mut ctx, _seen) = test_ctx(StageOptions {
-            dry_run: true,
-            ..Default::default()
-        });
-        // Force a wineserver path regardless of whether CrossOver is installed
-        // on this machine, so the test exercises the spawn path either way.
-        ctx.paths.wineserver = Some(PathBuf::from("/nonexistent/sabrage/wineserver"));
-        let bottle = Bottle::unvalidated("SabrageStopTest");
+    async fn dry_run_stop_wine_plans_the_wineserver_pair_only_when_crossover_is_present() {
+        let cases: &[StopWineCase<'_>] = &[
+            (
+                "wineserver present",
+                Some("/nonexistent/sabrage/wineserver"),
+                &[
+                    (PlannedKind::Spawn, "/nonexistent/sabrage/wineserver -k"),
+                    (PlannedKind::Spawn, "/nonexistent/sabrage/wineserver -w"),
+                ],
+            ),
+            ("no wineserver on this machine", None, &[]),
+        ];
+        for (label, wineserver, expected) in cases {
+            let (mut ctx, _seen) = test_ctx(StageOptions {
+                dry_run: true,
+                ..Default::default()
+            });
+            ctx.paths.wineserver = wineserver.map(PathBuf::from);
+            let bottle = Bottle::unvalidated("SabrageStopTest");
 
-        stop_wine(&ctx, &bottle).await.expect("not cancelled");
+            stop_wine(&ctx, &bottle).await.expect("not cancelled");
 
-        let planned = ctx.executor.planned();
-        let spawns: Vec<_> = planned
-            .into_iter()
-            .filter(|p| p.kind == PlannedKind::Spawn)
-            .collect();
-        assert_eq!(spawns.len(), 2, "expected -k and -w to both be planned");
-        assert!(spawns[0].reason.ends_with("wineserver -k"));
-        assert!(spawns[1].reason.ends_with("wineserver -w"));
-    }
-
-    #[tokio::test]
-    async fn dry_run_stop_wine_is_a_no_op_without_crossover() {
-        let (mut ctx, _seen) = test_ctx(StageOptions {
-            dry_run: true,
-            ..Default::default()
-        });
-        // Deterministic regardless of whether this machine happens to have a
-        // real CrossOver.app (Paths::new probes for one unconditionally).
-        ctx.paths.wineserver = None;
-        let bottle = Bottle::unvalidated("SabrageStopTest");
-        stop_wine(&ctx, &bottle).await.expect("not cancelled");
-        assert!(ctx.executor.planned().is_empty());
+            let planned: Vec<(PlannedKind, String)> = ctx
+                .executor
+                .planned()
+                .into_iter()
+                .map(|p| (p.kind, p.reason))
+                .collect();
+            let want: Vec<(PlannedKind, String)> = expected
+                .iter()
+                .map(|(kind, reason)| (*kind, (*reason).to_string()))
+                .collect();
+            assert_eq!(planned, want, "{label}");
+        }
     }
 
     /// A [`ReapMsg`] whose three texts are distinguishable at a glance.
@@ -1374,100 +1383,97 @@ mod tests {
 
     // ── cross-checkout helper scan (finding A5-7) ────────────────────────────
 
+    /// A helper left over in another checkout must be reported whether or not
+    /// this checkout's own reap matched: the scan used to run only on a local
+    /// miss, so the killed row silently hid the foreign one.
     #[test]
-    fn a_helper_from_another_checkout_is_reported_instead_of_no_leftover() {
+    fn a_foreign_helper_is_reported_whatever_the_local_reap_did() {
         let sleeper = spawn_sleeper(false);
-        let (mut ctx, seen) = test_ctx(StageOptions::default());
-        // "Another checkout": this repo root contains neither the sleeper nor
-        // anything else, and the staged path does not exist.
-        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
-        ctx.paths.oxr_helper_staged = PathBuf::from("/nonexistent/sabrage/helper");
-
-        assert!(process::find_processes_by_exe(&ctx.paths.oxr_helper_staged).is_empty());
-        report_foreign_helpers(
-            &ctx,
-            &ctx.paths.root.clone(),
-            process::find_processes_by_cmdline(HELPER_BASENAME),
-            false,
-        );
-
-        let rows = rows(&seen);
-        assert!(
-            !rows.iter().any(|(_, t)| t == NO_LEFTOVER_HELPER),
-            "claimed no leftover helper with one running elsewhere: {rows:?}"
-        );
         let pid = sleeper.child.id();
-        assert!(
-            rows.iter().any(|(sev, t)| *sev == Severity::Warn
-                && t.starts_with("leftover encoder helper from another checkout: ")
-                && t.contains(&pid.to_string())),
-            "{rows:?}"
-        );
-    }
+        // (label, local_matched — whether this checkout's own exact-path
+        // reap already killed a helper just before the scan)
+        let cases: &[(&str, bool)] = &[
+            (
+                "r1:A5-7 regression: a foreign helper is reported instead of the not-found row",
+                false,
+            ),
+            (
+                "r2:A5-2 regression: a local helper match must not suppress the cross-checkout warn",
+                true,
+            ),
+        ];
+        for (label, local_matched) in cases {
+            let (mut ctx, seen) = test_ctx(StageOptions::default());
+            // "Another checkout": this repo root contains neither the sleeper
+            // nor anything else.
+            ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+            report_foreign_helpers(
+                &ctx,
+                &ctx.paths.root.clone(),
+                process::find_processes_by_cmdline(HELPER_BASENAME),
+                *local_matched,
+            );
 
-    #[test]
-    fn with_no_foreign_helper_running_the_shells_not_found_row_is_unchanged() {
-        let (mut ctx, seen) = test_ctx(StageOptions::default());
-        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
-        // Ground truth is machine state (this file's own testing pattern):
-        // only assert the row when nothing on this Mac qualifies as foreign.
-        let matches = process::find_processes_by_cmdline(HELPER_BASENAME);
-        let any_foreign = matches
-            .iter()
-            .any(|p| p.exe.file_name().and_then(|n| n.to_str()) == Some(HELPER_BASENAME));
-        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), matches, false);
-        if !any_foreign {
-            assert_eq!(
-                rows(&seen),
-                vec![(Severity::Ok, NO_LEFTOVER_HELPER.to_string())]
+            let rows = rows(&seen);
+            assert!(
+                rows.iter().any(|(sev, t)| *sev == Severity::Warn
+                    && t.starts_with("leftover encoder helper from another checkout: ")
+                    && t.contains(&pid.to_string())),
+                "{label}: {rows:?}"
+            );
+            assert!(
+                !rows.iter().any(|(_, t)| t == NO_LEFTOVER_HELPER),
+                "{label}: {rows:?}"
             );
         }
     }
 
-    /// A5-2: with a helper from this checkout killed **and** one left over in
-    /// another checkout, the foreign one must still be reported. The scan used
-    /// to run only on a local miss, so the killed row silently hid it.
+    /// (label, cmdline matches by pid, `local_matched`, expected rows).
+    type ForeignHelperCase<'a> = (&'a str, &'a [u32], bool, &'a [(Severity, &'a str)]);
+
+    /// The gate on the shell's not-found row: it prints only when neither
+    /// scan found anything, so the killed row and `NO_LEFTOVER_HELPER` can
+    /// never both appear — and a cmdline match whose exe is not the helper
+    /// binary was never a foreign helper to begin with.
     #[test]
-    fn a_foreign_helper_is_reported_even_when_the_local_reap_matched() {
-        let sleeper = spawn_sleeper(false);
-        let (mut ctx, seen) = test_ctx(StageOptions::default());
-        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
-
-        // `local_matched: true` — this checkout's own helper was found and
-        // killed by the exact-path reap just before.
-        report_foreign_helpers(
-            &ctx,
-            &ctx.paths.root.clone(),
-            process::find_processes_by_cmdline(HELPER_BASENAME),
-            true,
-        );
-
-        let rows = rows(&seen);
-        let pid = sleeper.child.id();
-        assert!(
-            rows.iter().any(|(sev, t)| *sev == Severity::Warn
-                && t.starts_with("leftover encoder helper from another checkout: ")
-                && t.contains(&pid.to_string())),
-            "a local match hid the foreign helper: {rows:?}"
-        );
-        // …and the shell's not-found row stays suppressed, so the killed row
-        // and "no leftover encoder helper" never both print.
-        assert!(
-            !rows.iter().any(|(_, t)| t == NO_LEFTOVER_HELPER),
-            "{rows:?}"
-        );
-    }
-
-    /// The other half of the same gate: nothing foreign running and the local
-    /// reap already reported a kill means **no** row at all from this scan.
-    #[test]
-    fn a_matched_local_reap_suppresses_the_not_found_row() {
-        let (mut ctx, seen) = test_ctx(StageOptions::default());
-        ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
-        // No foreign candidates at all: an empty match list is the shape a
-        // machine with nothing else running produces, machine-independently.
-        report_foreign_helpers(&ctx, &ctx.paths.root.clone(), Vec::new(), true);
-        assert!(rows(&seen).is_empty(), "{:?}", rows(&seen));
+    fn the_not_found_row_prints_only_when_nothing_foreign_and_no_local_match() {
+        // A live pid whose executable is NOT named oxrsys-encoder-helper: the
+        // basename filter must drop it.
+        let not_the_helper = [std::process::id()];
+        let cases: &[ForeignHelperCase<'_>] = &[
+            (
+                "nothing foreign, no local match: the shell's not-found row",
+                &[],
+                false,
+                &[(Severity::Ok, NO_LEFTOVER_HELPER)],
+            ),
+            (
+                "nothing foreign, local reap already reported a kill: no row at all",
+                &[],
+                true,
+                &[],
+            ),
+            (
+                "a cmdline match that is not the helper binary is filtered out",
+                &not_the_helper,
+                false,
+                &[(Severity::Ok, NO_LEFTOVER_HELPER)],
+            ),
+        ];
+        for (label, pids, local_matched, expected) in cases {
+            let (mut ctx, seen) = test_ctx(StageOptions::default());
+            ctx.paths.root = PathBuf::from("/nonexistent/sabrage-stop-test");
+            let matches: Vec<ProcInfo> = pids
+                .iter()
+                .map(|pid| ProcInfo::observe(*pid).expect("observe a live pid"))
+                .collect();
+            report_foreign_helpers(&ctx, &ctx.paths.root.clone(), matches, *local_matched);
+            let want: Vec<(Severity, String)> = expected
+                .iter()
+                .map(|(sev, text)| (*sev, (*text).to_string()))
+                .collect();
+            assert_eq!(rows(&seen), want, "{label}");
+        }
     }
 
     // ── cancellation propagation (finding #2) ────────────────────────────────
