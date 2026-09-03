@@ -826,6 +826,42 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// An absent record stays absent; a record for a different run stays
+    /// byte-identical. Re-creating either would resurrect a session the
+    /// supervisor already cleared.
+    #[tokio::test]
+    async fn mark_detached_never_recreates_a_cleared_record() {
+        let dir = scratch("detach-no-create");
+        let path = dir.join("session-state.json");
+
+        // Case 1 — absent record: no file created, returns false.
+        let mine = Uuid::new_v4();
+        let result = mark_detached(&real(), &path, mine).await.unwrap();
+        assert!(
+            !result,
+            "mark_detached should return false for absent record"
+        );
+        assert!(!path.exists(), "mark_detached created a file from nothing");
+
+        // Case 2 — foreign record (different run_id): file left byte-identical,
+        // returns false.
+        let other = Uuid::new_v4();
+        let mut state = sample();
+        state.run_id = other;
+        save(&real(), &path, &state).await.unwrap();
+        let bytes_before = std::fs::read(&path).unwrap();
+
+        let result = mark_detached(&real(), &path, mine).await.unwrap();
+        assert!(!result, "mark_detached should return false for foreign run");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            bytes_before,
+            "the foreign record must be byte-identical afterwards"
+        );
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test]
     async fn clearing_is_idempotent() {
         let dir = scratch("clear");
