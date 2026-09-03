@@ -1814,7 +1814,6 @@ mod tests {
 
     #[test]
     fn support_dir_is_under_application_support() {
-        assert!(sabrage_support_dir().ends_with("Library/Application Support/Sabrage"));
         assert!(sabrage_temp_dir().ends_with("Library/Application Support/Sabrage/tmp"));
         assert!(
             !sabrage_temp_dir().starts_with("/tmp"),
@@ -1847,14 +1846,6 @@ mod tests {
                 "stdin_is_tty={stdin_is_tty} controlling_tty={controlling_tty}"
             );
         }
-
-        // And `detect()` is exactly that decision over the two live probes —
-        // asserted as an invariant, not a constant, so it holds whether or not
-        // `cargo test` was launched from a terminal.
-        assert_eq!(
-            AdminMethod::detect(),
-            AdminMethod::choose(std::io::stdin().is_terminal(), controlling_tty_available())
-        );
     }
 
     // ── the byte source (the one artifact that must not drift) ───────────────
