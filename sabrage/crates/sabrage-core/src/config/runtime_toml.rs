@@ -2017,19 +2017,23 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_streaming_table_is_created_at_the_end_with_one_blank_line() {
-        let text = "# a hand-written file\nabr_mode = \"off\"\n";
-        let out = apply_patch(text, &patch_bitrate(60)).unwrap();
-        assert_eq!(
-            out.text,
-            "# a hand-written file\nabr_mode = \"off\"\n\n[streaming]\nbitrate_mbps = 60\n"
-        );
-    }
-
-    #[test]
-    fn an_empty_document_gains_no_leading_blank_line() {
-        let out = apply_patch("", &patch_bitrate(60)).unwrap();
-        assert_eq!(out.text, "[streaming]\nbitrate_mbps = 60\n");
+    fn a_missing_streaming_table_is_created_at_the_end() {
+        let cases: &[(&str, &str, &str)] = &[
+            (
+                "blank line before an appended [streaming] table",
+                "# a hand-written file\nabr_mode = \"off\"\n",
+                "# a hand-written file\nabr_mode = \"off\"\n\n[streaming]\nbitrate_mbps = 60\n",
+            ),
+            (
+                "no leading blank line on an empty document",
+                "",
+                "[streaming]\nbitrate_mbps = 60\n",
+            ),
+        ];
+        for &(label, input, expected) in cases {
+            let out = apply_patch(input, &patch_bitrate(60)).unwrap();
+            assert_eq!(out.text, expected, "{label}");
+        }
     }
 
     // ── rule 5: same-line comment relocation ─────────────────────────────────
@@ -2937,32 +2941,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[tokio::test]
-    async fn an_unchanged_patch_writes_nothing_and_takes_no_backup() {
-        let _g = crate::session::lock_session_globals();
-        let dir = scratch("noop");
-        let path = dir.join("oxrsys-runtime.toml");
-        let backups = dir.join("backups");
-        std::fs::write(&path, deployed()).unwrap();
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
-        let ex = real();
-
-        let report = write(&ex, &path, &backups, &patch_bitrate(80))
-            .await
-            .unwrap();
-        assert!(report.changed_keys.is_empty());
-        assert_eq!(report.backup_path, None);
-        assert!(!report.created_from_template);
-        assert!(!backups.exists(), "no backup directory is even created");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), deployed());
-        assert_eq!(
-            std::fs::metadata(&path).unwrap().modified().unwrap(),
-            before,
-            "the file must not be reopened for writing"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// Regression: a hand-maintained file that is not LF + newline-terminated
     /// used to be backed up and rewritten whole by an EMPTY patch, because the
     /// no-op test compared `toml_edit`'s re-render against the file. The report
@@ -2970,34 +2948,55 @@ mod tests {
     /// "Sabrage touched my file and told me it didn't" failure this module
     /// exists to prevent.
     #[tokio::test]
-    async fn a_no_op_write_leaves_an_unnormalised_file_alone() {
+    async fn a_no_op_write_leaves_the_file_and_backups_untouched() {
         let _g = crate::session::lock_session_globals();
-        let dir = scratch("noop-unnormalised");
-        let path = dir.join("oxrsys-runtime.toml");
-        let backups = dir.join("backups");
-        let original = "# my notes\n[streaming]\nprotocol = \"alvr\"\nbitrate_mbps = 80";
-        std::fs::write(&path, original).unwrap();
-        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let dep = deployed();
+        let unnormalised = "# my notes\n[streaming]\nprotocol = \"alvr\"\nbitrate_mbps = 80";
+        let cases: &[(&str, &str, RuntimeConfigPatch)] = &[
+            (
+                "deployed file, same-bitrate patch",
+                dep.as_str(),
+                patch_bitrate(80),
+            ),
+            (
+                "unnormalised file, empty patch",
+                unnormalised,
+                RuntimeConfigPatch::default(),
+            ),
+            (
+                "unnormalised file, same protocol",
+                unnormalised,
+                RuntimeConfigPatch {
+                    protocol: Some(Protocol::Alvr),
+                    ..RuntimeConfigPatch::default()
+                },
+            ),
+        ];
         let ex = real();
+        for (i, &(label, original, patch)) in cases.iter().enumerate() {
+            let dir = scratch(&format!("write-noop-{i}"));
+            let path = dir.join("oxrsys-runtime.toml");
+            let backups = dir.join("backups");
+            std::fs::write(&path, original).unwrap();
+            let before = std::fs::metadata(&path).unwrap().modified().unwrap();
 
-        for patch in [
-            RuntimeConfigPatch::default(),
-            RuntimeConfigPatch {
-                protocol: Some(Protocol::Alvr),
-                ..RuntimeConfigPatch::default()
-            },
-        ] {
             let report = write(&ex, &path, &backups, &patch).await.unwrap();
-            assert!(report.changed_keys.is_empty(), "{:?}", report.changed_keys);
-            assert_eq!(report.backup_path, None);
-            assert!(!backups.exists(), "no backup slot may be burned");
-            assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+            assert!(
+                report.changed_keys.is_empty(),
+                "{label}: {:?}",
+                report.changed_keys
+            );
+            assert_eq!(report.backup_path, None, "{label}");
+            assert!(!report.created_from_template, "{label}");
+            assert!(!backups.exists(), "{label}: no backup slot may be burned");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), original, "{label}");
             assert_eq!(
                 std::fs::metadata(&path).unwrap().modified().unwrap(),
-                before
+                before,
+                "{label}: the file must not be reopened for writing"
             );
+            let _ = std::fs::remove_dir_all(&dir);
         }
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
