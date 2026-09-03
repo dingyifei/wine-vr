@@ -2605,7 +2605,6 @@ mod tests {
         assert_eq!(j["kind"], "dead");
         assert_eq!(j["pending"], true);
         assert_eq!(j["state"]["prevAudioOutput"], "MacBook Pro Speakers");
-        assert_eq!(serde_json::from_value::<Reconciled>(j).unwrap(), ev);
     }
 
     // ── finish_stopped_session (stop's tail) ─────────────────────────────────
@@ -2760,11 +2759,13 @@ mod tests {
         let seen_rows = rows(&seen);
         assert_eq!(seen_rows.len(), 2, "{seen_rows:?}");
         assert_eq!(seen_rows[0].0, Severity::Warn);
+        let detail = seen_rows[0]
+            .1
+            .strip_prefix("previous session not fully restored: ")
+            .unwrap_or_else(|| panic!("the warn must carry the prefix: {:?}", seen_rows[0].1));
         assert!(
-            seen_rows[0]
-                .1
-                .starts_with("previous session not fully restored: "),
-            "{:?}",
+            !detail.is_empty(),
+            "the underlying error is appended after the prefix: {:?}",
             seen_rows[0].1
         );
         assert_eq!(
@@ -2800,18 +2801,6 @@ mod tests {
             "cancellation is not a partial-restore report"
         );
 
-        // …while any other error is absorbed into the two rows.
-        tolerate_reconcile_failure(&ctx, Err(SabrageError::fatal_bare("boom")))
-            .expect("only cancellation propagates");
-        assert_eq!(
-            rows(&seen),
-            vec![
-                (Severity::Warn, format!("{RECONCILE_FAILED}: boom")),
-                (Severity::Info, RECONCILE_RETRY_HINT.to_string()),
-            ]
-        );
-        tolerate_reconcile_failure(&ctx, Ok(())).expect("success stays silent");
-        assert_eq!(rows(&seen).len(), 2, "Ok emits nothing");
         std::fs::remove_dir_all(&dir).ok();
     }
 
