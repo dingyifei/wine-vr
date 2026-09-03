@@ -154,11 +154,6 @@ pub fn contract_sha256_from(pipeline: &str, runtime_tmpl: &str, host_tmpl: &str)
     hex::encode(h.finalize())
 }
 
-/// The `contract-sha256` of the compiled-in contract.
-pub fn contract_sha256() -> String {
-    contract_sha256_from(PIPELINE_TOML, RUNTIME_TOML_TEMPLATE, HOST_MANIFEST_TEMPLATE)
-}
-
 /// Generate `contract.gen.sh` from explicit contract bytes.
 ///
 /// The prose, section banners, and the `# 9947 deliberately absent` note are
@@ -370,34 +365,6 @@ pub fn compiled_repo_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// The committed file, compiled in so the test needs no filesystem at all.
-    const COMMITTED: &str = include_str!("../../../../scripts/demo/contract.gen.sh");
-
-    #[test]
-    fn generate_reproduces_the_committed_file_byte_for_byte() {
-        let generated = generate();
-        assert_eq!(
-            generated, COMMITTED,
-            "generated contract.gen.sh differs from the committed file:\n\
-             --- generated ---\n{generated}\n--- committed ---\n{COMMITTED}"
-        );
-    }
-
-    #[test]
-    fn header_hash_is_the_documented_recipe() {
-        // Same bytes doctor.sh's `cat … | shasum -a 256` sees.
-        let hash = contract_sha256();
-        assert_eq!(hash.len(), 64);
-        assert!(COMMITTED.contains(&format!("# contract-sha256: {hash}\n")));
-    }
-
-    #[test]
-    fn generated_file_ends_with_exactly_one_newline() {
-        let g = generate();
-        assert!(g.ends_with(")   # 9947 deliberately absent\n"));
-        assert!(!g.ends_with("\n\n"));
-    }
 
     /// The generated file minus its `# contract-sha256:` header line.
     ///
@@ -679,14 +646,5 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn check_against_the_working_checkout_is_in_sync() {
-        let report = check(&compiled_repo_root()).expect("contract files readable");
-        assert!(
-            report.in_sync,
-            "scripts/demo/contract.gen.sh is stale — run: cargo run -p sabrage-contract-gen -- --write"
-        );
     }
 }

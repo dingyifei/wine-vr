@@ -32,19 +32,20 @@ mod tests {
 
     // ── (1) contract-gen regen ──────────────────────────────────────────────
 
-    /// `generate() == committed scripts/demo/contract.gen.sh`, both as a
-    /// compile-time byte comparison (this test's own copy, independent of
-    /// `sabrage-contract-gen`'s in-crate version of the same assertion) and as
-    /// a live `--check` against the working checkout.
+    /// `generate() == committed scripts/demo/contract.gen.sh`, as a compile-time
+    /// byte comparison against this crate's own `include_str!` of the checked-in
+    /// file, plus a live `--check` against the working checkout. This module is
+    /// the only place those bytes are pinned.
     mod contract_gen_parity {
         use super::repo_root;
 
         #[test]
         fn generate_matches_the_committed_contract_gen_sh() {
             let generated = sabrage_contract_gen::generate();
-            // Compiled in independently of sabrage-contract-gen's own copy of
-            // this comparison, at this crate's own include-path depth
-            // (src/lib.rs -> sabrage-parity -> crates -> sabrage -> repo root).
+            // Included at this crate's own include-path depth (src/lib.rs ->
+            // sabrage-parity -> crates -> sabrage -> repo root), so the
+            // comparison is against the bytes checked in on disk at build
+            // time, not against a value re-derived from contract/.
             let committed = include_str!("../../../../scripts/demo/contract.gen.sh");
             assert_eq!(
                 generated, committed,
@@ -135,8 +136,21 @@ mod tests {
             }
         }
 
+        /// `--check` against the working checkout reports in sync — and the
+        /// root it is checked against is the same directory the contract-gen
+        /// binary falls back to when `--repo-root` is omitted
+        /// (`compiled_repo_root`, `main.rs`), which nothing else exercises.
         #[test]
         fn check_reports_in_sync_against_the_live_checkout() {
+            let compiled = sabrage_contract_gen::compiled_repo_root()
+                .canonicalize()
+                .expect("sabrage-contract-gen::compiled_repo_root() resolves");
+            assert_eq!(
+                compiled,
+                repo_root(),
+                "sabrage-contract-gen::compiled_repo_root() no longer resolves to the repo \
+                 root — the contract-gen binary's default --repo-root (main.rs) is wrong"
+            );
             let report = sabrage_contract_gen::check(&repo_root())
                 .expect("contract/ files under repo_root are readable");
             assert!(
