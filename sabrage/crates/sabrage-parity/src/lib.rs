@@ -1926,9 +1926,11 @@ mod tests {
     /// `stages::run::preflight::block_die` / `post_fix_die`), plus one new
     /// fixture constructor, [`sabrage_core::stages::StageCtx::for_fixture`],
     /// so this crate never has to depend on `tokio_util` just to build a
-    /// `StageCtx`. What remains substring-only: `checks::run_only`'s die text
-    /// is covered by [`native_run_only_die_text_is_verbatim_in_run_sh`]
-    /// already; `stages::run::actions::wineserver_reset` / `goldberg_stage` /
+    /// `StageCtx`. `checks::run_only`'s die text is covered by
+    /// [`native_run_only_die_text_is_verbatim_in_run_sh`], which calls that
+    /// module's evaluators for real and pins the `--wired`-with-no-adb die
+    /// by exact equality. What remains substring-only:
+    /// `stages::run::actions::wineserver_reset` / `goldberg_stage` /
     /// `adb_reverse_cleanup` / `adb_forward_hygiene` and
     /// `fixes::adb::remove_adb_forwards_at`'s text, and
     /// `stages::run::preflight::emit_encoder_notice`'s two lines and the
@@ -2007,6 +2009,10 @@ mod tests {
                 },
             );
             assert_eq!(wired.status, CheckStatus::Fail);
+            assert_eq!(
+                wired.message,
+                "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
+            );
             assert_verbatim(&text, &wired.message, "checks::run_only::run_wired_adb");
 
             std::fs::remove_dir_all(&scratch).ok();

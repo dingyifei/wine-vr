@@ -395,25 +395,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    #[test]
-    fn wired_adb_fails_verbatim_when_adb_is_absent() {
-        let root = scratch("wired-noadb");
-        let ctx = fixture_ctx(
-            &root,
-            CheckOptions {
-                wired: true,
-                ..CheckOptions::new()
-            },
-        );
-        let out = run_wired_adb(&ctx);
-        assert_eq!(out.status, CheckStatus::Fail);
-        assert_eq!(
-            out.message,
-            "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
-        );
-        std::fs::remove_dir_all(&root).ok();
-    }
-
     /// With probing disabled the row is honestly unverifiable rather than a
     /// pass — the preflight turns this into a Fatal, never a launch.
     #[test]
