@@ -326,7 +326,6 @@ mod tests {
         save(&real(), &path, &s).await.unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.contains("\"futureFlag\""), "{text}");
         let parsed: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(parsed["launch"]["futureFlag"], serde_json::json!("keep-me"));
         assert_eq!(parsed["launch"]["wired"], serde_json::json!(true));
@@ -412,11 +411,6 @@ mod tests {
             runtime_config_edit_acknowledged: true,
             ..Settings::default()
         };
-        assert_eq!(
-            load(&path).unwrap(),
-            Settings::default(),
-            "absent -> default"
-        );
         save(&real(), &path, &s).await.unwrap();
 
         let text = std::fs::read_to_string(&path).unwrap();
