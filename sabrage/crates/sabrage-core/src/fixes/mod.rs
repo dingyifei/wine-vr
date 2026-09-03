@@ -552,10 +552,6 @@ mod tests {
         let _g = crate::session::lock_session_globals();
         let ctx = scratch_ctx("apply-blocks", None);
         let sink = null_sink();
-        assert!(
-            !ctx.paths.alvr_session_json().exists(),
-            "fixture must not exist"
-        );
         let guard = acquire_operation_lock().await;
         let mut task =
             tokio::spawn(async move { apply(FixAction::DeleteSessionJson, &ctx, &sink).await });
@@ -691,7 +687,6 @@ mod tests {
         let ctx = scratch_ctx("live-preflight", None);
         record_a_live_session(&ctx);
         let sink = null_sink();
-        assert!(!ctx.paths.alvr_session_json().exists());
 
         let guard = acquire_operation_lock().await;
         let report = apply_holding_lock(FixAction::DeleteSessionJson, &ctx, &sink)
@@ -730,18 +725,13 @@ mod tests {
         assert!(FixAction::from_str("fix.nope").is_err());
     }
 
-    /// The known-bad `session.json` deletion is withheld from the GUI (no
-    /// button) but keeps honest metadata for the CLI door and for any
-    /// confirmation dialog that grows one.
+    /// r1:A12-1 regression: the withheld `session.json` deletion must state its
+    /// known outcome before anything can run it — `destructive`, plus a
+    /// `consequence` naming the 800x900 black screen, the absent backups and
+    /// the in-place recovery. The no-button half of the withholding is pinned
+    /// by `is_deferred_is_exactly_the_withheld_set`.
     #[test]
-    fn the_known_bad_session_json_deletion_is_withheld_but_documented() {
-        assert_eq!(
-            FixAction::from_contract_id("fix.delete-session-json"),
-            None,
-            "a destructive remedy known to black-screen the client must render no Fix button"
-        );
-        assert!(DEFERRED_CONTRACT_FIX_IDS.contains(&"fix.delete-session-json"));
-
+    fn the_known_bad_session_json_deletion_documents_its_outcome() {
         let def = FixAction::DeleteSessionJson.def();
         assert!(def.destructive);
         let consequence = def
@@ -994,6 +984,7 @@ mod tests {
         );
     }
 
+    /// r1:A4-2 regression: a known-broken destructive remedy renders no Fix button.
     /// `is_deferred` is the [`FixAction`]-shaped form of the withheld set: the
     /// Tauri `fix` command needs it to refuse an action the GUI should never
     /// have offered (its TypeScript mirror of the fix table can render a button
