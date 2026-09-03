@@ -658,24 +658,6 @@ mod tests {
         geteuid()
     }
 
-    /// The only fixture whose `manual_ips` is present but falsy: it is the sole
-    /// killer of the `json_falsy` guard on the per-entry `manual_ips` match, so
-    /// it stays out of `session_json_shape_matrix`.
-    #[test]
-    fn empty_manual_ips_is_clean() {
-        let tmp = scratch("session-empty-ips");
-        let sessjson = tmp.join("OXRSys/alvr/session.json");
-        fs::create_dir_all(sessjson.parent().unwrap()).unwrap();
-        fs::write(
-            &sessjson,
-            br#"{"client_connections":{"Quest 3":{"manual_ips":[]}}}"#,
-        )
-        .unwrap();
-        let ctx = ctx_with_session(&tmp, sessjson);
-        assert_eq!(cfg_session_pins(&ctx).status, CheckStatus::Pass);
-        fs::remove_dir_all(&tmp).ok();
-    }
-
     #[test]
     fn one_pinned_client_warns_with_the_trailing_space_quirk() {
         let tmp = scratch("session-one-pin");
@@ -722,15 +704,23 @@ mod tests {
     /// `cfg.session-pins` for the session.json bodies whose shape alone decides
     /// the verdict. `{session}` in an expected message is the row's own scratch
     /// session.json path. The missing, unreadable and malformed files, the
-    /// bodies that do carry pins, and the present-but-falsy `manual_ips` body
-    /// (`empty_manual_ips_is_clean`) keep their own functions: their setup,
-    /// their assertions or the mutants they alone kill differ.
+    /// bodies that do carry pins keep their own functions: their setup, their
+    /// assertions or the mutants they alone kill differ.
     #[test]
     fn session_json_shape_matrix() {
         let cases: &[(&str, &str, CheckStatus, &str)] = &[
             (
                 "missing-client-connections",
                 "{}",
+                CheckStatus::Pass,
+                "ALVR session state has no stale manual-IP pins",
+            ),
+            // The only fixture whose `manual_ips` is present but falsy: it is
+            // the sole killer of the `json_falsy` guard on the per-entry
+            // `manual_ips` match, so its bytes stay exactly as written.
+            (
+                "empty-manual-ips",
+                r#"{"client_connections":{"Quest 3":{"manual_ips":[]}}}"#,
                 CheckStatus::Pass,
                 "ALVR session state has no stale manual-IP pins",
             ),
