@@ -727,9 +727,9 @@ mod tests {
 
     /// r1:A12-1 regression: the withheld `session.json` deletion must state its
     /// known outcome before anything can run it — `destructive`, plus a
-    /// `consequence` naming the 800x900 black screen, the absent backups and
-    /// the in-place recovery. The no-button half of the withholding is pinned
-    /// by `is_deferred_is_exactly_the_withheld_set`.
+    /// `consequence` naming the 800x900 black screen, the backup it takes
+    /// first and the in-place recovery. The no-button half of the withholding
+    /// is pinned by `is_deferred_is_exactly_the_withheld_set`.
     #[test]
     fn the_known_bad_session_json_deletion_documents_its_outcome() {
         let def = FixAction::DeleteSessionJson.def();

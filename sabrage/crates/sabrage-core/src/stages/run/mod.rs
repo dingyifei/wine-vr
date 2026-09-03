@@ -1316,10 +1316,10 @@ mod tests {
         );
         assert!(held.audio.is_none(), "the guard was released, not leaked");
         assert!(sess.guards.audio_restored);
-        // Still no `stop_wine`, and this fixture can prove it: the shared
-        // `dry_ctx` leaves `paths.wineserver` None, so the path is armed above
-        // and a stray `wineserver -k` on the normal path would be planned —
-        // the dry run records a spawn's argv as the plan's reason.
+        // Still no `stop_wine`, and this fixture can prove it: `dry_ctx` leaves
+        // `paths.wineserver` None, so the fixture sets one up front — a stray
+        // `wineserver -k` would now be planned, since the dry run records a
+        // spawn's argv as the plan's reason.
         assert!(!ctx
             .executor
             .planned()
@@ -2185,7 +2185,7 @@ mod tests {
     #[tokio::test]
     async fn disarming_consumes_both_guard_slots() {
         let root = scratch("guard-disarm");
-        let (ctx, seen) = dry_ctx(
+        let (ctx, _) = dry_ctx(
             &root,
             StageOptions {
                 no_audio: true,
@@ -2202,7 +2202,6 @@ mod tests {
                     .unwrap(),
             ),
         };
-        seen.lock().unwrap().clear();
         held.disarm();
         assert!(held.audio.is_none() && held.dashboard.is_none());
         std::fs::remove_dir_all(&root).unwrap();

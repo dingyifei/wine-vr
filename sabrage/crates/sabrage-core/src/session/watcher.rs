@@ -1523,13 +1523,13 @@ mod tests {
         /// #2/#100: the precedence table in [`SessionMonitor::snapshot`]'s doc
         /// comment — every row where two sources disagree, plus the live-only
         /// and persisted-only baselines those conflicts are measured against.
-        /// The unopposed rows live with their carriers:
-        /// `snapshot_phase_transitions` pins published Preflight/Launching/
-        /// Stopping over the Idle fallthrough and the bare Idle case, and
-        /// `snapshot_identity_and_exit_code_sources` pins published `Exited`
-        /// over an empty fixture. Consolidated into one test for the same
-        /// reason `snapshot_phase_transitions` is — these all read the same
-        /// process-global slots.
+        /// The rows this table gave up live with their carriers:
+        /// `snapshot_phase_transitions` pins published Preflight over the Idle
+        /// fallthrough (alongside Launching and Stopping) and the bare Idle
+        /// case, and `snapshot_identity_and_exit_code_sources` pins published
+        /// `Exited` over an empty fixture. Consolidated into one test for the
+        /// same reason `snapshot_phase_transitions` is — these all read the
+        /// same process-global slots.
         #[tokio::test]
         async fn snapshot_phase_precedence_table() {
             let _g = lock_session_globals();

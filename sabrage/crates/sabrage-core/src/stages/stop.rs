@@ -1361,10 +1361,10 @@ mod tests {
     }
 
     /// A stale identity — same pid, a start time that process never had — must
-    /// not be signalled at all: `reap` skips it and reports nothing killed.
+    /// not be signalled at all: `reap` skips it.
     ///
-    /// r1:A5-5 regression: a pid whose start time no longer matches is never
-    /// signalled.
+    /// r1:A5-5 regression: a pid whose start time no longer matches fails
+    /// `is_same_process`, so `wait_for_exit` never counts it alive.
     #[tokio::test]
     async fn reap_never_signals_a_pid_whose_identity_no_longer_matches() {
         let mut mismatched = ProcInfo::observe(std::process::id()).expect("observe self");

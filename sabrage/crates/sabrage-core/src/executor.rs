@@ -1361,6 +1361,8 @@ mod tests {
         // Fresh copy carries the execute bit over.
         ex.copy_if_changed(&src, &dst).await.unwrap();
         assert_eq!(mode_bits(&dst), 0o755);
+        // The identical repeat must not error (its `Unchanged` result is pinned
+        // by `copy_if_changed_matches_install_if_changed`).
         ex.copy_if_changed(&src, &dst).await.unwrap();
 
         // Bytes still equal, mode drifted: repaired, and reported as Copied.

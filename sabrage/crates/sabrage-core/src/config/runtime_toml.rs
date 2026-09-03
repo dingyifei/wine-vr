@@ -2129,7 +2129,7 @@ mod tests {
     fn a_parse_failure_refuses_to_rewrite() {
         let text = fixture("oxrsys-runtime.broken.toml");
         let err = apply_patch(&text, &patch_bitrate(60)).unwrap_err();
-        assert!(err.to_string().contains("refusing to rewrite"), "{err}");
+        assert!(err.to_string().contains("is not valid TOML"), "{err}");
     }
 
     #[test]
@@ -3029,7 +3029,7 @@ mod tests {
 
         let kept = list_backups(&backups);
         assert_eq!(kept.len(), BACKUP_KEEP, "{kept:#?}");
-        // The three oldest went.
+        // The three oldest went; the newest old one stayed.
         assert!(!backups.join(format!("{BACKUP_PREFIX}1000")).exists());
         assert!(!backups.join(format!("{BACKUP_PREFIX}1001")).exists());
         assert!(!backups.join(format!("{BACKUP_PREFIX}1002")).exists());
