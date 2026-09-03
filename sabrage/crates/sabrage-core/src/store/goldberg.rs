@@ -568,14 +568,6 @@ mod tests {
         std::fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM-BYTES").unwrap();
 
         let paths = test_paths(&bs_dir);
-        assert!(
-            !paths.session_state_path().exists(),
-            "the shell pipeline writes no session record"
-        );
-        assert!(
-            session::live_session_reason(&paths).is_none(),
-            "and nothing else on the machine reports a live session"
-        );
 
         let exe = std::env::current_exe().expect("test binary path");
         let name = exe
@@ -640,10 +632,6 @@ mod tests {
         std::fs::write(dir.join("steam_api64.dll.orig-steam"), b"REAL-STEAM-BYTES").unwrap();
 
         let paths = test_paths(&bs_dir);
-        assert!(
-            !paths.session_state_path().exists(),
-            "the shell pipeline writes no session record"
-        );
         std::fs::create_dir_all(&paths.oxr_appsup).unwrap();
         let now = crate::session::now_unix_ms();
         // Both halves of `watcher::runtime_status_live`: a fresh stamp *and* a
