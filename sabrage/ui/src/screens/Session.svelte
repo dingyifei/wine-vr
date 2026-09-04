@@ -1,4 +1,10 @@
 <script lang="ts">
+  // Session screen. Owns launch form state (bottle, Beat Saber directory, four
+  // demo.sh toggles — prefilled at mount from `AppState` and `settingsStore`)
+  // and drives `sessionStore`: launch, stop, detach, and the mount-time
+  // reconcile whose rows become the banner. The stage-gate dialog belongs to
+  // `stageStore`; "is a session live" is `isLivePhase` / `canStop` from
+  // `ipc.ts`, shared with Library.svelte.
   import { onDestroy, onMount } from "svelte";
   import { errMsg } from "../lib/text";
   import {
@@ -18,18 +24,15 @@
 
   interface Props {
     onNavigate?: (screen: Screen) => void;
-    /** Bumped by App.svelte on every Pipeline ▸ Launch menu firing (⌘R). A
-     * change is picked up by the `$effect` below, which waits for this
-     * screen's own bottle/options load and then calls `doLaunch(false)` —
-     * the exact function the Launch button's own `onclick` calls — rather
-     * than duplicating any launch logic here. `0` (the default) never
-     * triggers anything; only a change away from the last-handled value
-     * does. */
+    /** Bumped by App.svelte on Pipeline ▸ Launch (⌘R). A change from the
+     * last-handled value calls `doLaunch(false)` — the same function the
+     * Launch button calls — once this screen's mount-time prefill has settled;
+     * if a launch or stage is already running or no bottle is selected, a
+     * notice is shown instead. `0` never triggers. */
     launchRequest?: number;
   }
   let { onNavigate, launchRequest = 0 }: Props = $props();
 
-  // ── bottle + launch options ─────────────────────────────────────────────────
 
   const bottles = $derived(bottlesStore.bottles);
   const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
@@ -41,24 +44,16 @@
   let verbose = $state(false);
   let copied = $state(false);
 
-  /** Set once at mount when any field below actually got prefilled from
-   * `settings.json` (bottle/bsDir from `AppState` — Phase 4 added those two
-   * fields there specifically so this screen and the Sidebar can prefill
-   * without a second round trip — the four toggles from `settingsStore`,
-   * which this screen already needed to load anyway). Drives the small
-   * "defaults from Settings" hint; stays false on a fresh install where
-   * nothing has been set yet, so the hint doesn't appear over plain
-   * hardcoded fallbacks. */
+  /** True when the launch form was prefilled at mount: a bottle or Beat Saber
+   * directory from `AppState`, or at least one `settingsStore` toggle on.
+   * Drives the "defaults from Settings" hint, hidden on a fresh install where
+   * only hardcoded fallbacks apply. */
   let prefilledFromSettings = $state(false);
-  /** True once THIS screen's own onMount has finished prefilling
-   * `selectedBottle` (successfully or not) — deliberately separate from
-   * `bottlesStore.bottlesLoaded`, which is a module-global flag that stays
-   * `true` forever after the FIRST screen anywhere loads it. If the menu
-   * Launch replay effect below gated on that global flag instead, firing
-   * ⌘R from another screen (which had already loaded bottles once) would
-   * see `bottlesLoaded === true` and read `selectedBottle` before this
-   * mount's own prefill assignment below ran, producing a false "No bottle
-   * selected" notice on a perfectly configured install. */
+  /** True once THIS mount has finished prefilling `selectedBottle`. The
+   * menu-launch effect gates on this, never on the module-global
+   * `bottlesStore.bottlesLoaded` — already `true` when ⌘R arrives from
+   * another screen, so it would read `selectedBottle` before this mount
+   * assigns it and show a false "No bottle selected". */
   let bottlePrefillDone = $state(false);
 
   function pickDefaultBottle(list: string[]): string {
@@ -122,28 +117,24 @@
 
   const status = $derived(sessionStore.status);
 
-  // `isLivePhase` is the one definition of "a session is live" for the whole
-  // UI (ipc.ts) — Library.svelte already uses it for the same decision. This
-  // used to hand-list only "running"/"launching"/"preflight", which omitted
-  // "stalled"/"stopping"/"detached"/"external" — all four are live sessions
-  // (an external one has no Sabrage-owned handle at all, only a fresh
-  // runtime_status.json naming a live pid) that a second Launch must not run
-  // over.
+  // `isLivePhase` (ipc.ts) defines "session is live" for the whole UI, shared
+  // with Library.svelte: every phase but `idle` and `exited`, `external`
+  // included — a session with no Sabrage-owned handle, only a fresh
+  // runtime_status.json naming a live pid. No second Launch may run over them.
   //
   // `stageStore.running` is the other half of `gate !== null`: Hide closes the
-  // dialog without stopping the stage it was showing, so a Launch fired over a
-  // hidden-but-running install queues a second `openGate` that GateModal
-  // refuses to adopt — the modal reopens showing the *install's* title, rows
-  // and Cancel target while this launch runs behind the operation lock with no
-  // feedback and nothing to cancel it with. Refuse it up front instead, the
-  // same rule StagesPanel and Doctor already apply.
+  // dialog without stopping its stage, so a Launch over a hidden-but-running
+  // install would queue a second `openGate` that GateModal refuses to adopt —
+  // the modal reopens on the install's title, rows and Cancel target while
+  // this launch runs behind the operation lock with no feedback. Refuse up
+  // front, the same rule StagesPanel and Doctor apply.
   const busy = $derived(
     sessionStore.launching || isLivePhase(status.phase) || stageStore.gate !== null || stageStore.running,
   );
 
-  /** Delegates to `demoRunCommand` (moved out of this screen in Phase 4 so
-   * Library renders the byte-identical string for the same options) — same
-   * flag order/quoting as before. */
+  /** The `./demo.sh run …` command equivalent to the options selected here,
+   * built by `demoRunCommand` (lib/demo.ts) so every screen that shows this
+   * line renders the byte-identical string for the same options. */
   function equivalentCommand(): string {
     return demoRunCommand({ bottle: selectedBottle, bsDir, noAudio, noDashboard, wired, verbose });
   }
@@ -183,12 +174,6 @@
     });
   }
 
-  // ── menu-triggered launch (Pipeline ▸ Launch, ⌘R) ───────────────────────────
-  // App.svelte navigates here and bumps `launchRequest`; this effect waits for
-  // this screen's own mount-time bottle/options load (`bottlePrefillDone`) and
-  // then calls `doLaunch` — never a second, hand-duplicated launch call — so a
-  // menu-triggered launch behaves exactly like clicking the Launch button
-  // below with whatever bottle/options this screen already has selected.
 
   let lastHandledLaunchRequest = $state(0);
   let launchRequestNotice = $state<string | null>(null);
@@ -210,11 +195,6 @@
     doLaunch(false);
   });
 
-  // ── reconcile banner ─────────────────────────────────────────────────────────
-  // Derived from already-documented sessionStore surface only
-  // (`status` + `reconcileRows`) rather than a bespoke "what kind of
-  // reconcile was this" field — see the report's NEEDS FROM note if a richer
-  // signal becomes available.
 
   let bannerDismissed = $state(false);
   const reconcileBanner = $derived.by(() => {
@@ -228,17 +208,14 @@
     return null;
   });
 
-  // ── stop ─────────────────────────────────────────────────────────────────────
 
   let stopping = $state(false);
   let stopError = $state<string | null>(null);
-  /** The stop stage's own lines, shown as a small local list next to the
-   * button — scoped to this component (unlike `launchRows`, nothing else
-   * needs to read a Stop invocation's progress) so it rides the same
-   * `(ev) => void` callback `applyFix`/`runStage` already take. Only ever
-   * populated for a session this process does *not* supervise (`stop_session`
-   * runs the real `Stop` stage there, which does emit rows on `onEvent`) —
-   * see `sessionLogTail` below for the supervised case. */
+  /** The Stop stage's own lines, shown as a small local list next to the
+   * button. Only populated for a session this process does *not* supervise,
+   * where `stop_session` runs the real `Stop` stage; a supervised session's
+   * teardown rows arrive on `sessionStore.launchRows` instead, rendered by
+   * `sessionLogTail` below. */
   let stopRows = $state<string[]>([]);
 
   function stopRowText(ev: StageEvent): string | null {
@@ -256,14 +233,10 @@
   /** How many trailing lines of `sessionLogTail` to show. */
   const SESSION_LOG_TAIL_LINES = 12;
 
-  /** Teardown rows for a session this process launched land on the *launch*
-   * invocation's own event channel (`sessionStore.launchRows`), never on the
-   * Stop button's local `onEvent` callback — `commands::stop_session`'s own
-   * doc comment: stopping a session this process supervises fires its cancel
-   * token and streams "nothing new" on `on_event`, because the still-pending
-   * `launch()` call is what emits every resulting row itself, onto
-   * `launchRows`. Without this, Stop showed "Stopping…" with no rows at all
-   * for the one case a user watching Stop actually cares about. */
+  /** Trailing lines of the launch invocation's own rows, for a session this
+   * process supervises: `commands::stop_session` only fires the cancel token
+   * there and streams nothing on `on_event`, because the still-pending
+   * `launch()` call emits every teardown row onto `sessionStore.launchRows`. */
   const sessionLogTail = $derived.by((): string[] => {
     if (!status.ownedByThisProcess) return [];
     const lines: string[] = [];
@@ -290,7 +263,6 @@
     }
   }
 
-  // ── detach ───────────────────────────────────────────────────────────────────
 
   let detaching = $state(false);
   let detachError = $state<string | null>(null);
@@ -309,7 +281,6 @@
     }
   }
 
-  // ── display helpers ──────────────────────────────────────────────────────────
 
   const PHASE_LABEL: Record<SessionStatus["phase"], string> = {
     idle: "Idle",
@@ -355,11 +326,10 @@
   }
 
   const hasSession = $derived(status.phase !== "idle");
-  // `ipc.ts`'s `canStop` (== `isLivePhase`, every phase but idle/exited) — was
-  // a hand-rolled list here that omitted `"stopping"` and the newer
-  // `"external"` (a session Sabrage didn't start but can still stop; the
-  // recordless `stop` stage handles it). Using the shared predicate is what
-  // keeps this screen in sync with a new `SessionPhase` automatically.
+  // `canStop` (ipc.ts) is `isLivePhase`, the same predicate `busy` uses above:
+  // `external` counts — a session Sabrage did not start, which the recordless
+  // `stop` stage can still stop. Sharing the predicate is what keeps this
+  // screen in sync with a new `SessionPhase`.
   const canStop = $derived(sessionCanStop(status.phase));
 </script>
 
