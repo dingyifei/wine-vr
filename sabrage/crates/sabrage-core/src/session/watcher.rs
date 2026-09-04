@@ -1,23 +1,12 @@
-//! Telemetry v1: what the session is doing, from files only.
+//! Session telemetry, derived entirely from files and polls.
 //!
-//! Every source here is a file or a poll — oxrsys needs to cooperate with
-//! nothing (design-core §7). Three of them:
-//!
-//! | source | read as |
-//! |---|---|
-//! | `~/Library/Application Support/OXRSys/runtime_status.json` | [`RuntimeStatus`], believed only while [`is_fresh`] |
-//! | `…/OXRSys/oxrsys-runtime.log` | tailed; [`parse_encoder_ready`] pulls the encoder line out |
-//! | the wine child + `session-state.json` | liveness and identity |
-//!
-//! # Liveness is freshness, never existence
-//!
-//! `runtime_status.json` **persists after the runtime dies**. Treating its
-//! presence — or its `state` field — as "a session is running" reports a dead
-//! session as healthy forever. The only honest signal is
-//! `updated_at_unix_ms` against the wall clock
-//! ([`RUNTIME_STATUS_MAX_AGE`]). `state` itself stays an **opaque string**:
-//! its vocabulary is unverified upstream (design-core §10, unverified fact 1),
-//! so nothing here may branch on a particular word.
+//! `runtime_status.json` outlives the runtime, so it evidences a live session
+//! only while fresh and while the pid it names is alive. Its `state` is
+//! oxrsys's vocabulary: only [`RUNTIME_STATE_STREAMING`] is compared, and only
+//! to decide whether a missing heartbeat means anything; every other value is
+//! carried through and displayed
+//! (tests::runtime_status_live_is_freshness_and_a_live_pid_together,
+//! tests::is_fresh_accepts_only_stamps_inside_both_budgets).
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -28,21 +17,16 @@ use super::{run_phase, EncoderInfo, SessionPhase, SessionStatus};
 use crate::logs::Tailer;
 use crate::paths::Paths;
 
-/// `~/Library/Application Support/OXRSys/runtime_status.json`, as observed:
+/// `runtime_status.json` as oxrsys writes it.
 ///
-/// ```json
-/// {"state":"idle","transport":"","process_id":59004,
-///  "application_name":"Beat Saber","updated_at_unix_ms":1786300214181}
-/// ```
-///
-/// Keys are **snake_case on the wire** — this file is written by oxrsys, not
-/// by Sabrage, so it is the one type in the session layer that does *not*
-/// rename to camelCase. Unknown fields (`transport`, and whatever a future
-/// runtime adds) are ignored rather than rejected: a runtime that grows a
-/// field must not blank the status pill.
+/// Keys are snake_case on the wire — the one session-layer type not renamed to
+/// camelCase, because oxrsys owns the file. Unknown fields are ignored so a
+/// runtime that grows a field does not blank the status pill. Shape pinned by
+/// tests::parse_runtime_status_accepts_the_observed_and_minimal_documents_and_rejects_a_half_written_one.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RuntimeStatus {
-    /// Opaque. Displayed, never branched on.
+    /// Free-form. Only [`RUNTIME_STATE_STREAMING`] is ever compared; every
+    /// other value is carried through and displayed.
     pub state: String,
     #[serde(default)]
     pub process_id: Option<u32>,
@@ -51,14 +35,9 @@ pub struct RuntimeStatus {
     pub application_name: Option<String>,
 }
 
-/// How stale `runtime_status.json` may be before it stops counting as
-/// evidence of a live runtime.
-///
-/// Three seconds: comfortably above the observed write cadence, low enough
-/// that a killed runtime stops looking alive within one status poll.
-/// The `state` value oxrsys writes while a client is connected and frames are
-/// flowing (`RuntimeStatus::SetStreaming`); the only state with a per-second
-/// heartbeat, hence the only one whose staleness means anything.
+/// The `state` oxrsys writes while a client is connected and frames are
+/// flowing; the only state with a per-second heartbeat, hence the only one
+/// whose staleness means anything (tests::snapshot_tests::snapshot_phase_transitions).
 pub const RUNTIME_STATE_STREAMING: &str = "streaming";
 
 pub const RUNTIME_STATUS_MAX_AGE: Duration = Duration::from_secs(3);
@@ -97,14 +76,13 @@ pub fn parse_runtime_status(json: &str) -> Option<RuntimeStatus> {
     serde_json::from_str(json).ok()
 }
 
-/// How far into the future a `updated_at_unix_ms` stamp may sit and still be
-/// believed: ordinary skew between the runtime's clock read and this one.
+/// How far into the future an `updated_at_unix_ms` stamp may sit and still be
+/// believed: ordinary clock skew between the runtime and this process.
 ///
-/// Unbounded tolerance is what a saturating subtraction gives by accident, and
-/// it is not tolerance at all — a stamp an hour ahead (a clock correction, a
-/// corrupted number) then reads as "written now" and keeps reading that way
-/// until wall time catches up, suppressing [`SessionPhase::Stalled`] for the
-/// whole hour.
+/// Without a bound, a stamp an hour ahead (clock correction or corruption)
+/// reads as "written now" and suppresses [`SessionPhase::Stalled`] until wall
+/// time catches up
+/// (tests::is_fresh_accepts_only_stamps_inside_both_budgets).
 pub const MAX_FUTURE_SKEW: Duration = Duration::from_secs(2);
 
 /// Is a `updated_at_unix_ms` stamp recent enough to believe?
@@ -121,19 +99,18 @@ pub fn is_fresh(updated_at_unix_ms: u64, now_unix_ms: u64) -> bool {
 
 /// Does `rs` describe a runtime that is **running right now**?
 ///
-/// [`is_fresh`] *and* a `process_id` that is still alive — the two halves
-/// PARITY.md's "External sessions" row states, in the one function both readers
-/// call: [`SessionMonitor::snapshot`]'s [`SessionPhase::External`] derivation
-/// and [`crate::session::session_block_at`]'s status signal (the door every
-/// mutating operation goes through). They used to spell it differently — the
-/// door believed freshness alone — so the Session screen could report Idle
-/// while Settings refused to save, over the very same file.
+/// [`is_fresh`] *and* a `process_id` that is still alive: the two halves of
+/// PARITY.md § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+/// "**External sessions.** The session monitor reports a session started
+/// outside this Sabrage process". Both readers call this one function --
+/// [`SessionMonitor::snapshot`]'s [`SessionPhase::External`] derivation and
+/// [`crate::session::session_block_at`]'s status signal, the door every
+/// mutating operation goes through.
 ///
-/// A status with no `process_id` at all is therefore *not* evidence of a live
-/// runtime: oxrsys has always written that field (`RuntimeStatus.cpp` writes it
-/// unconditionally), so its absence means a file this build cannot vouch for,
-/// and a door that cannot be reasoned about is worse than a door that stays
-/// with the other six signals.
+/// A status with no `process_id` is therefore not evidence of a live runtime:
+/// oxrsys writes that field unconditionally (`RuntimeStatus.cpp`), so its
+/// absence means a file this build cannot vouch for
+/// (tests::runtime_status_live_is_freshness_and_a_live_pid_together).
 pub fn runtime_status_live(rs: &RuntimeStatus, now_unix_ms: u64) -> bool {
     is_fresh(rs.updated_at_unix_ms, now_unix_ms)
         && rs.process_id.is_some_and(crate::process::is_alive)
@@ -142,17 +119,13 @@ pub fn runtime_status_live(rs: &RuntimeStatus, now_unix_ms: u64) -> bool {
 /// The wall-clock time an oxrsys log line carries, in [`super::now_unix_ms`]'s
 /// units, or `None` when the line does not start with one.
 ///
-/// The pattern is oxrsys's spdlog format (`Config.cpp`:
-/// `[%Y-%m-%d %H:%M:%S.%e] [%l] %v`), and the stamp is **local** time, which is
-/// what makes this comparable with `started_at_unix_ms` at all.
-///
-/// It exists for one question: the runtime log is a single appending, rotating
-/// sink shared by every session, so a line found in
-/// [`RUNTIME_LOG_PRELOAD_LINES`]'s backward window is only *this* session's if
-/// it was written after this session started. Without the stamp, reopening
-/// Sabrage onto a running game republished the previous session's
-/// `(HEVC, native helper)` chip and hid the current one's `(H.264, in-process)`
-/// downgrade.
+/// The stamp follows oxrsys's spdlog format (`Config.cpp`:
+/// `[%Y-%m-%d %H:%M:%S.%e] [%l] %v`) and is **local** time, making it
+/// comparable with `started_at_unix_ms`. It exists for one question: the
+/// runtime log is a single appending sink shared by every session, so a line in
+/// `RUNTIME_LOG_PRELOAD_LINES`'s backward window is this session's only if
+/// written after this session started
+/// (tests::snapshot_tests::an_adopted_session_only_inherits_lines_written_after_it_started).
 pub fn parse_log_timestamp(line: &str) -> Option<u64> {
     use chrono::TimeZone;
 
@@ -169,22 +142,16 @@ pub fn parse_log_timestamp(line: &str) -> Option<u64> {
     u64::try_from(local.timestamp_millis()).ok()
 }
 
-/// Pull an [`EncoderInfo`] out of one oxrsys log line.
+/// Pull an [`EncoderInfo`] out of one oxrsys log line, or `None`.
 ///
-/// The line, verbatim:
+/// The marker `OXRSys/ALVR: encoder ready ` is searched anywhere in the input,
+/// so a timestamped spdlog line parses identically to the bare message
+/// (tests::parse_encoder_ready_works_on_the_bare_message_with_no_timestamp_prefix).
 ///
-/// ```text
-/// OXRSys/ALVR: encoder ready 2064x2208 @72Hz 100Mbps (HEVC, native helper)
-/// ```
-///
-/// The marker is searched for anywhere in the input, so a full timestamped
-/// spdlog line (`[2026-08-10 01:30:13.017] [info] OXRSys/ALVR: encoder ready
-/// …`) parses identically to the bare message shown above.
-///
-/// `(H.264, in-process)` in the parenthesis is the silent-downgrade signature
-/// the Session screen must surface: it means the native arm64 helper did not
-/// take and encoding fell back to Rosetta H.264 (CLAUDE.md's encoder-helper
-/// note). Returns `None` for any other line.
+/// `(H.264, in-process)` is the silent-downgrade signature the Session screen
+/// must surface: the native arm64 helper did not take and encoding fell back to
+/// Rosetta H.264. Shape pinned by
+/// tests::the_encoder_ready_format_string_pin_is_unchanged.
 pub fn parse_encoder_ready(line: &str) -> Option<EncoderInfo> {
     const MARKER: &str = "OXRSys/ALVR: encoder ready ";
     let idx = line.find(MARKER)?;
@@ -231,14 +198,12 @@ pub struct SessionMonitor {
     /// failed for a reason other than "the file does not exist yet" (that
     /// case is `Some` with no open file inside — see [`Tailer::open`]).
     runtime_log_tailer: Option<Tailer>,
-    /// The most recent `encoder ready` line parsed so far. Kept until a newer
-    /// one replaces it *within the same session* — cleared on the edge into
-    /// [`SessionPhase::Idle`] / [`SessionPhase::Exited`] (tracked via
-    /// `last_phase`, below) and whenever the run it belongs to is no longer the
-    /// run being reported (`encoder_run_id`), so a new session never inherits
-    /// the previous one's chip as a false-healthy signal. Nothing here does
-    /// design-core §7's Phase-5 downgrade detection — that is about a codec
-    /// change *within* one still-running session, not this.
+    /// The most recent `encoder ready` line parsed so far. Cleared on the edge
+    /// into [`SessionPhase::Idle`] / [`SessionPhase::Exited`]
+    /// (tests::snapshot_tests::snapshot_phase_transitions, F16) and whenever
+    /// the run it belongs to differs from the run being reported, so a new
+    /// session never inherits the previous one's chip as a false-healthy signal
+    /// (tests::snapshot_tests::a_previous_sessions_encoder_line_is_never_published_for_a_new_run).
     encoder: Option<EncoderInfo>,
     /// Which run `encoder` was parsed for. `None` is a real value: a chip
     /// picked up while nothing identifiable is running belongs to no run, and
@@ -246,15 +211,11 @@ pub struct SessionMonitor {
     encoder_run_id: Option<crate::events::RunId>,
     /// When this monitor was built, against [`super::now_unix_ms`]'s clock.
     ///
-    /// The preload window ([`RUNTIME_LOG_PRELOAD_LINES`]) reads log lines
-    /// written *before* this monitor existed. Those are only this session's
-    /// lines when the session predates the monitor — Sabrage opened onto a
-    /// game that was already running, which is the case preload exists for. A
-    /// session that starts *after* the monitor writes its own encoder line,
-    /// and anything already in the file then belongs to a previous one: the
-    /// stale `(HEVC, native helper)` chip that would otherwise sit where
-    /// "waiting for encoder…" belongs and mask an `(H.264, in-process)`
-    /// downgrade for as long as the session lasts.
+    /// Preloaded log lines (`RUNTIME_LOG_PRELOAD_LINES`) predate the monitor,
+    /// so they belong to the current session only when that session predates the
+    /// monitor too: Sabrage opened onto a game already running
+    /// (tests::snapshot_tests::an_adopted_session_only_inherits_lines_written_after_it_started,
+    /// tests::snapshot_tests::a_previous_sessions_encoder_line_is_never_published_for_a_new_run).
     created_at_unix_ms: u64,
     /// Has the first (history-bearing) tail poll happened yet?
     preload_pending: bool,
@@ -268,13 +229,12 @@ pub struct SessionMonitor {
     /// run.
     last_fresh_unix_ms: Option<u64>,
     /// Which run `ever_fresh`/`last_fresh_unix_ms`/`runtime_status` describe.
-    /// The monitor is built once and outlives every session it watches, so
-    /// without this the *previous* session's freshness history decides whether
-    /// the current one is `Stalled` — a fresh launch inherits `ever_fresh` and
-    /// a timestamp it never wrote, and flips to Stalled the moment it passes
-    /// the startup grace. `None` is a real value (nothing identifiable is
-    /// running), and history recorded under it must not survive into a run
-    /// either.
+    ///
+    /// The monitor outlives every session it watches, so freshness history not
+    /// reset on a run change decides the *next* session's `Stalled`. `None` is
+    /// a real value (nothing identifiable is running), and history recorded
+    /// under it must not survive into a run either
+    /// (tests::snapshot_tests::freshness_history_never_crosses_from_one_session_to_the_next).
     fresh_run_id: Option<crate::events::RunId>,
     /// The phase reported by the *previous* [`snapshot`](Self::snapshot) call.
     /// Purely for detecting the Idle/Exited *entry* edge that clears
@@ -284,7 +244,7 @@ pub struct SessionMonitor {
 
 /// Which derived source produced a snapshot's phase, before the run stage's
 /// published phase is weighed against it. See [`SessionMonitor::snapshot`]'s
-/// precedence table.
+/// precedence rules.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Base {
     /// [`super::live_session`] — this process owns a launched session.
@@ -320,60 +280,21 @@ impl SessionMonitor {
         monitor
     }
 
-    /// One snapshot, combining [`super::live_session`], the run stage's
-    /// published [`super::RunPhaseInfo`], the persisted
-    /// [`super::state::SessionState`], the wine child's liveness, the
-    /// freshness of `runtime_status.json`, a running `Beat Saber.exe` nothing
-    /// here started, and the newest `encoder ready` line in the runtime log.
+    /// One snapshot folding [`super::live_session`], the run stage's published
+    /// [`super::RunPhaseInfo`], persisted [`super::state::SessionState`], wine
+    /// child liveness, `runtime_status.json` freshness, an external
+    /// `Beat Saber.exe`, and the newest `encoder ready` line into one
+    /// [`SessionStatus`]. Never fails: an unreadable source degrades one field
+    /// rather than the whole snapshot.
     ///
-    /// # Phase precedence (highest first)
-    ///
-    /// | # | source | phase |
-    /// |---|---|---|
-    /// | 1 | published | `Stopping` |
-    /// | 2 | `live_session()` | `Running` / `Stalled` / `Exited` |
-    /// | 3 | published | `Preflight` / `Launching` |
-    /// | 4 | `session-state.json` | `Detached` / `Running` / `Exited` |
-    /// | 5 | fresh `runtime_status.json` + a live pid, or a live `Beat Saber.exe` | `External` |
-    /// | 6 | published | `Exited` (carrying `exit_code`) |
-    /// | 7 | — | `Idle` |
-    ///
-    /// The two inversions are the whole point of the ordering:
-    ///
-    /// * **Published `Stopping` outranks a live handle.** Teardown publishes
-    ///   `Stopping` *before* it clears [`super::LIVE_SESSION`]; without this
-    ///   row a session being torn down keeps reading `Running` (or `Exited`,
-    ///   which is worse — it looks finished while wineserver is still going
-    ///   down) for the whole of it.
-    /// * **Published `Exited` ranks below `session-state.json`.** It survives
-    ///   `run()` returning, so the Session screen can say "Exited (code N)"
-    ///   until the next launch overwrites it with `Preflight` — but a session
-    ///   that is genuinely on disk, detached or adopted from a previous
-    ///   process, is the newer truth and wins.
-    ///
-    /// Identity (`run_id`, `bottle`) is taken from the published info where
-    /// the derived branches supplied none — a phase without a bottle name is a
-    /// Stop button that deadlocks and then dies (`bottle name required`) — and
-    /// **wholesale**, pid and log path blanked, when a published phase beats a
-    /// `session-state.json` describing a *different* run (#200): the phase and
-    /// the run it names must be the same run, or Stop targets a session the
-    /// `RunRegistry` does not know. A winning publication also marks the
-    /// snapshot `owned_by_this_process` (#201): `RUN_PHASE` is in-process by
-    /// construction, so nothing else can have written it.
-    ///
-    /// `exit_code` rides along with any published `Exited` whenever the
-    /// resulting phase is `Exited`, even if the phase itself came from
-    /// elsewhere — the status line and the number it names must agree.
-    ///
-    /// Never fails: an unreadable source degrades one field (a `None`, a
-    /// `runtime_fresh: false`) rather than the whole snapshot. A status poll
-    /// that can error is a status poll that spends the user's attention on
-    /// itself.
+    /// Phase precedence, the wholesale identity takeover (#200), and the
+    /// `owned_by_this_process` rule (#201) are pinned by
+    /// tests::snapshot_tests::snapshot_phase_precedence_table and
+    /// tests::snapshot_tests::snapshot_identity_and_exit_code_sources.
     pub async fn snapshot(&mut self) -> SessionStatus {
         let now = super::now_unix_ms();
         let mut status = SessionStatus::default();
 
-        // ── phase + identity: live_session() > persisted state > Idle ──────
         // Which of the three derived branches produced `status.phase` — the
         // published-phase precedence below is a function of it, not just of
         // the phase value.
@@ -387,10 +308,10 @@ impl SessionMonitor {
             status.started_at_unix_ms = Some(handle.started_at_unix_ms);
             status.log_path = Some(handle.log_path.display().to_string());
             // Through `classify`, not `is_same_process()`: an alive pid whose
-            // recorded `start_time` is the spawn fallback's 0 is
-            // `Unverifiable` — live as far as anything can tell — and every
-            // door treats it that way. Rendering it `Exited` put a Launch
-            // button under a session the launch path refuses.
+            // recorded `start_time` is the spawn fallback's 0 is `Unverifiable`
+            // — live as far as anything can tell, and every door treats it that
+            // way
+            // (tests::snapshot_tests::an_alive_pid_with_no_verifiable_start_time_is_never_reported_exited).
             status.phase = if super::reconcile::classify_identity(Some(&handle.identity)).is_live()
             {
                 SessionPhase::Running
@@ -417,13 +338,11 @@ impl SessionMonitor {
         // else: nothing live, nothing persisted — `status.phase` stays Idle
         // (`SessionStatus::default()`).
 
-        // ── freshness history belongs to ONE run ────────────────────────────
         // `ever_fresh`, `last_fresh_unix_ms` and the cached status are what the
         // stall rule below reasons over, and this monitor outlives every
-        // session it watches (the app builds one, once). Carrying session A's
-        // history into session B classified B as `Stalled` off A's timestamps
-        // the moment B passed the startup grace — a healthy launch reported as
-        // the standby freeze, without B ever having reported in at all.
+        // session it watches: carrying session A's history into session B
+        // classifies B as `Stalled` off A's timestamps
+        // (tests::snapshot_tests::freshness_history_never_crosses_from_one_session_to_the_next).
         if self.fresh_run_id != status.run_id {
             self.fresh_run_id = status.run_id;
             self.ever_fresh = false;
@@ -431,10 +350,10 @@ impl SessionMonitor {
             self.runtime_status = None;
         }
 
-        // ── runtime_status.json freshness ───────────────────────────────────
         // The file is global and outlives every session, so a stamp written
         // *before* the session being reported started is the previous
-        // session's — evidence about a runtime that is gone, not this one.
+        // session's — evidence about a runtime that is gone, not this one
+        // (tests::snapshot_tests::a_status_written_before_this_session_started_is_not_fresh).
         if let Ok(text) = std::fs::read_to_string(self.runtime_status_path()) {
             if let Some(rs) = parse_runtime_status(&text) {
                 let predates_session = status
@@ -447,16 +366,11 @@ impl SessionMonitor {
                     self.ever_fresh = true;
                     self.last_fresh_unix_ms = Some(now);
 
-                    // ── a session nothing here started ──────────────────────
                     // No handle, no record, but the runtime is reporting *now*
-                    // and the process it names is alive: `demo.sh run` in
-                    // another terminal. Saying "No session running" over that
-                    // invites a second launch onto a live game. Never derived
-                    // from freshness alone — the pid has to answer too
-                    // ([`runtime_status_live`], the same predicate every
-                    // mutating door uses) — and the phase carries nothing
-                    // else, because nothing else about that session is
-                    // knowable from here.
+                    // and the process it names is alive — an external launch.
+                    // Reporting idle here invites a second launch onto a live
+                    // game. Never from freshness alone: the pid must answer too
+                    // (tests::snapshot_tests::a_session_started_outside_sabrage_is_reported_not_called_idle).
                     if base == Base::None && runtime_status_live(&rs, now) {
                         base = Base::External;
                         status.phase = SessionPhase::External;
@@ -467,19 +381,14 @@ impl SessionMonitor {
             }
         }
 
-        // ── a session with nothing written about it at all ──────────────────
         // The seventh door signal ([`super::running_game_pid`]) rendered.
-        // `runtime_status.json` only appears once *streaming* starts, which is
-        // minutes after a `./demo.sh run` spawned the game — and for that whole
-        // window every file-based source above reads idle. The doors already
-        // refuse there (A13a-2), so without this the Session screen said
-        // "Idle" and offered Launch/Run/Fix while every one of them died with
-        // a Fatal: exactly the disagreement the `runtime_status_live` fix
-        // above removed, one signal later.
+        // `runtime_status.json` appears only once streaming starts, minutes
+        // after `./demo.sh run` spawned the game; every file source above reads
+        // idle for that window while the doors already refuse (A13a-2)
+        // (tests::snapshot_tests::a_running_game_with_nothing_on_disk_is_external_not_idle).
         //
-        // Last, and only for `Base::None`: it is the one probe that costs a
-        // full process-table walk, and any of the branches above already knows
-        // more about the session than a pid.
+        // Last, and only for `Base::None`: the one probe that costs a full
+        // process-table walk; any branch above already knows more than a pid.
         if base == Base::None {
             if let Some(pid) = super::running_game_pid() {
                 base = Base::External;
@@ -488,7 +397,6 @@ impl SessionMonitor {
             }
         }
 
-        // ── encoder chip: the last `encoder ready` line seen so far ─────────
         // Parsed here (the cursor has to advance every poll) but *attributed*
         // at the end of this method, once the phase and the run it belongs to
         // are settled.
@@ -505,17 +413,12 @@ impl SessionMonitor {
                 }
             }
         }
-        // ── Stalled: Running + streaming, past the startup grace, stale too long
-        //
-        // oxrsys writes `runtime_status.json` on state changes (`SetIdle` /
-        // `SetStreaming`) and then once per second *only while streaming*
-        // (`SetStreamingStats`, StreamingServer.cpp) — there is no idle
-        // heartbeat. So staleness means "the stream's heartbeat stopped" only
-        // when the file's last state is `streaming`; an `idle` runtime waiting
-        // for the headset is legitimately stale for as long as the user takes
-        // to put it on, and must never read as Stalled (live-verified
-        // 2026-08-29: a fresh launch flipped to Stalled 13 s in, before the
-        // Quest had connected).
+        // oxrsys writes `runtime_status.json` on state changes and once per
+        // second *only while streaming* — there is no idle heartbeat. Staleness
+        // therefore means "the stream's heartbeat stopped" only when the last
+        // state is `streaming`; an `idle` runtime is legitimately stale for as
+        // long as the user takes to put the headset on
+        // (tests::snapshot_tests::snapshot_phase_transitions).
         let runtime_streaming = self
             .runtime_status
             .as_ref()
@@ -535,41 +438,36 @@ impl SessionMonitor {
             }
         }
 
-        // ── the run stage's published phase, at its rank ────────────────────
-        // The table in this method's doc comment, in code. `Preflight` /
-        // `Launching` / `Stopping` exist only in the run stage's own head —
-        // there is no `LIVE_SESSION` yet, or teardown has already started
-        // clearing it — so nothing derived above can produce them at all.
+        // `Preflight` / `Launching` / `Stopping` exist only in the run stage's
+        // own head — there is no `LIVE_SESSION` yet, or teardown has already
+        // started clearing it — so nothing derived above can produce them.
         if let Some(info) = run_phase() {
             let outranks_derived = match info.phase {
-                // 1: teardown is underway even though the handle is still up.
+                // Teardown is underway even though the handle is still up.
                 SessionPhase::Stopping => true,
-                // 3: a launch that has not published its handle yet.
+                // A launch that has not published its handle yet.
                 SessionPhase::Preflight | SessionPhase::Launching => base != Base::Live,
-                // 5: `Exited` — and defensively anything else the run stage
+                // `Exited` — and defensively anything else the run stage
                 // might one day publish — is the weakest signal there is: it
-                // fills `Idle` and nothing else.
+                // survives `run()` returning, so it fills `Idle` (the screen
+                // can still say "Exited (code N)") and loses to anything on
+                // disk, which is newer truth.
                 _ => base == Base::None,
             };
             if outranks_derived {
                 status.phase = info.phase;
-                // #201: `RUN_PHASE` is an in-process global (`session::mod`) —
-                // only *this* process's run stage can have published it. So a
-                // published phase that wins is by construction a session this
-                // Sabrage owns, even in the window where `LIVE_SESSION` is not
-                // populated yet (Preflight/Launching) or has already been
-                // cleared. Without this the Session screen shows "a session is
-                // running outside this Sabrage instance" through every normal
-                // launch's preflight.
+                // #201: `RUN_PHASE` is an in-process global, so a published
+                // phase that wins names a session this Sabrage owns — including
+                // the Preflight/Launching window where `LIVE_SESSION` is not
+                // populated yet
+                // (tests::snapshot_tests::snapshot_identity_and_exit_code_sources).
                 status.owned_by_this_process = true;
                 // #200: a published phase outranking a *persisted* derivation
-                // for a DIFFERENT run means a launch has started over a stale
-                // `session-state.json` — a detached or crashed session A on
-                // disk while the user launches bottle B. Keeping A's identity
-                // under B's phase points Stop at a run the `RunRegistry` has
-                // never heard of (a silent no-op while B keeps launching), so
-                // the publication's identity is taken wholesale and the fields
-                // it cannot carry are dropped rather than left describing A.
+                // for a DIFFERENT run means a launch started over a stale
+                // `session-state.json`; keeping the old identity under the new
+                // phase points Stop at a run the `RunRegistry` never heard of,
+                // so the publication's identity is taken wholesale
+                // (tests::snapshot_tests::snapshot_identity_and_exit_code_sources).
                 //
                 // `Base::Live` needs no such branch: a published phase over a
                 // live handle is always the same run (teardown's `Stopping`).
@@ -596,15 +494,10 @@ impl SessionMonitor {
             }
         }
 
-        // A session that has just settled into Idle or Exited has nothing
-        // left to report a codec for — carrying the *previous* session's
-        // `encoder ready` line forward here would show it as a still-healthy
-        // chip for a session that no longer exists. Edge-triggered (only on
-        // entry into Idle/Exited from something else) so a monitor that has
-        // never seen a session — the common Idle-from-`new()` case exercised
-        // by tests that never touch `LIVE_SESSION` at all — does not have a
-        // freshly parsed chip yanked back out from under it in the very same
-        // poll that produced it.
+        // A session that has just settled into Idle or Exited has nothing left
+        // to report a codec for. Edge-triggered on entry, so a monitor that has
+        // never seen a session does not have a freshly parsed chip yanked out
+        // from under it in the very poll that produced it.
         let was_idle_or_exited =
             matches!(self.last_phase, SessionPhase::Idle | SessionPhase::Exited);
         let now_idle_or_exited = matches!(status.phase, SessionPhase::Idle | SessionPhase::Exited);
@@ -612,29 +505,23 @@ impl SessionMonitor {
             self.encoder = None;
             self.encoder_run_id = None;
         }
-        // …and a chip never crosses from one run to another. The edge above
-        // cannot catch a monitor that reports Running from its very first poll
-        // (a fresh launch under a Sabrage that was already open never passes
-        // through Idle *within this monitor*), which is exactly the case where
-        // the log still holds the previous session's line.
+        // …and a chip never crosses from one run to another: the edge above
+        // cannot catch a monitor that reports Running from its very first poll,
+        // which is exactly when the log still holds the previous session's line
+        // (tests::snapshot_tests::a_previous_sessions_encoder_line_is_never_published_for_a_new_run).
         if self.encoder_run_id != status.run_id {
             self.encoder = None;
             self.encoder_run_id = None;
         }
         if let Some((info, line_unix_ms)) = parsed {
             // A line the tail read *live* was written after this poll's
-            // predecessor, so the session being reported is the one that wrote
-            // it. A line out of the preload window is history, and history is
-            // only this session's when two things hold at once: the session
-            // predates the monitor (see `created_at_unix_ms`), and the line's
-            // own timestamp is not older than the session
-            // ([`parse_log_timestamp`]). The log is one appending, rotating
-            // sink shared by every session that ever ran, so without the second
-            // half a Sabrage opened onto a live game republished *some*
-            // previous session's chip — masking an `(H.264, in-process)`
-            // downgrade for as long as the session lasted, since the line is
-            // emitted once per session. A preloaded line with no readable
-            // timestamp proves nothing and is dropped.
+            // predecessor, so it belongs to the session being reported. A
+            // preloaded line is history, and history is this session's only if
+            // the session predates the monitor and the line's own timestamp is
+            // not older than the session; the log is one appending sink shared
+            // by every session, so a preloaded line with no readable timestamp
+            // proves nothing and is dropped
+            // (tests::snapshot_tests::an_adopted_session_only_inherits_lines_written_after_it_started).
             let believable = if history {
                 match (status.started_at_unix_ms, line_unix_ms) {
                     (Some(started), Some(written)) => {
@@ -776,9 +663,9 @@ mod tests {
     }
 
     /// A10-8. One predicate, two readers: the `External` phase the Session
-    /// screen shows and the door every mutating operation goes through. They
-    /// used to spell "is the runtime live" differently, so the UI could say
-    /// Idle while Settings refused to save over the same file.
+    /// screen shows and the door every mutating operation goes through. Two
+    /// spellings of "is the runtime live" let the UI say Idle while Settings
+    /// refused to save over the same file.
     #[test]
     fn runtime_status_live_is_freshness_and_a_live_pid_together() {
         let now = crate::session::now_unix_ms();
@@ -830,8 +717,6 @@ mod tests {
         assert!(parse_log_timestamp("[info] no date here]").is_none());
         assert!(parse_log_timestamp("").is_none());
     }
-
-    // ── parse_encoder_ready ──────────────────────────────────────────────────
 
     fn fixture_log_lines() -> Vec<String> {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -932,8 +817,6 @@ mod tests {
         );
     }
 
-    // ── SessionMonitor::snapshot ─────────────────────────────────────────────
-
     mod snapshot_tests {
         use super::super::*;
         use crate::process::ProcInfo;
@@ -960,12 +843,9 @@ mod tests {
             paths
         }
 
-        /// Best-effort cleanup of the process-global live-session slot — and
-        /// the run-phase override slot, the same kind of global — before a
-        /// test that must start from Idle with nothing published. Cannot
-        /// fully rule out interference from a concurrently running test in
-        /// another module that also touches these globals (same caveat
-        /// `session::mod`'s own tests carry).
+        /// Best-effort reset of the process-global live-session and run-phase
+        /// slots before a test that must start from Idle. Cannot rule out a
+        /// concurrent test in another module touching the same globals.
         fn force_idle() {
             if let Ok(mut g) = LIVE_SESSION.lock() {
                 *g = None;
@@ -1019,13 +899,11 @@ mod tests {
             }));
         }
 
-        /// A9-6. The runtime log is global and append-only across sessions
-        /// (oxrsys opens it with a rotating sink; neither front-end truncates
-        /// it), and a new monitor preloads the last 200 lines. Publishing an
-        /// `encoder ready` line from *before* this session as its chip shows a
-        /// healthy `(HEVC, native helper)` where "waiting for encoder…"
-        /// belongs — and hides an `(H.264, in-process)` downgrade for as long
-        /// as the session lasts, since the line is emitted once per session.
+        /// A9-6. The runtime log is global and append-only across sessions and a
+        /// new monitor preloads its last 200 lines, so an `encoder ready` line
+        /// from an earlier session would show a healthy chip where "waiting for
+        /// encoder…" belongs — and, since oxrsys emits that line once per
+        /// session, hide an `(H.264, in-process)` downgrade for the whole run.
         #[tokio::test]
         async fn a_previous_sessions_encoder_line_is_never_published_for_a_new_run() {
             let _g = lock_session_globals();
@@ -1112,18 +990,15 @@ mod tests {
             )
         }
 
-        /// A9-6, both halves. The preload window is believed for an *adopted*
-        /// session — one that started before the monitor — and the 200 lines it
-        /// reads span every session that ever ran. A line stamped after this
-        /// session started is its own, and the chip it negotiated is published;
-        /// a line stamped before it belongs to a previous session, and
-        /// publishing that one puts a healthy `(HEVC, native helper)` chip where
-        /// "waiting for encoder…" belongs.
+        /// A9-6, both halves. An adopted session — one that started before the
+        /// monitor — believes a preloaded line stamped after it started and
+        /// publishes the chip it names; a line stamped before it belongs to a
+        /// previous session, and publishing that one shows a healthy `(HEVC,
+        /// native helper)` chip where "waiting for encoder…" belongs.
         #[tokio::test]
         async fn an_adopted_session_only_inherits_lines_written_after_it_started() {
             let _g = lock_session_globals();
 
-            // (a) older than the session, (b) and (c) written after it started, (d) no timestamp at all.
             for (row, line, want_codec) in [
                 (
                     "r1:A9-6 regression: a line from before this session started is never published as this session's chip",
@@ -1275,12 +1150,11 @@ mod tests {
             }
         }
 
-        /// A13a-2, rendered. The door grew a seventh signal — a running
-        /// `Beat Saber.exe` — for the window a `./demo.sh run` spends between
-        /// its wine spawn and its first `runtime_status.json`. The phase has
-        /// to carry it too: with the monitor still reporting `Idle` there,
-        /// Library/Session leave Launch enabled and Doctor leaves every Fix
-        /// enabled, and each one then dies with the Fatal the door raises.
+        /// A13a-2, rendered. The door counts a running `Beat Saber.exe` as a live
+        /// session for the window a `./demo.sh run` spends between its wine spawn
+        /// and its first `runtime_status.json`. The phase carries it too:
+        /// reporting `Idle` there leaves Launch and every Doctor Fix enabled, and
+        /// each one then dies with the Fatal the door raises.
         #[tokio::test]
         async fn a_running_game_with_nothing_on_disk_is_external_not_idle() {
             let _g = lock_session_globals();
@@ -1393,12 +1267,11 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// A9-5. The spawn fallback records `start_time: 0` when the child
-        /// could not be observed (`Executor::spawn_detached`), and
-        /// `is_same_process()` is false for it forever after. Reconciliation
-        /// calls that alive pid `Unverifiable` and every door treats it as
-        /// live; the monitor used to call it `Exited`, which is a Launch button
-        /// over a session `run` then refuses.
+        /// A9-5. The spawn fallback records `start_time: 0` when the child could
+        /// not be observed (`Executor::spawn_detached`), so `is_same_process()`
+        /// is false for it forever after. Reconciliation calls that alive pid
+        /// `Unverifiable` and every door treats it as live; reporting `Exited`
+        /// would put a Launch button over a session `run` refuses.
         #[tokio::test]
         async fn an_alive_pid_with_no_verifiable_start_time_is_never_reported_exited() {
             let _g = lock_session_globals();
@@ -1521,15 +1394,8 @@ mod tests {
         }
 
         /// #2/#100: the precedence table in [`SessionMonitor::snapshot`]'s doc
-        /// comment — every row where two sources disagree, plus the live-only
-        /// and persisted-only baselines those conflicts are measured against.
-        /// The rows this table gave up live with their carriers:
-        /// `snapshot_phase_transitions` pins published Preflight over the Idle
-        /// fallthrough (alongside Launching and Stopping) and the bare Idle
-        /// case, and `snapshot_identity_and_exit_code_sources` pins published
-        /// `Exited` over an empty fixture. Consolidated into one test for the
-        /// same reason `snapshot_phase_transitions` is — these all read the
-        /// same process-global slots.
+        /// comment — every row where two sources disagree, plus the live-only and
+        /// persisted-only baselines those conflicts are measured against.
         #[tokio::test]
         async fn snapshot_phase_precedence_table() {
             let _g = lock_session_globals();
@@ -1791,17 +1657,10 @@ mod tests {
             }
         }
 
-        /// Every scenario below runs in strict sequence inside one test
-        /// function, rather than as separate `#[tokio::test]`s. `snapshot()`
-        /// reads the process-global `LIVE_SESSION` slot, so two of these
-        /// scenarios genuinely race each other if the standard test harness
-        /// schedules them on different OS threads at the same moment (a
-        /// `detached`/`exited`/`idle` case expects the slot to be *empty*,
-        /// exactly while another case is legitimately setting it) — this was
-        /// caught as a real, reproducible flake, not a theoretical one.
-        /// Consolidating removes the intra-file race entirely; the residual
-        /// cross-file risk (another module's test touching the same global)
-        /// is the same caveat `session::mod`'s own test already carries.
+        /// The phase transitions, in strict sequence inside one test rather than
+        /// separate `#[tokio::test]`s: they read the process-global
+        /// `LIVE_SESSION` slot and would race on separate threads. The residual
+        /// cross-file risk is the caveat `session::mod`'s tests carry.
         #[tokio::test]
         async fn snapshot_phase_transitions() {
             let _g = lock_session_globals();
@@ -1867,11 +1726,9 @@ mod tests {
             }
 
             // F2: the run stage's published phase wins over whatever would
-            // otherwise be derived — here, plain Idle (nothing live, nothing
-            // persisted) — for exactly the three phases only the run stage
-            // can know about. #100: it must also publish the identity that
-            // goes with the phase, or the Session screen offers a Stop button
-            // with no bottle to stop.
+            // otherwise be derived — here plain Idle — for the three phases only
+            // it can know about. #100: it must also publish the identity, or the
+            // Session screen offers a Stop button with no bottle to stop.
             for phase in [
                 SessionPhase::Preflight,
                 SessionPhase::Launching,
@@ -1897,12 +1754,10 @@ mod tests {
                 );
             }
 
-            // F16: the encoder chip must not survive a session actually
-            // ending — it must clear on the edge into Exited, not linger as a
-            // false-healthy chip for a session that no longer exists. Same
-            // monitor throughout, so `last_phase` genuinely transitions
-            // Running -> Exited within one instance, unlike the "Idle
-            // throughout" encoder-chip scenario above.
+            // F16: the encoder chip must clear on the edge into Idle/Exited
+            // rather than linger as a false-healthy chip for a session that no
+            // longer exists. One monitor throughout, so `last_phase` really
+            // transitions out of Running within one instance.
             {
                 let dir = scratch("encoder-clears-on-exit");
                 let paths = fixture_paths(&dir);
@@ -1952,9 +1807,8 @@ mod tests {
                 );
             }
 
-            // Encoder chip: picked up from a fresh line appended after the
-            // monitor already exists (Idle phase throughout — no live session
-            // involved, but sequenced here anyway for consistency).
+            // Encoder chip: picked up from a fresh line appended after the monitor
+            // already exists — Idle phase throughout, no live session.
             {
                 let dir = scratch("encoder-chip");
                 let paths = fixture_paths(&dir);
@@ -2062,10 +1916,8 @@ mod tests {
             }
 
             // Idle runtime waiting for the headset: the file was written once
-            // (`SetIdle`) and is now arbitrarily stale, past every grace —
-            // oxrsys has no idle heartbeat, so this is Running, never Stalled
-            // (live-verified 2026-08-29: the pre-fix rule flipped a fresh
-            // launch to Stalled 13 s in, before the Quest had connected).
+            // (`SetIdle`) and is now arbitrarily stale, past every grace — oxrsys
+            // has no idle heartbeat, so this is Running, never Stalled.
             {
                 let dir = scratch("live-idle-waiting");
                 let paths = fixture_paths(&dir);
