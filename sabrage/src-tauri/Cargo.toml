@@ -1,0 +1,20 @@
+[package]
+name = "sabrage-app"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "sabrage_app_lib"
+crate-type = ["lib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-single-instance = "2"
+sabrage-core = { path = "../crates/sabrage-core" }
+serde = { version = "1", features = ["derive"] }
+# Native folder picker for the Browse… buttons (Settings paths, Edit game).
+# `dialog:allow-open` is the only capability granted (capabilities/main.json).
+tauri-plugin-dialog = "2"

@@ -1,0 +1,13 @@
+# Restored 2026-07-04 (user-approved) after a Catch2 test run clobbered this file
+# (tests write the real user config path — known issue, fix pending). Values from the
+# effective-config dump in wine-vr/evidence/bs_launch_round6f.log.
+# 2026-07-10: native-res + higher bitrate for video-shoot quality (was 0.75 default / 42).
+[streaming]
+protocol = "alvr"
+bitrate_mbps = 80
+resolution_scale = 1.0
+refresh_rate_hz = 90
+# native-arm64 helper when available (HW HEVC); 2026-08-03
+encoder_process = "auto"
+# helper negotiates HEVC; falls back H.264 in-process
+video_codec = "auto"

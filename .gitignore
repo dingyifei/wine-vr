@@ -4,6 +4,9 @@ third_party/
 
 # Build outputs
 build/
+# …but not the source directories that hold a `build.rs` module's extracted tests (sibling-module layout, code-standards §3.9)
+!sabrage/crates/sabrage-core/src/checks/build/
+!sabrage/crates/sabrage-core/src/stages/build/
 *.exe
 *.dll
 *.so
@@ -15,6 +18,8 @@ build/
 *.dxvk-cache
 *.log
 logs/
+# …but not sabrage-core/src/logs/, the sibling-module directory of logs.rs's extracted tests
+!sabrage/crates/sabrage-core/src/logs/
 
 # Local investigation evidence (kept out of git history)
 evidence/
@@ -28,6 +33,12 @@ tools/vt-llrc-probe/vt-llrc-probe-arm64
 tools/alvr-smoke/alvr-smoke
 tools/xarch-ipc-probe/xarch-ipc-probe
 tools/xarch-ipc-probe/xarch-ipc-probe-arm64
+
+# Sabrage (Tauri app) build artifacts — the workspace target lives at sabrage/target
+sabrage/target/
+sabrage/ui/node_modules/
+sabrage/ui/dist/
+sabrage/src-tauri/gen/
 
 # macOS
 .DS_Store

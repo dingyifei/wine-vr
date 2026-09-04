@@ -1,0 +1,152 @@
+//! `fix.restage-helper` — stage the native-arm64 encoder helper from
+//! `build-helper-arm64` next to the runtime dylib in `build-x64`.
+//!
+//! Returns unchanged when the staged copy is already arm64, changed once
+//! restaged, or fails when neither copy nor build output is arm64. The x86_64
+//! runtime finds the helper beside its own dylib, so a swept staged copy
+//! silently downgrades to in-process H.264.
+//!
+//! Only `build-helper-arm64` builds the helper; the staged copy is validated
+//! at its destination (arm64, executable):
+//! tests::a_byte_identical_but_non_executable_staged_helper_is_repaired.
+//!
+//! Reference: `scripts/demo/run.sh`'s `ensure_helper_staged`. The shell skips
+//! that function for `encoder_process=inproc`; this fix always attempts the
+//! restage regardless of launch context.
+
+use crate::error::Result;
+use crate::events::{step, StageEvent, StepId};
+use crate::executor::Copied;
+use crate::fixes::{FixAction, FixReport};
+use crate::stages::{EventSink, StageCtx};
+use crate::util::helper_is_arm64;
+
+/// Step id for this fix's [`crate::events::StageEvent::Line`] rows; the copy
+/// itself uses [`step::BUILD_HELPER`], since restaging is that step's purpose.
+const STEP: StepId = "fix.restage-helper";
+
+/// `$ENCODER_PROC` as the *runtime* resolves it, not as the shell's `awk`
+/// recipe does.
+///
+/// [`crate::config::runtime_toml`]'s reader is table-blind and last-assignment-wins,
+/// matching `ext/oxrsys/runtime/src/Config.cpp`, so the die text names the value
+/// the runtime will actually use. Returns empty when no usable assignment exists,
+/// including values the runtime would ignore
+/// (tests::parse_encoder_process_follows_the_runtime_semantics).
+fn parse_encoder_process(toml_text: &str) -> String {
+    let (values, _invalid, _shadowed) =
+        crate::config::runtime_toml::read_lines_like_the_runtime(toml_text);
+    values
+        .encoder_process
+        .map(|e| e.as_str().to_string())
+        .unwrap_or_default()
+}
+
+/// `${ENCODER_PROC:-auto}` — an empty read (no `encoder_process` key, no file,
+/// or a value the runtime would ignore) falls back to `"auto"`, like the shell
+/// parameter expansion (tests::encoder_process_or_default_falls_back_to_auto).
+///
+/// This reader and the doctors' `awk` emulation disagree on unquoted values:
+/// PARITY.md § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+/// "Config readers: doctor emulates `awk`, launch uses the runtime's semantics."
+fn encoder_process_or_default(toml_text: &str) -> String {
+    let raw = parse_encoder_process(toml_text);
+    if raw.is_empty() {
+        "auto".to_string()
+    } else {
+        raw
+    }
+}
+
+/// Stage the arm64 helper next to the runtime dylib.
+pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
+    let staged = ctx.paths.oxr_helper_staged.clone();
+    let built = ctx.paths.oxr_helper_built.clone();
+
+    if helper_is_arm64(&staged) {
+        return Ok(FixReport::unchanged(
+            FixAction::RestageHelper,
+            format!("{} is already an arm64 executable", staged.display()),
+        ));
+    }
+
+    if !helper_is_arm64(&built) {
+        let encoder_process = {
+            let text = std::fs::read_to_string(&ctx.paths.toml_path).unwrap_or_default();
+            encoder_process_or_default(&text)
+        };
+        return Err(ctx.fatal(
+            format!(
+                "encoder_process={encoder_process} needs the arm64 helper, but neither the \
+                 staged copy\n       ({}) nor the build output ({}) is an arm64 executable — \
+                 ./demo.sh build",
+                staged.display(),
+                built.display()
+            ),
+            None,
+        ));
+    }
+
+    sink(StageEvent::warn(
+        ctx.run_id,
+        Some(STEP),
+        format!(
+            "encoder helper missing/not arm64 at {} — restaging from the helper build tree",
+            staged.display()
+        ),
+    ));
+
+    let dry_run = ctx.executor.is_dry_run();
+    let executor = ctx.executor_for(step::BUILD_HELPER);
+
+    let copied = executor.copy_if_changed(&built, &staged).await?;
+    match copied {
+        // Unreachable unless the destination changed since the arm64 probe:
+        // `copy_if_changed` reports a mode-only repair as `Copied`, not as
+        // unchanged (tests::a_byte_identical_but_non_executable_staged_helper_is_repaired).
+        // The `unchanged:` row is `install_if_changed`'s, reproduced regardless.
+        Copied::Unchanged => sink(StageEvent::info(
+            ctx.run_id,
+            Some(step::BUILD_HELPER),
+            format!("unchanged: {}", staged.display()),
+        )),
+        Copied::Copied => {
+            let verb = if dry_run {
+                "would install"
+            } else {
+                "installed"
+            };
+            sink(StageEvent::ok(
+                ctx.run_id,
+                Some(step::BUILD_HELPER),
+                format!("{verb}: {}", staged.display()),
+            ));
+        }
+    }
+
+    // A dry run never wrote the file, so re-validating it would always look
+    // like a failed restage; the plan records the work instead, including a
+    // mode-only repair (tests::a_dry_run_plans_the_mode_repair_without_performing_it).
+    if dry_run {
+        let description = "encoder helper would be restaged (arm64)".to_string();
+        sink(StageEvent::ok(ctx.run_id, Some(STEP), description.clone()));
+        return Ok(FixReport::changed(FixAction::RestageHelper, description));
+    }
+
+    if !helper_is_arm64(&staged) {
+        return Err(ctx.fatal(
+            format!(
+                "encoder helper restage failed validation at {} — ./demo.sh build",
+                staged.display()
+            ),
+            None,
+        ));
+    }
+
+    let description = "encoder helper restaged (arm64)".to_string();
+    sink(StageEvent::ok(ctx.run_id, Some(STEP), description.clone()));
+    Ok(FixReport::changed(FixAction::RestageHelper, description))
+}
+
+#[cfg(test)]
+mod tests;

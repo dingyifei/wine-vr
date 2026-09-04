@@ -1,0 +1,32 @@
+name: parity
+
+# Tier-1 Sabrage <-> demo.sh parity (see sabrage/docs/design/design-parity.md §4).
+# Hermetic and pure: contract regen diff, shell-fingerprint tripwire, check-set
+# coverage, and golden-byte tests — no machine state, no macOS-only APIs, so
+# ubuntu-latest is sufficient. One test sources scripts/demo/lib.sh under zsh
+# (lib_sh_contract), so zsh is installed below. Tier 2 (the live doctor differ) needs a real Mac
+# with CrossOver/a bottle and only ever runs locally via scripts/dev/parity.sh.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  tier1:
+    name: sabrage tier-1 (cargo test)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sabrage
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install zsh (lib.sh contract test)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq zsh
+
+      - name: cargo test -p sabrage-parity -p sabrage-contract-gen
+        run: cargo test -p sabrage-parity -p sabrage-contract-gen

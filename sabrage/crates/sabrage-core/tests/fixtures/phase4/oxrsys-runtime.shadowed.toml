@@ -1,0 +1,9 @@
+# The user "fixed" protocol at the top, then a stale [legacy] block below still
+# wins: the runtime ignores tables and honours the LAST assignment.
+protocol = "alvr"
+
+[streaming]
+bitrate_mbps = 80
+
+[legacy]
+protocol = "oxrsys"

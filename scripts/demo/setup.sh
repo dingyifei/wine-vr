@@ -23,17 +23,17 @@ fi
 if [ -f "$GBE_DLL" ] && ! sha256_ok "$GBE_DLL" "$GBE_DLL_SHA256"; then
   warn "Goldberg dll present with a non-pinned hash — keeping it (delete $GBE_DLL to re-fetch the pinned build)"
 else
-  fetch_pinned "$DEPS_URL/gbe-steam_api64-regular-x64.dll" "$GBE_DLL" "$GBE_DLL_SHA256" \
+  fetch_pinned "$DEPS_URL/$GBE_DLL_ASSET" "$GBE_DLL" "$GBE_DLL_SHA256" \
     "Goldberg Steam emulator dll"
 fi
 if dxmt_ok; then
   info "already present: dxmt-artifacts (sha256 marker matches)"
 else
-  fetch_pinned "$DEPS_URL/dxmt-artifacts-monofunc.tar.gz" \
-    "$ROOT/third_party/downloads/dxmt-artifacts-monofunc.tar.gz" "$DXMT_TGZ_SHA256" \
+  fetch_pinned "$DEPS_URL/$DXMT_TGZ_ASSET" \
+    "$ROOT/third_party/downloads/$DXMT_TGZ_ASSET" "$DXMT_TGZ_SHA256" \
     "DXMT fork artifacts"
   rm -rf "$DXMT_ART"
-  tar -xzf "$ROOT/third_party/downloads/dxmt-artifacts-monofunc.tar.gz" -C "$ROOT/ext" || die "extraction failed"
+  tar -xzf "$ROOT/third_party/downloads/$DXMT_TGZ_ASSET" -C "$ROOT/ext" || die "extraction failed"
   dxmt_files_ok || die "extracted dxmt-artifacts are incomplete — delete $DXMT_ART and re-run setup"
   print -r -- "$DXMT_TGZ_SHA256" > "$DXMT_ART/.sha256"
   ok "extracted ext/dxmt-artifacts (provenance marker written)"
@@ -46,15 +46,8 @@ if [ -f "$TOML" ]; then
   if [ "$PROTO" = "alvr" ]; then info "config present: $TOML (protocol=alvr)"
   else warn "config present with protocol='"$PROTO"' — the demo needs protocol = \"alvr\"; edit $TOML yourself (not overwriting)"; fi
 else
-  cat > "$TOML" <<'EOF'
-# oxrsys runtime configuration (created by wine-vr demo.sh setup)
-[streaming]
-# embedded ALVR core; stock ALVR Quest client connects over WiFi
-protocol = "alvr"
-bitrate_mbps = 42
-# "auto" | "native" (arm64 helper, HW HEVC) | "inproc" (x86_64, H.264)
-encoder_process = "auto"
-EOF
+  # Byte-shared with sabrage-core: both sides create this file from the same template.
+  cat "$ROOT/contract/oxrsys-runtime.toml.template" > "$TOML"
   # Deployed configs that predate encoder_process are left untouched (write-once);
   # the runtime's code default is the same "auto".
   ok "wrote $TOML (protocol=alvr, 42 Mbps, encoder_process=auto)"
@@ -65,7 +58,7 @@ info "note: the embedded ALVR core keeps its session.json under '$OXR_APPSUP/alv
 if [ -n "${WINEVR_BOTTLE:-}" ] || [ -n "${WINEVR_BS_DIR:-}" ]; then
   [ -n "${WINEVR_BOTTLE:-}" ] && require_bottle || {
     BS_DIR="$WINEVR_BS_DIR"
-    DEPOT_CMD="DepotDownloader -app 620980 -depot 620981 -manifest 6291266771922375922 -username <steam-user> -dir \"$BS_DIR\""
+    DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
   }
   if [ -f "$BS_DIR/Beat Saber.exe" ]; then ok "Beat Saber found at $BS_DIR"
   else

@@ -1,0 +1,15 @@
+# A hand-maintained file whose "note" block hides a live assignment.
+#
+# `toml_edit` sees ONE `protocol` key (the outer one) and one string value;
+# `Config.cpp`'s line reader sees TWO `protocol =` lines and honours the last
+# one, so this file streams over the legacy backend while every TOML tool says
+# "alvr". There is no line Sabrage could edit that would beat the one inside
+# the string, so the write is refused.
+
+[streaming]
+protocol = "alvr"
+bitrate_mbps = 80
+
+note = """
+protocol = "oxrsys"
+"""

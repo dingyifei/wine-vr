@@ -1,0 +1,51 @@
+[package]
+name = "sabrage-core"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+# preserve_order: cfg.session-pins must render pinned clients in session.json
+# file order to match doctor.sh's python (dict insertion order) verbatim.
+serde_json = { version = "1", features = ["preserve_order"] }
+toml = "1"
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+# ── Phase 2 (stages) ──────────────────────────────────────────────────────────
+# Deliberately NOT added: reqwest / flate2 / tar. setup's download execs
+# `curl -fL --retry 3` and its extraction execs `tar -xzf`, exactly like
+# scripts/demo/setup.sh — parity-faithful (same tool, same flags, same failure
+# text) and three fewer dependency trees. See executor.rs.
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "process", "io-util", "sync", "time", "fs", "macros"] }
+# CancellationToken only (tokio_util::sync is unconditional; no feature needed).
+# The \n-AND-\r output splitter in process.rs is hand-rolled rather than a
+# tokio_util::codec::Decoder, so the "codec" feature stays off.
+tokio-util = "0.7.19"
+# killpg(SIGTERM/SIGKILL) for the process-group cancellation escalation.
+nix = { version = "0.31.3", default-features = false, features = ["signal", "process"] }
+# Process enumeration for stop: by RESOLVED EXECUTABLE PATH for the two reaps
+# (`process::find_processes_by_exe` replaces the shell's `pkill -f`), and by
+# argv for the Beat Saber survivor probe (`stop::find_processes_by_cmdline`,
+# `with_cmd(UpdateKind::Always)` — the same substring match as `pgrep -f`),
+# which is why both refresh kinds are needed (PARITY.md "Stop", design-core
+# §10 divergence 7).
+sysinfo = "0.39.6"
+# run_id for the event stream; "serde" so StageEvent serializes it directly.
+uuid = { version = "1.26.0", features = ["v4", "serde"] }
+
+# ── Phase 3 (run) ─────────────────────────────────────────────────────────────
+# LOCAL wall-clock only, for the wine log filename: run.sh spells it
+# `date +%Y%m%d-%H%M%S`, which is the machine's local time — `std::time` has no
+# civil calendar at all, so a hand-rolled epoch→Y/M/D conversion would have to
+# reimplement the tz database to stay byte-identical with the shell.
+# default-features = false drops `oldtime`/`wasmbind`/`serde`; `clock` brings
+# `Local::now` (and its `iana-time-zone` lookup), `std` the error types.
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+
+# ── Phase 4 (settings + library) ─────────────────────────────────────────────
+# Format-preserving edits of the user's `oxrsys-runtime.toml` (comments,
+# unknown keys, ordering kept byte-for-byte outside the edited value) — the
+# deliberate write-once override in design-app §4 / design-core §4.1.
+toml_edit = "0.25"

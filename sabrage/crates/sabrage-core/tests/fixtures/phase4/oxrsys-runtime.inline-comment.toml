@@ -1,0 +1,7 @@
+# A hand-maintained config with same-line comments — the shape the pre-2026-08
+# runtime parser mis-read, and the reason Sabrage never leaves one on a line it
+# rewrites.
+[streaming]
+protocol = "alvr"
+bitrate_mbps = 80  # measured 2026-08-10, was 42
+refresh_rate_hz = 90 # Quest 3 panel

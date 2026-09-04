@@ -46,19 +46,19 @@ fi
 #    ignores XR_RUNTIME_JSON; this root-owned file is what actually routes the
 #    game to the oxrsys runtime.
 print -r -- "-- host OpenXR registration ($HOST_XR_JSON)"
-WANT="{
-    \"file_format_version\": \"1.0.0\",
-    \"runtime\": {
-        \"name\": \"OXRSys Runtime\",
-        \"library_path\": \"$OXR_DYLIB\"
-    }
-}"
+# Byte-shared with sabrage-core: both sides render contract/active_runtime.x86_64.json.template;
+# drift = re-sudo thrash. $(<…) strips trailing newline; `\` and `"` escaped for JSON.
+# Pinned: sabrage-parity tests::artifact_goldens::render_host_manifest_matches_the_on_disk_template,
+# sabrage-parity tests::artifact_goldens::render_host_manifest_json_escapes_the_dylib_path.
+OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
+OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
+WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB_JSON}"
 if [ -f "$HOST_XR_JSON" ] && [ "$(cat "$HOST_XR_JSON")" = "$WANT" ]; then
   info "host registration already current"
 else
   info "writing $HOST_XR_JSON (needs sudo)..."
   sudo mkdir -p "$(dirname "$HOST_XR_JSON")" || die "sudo mkdir failed"
-  print -- "$WANT" | sudo tee "$HOST_XR_JSON" >/dev/null || die "sudo write failed"
+  print -r -- "$WANT" | sudo tee "$HOST_XR_JSON" >/dev/null || die "sudo write failed"
   ok "host registration written"
 fi
 

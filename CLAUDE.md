@@ -53,7 +53,7 @@ What `build` actually runs (useful for iterating on one component):
 ```sh
 # oxrsys — Debug x86_64 is the live-verified config (game runs under Rosetta, runtime loads in-process)
 cmake -S ext/oxrsys -B ext/oxrsys/build-x64 -G Ninja -DCMAKE_BUILD_TYPE=Debug \
-      -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOXRSYS_ENABLE_ALVR=ON
+      -DCMAKE_OSX_ARCHITECTURES=x86_64 -DOXRSYS_ENABLE_ALVR=ON -DOXRSYS_BUILD_ENCODER_HELPER=OFF
 cmake --build ext/oxrsys/build-x64 -j8
 
 # wineopenxr — PE dll via mingw + unix .so
@@ -91,7 +91,7 @@ scripts/dev/run_quest_gate1.sh     # streaming path without Wine (needs arm64 ex
 - **The ALVR C API header** (`ext/oxrsys/runtime/src/alvr/alvr_server_core.h`) is hand-written and pinned to ALVR v20.14.1 commit a9f6542; the upstream C API changed after that tag, so bumping the ALVR pin without re-verifying against `c_api.rs` produces silent ABI breakage. `oxrsys-runtime.toml` is the single source of truth: it's synced into ALVR's `session.json` **before** `alvr_initialize` (server_core reads it once at init).
 - **Streaming backends:** two implementations behind `IStreamingBackend` in oxrsys, selected by `protocol = "alvr" | "oxrsys"` in the runtime config. `alvr` is the demo path (stock Quest client); `oxrsys` is the legacy USB/adb-reverse protocol. Preserve `StopForProcessExit()` — `alvr_shutdown()` hangs at process exit by design.
 - **`--wired`** creates `adb forward tcp:9943`/`tcp:9944`; these forwards persist across sessions and silently break WiFi discovery ("searching for streamer") if left behind — a normal (non-wired) run removes exactly those two forwards in preflight, and `doctor` WARNs when they're present. Manual recovery: `adb forward --remove tcp:9943` (and `tcp:9944`) — avoid `--remove-all`, which also deletes unrelated forwards (distinct from `adb reverse --remove-all`, which `run.sh` already does).
-- **Config/state:** `~/Library/Application Support/OXRSys/` holds `oxrsys-runtime.toml` (written once by `setup`, never overwritten; `doctor` FAILs if protocol ≠ alvr), `alvr/session.json` (auto-created, LAN auto-trust; delete it to clear a stale IP pin after a DHCP change), and runtime logs. The oxrsys 1.3.0 merge added `[streaming]` keys (`render_device`, `video_codec`, `encoder_10bit`, `client_sharpening`, `app_alpha_blend_passthrough`, `encoder_process`); deployed write-once configs that predate them fall back to code defaults identical to the template, so no migration is needed — and `render_device` only affects the legacy oxrsys protocol, not the ALVR session template. Caveat: runtime builds before the 2026-08 parser fix mis-parsed same-line `#` comments — see the Config rows in `docs/troubleshooting.md`.
+- **Config/state:** `~/Library/Application Support/OXRSys/` holds `oxrsys-runtime.toml` (written once by `setup`, never overwritten; `doctor` FAILs if protocol ≠ alvr), `alvr/session.json` (auto-created, LAN auto-trust; after a DHCP change edit the pinned IP in place — deleting the file is a proven-broken remedy that streams a black 800×900 screen), and runtime logs. The oxrsys 1.3.0 merge added `[streaming]` keys (`render_device`, `video_codec`, `encoder_10bit`, `client_sharpening`, `app_alpha_blend_passthrough`, `encoder_process`); deployed write-once configs that predate them fall back to code defaults identical to the template, so no migration is needed — and `render_device` only affects the legacy oxrsys protocol, not the ALVR session template. Caveat: runtime builds before the 2026-08 parser fix mis-parsed same-line `#` comments — see the Config rows in `docs/troubleshooting.md`.
 
 ## Cross-repo workflow
 
@@ -100,6 +100,44 @@ Changes to `ext/*` must land on the fork branch, be **pushed to the dingyifei fo
 Pre-push arch gate for oxrsys changes (all four must hold): (1) any `oxrsys-encoder-helper` file at `ext/oxrsys/build-x64/runtime/` must be arm64 (`lipo -archs … | grep -qw arm64`); (2) `grep -q '^OXRSYS_BUILD_ENCODER_HELPER:BOOL=OFF$' ext/oxrsys/build-x64/CMakeCache.txt`; (3) `cmake --build ext/oxrsys/build-x64 --target oxrsys_encoder_helper` must fail (target absent); (4) a scratch configure with `-DOXRSYS_BUILD_ENCODER_HELPER=ON` must FATAL for `CMAKE_OSX_ARCHITECTURES` = `x86_64`, `arm64e`, and `"x86_64;arm64"`, and succeed for thin `arm64`.
 
 When adding a new requirement to the pipeline, add a `doctor` section with a one-line remedy string, and a matching hard preflight in `run.sh` if it's launch-critical (fresh bottles / CrossOver updates pass machine-global checks yet launch with no VR).
+
+## Sabrage ⇄ demo.sh parity (both front-ends stay alive)
+
+The native pipeline (`sabrage/`, Rust — the Sabrage GUI + `sabrage` CLI) and the zsh
+pipeline are two independent implementations of ONE pipeline. They meet at on-disk
+artifacts and at `contract/`. Rules:
+
+- **Never edit `scripts/demo/contract.gen.sh`.** Pins, URLs, ports, artifact lists, and
+  the check registry live in `contract/pipeline.toml`; regenerate with
+  `scripts/dev/parity.sh --regen`. The two templates in `contract/` are read at runtime
+  by BOTH sides — a byte changed there changes what both implementations write.
+  Doctor's `meta.contract-sync` check catches a stale regen with zero Rust.
+- **A pipeline behavior change lands in both implementations in the same commit**: a
+  new/changed doctor check needs its slug in the contract, a literal `chk`/`tap` call in
+  doctor.sh, and an evaluator in `sabrage-core/src/checks/`; a run-preflight change needs
+  the `# preflight:` tag in run.sh + the contract's per-side gates + the native preflight;
+  a change to bytes either side writes (host XR JSON, toml template, cxbottle line,
+  steam_appid.txt, `.sha256` marker) needs its golden test updated.
+- **Run `scripts/dev/parity.sh` after touching `scripts/demo/`, `demo.sh`, `contract/`,
+  or `sabrage/` core, and before any push.** Tier-1 is hermetic (`cargo test -p
+  sabrage-parity`, also run by `.github/workflows/parity.yml`); tier-2 live-diffs the two
+  doctors' tap channels (needs `--bottle`/`WINEVR_BOTTLE`). A red `shell_fingerprint`
+  test means shell was edited without re-running parity — fix the divergence, then
+  `scripts/dev/parity.sh --bless`; don't bless around a real break. One-time hook setup:
+  `scripts/dev/parity.sh --install-hook` (note: `core.hooksPath` is shared git config —
+  it applies to ALL worktrees of this repo, including agent worktrees; the hook
+  fast-paths tier-1 only, passes loudly when cargo is absent, and honors `PARITY_SKIP=1`).
+- **Intentional divergences go in `sabrage/PARITY.md`** (human rationale); the
+  machine-checkable side (per-side launch gates, volatile flags) lives in the contract.
+  Bug-for-bug parity is NOT required; artifact-byte parity IS.
+- **demo.sh scope**: frozen vocabulary (7 stages incl. `all`, 6 flags, `WINEVR_*` env,
+  exit-code conventions). It gains changes only for shared pipeline requirements, never
+  for GUI features. GUI-only state lives under `~/Library/Application Support/Sabrage/`,
+  and every Sabrage pipeline action must stay expressible as a `./demo.sh …` command.
+- demo.sh never invokes `sabrage`, and `sabrage` never shells out to demo.sh for core
+  operations. The parity harness is the only place both run together.
+- Telemetry format strings (Phase 5 parsers over oxrsys/ALVR logs) join the
+  both-sides-same-commit rule on `ext/` submodule pin bumps.
 
 ## Constraints that look wrong but aren't
 
@@ -120,4 +158,5 @@ When adding a new requirement to the pipeline, add a `doctor` section with a one
 
 - Demo runs log to `logs/`; dev/diagnostic scripts write to `evidence/`. Both are gitignored on purpose — docs cite `evidence/` files by name as local artifacts, so don't delete that directory.
 - `.gitignore` blanket-ignores binaries (`*.dll`, `*.dylib`, `build/`, `third_party/`, `ext/dxmt-artifacts/`); a root-level `BeatSaberVersion.txt` is expected runtime junk.
+- Comments and tests follow `docs/code-standards.md`: what a comment may contain, a false comment is rewritten at the source (never appended to), one behaviour per test, the redundant-test definition, the regression-label rule, and which layer owns a byte-fact. Read it before editing tests or comments in `sabrage/` or `scripts/demo/`. Rust tests are never inline (§3.10): `foo.rs`'s tests are in `foo/tests.rs`, a `mod.rs`/`lib.rs`/`main.rs` parent's in a sibling `tests.rs`.
 - Setup/onboarding and user-facing knobs are documented in `README.md`; the frame path in `docs/architecture.md`; failure modes in `docs/troubleshooting.md`. Keep those current when behavior changes rather than duplicating them here.

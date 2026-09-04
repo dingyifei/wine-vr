@@ -1,0 +1,18 @@
+[package]
+name = "sabrage-cli"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "sabrage"
+path = "src/main.rs"
+
+# NOTE (Frame agent): no ARGUMENT-PARSING dependency, on purpose.
+# demo.sh's flag surface (--bottle/--bs-dir/--no-audio/--no-dashboard/--verbose/
+# --wired, `exit 2` on unknown arg or missing value) is hand-parsed so the CLI can
+# match it byte-for-byte; clap would impose its own error text and exit codes.
+# tokio is here only to provide `#[tokio::main]` for the async stage entry points
+# (sabrage_core::stages::run_stage); doctor stays synchronous.
+[dependencies]
+sabrage-core = { path = "../sabrage-core" }
+tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "macros"] }
