@@ -1,50 +1,24 @@
-//! The fix registry: the small set of *mutations offered as remedies*.
+//! The fix registry: the small set of mutations offered as remedies.
 //!
-//! A doctor row never mutates anything (see [`crate::checks`]); when its remedy
-//! is mechanically applicable, the contract names a fix id and the GUI turns the
-//! remedy into a button. The launch preflight applies the same fixes
-//! automatically for the checks whose gate is `autofix`.
+//! A doctor row never mutates anything ([`crate::checks`]); when its remedy is
+//! mechanically applicable the contract names a fix id, the GUI turns it into a
+//! button, and the launch preflight applies it for `autofix`-gated checks.
 //!
-//! # Contract ids vs. this enum
+//! [`FixAction`]'s serde spelling is the contract id without the `fix.` prefix,
+//! which lives in one constant ([`CONTRACT_FIX_PREFIX`]).
+//! [`DEFERRED_CONTRACT_FIX_IDS`] are contract ids this crate never offers;
+//! tests::every_contract_fix_id_is_modelled_or_explicitly_deferred pins that
+//! set exactly, so a new contract fix cannot disappear silently.
 //!
-//! `contract/pipeline.toml` spells fixes `"fix.set-graphics-backend"`; this enum
-//! carries the id **without** the `fix.` prefix as its serde representation, so
-//! the wire format is `"set-graphics-backend"` and
-//! [`FixAction::to_contract_id`] / [`FixAction::from_contract_id`] bridge the
-//! two. The prefix lives in exactly one constant ([`CONTRACT_FIX_PREFIX`]).
-//!
-//! Two contract fix ids are deliberately **not** offered — see
-//! [`DEFERRED_CONTRACT_FIX_IDS`]. `from_contract_id` returns `None` for them
-//! rather than pretending; a test in this module pins that the set of unoffered
-//! ids is exactly those, so adding a fix to the contract without a variant here
-//! fails the build's test run instead of silently disappearing.
-//!
-//! # Serialization guarantee
-//!
-//! Every action runs behind the same operation lock as a stage
-//! ([`crate::stages::OPERATION_LOCK`]) and every one of them mutates state a
-//! live session depends on, which is why `forbidden_while_session_live` is true
-//! for all of them. [`apply`] takes that lock; [`apply_holding_lock`] is the
-//! same dispatch for a caller that already holds it (a launch preflight), since
-//! `tokio::sync::Mutex` is not reentrant and taking it twice on one task
-//! deadlocks in silence.
-//!
-//! # `forbidden_while_session_live` is enforced, not advertised
-//!
-//! [`apply`] — the GUI/CLI door — refuses every such action while
-//! [`crate::stages::live_session_block`] can see a session, using persistent
-//! identity (`session-state.json`, `runtime_status.json`) rather than only this
-//! process's in-memory handle: the session a Doctor button would break is often
-//! one *another* front-end (or `./demo.sh run`) started. It refuses **twice** —
-//! before the operation-lock wait and again with the lock held — because a
-//! `run` that won the lock race publishes its session and then releases the
-//! lock at its launch boundary.
-//!
-//! [`apply_holding_lock`] deliberately does **not** check: it is the launch
-//! preflight's door, reached from inside `run` before the live handle is
-//! published, and one of the fixes it applies
-//! ([`crate::fixes::backend::set_graphics_backend_for_launch`]) exists precisely
-//! to edit while a stale wineserver is still alive.
+//! Every action runs behind [`crate::stages::OPERATION_LOCK`] and mutates state
+//! a live session depends on. [`apply`] takes the lock and refuses a live
+//! session both before and after the wait, using persistent identity rather than
+//! this process's handle
+//! (tests::a_queued_fix_is_refused_when_a_session_goes_live_during_the_wait).
+//! [`apply_holding_lock`] is for callers that already hold the lock:
+//! `tokio::sync::Mutex` is not reentrant (silent deadlock). It skips the
+//! liveness check because the launch preflight edits while a stale wineserver
+//! is still alive.
 
 pub mod adb;
 pub mod backend;
@@ -62,20 +36,16 @@ pub const CONTRACT_FIX_PREFIX: &str = "fix.";
 
 /// Contract fix ids this crate does not offer as a button, sorted.
 ///
-/// * `fix.create-z-drive` — creating `dosdevices/z:` in a bottle; only reachable
-///   from `bottle.z-drive`, which no gate auto-fixes. No [`FixAction`] variant
-///   yet.
-/// * `fix.delete-session-json` — modelled ([`FixAction::DeleteSessionJson`]) but
-///   **withheld**: the remedy is known to leave the client at an 800x900 black
+/// * `fix.create-z-drive` - creating `dosdevices/z:` in a bottle, reachable
+///   only from `bottle.zdrive`, which no gate auto-fixes; no [`FixAction`]
+///   variant models it.
+/// * `fix.delete-session-json` - modelled ([`FixAction::DeleteSessionJson`])
+///   but withheld: deleting the file leaves the client at an 800x900 black
 ///   screen ([`crate::fixes::session_json`]), and the working recovery is to
-///   edit the pinned IP in place, which the Settings screen's config editor now
-///   does. Returning `None` here is what keeps the destructive button off the
-///   Doctor row; the action itself stays reachable from `sabrage fix
-///   delete-session-json` for a user who has read [`FixDef::consequence`].
-///
-/// `fix.edit-protocol` left this list in Phase 4, when the comment-preserving
-/// config editor it needed ([`crate::config::runtime_toml`], design-core §4.1)
-/// landed with the Settings screen.
+///   edit the pinned IP in place, which the Settings screen's config editor
+///   does. Returning `None` here keeps the destructive button off the Doctor
+///   row; the action stays reachable from `sabrage fix delete-session-json`
+///   for a user who has read [`FixDef::consequence`].
 pub const DEFERRED_CONTRACT_FIX_IDS: [&str; 2] = ["fix.create-z-drive", "fix.delete-session-json"];
 
 /// A mutation the pipeline can apply on the user's behalf.
@@ -83,7 +53,7 @@ pub const DEFERRED_CONTRACT_FIX_IDS: [&str; 2] = ["fix.create-z-drive", "fix.del
 #[serde(rename_all = "kebab-case")]
 pub enum FixAction {
     /// Force `"CX_GRAPHICS_BACKEND" = "dxmt"` in the bottle's `cxbottle.conf`
-    /// (`bottle.graphics-backend`). CrossOver's "auto" silently breaks DXMT.
+    /// (`bottle.gfx-dxmt`). CrossOver's "auto" silently breaks DXMT.
     SetGraphicsBackend,
     /// Copy the arm64 encoder helper from `build-helper-arm64` next to the
     /// runtime dylib (`build.helper-staged` / `build.helper-arm64`).
@@ -93,20 +63,18 @@ pub enum FixAction {
     RemoveAdbForwards,
     /// Delete ALVR's `session.json` to clear stale manual IP pins.
     ///
-    /// **Known-bad remedy.** Deleting the file has been observed to leave the
-    /// client at an 800x900 black screen; editing the pinned IPs in place is the
-    /// working recovery. Kept because the contract's `cfg.session-pins` row
-    /// still names it, marked `destructive` so it can never run unconfirmed, and
-    /// superseded once the in-place config editor lands.
+    /// **Known-bad remedy.** Deleting the file leaves the client at an 800x900
+    /// black screen; editing the pinned IPs in place is the working recovery.
+    /// Modelled because `cfg.session-pins` names it, marked `destructive` so
+    /// it never runs unconfirmed
+    /// (tests::the_known_bad_session_json_deletion_documents_its_outcome), and
+    /// withheld from every Doctor button by [`DEFERRED_CONTRACT_FIX_IDS`].
     DeleteSessionJson,
     /// Set `protocol = "alvr"` in `oxrsys-runtime.toml`
     /// (`cfg.protocol.supported` / `cfg.protocol.legacy-oxrsys`).
     ///
-    /// The one fix that writes the runtime config. It goes through
-    /// [`crate::config::runtime_toml::write`], so it inherits that module's
-    /// rules: create-if-absent from the shared template, an in-place value edit
-    /// that moves no other byte, and a rolling backup under Sabrage's own
-    /// `backups/`.
+    /// The only fix that writes the runtime config; delegates to
+    /// [`crate::config::runtime_toml::write`].
     EditProtocol,
     /// Run the whole `setup` stage.
     RunSetup,
@@ -171,12 +139,11 @@ impl FixAction {
     /// Is this action's contract id one of the deliberately withheld ones
     /// ([`DEFERRED_CONTRACT_FIX_IDS`])?
     ///
-    /// The named form of `DEFERRED_CONTRACT_FIX_IDS.contains(&id)` for callers
-    /// that hold a [`FixAction`] rather than a contract id — the Tauri `fix`
-    /// command needs exactly this to refuse an action the registry withholds
-    /// from the GUI, however the frontend arrived at it (A4-2: the TypeScript
-    /// mirror of the fix table can offer a button
-    /// [`FixAction::from_contract_id`] would not).
+    /// The [`FixAction`]-shaped form of the withheld set: the Tauri `fix`
+    /// command needs it to refuse an action the registry withholds from the
+    /// GUI, however the frontend arrived at it (A4-2 - the TypeScript mirror
+    /// of the fix table can offer a button [`FixAction::from_contract_id`]
+    /// would not). Pinned by tests::is_deferred_is_exactly_the_withheld_set.
     pub fn is_deferred(self) -> bool {
         DEFERRED_CONTRACT_FIX_IDS.contains(&self.to_contract_id().as_str())
     }
@@ -365,34 +332,25 @@ impl FixReport {
 
 /// Apply one fix, taking [`crate::stages::OPERATION_LOCK`] for its duration.
 ///
-/// The public entry point for the CLI and the Tauri `fix` command: a Doctor
-/// "Fix" button must not rewrite `cxbottle.conf` or restage the helper while a
-/// build or install is halfway through, and a whole-stage fix must serialize
-/// against a user-initiated stage exactly as one stage serializes against
-/// another.
-///
-/// `sink` is normally `&ctx.sink`; it is a separate parameter so a fix invoked
-/// from a *run* preflight can stream its rows into the run's event channel
+/// The public door for the CLI and the Tauri `fix` command: a fix serializes
+/// against stages and other Sabrage processes' operations. `sink` is a separate
+/// parameter so a run preflight can stream fix rows into the run's event channel
 /// while carrying the run's own [`StageCtx`].
 ///
-/// **A caller that already holds the lock must call [`apply_holding_lock`]
-/// instead** — `tokio::sync::Mutex` is not reentrant.
+/// The row carrying `ctx.run_id` is emitted before the cancellable wait, and
+/// refusals are re-run once the lock is in hand: a `run` that won the lock race
+/// publishes its live session and hands the lock back at its launch boundary.
+/// See tests::{a_queued_fix_carries_its_run_id_and_cancels_out_of_the_wait,
+/// a_queued_fix_is_refused_when_a_session_goes_live_during_the_wait}.
 ///
-/// # Waiting is visible, cancellable, and re-judged
+/// **A caller that already holds the lock must call [`apply_holding_lock`]** -
+/// `tokio::sync::Mutex` is not reentrant.
 ///
-/// Mirrors [`crate::stages::run_stage`] exactly, and for the same reasons:
+/// # Errors
 ///
-/// * a row carrying `ctx.run_id` is emitted **before** the wait, because that
-///   id is the front-end's only handle on the operation — a fix queued behind
-///   another Sabrage process's build otherwise had nothing to name and no way
-///   to be cancelled, while still mutating the machine when its turn came;
-/// * the wait itself goes through
-///   [`crate::stages::acquire_operation_lock_cancellable`], so Cancel ends it as
-///   [`SabrageError::Cancelled`] with nothing touched;
-/// * the refusals are re-run **after** the lock is in hand. A `run` that won the
-///   lock race publishes its live session and then gives the lock back at its
-///   launch boundary, so a fix admitted while the machine was idle could
-///   otherwise remove the very `--wired` forwards the stream is running over.
+/// [`SabrageError::Cancelled`] when the wait is cancelled; a fatal error when a
+/// session is live or the checkout is not the one this binary was built from;
+/// otherwise whatever the action itself fails with.
 pub async fn apply(action: FixAction, ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
     deny_before_apply(action, ctx)?;
     sink(StageEvent::info(
@@ -430,11 +388,7 @@ fn deny_before_apply(action: FixAction, ctx: &StageCtx) -> Result<()> {
 ///
 /// Checked **before** the lock, because the operation lock is deliberately free
 /// for the whole of a live session (`stages`' "Lock policy for `run`"): waiting
-/// on it would tell us nothing about whether a session is running.
-///
-/// TODO: call `session::ensure_idle` here once it lands — the liveness policy
-/// belongs to the session layer; [`crate::stages::live_session_block`] is the
-/// same rule, parked next to the operation lock it complements.
+/// on it would say nothing about whether a session is running.
 fn deny_if_session_live(action: FixAction, ctx: &StageCtx) -> Result<()> {
     if !action.def().forbidden_while_session_live {
         return Ok(());
@@ -454,18 +408,17 @@ fn deny_if_session_live(action: FixAction, ctx: &StageCtx) -> Result<()> {
     }
 }
 
-/// [`apply`] for a caller that already holds [`crate::stages::OPERATION_LOCK`].
+/// [`apply`] for a caller that already holds [`crate::stages::OPERATION_LOCK`] -
+/// the shape a launch preflight needs, taking the lock once and auto-fixing what
+/// its `autofix`-gated checks reported.
 ///
-/// This is the shape a launch preflight needs: it takes the lock once for the
-/// whole launch and then auto-fixes whatever its `autofix`-gated checks
-/// reported. Whole-stage fixes therefore delegate to
-/// [`crate::stages::run_stage_holding_lock`] rather than
-/// [`crate::stages::run_stage`], which would deadlock on the second acquire.
+/// `tokio::sync::Mutex` is not reentrant, so whole-stage fixes delegate to
+/// [`crate::stages::run_stage_holding_lock`] (not [`crate::stages::run_stage`],
+/// which would deadlock); they still stream like a user-initiated stage. See
+/// tests::apply_holding_lock_runs_a_stage_fix_under_a_lock_the_caller_holds.
 ///
-/// Whole-stage fixes (`RunSetup`/`RunBuild`/`RunInstall`) still stream exactly
-/// like a user-initiated stage — no second, quieter code path. The delegation is
-/// boxed: it keeps the future's size independent of the stage layer and makes
-/// any future fix→stage→fix cycle a runtime recursion rather than an
+/// The delegation is boxed so the future's size stays independent of the stage
+/// layer and a fix->stage->fix cycle is a runtime recursion rather than an
 /// unsized-future compile error.
 pub async fn apply_holding_lock(
     action: FixAction,
@@ -543,8 +496,7 @@ mod tests {
 
     /// `apply` is the public entry point, so it must serialize against a stage:
     /// a Doctor "Fix" button cannot be allowed to rewrite `cxbottle.conf` or
-    /// restage the helper while an install is halfway through. Before this, the
-    /// four non-stage actions took no lock at all.
+    /// restage the helper while an install is halfway through.
     #[tokio::test]
     async fn apply_waits_for_the_operation_lock_then_proceeds() {
         // `apply` now also consults the live-session policy, which reads
@@ -810,11 +762,10 @@ mod tests {
 
     /// The refusal is re-run with the operation lock in hand.
     ///
-    /// The window: a Doctor fix admitted while the machine was idle waits
-    /// behind another operation; a `run` acquires first, publishes its live
-    /// session and hands the lock back at its launch boundary. The fix used to
-    /// then mutate — for `remove-adb-forwards`, by deleting the very forwards
-    /// the `--wired` stream was running over.
+    /// The window: a fix admitted while idle waits behind another operation;
+    /// a `run` acquires first, publishes its live session and hands the lock
+    /// back at its launch boundary - leaving `remove-adb-forwards` free to
+    /// delete the very forwards the `--wired` stream is running over.
     #[tokio::test]
     async fn a_queued_fix_is_refused_when_a_session_goes_live_during_the_wait() {
         let _g = crate::session::lock_session_globals();
