@@ -1,28 +1,10 @@
-//! `win_path()` — the unix→Windows path rule the run stage hands to wine.
+//! `win_path()` — the unix→Windows path rule the run stage hands to wine
+//! (reference: `scripts/demo/lib.sh`).
 //!
-//! lib.sh:
-//!
-//! ```zsh
-//! win_path() {
-//!   if [ -n "${PREFIX:-}" ] && [[ "$1" == "$PREFIX/drive_c/"* ]]; then
-//!     local rel="${1#$PREFIX/drive_c/}"
-//!     print -r -- "C:\\${rel//\//\\}"
-//!   else
-//!     print -r -- "Z:${1//\//\\}"
-//!   fi
-//! }
-//! ```
-//!
-//! Two semantics are load-bearing and must not be "cleaned up"
-//! (design-core §10 parity decision 22); both are pinned by
-//! `sabrage-parity`'s `win_path_table`:
-//!
-//! 1. The glob is `"$PREFIX/drive_c/"*` — a **trailing slash**. So the literal
-//!    directory `<prefix>/drive_c` (no trailing slash, nothing after it) does
-//!    *not* match and falls through to the `Z:` branch. This is string matching,
-//!    not path-component matching: `PathBuf::starts_with` would wrongly accept it.
-//! 2. The `Z:` branch prefixes the **whole** unix path (leading `/` included) and
-//!    only translates separators, producing e.g. `Z:\Users\me\game`.
+//! Load-bearing (design-core §10 parity decision 22), pinned by
+//! `sabrage-parity::tests::artifact_goldens::win_path_table`: `C:` needs the trailing slash of
+//! `<prefix>/drive_c/` (bare `drive_c` falls through); `Z:` prefixes the whole unix path and only
+//! translates separators.
 
 use std::path::Path;
 
