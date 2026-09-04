@@ -2532,43 +2532,60 @@ mod tests {
         }
 
         /// One error string per citation in `flat_text` that names a heading
-        /// PARITY.md does not have, or quotes words its section does not
-        /// contain.
+        /// PARITY.md does not have, follows a heading with words that are not
+        /// a `, "<quote>"`, leaves that quote unterminated, or quotes words
+        /// the section does not contain.
         fn check_citations(flat_text: &str, headings: &[(String, String)]) -> Vec<String> {
             const MARKER: &str = "PARITY.md \u{a7} ";
+            const WINDOW: usize = 400;
+            // A heading ends at punctuation or the end of the text, never
+            // inside a run of words: `Setup / install` is no citation of `Setup`.
+            const BOUNDARY: &[char] = &[',', '.', ';', ':', ')', ']'];
+            let excerpt = |s: &str| s.chars().take(80).collect::<String>();
             let mut errors = Vec::new();
             let mut rest = flat_text;
             while let Some(at) = rest.find(MARKER) {
                 let tail = &rest[at + MARKER.len()..];
                 rest = tail;
-                let line: String = tail
-                    .lines()
-                    .next()
-                    .unwrap_or("")
-                    .chars()
-                    .take(120)
-                    .collect();
+                let mut cite: String = tail.chars().take(WINDOW).collect();
+                if let Some(next) = cite.find(MARKER) {
+                    cite.truncate(next);
+                }
+                let cite = cite.trim_end();
                 // Longest title first, so `Run (launch)` wins over `Run` when both exist.
                 let mut candidates: Vec<&(String, String)> = headings.iter().collect();
                 candidates.sort_by_key(|(title, _)| std::cmp::Reverse(title.len()));
                 let matched = candidates.into_iter().find(|(title, _)| {
-                    line.strip_prefix(title.as_str())
-                        .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric()))
+                    cite.strip_prefix(title.as_str())
+                        .is_some_and(|after| after.is_empty() || after.starts_with(BOUNDARY))
                 });
                 let Some((title, body)) = matched else {
-                    errors.push(format!("no such PARITY.md heading in citation: {line:?}"));
-                    continue;
-                };
-                let after = &line[title.len()..];
-                let Some(quoted) = after
-                    .strip_prefix(", \"")
-                    .and_then(|q| q.split_once('"').map(|(words, _)| words))
-                else {
-                    continue;
-                };
-                if !normalize(body).contains(&normalize(quoted)) {
                     errors.push(format!(
-                        "PARITY.md \u{a7} {title} does not contain the quoted words {quoted:?}"
+                        "no such PARITY.md heading in citation: {:?}",
+                        excerpt(cite)
+                    ));
+                    continue;
+                };
+                let after = &cite[title.len()..];
+                if let Some(quote) = after.strip_prefix(", \"") {
+                    match quote.split_once('"') {
+                        Some((words, _)) => {
+                            if !normalize(body).contains(&normalize(words)) {
+                                errors.push(format!(
+                                    "PARITY.md \u{a7} {title} does not contain the quoted words {words:?}"
+                                ));
+                            }
+                        }
+                        None => errors.push(format!(
+                            "unterminated quote in citation of PARITY.md \u{a7} {title}: {:?}",
+                            excerpt(after)
+                        )),
+                    }
+                } else if after.starts_with([',', ':']) && after[1..].trim_start().starts_with('"')
+                {
+                    errors.push(format!(
+                        "malformed quote after PARITY.md \u{a7} {title} (expected `, \"...\"`): {:?}",
+                        excerpt(after)
                     ));
                 }
             }
@@ -2628,6 +2645,8 @@ mod tests {
             files
         }
 
+        /// Vacuous in a tree with no section citations; the table test below
+        /// proves the checker on literals.
         #[test]
         fn parity_md_section_citations_name_real_headings() {
             let root = repo_root();
@@ -2651,7 +2670,7 @@ mod tests {
         }
 
         #[test]
-        fn citation_checker_rejects_a_mistyped_heading_and_a_paraphrased_quote() {
+        fn citation_checker_accepts_verbatim_quotes_and_rejects_mistyped_or_malformed_ones() {
             let headings = vec![
                 (
                     "Doctor / checks".to_string(),
@@ -2665,36 +2684,65 @@ mod tests {
             ];
             // The section sign is spelled `\u{a7}` in every literal below so
             // that the tree scan above does not read these fixtures as real
-            // citations in this file.
-            let cases: &[(&str, &str, bool)] = &[
-                (
-                    "mistyped heading",
-                    "PARITY.md \u{a7} Doctor / cheks, \"Console colors gated on isatty\"",
-                    false,
-                ),
-                (
-                    "paraphrased quote",
-                    "PARITY.md \u{a7} Doctor / checks, \"ANSI colors are gated on a tty\"",
-                    false,
-                ),
+            // citations in this file. The third column is the error each
+            // citation must produce, in order; empty means accepted.
+            let cases: &[(&str, &str, &[&str])] = &[
                 (
                     "exact heading with an exact quote",
                     "PARITY.md \u{a7} Doctor / checks, \"Console colors gated on isatty\"",
-                    true,
+                    &[],
                 ),
                 (
                     "quote omitting the row's bold asterisks",
                     "PARITY.md \u{a7} Run preflight, \"The wired forwards row\"",
-                    true,
+                    &[],
+                ),
+                (
+                    "bare heading closing a sentence",
+                    "see PARITY.md \u{a7} Run preflight. The next sentence quotes \"nothing\".",
+                    &[],
+                ),
+                (
+                    "mistyped heading",
+                    "PARITY.md \u{a7} Doctor / cheks, \"Console colors gated on isatty\"",
+                    &["no such PARITY.md heading"],
+                ),
+                (
+                    "real heading with trailing words",
+                    "PARITY.md \u{a7} Doctor / checks and more, \"Console colors gated on isatty\"",
+                    &["no such PARITY.md heading"],
+                ),
+                (
+                    "paraphrased quote",
+                    "PARITY.md \u{a7} Doctor / checks, \"ANSI colors are gated on a tty\"",
+                    &["does not contain the quoted words"],
+                ),
+                (
+                    "colon instead of the comma",
+                    "PARITY.md \u{a7} Doctor / checks: \"Console colors gated on isatty\"",
+                    &["malformed quote"],
+                ),
+                (
+                    "unterminated quote",
+                    "PARITY.md \u{a7} Doctor / checks, \"Console colors gated on isatty",
+                    &["unterminated quote"],
+                ),
+                (
+                    "quote longer than 120 characters that the section lacks",
+                    "PARITY.md \u{a7} Run preflight, \"the encoder helper is restaged from build-helper-arm64 before every launch and the stale forward pair on ports 9943 and 9944 is removed in preflight\"",
+                    &["does not contain the quoted words"],
                 ),
             ];
-            for (label, citation, accepted) in cases {
+            for (label, citation, expected) in cases {
                 let errors = check_citations(citation, &headings);
                 assert_eq!(
-                    errors.is_empty(),
-                    *accepted,
+                    errors.len(),
+                    expected.len(),
                     "{label}: {citation} -> {errors:?}"
                 );
+                for (error, want) in errors.iter().zip(expected.iter()) {
+                    assert!(error.contains(want), "{label}: {error:?} lacks {want:?}");
+                }
             }
         }
     }

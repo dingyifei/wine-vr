@@ -826,9 +826,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// An absent record stays absent; a record for a different run stays
-    /// byte-identical. Re-creating either would resurrect a session the
-    /// supervisor already cleared.
+    /// An absent record stays absent: re-creating it would resurrect a session
+    /// the supervisor already cleared. A record that belongs to a different run
+    /// stays byte-identical: its run, not this one, owns that file.
     #[tokio::test]
     async fn mark_detached_never_recreates_a_cleared_record() {
         let dir = scratch("detach-no-create");

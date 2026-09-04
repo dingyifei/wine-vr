@@ -931,13 +931,10 @@ mod tests {
             !marker.exists(),
             "dry-run Drop must not spawn the restore child"
         );
-        let restore_count = seen
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|e| matches!(e, StageEvent::Text { text, .. } if text.contains("restored")))
-            .count();
-        assert_eq!(restore_count, 0, "dry-run Drop must emit no restore row");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "dry-run Drop must emit no row"
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
