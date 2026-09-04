@@ -1,39 +1,20 @@
-//! `fix.remove-adb-forwards` — drop the two `--wired` port forwards.
+//! `fix.remove-adb-forwards` — drop the two `--wired` stream port forwards.
 //!
 //! Leftover `tcp:9943`/`tcp:9944` forwards persist across sessions and silently
-//! break WiFi discovery ("searching for streamer"). A normal (non-wired) run
-//! removes exactly those two in preflight.
+//! break WiFi discovery ("searching for streamer"), so a normal (non-wired) run
+//! clears exactly those, per serial (`adb -s <serial> forward --remove`), never
+//! with `--remove-all` — distinct from the `adb reverse --remove-all` that
+//! run.sh does use: PARITY.md § Invariants that must NOT change (byte/behavior
+//! parity), "adb `forward --remove` per-serial". The port pair comes from the
+//! contract (`ports.stream`), never a literal; an absent `paths.adb` is
+//! "nothing to do", not an error. Reference: `scripts/demo/run.sh`.
 //!
-//! Invariants (PARITY.md, "must NOT change"):
-//! * `adb forward --remove tcp:9943` and `tcp:9944`, **per serial**
-//!   (`adb -s <serial> forward --remove …`) — never `--remove-all`, which would
-//!   also delete unrelated forwards;
-//! * distinct from `adb reverse --remove-all`, which `run.sh` does use;
-//! * the port pair comes from the contract (`ports.stream`), never a literal;
-//! * `paths.adb` is `Option` — absent adb is "nothing to do", not an error.
-//!
-//! Ported verbatim from `run.sh` (lines 113–124):
-//!
-//! ```zsh
-//! elif [ -n "$ADB" ]; then
-//!   "$ADB" forward --list 2>/dev/null | while read -r fwd_ser fwd_local fwd_remote; do
-//!     case "$fwd_local" in
-//!       tcp:9943|tcp:9944)
-//!         "$ADB" -s "$fwd_ser" forward --remove "$fwd_local" 2>/dev/null && \
-//!           info "cleared stale adb forward $fwd_local on $fwd_ser (left over from a --wired launch — would otherwise break WiFi discovery)"
-//!         ;;
-//!     esac
-//!   done
-//! fi
-//! ```
-//!
-//! Note the `&&`: a failed removal prints nothing at all (no warn, no fail, no
-//! die). The `info` row is reproduced exactly — it appears only for a removal
-//! that really happened — but the shell's *silence* is not: a structured
-//! [`FixReport`] has to say something, and "no stale adb port forwards to clear"
-//! would be a lie on a device whose forward is still installed. A failed
-//! removal, and a `forward --list` that could not be read at all, therefore warn
-//! and report what is still (possibly) there. PARITY.md carries the divergence.
+//! Where the shell is silent about a removal that failed, a [`FixReport`] warns
+//! and names what may still be installed: PARITY.md § Declared by the
+//! 2026-08-30 adversarial review (round 1 fixes), "`net.adb-forwards` on a
+//! failed probe". Enforced by
+//! tests::removes_exactly_the_two_stale_ports_per_serial_never_remove_all and
+//! tests::a_failed_removal_is_never_reported_as_a_clean_table.
 
 use std::path::Path;
 use std::time::Duration;
@@ -44,20 +25,15 @@ use crate::events::{StageEvent, StepId};
 use crate::fixes::{FixAction, FixReport};
 use crate::stages::{EventSink, StageCtx};
 
-/// `adb forward --list` starts adb's background server on a cold run, which can
-/// block for a few seconds — long enough that a bare `.output().await` on the
-/// async worker is worth bounding. A timeout is reported as a query failure
-/// (see [`list_forwards`]), never as an empty forwarding table.
+/// Bound on `adb forward --list`: a cold run starts adb's background server and
+/// can block for seconds. A timeout is a query failure, never an empty table.
 const ADB_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// This fix's own step id, used when it runs **as a fix** — from the doctor's
-/// fix list or `fixes::apply`, where there is no stage step to belong to.
-///
-/// The launch path is the other caller and must *not* use it: run.sh's
-/// adb-forward hygiene is a numbered step of the run stage, and its rows have
-/// to sort and group with the rest of that stage's. It passes
-/// [`crate::events::step::RUN_ADB_FORWARDS`] to
-/// [`remove_adb_forwards_at`] instead.
+/// This fix's own step id, used when it runs as a fix (doctor's fix list or
+/// `fixes::apply`). The launch path must not use it: it passes
+/// [`crate::events::step::RUN_ADB_FORWARDS`] to [`remove_adb_forwards_at`] so
+/// its rows sort and group with the run stage's
+/// (tests::the_step_id_is_the_fixs_own_by_default_and_the_callers_with_at).
 const STEP: StepId = "fix.remove-adb-forwards";
 
 /// Parse `adb forward --list`'s stdout: `<serial> <local> <remote>` rows, one
@@ -75,21 +51,14 @@ fn parse_forward_list(stdout: &str) -> Vec<(String, String)> {
         .collect()
 }
 
-/// `"$ADB" forward --list 2>/dev/null`. A read-only query — like
-/// `checks::network`'s own adb probe, this bypasses the executor (dry-run
-/// gating only matters for mutations, and listing forwards changes nothing).
+/// `adb forward --list` as `(serial, local)` rows. A read-only query, so it
+/// bypasses the executor: dry-run gating only matters for mutations.
 ///
-/// Runs on `tokio::process::Command` rather than a blocking
-/// `std::process::Command::output()` (this fix's `remove_adb_forwards` is
-/// itself async, spawned on the async worker) and bounded by
-/// [`ADB_LIST_TIMEOUT`], since a cold `adb` starting its own server can block
-/// for seconds.
-///
-/// `Err(reason)` for a query that could not be answered — a spawn failure, the
-/// timeout, or a non-zero `adb`. It is deliberately **not** folded into an empty
-/// list: "adb could not tell us" and "there is nothing to clear" are different
-/// facts, and only one of them justifies telling the user their forwarding
-/// table is clean.
+/// # Errors
+/// `Err(reason)` when the query could not be answered — a spawn failure,
+/// [`ADB_LIST_TIMEOUT`], or a non-zero `adb`. Never folded into an empty list:
+/// "adb could not tell us" and "there is nothing to clear" are different facts
+/// (tests::a_query_failure_is_reported_as_a_query_failure).
 async fn list_forwards(adb: &Path) -> std::result::Result<Vec<(String, String)>, String> {
     let output = tokio::time::timeout(
         ADB_LIST_TIMEOUT,
@@ -111,19 +80,14 @@ async fn list_forwards(adb: &Path) -> std::result::Result<Vec<(String, String)>,
     }
 }
 
-/// run.sh's `info` row for one cleared forward, verbatim:
+/// run.sh's `info` row for one cleared forward. `verb` is `"cleared"` for a
+/// real removal and `"would clear"` for a dry run (Sabrage-only; the shell has
+/// no dry run) (tests::the_cleared_forward_line_is_the_one_renderer).
 ///
-/// ```zsh
-/// info "cleared stale adb forward $fwd_local on $fwd_ser (left over from a --wired launch — would otherwise break WiFi discovery)"
-/// ```
-///
-/// `verb` is `"cleared"` for a real removal and `"would clear"` for a dry run
-/// (Sabrage-only — the shell has no dry run).
-///
-/// `pub` so `sabrage-parity` can compare the **live** native string against
-/// `run.sh` rather than a fragment copied into the parity crate: tier 1 runs
-/// `-p sabrage-parity` only, so a native literal edited without touching run.sh
-/// is otherwise ungated (A1-3).
+/// `pub` for A1-3, so `sabrage-parity` can pin this live literal rather than a
+/// fragment copied into the parity crate: CI's tier 1 runs `-p sabrage-parity
+/// -p sabrage-contract-gen` only, so this module's own frozen-text test does
+/// not gate a native literal edited without touching run.sh.
 pub fn cleared_forward_line(verb: &str, local: &str, serial: &str) -> String {
     format!(
         "{verb} stale adb forward {local} on {serial} (left over from a --wired launch — would \
@@ -132,7 +96,7 @@ pub fn cleared_forward_line(verb: &str, local: &str, serial: &str) -> String {
 }
 
 /// The `tcp:<port>` local-forward specs this fix targets, from the contract's
-/// `[ports] stream` — never a literal `"tcp:9943"` (PARITY.md).
+/// `[ports] stream` — never a literal `"tcp:9943"`.
 fn stale_local_specs() -> Vec<String> {
     contract()
         .ports
@@ -145,17 +109,13 @@ fn stale_local_specs() -> Vec<String> {
 /// Remove the stale `tcp:9943`/`tcp:9944` forwards, per serial, as the
 /// standalone fix — every row stamped [`STEP`].
 ///
-/// Refuses while a session is live. During a `--wired` session the two forwards
-/// this fix removes are the ones the stream is running over, and doctor cannot
-/// tell them apart from stale ones (it does not know the launch's `wired`
-/// state), so its row offers this remedy either way. [`crate::fixes::apply`]
-/// already gates every fix the same way; the check is repeated here because this
-/// function is the one a caller could reach directly, and disconnecting the
-/// headset is not a mistake worth leaving one door open for.
-///
-/// The launch path calls [`remove_adb_forwards_at`], which is deliberately
-/// **not** gated: clearing leftovers is a preflight step of the very session
-/// being started.
+/// # Errors
+/// Refuses while a session is live — duplicating [`crate::fixes::apply`]'s
+/// gate, because this function is also reachable directly: a `--wired` session
+/// streams over these very forwards, and doctor offers this remedy without
+/// knowing the launch's `wired` state. The launch path calls
+/// [`remove_adb_forwards_at`], which is not gated
+/// (tests::the_standalone_fix_refuses_during_a_live_session_but_the_launch_path_does_not).
 pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
     if let Some(reason) = crate::stages::live_session_block(&ctx.paths) {
         return Err(ctx.fatal(
@@ -172,14 +132,10 @@ pub async fn remove_adb_forwards(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
     remove_adb_forwards_at(ctx, sink, STEP).await
 }
 
-/// The same removal, stamped with a caller-supplied step id.
-///
-/// The behaviour is identical — same per-serial `adb forward --remove`, same
-/// `info` text, same tolerant "a failed removal prints nothing" rule; only the
-/// step the rows are attributed to changes. The launch path
-/// ([`crate::stages::run::actions::adb_forward_hygiene`]) passes
-/// [`crate::events::step::RUN_ADB_FORWARDS`], so its rows belong to the run
-/// stage's step 2 rather than to a fix that is not running.
+/// The same removal as [`remove_adb_forwards`], stamped with a caller-supplied
+/// step id and without the live-session gate: the launch path clears leftovers
+/// before the session exists ([`crate::stages::run::actions::adb_forward_hygiene`];
+/// tests::the_step_id_is_the_fixs_own_by_default_and_the_callers_with_at).
 pub async fn remove_adb_forwards_at(
     ctx: &StageCtx,
     sink: &EventSink,
@@ -221,11 +177,9 @@ pub async fn remove_adb_forwards_at(
         let spec = ctx
             .child(adb.clone(), step)
             .args(["-s", &serial, "forward", "--remove", &local]);
-        // NEVER `--remove-all` here — see this module's header. `run_child`
-        // reports a non-zero exit as `Ok`, matching the shell's tolerant `&&`:
-        // a failed removal is not an error and never aborts the launch that
-        // calls this. Unlike the shell, it is not silent either — the pair is
-        // remembered so the report cannot claim the table is clean.
+        // Never `--remove-all` here. A non-zero exit comes back `Ok`, matching
+        // the shell's tolerant `&&`, but the pair is remembered so the report
+        // cannot claim a clean table (tests::a_failed_removal_is_never_reported_as_a_clean_table).
         let status = executor.run_child(&spec).await?;
         if !status.success() {
             let text = format!("could not clear adb forward {local} on {serial} ({status})");
@@ -277,8 +231,6 @@ mod tests {
     use std::path::PathBuf;
     use tokio_util::sync::CancellationToken;
 
-    // ── pure parsing ─────────────────────────────────────────────────────────
-
     #[test]
     fn parse_forward_list_takes_serial_and_local_and_skips_unusable_lines() {
         type Expected = &'static [(&'static str, &'static str)];
@@ -307,8 +259,6 @@ mod tests {
             assert_eq!(parse_forward_list(input), expected, "{label}");
         }
     }
-
-    // ── remove_adb_forwards (the async fix) ─────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sabrage-adb-fix-{tag}-{}", std::process::id()))
@@ -497,8 +447,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_step_id_is_the_fixs_own_by_default_and_the_callers_with_at() {
-        // #16c: the standalone fix keeps `fix.remove-adb-forwards`; the launch
-        // path stamps the run stage's step instead, without forking the code.
+        // #16c: one implementation serves both step ids.
         let root = scratch("step-id");
         let adb = root.join("adb.sh");
         let log = root.join("removed.log");
@@ -531,9 +480,8 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A device that disappeared mid-removal used to be reported exactly like a
-    /// clean forwarding table — "no stale adb port forwards to clear" — while
-    /// the WiFi-breaking forward was still installed.
+    /// A removal that failed must never be reported like a clean forwarding
+    /// table while the WiFi-breaking forward is still installed.
     #[tokio::test]
     async fn a_failed_removal_is_never_reported_as_a_clean_table() {
         let root = scratch("remove-fails");
@@ -621,22 +569,16 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// An `adb` that cannot be spawned at all (deleted between the probe that
-    /// found it and this fix, or not executable) is the other half of "adb
-    /// could not tell us" — and the one the GUI must render.
-    ///
-    /// This pins the payload Doctor has to keep on screen: exactly one `warn`
-    /// naming the query failure and the two ports that may still be installed,
-    /// plus an `unchanged` report carrying the same text. Doctor currently
-    /// records only `fatal` events and repaints the row from a fresh check
-    /// pass, so this warn is dropped and the row goes green over a forwarding
-    /// table nobody could read (review A4-5; the UI half is
-    /// `ui/src/screens/Doctor.svelte`).
+    /// An `adb` that cannot be spawned at all is the other half of "adb could
+    /// not tell us": exactly one `warn` naming the query failure and the two
+    /// ports that may still be installed, plus an `unchanged` report carrying
+    /// the same text. Doctor records only `fatal` events and repaints the row
+    /// from a fresh check pass, so this warn does not reach the GUI (A4-5;
+    /// the UI half is `ui/src/screens/Doctor.svelte`).
     #[tokio::test]
     async fn an_unspawnable_adb_warns_once_and_never_reports_a_clean_table() {
         let root = scratch("list-unspawnable");
         std::fs::create_dir_all(&root).unwrap();
-        // Nothing is ever written here: the path does not exist.
         let adb = root.join("no-such-adb");
         assert!(!adb.exists());
 
