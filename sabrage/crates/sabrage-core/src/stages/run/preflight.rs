@@ -1,61 +1,26 @@
-//! The launch preflight — run.sh lines 6–91.
+//! Contract-ordered launch gates. Reference: scripts/demo/run.sh — its
+//! `# preflight:` / `# preflight-autofix:` tags name the slugs, and the
+//! contract's `native_gate` column decides `block` / `warn` / `autofix` /
+//! `none` per slug, so a per-side divergence is recorded in
+//! `contract/pipeline.toml` rather than discovered by reading two
+//! implementations.
 //!
-//! Every `# preflight:` and `# preflight-autofix:` tag in run.sh names one
-//! contract slug, and the contract's `native_gate` column says what this side
-//! does with a failure:
+//! Each evaluated slug emits exactly one [`crate::events::StageEvent::Check`]
+//! carrying its final outcome; for an `autofix` slug that is the re-check's,
+//! preceded by the [`crate::events::StageEvent::AutoFixed`] describing what
+//! changed.
 //!
-//! * `block` → [`crate::error::SabrageError::Fatal`], the `die` equivalent;
-//! * `warn` → a warn row, launch continues;
-//! * `autofix` → apply the slug's fix, re-check, and only then decide;
-//! * `none` → not part of this side's preflight at all.
-//!
-//! The gates are contract data precisely so a per-side divergence
-//! (`cfg.protocol.legacy-oxrsys` is `warn` in the shell and `block` here) is
-//! recorded once, in `contract/pipeline.toml`, rather than discovered by
-//! reading two implementations.
-//!
-//! Each evaluated check emits exactly one [`crate::events::StageEvent::Check`]
-//! carrying its **final** outcome — for an `autofix` slug that is the outcome
-//! of the re-check, preceded by the [`crate::events::StageEvent::AutoFixed`]
-//! describing what changed.
-//!
-//! # Order is load-bearing
-//!
-//! [`preflight_slugs`] returns contract order, which is doctor's order, in
-//! which the bottle context resolves before anything consumes it. The parity
-//! harness asserts run.sh's `# preflight:` tags against this same list, so a
-//! check added to one side and not the other fails a test rather than a
-//! launch.
-//!
-//! ## …but it is *not* run.sh's order
-//!
-//! run.sh's own sequence is game → wine → bridge → host → bottle → overlay →
-//! backend → goldberg → protocol → helper. Contract order is doctor's:
-//! bottle → goldberg → game → helper → overlay → bottle-bridge → host →
-//! protocol → run-only. Both sides evaluate the **same set** and abort on the
-//! same conditions; only *which* die wins when several would fire at once can
-//! differ. Two visible consequences, both declared in `sabrage/PARITY.md`:
-//!
-//! * with CrossOver absent, the shell dies on `run.wine-exec` while this side
-//!   dies earlier, on `overlay.dxmt-d3d11` being unverifiable;
-//! * with `oxrsys-runtime.toml` missing *and* the arm64 helper unstaged, the
-//!   shell dies on the missing toml (line 56) and this side on the helper —
-//!   because a missing file yields the shell's own `${ENCODER_PROC:-auto}`
-//!   default, which requires the helper.
-//!
-//! # Skipped is never Pass
-//!
-//! A check may be skipped for two very different reasons, and they are not
-//! interchangeable:
-//!
-//! * **not applicable** — the shell would not have evaluated it either
-//!   (`run.wired-adb` without `--wired`, the helper pair under
-//!   `encoder_process = "inproc"`). Emitted as a `Skipped` check row; never
-//!   blocks.
-//! * **applicable but unverifiable** — the probe could not reach a verdict
-//!   (CrossOver.app missing under an `overlay.*` row, adb probing switched
-//!   off under `--wired`). That is a Fatal, not a pass: launching on an
-//!   unverified gate is how a black window happens.
+//! The walk follows contract order, which is doctor's, not run.sh's, and in
+//! which the bottle context resolves before anything consumes it. Both sides
+//! evaluate the same set and abort on the same conditions, so only which die
+//! wins can differ. A check the shell would not have evaluated either is a
+//! `Skipped` row that never blocks; an applicable check that reached no
+//! verdict is Fatal, never a pass — launching on an unverified gate is how a
+//! black window happens. Pinned by
+//! tests::{the_slug_list_is_unique_gating_only_and_includes_the_run_only_slugs,
+//! an_unverifiable_applicable_check_is_fatal_not_a_pass}; the order and gate
+//! divergences are declared in PARITY.md § Run preflight (encoded in the
+//! contract's per-side gates).
 
 use std::path::Path;
 
@@ -71,15 +36,17 @@ use super::PreflightFacts;
 
 /// The two `preflight-autofix`-gated helper slugs, in contract order. Both map
 /// to `fix.restage-helper` and both are skipped under
-/// `encoder_process = "inproc"` (run.sh lines 85–91).
+/// `encoder_process = "inproc"`.
 const HELPER_SLUGS: [&str; 2] = ["build.helper-staged", "build.helper-arm64"];
 
 /// The launch-preflight slugs this side evaluates, in contract order.
 ///
 /// Exactly `contract().native_preflight()` — every check whose `native_gate`
-/// is gating. Derived, never hand-written: the parity crate joins run.sh's
-/// `# preflight:` tags against this, and a hand-maintained second list is how
-/// the two drift.
+/// is gating
+/// (tests::the_slug_list_is_unique_gating_only_and_includes_the_run_only_slugs).
+/// Derived, never hand-written: the parity crate joins run.sh's
+/// `# preflight:` tags against this list, and a hand-maintained second list is
+/// how the two drift.
 pub fn preflight_slugs() -> Vec<&'static str> {
     contract()
         .native_preflight()
@@ -88,11 +55,9 @@ pub fn preflight_slugs() -> Vec<&'static str> {
         .collect()
 }
 
-// ── the two config facts, read once ───────────────────────────────────────────
-
 /// `oxrsys-runtime.toml` read once, before the checks that branch on it — the
-/// same two facts run.sh captures with `awk` on lines 57 and 70, resolved the
-/// way the runtime resolves them ([`read_toml_facts`]).
+/// same two facts run.sh captures with `awk`, resolved the way the runtime
+/// resolves them (`read_toml_facts`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct TomlFacts {
     /// `[ -f "$TOML" ]`.
@@ -101,59 +66,45 @@ struct TomlFacts {
     /// last assignment, and `""` when the key is absent or the file does not
     /// exist.
     protocol: String,
-    /// `${ENCODER_PROC:-auto}` — already defaulted, exactly like the shell
-    /// parameter expansion on line 71.
+    /// `${ENCODER_PROC:-auto}` — already defaulted, exactly like the shell's
+    /// own parameter expansion.
     encoder_process: String,
 }
 
-/// One key's **raw** last assignment:
-/// [`crate::config::runtime_toml::effective_string`] — `Config.cpp`'s
-/// `ParseConfigToml` loop, narrowed to a single key. Quote-aware `#`
-/// stripping, `[table]` headers ignored, split on the first `=`, quotes
-/// removed, and the **last** assignment wins, with no accepted-set filtering.
-/// An unassigned key is the empty string, which is what the callers below
+/// One key's **raw** last assignment via
+/// [`crate::config::runtime_toml::effective_string`], with no accepted-set
+/// filtering; an unassigned key is the empty string, which the callers below
 /// already treat as "unset".
 ///
 /// This is the right reader for a key whose accepted set Sabrage does not
-/// model, and — for the two keys it does model — the right *fallback* when no
-/// occurrence at all is one the runtime would accept: that is the value the
-/// die text has to quote back to the user ([`read_toml_facts`]).
+/// model, and the fallback `read_toml_facts` uses when no occurrence at all
+/// is one the runtime would accept: that is the value the die text has to
+/// quote back to the user.
 fn effective_string(toml_text: &str, key: &str) -> String {
     crate::config::runtime_toml::effective_string(toml_text, key).unwrap_or_default()
 }
 
-/// run.sh lines 56–57 and 70–71, in one read of the file — but resolved the way
-/// the **runtime** resolves them, not the way `awk` does.
+/// The two config facts a launch branches on, in one read of the file,
+/// resolved the way the **runtime** resolves them rather than the way `awk`
+/// does.
 ///
-/// `protocol` and `encoder_process` are two of the six keys Sabrage models, so
-/// they go through [`crate::config::runtime_toml::read_lines_like_the_runtime`]:
-/// `Config.cpp` assigns only inside its whitelist and its `catch` block
-/// "ignore[s] malformed values and keep[s] the last valid/default setting", so
-/// the value the launched runtime uses is the last assignment it would
-/// **accept** — `protocol = "alvr"` followed by `protocol = "banana"` still
-/// runs ALVR. Reading the last *raw* assignment instead refused a
-/// configuration the runtime accepts (and could demand the arm64 helper for an
-/// `inproc` runtime). The Settings screen reads the same file through the same
-/// function, so the two can no longer name different backends.
+/// `protocol` and `encoder_process` go through
+/// [`crate::config::runtime_toml::read_lines_like_the_runtime`]: the value the
+/// launched runtime uses is the last assignment it would **accept**, across
+/// `[table]` boundaries, so `protocol = "alvr"` followed by
+/// `protocol = "banana"` still runs ALVR. When nothing is acceptable each key
+/// falls back to its raw last assignment, so run.sh's die still quotes the
+/// value back; an absent `encoder_process` reads as `auto`. The Settings
+/// screen reads the same file through the same function, so the two cannot
+/// name different backends.
 ///
-/// Two fallbacks keep the shell's own texts intact when nothing is accepted:
-///
-/// * `protocol` — the raw last assignment, so `protocol='banana'` is quoted
-///   back in run.sh's die, and the empty string (an absent key, an unreadable
-///   file) still reads as run.sh's empty `$PROTOCOL`;
-/// * `encoder_process` — the raw last assignment, which
-///   [`encoder_mode`] then reports as unrecognized-treated-as-auto, and
-///   `auto` when the key is absent (`${ENCODER_PROC:-auto}`).
-///
-/// Last-wins across `[table]` boundaries is load-bearing either way: the
-/// runtime is table-blind, so a second `protocol =` further down the file is
-/// the value it uses; validating the *first* one let a launch pass every ALVR
-/// gate and then start the legacy backend.
-///
-/// One narrow DIVERGENCE from run.sh, in this side's favour and declared in
-/// `sabrage/PARITY.md`: an **unquoted** value (`protocol = alvr`) is accepted
-/// here and reads as the empty string through `awk -F'"'`, which then dies.
-/// The runtime accepts it, so refusing the launch would be the wrong verdict.
+/// One declared DIVERGENCE from run.sh, in this side's favour: an **unquoted**
+/// value (`protocol = alvr`) is accepted here and reads as empty through
+/// `awk -F'"'`. PARITY.md § Declared by the 2026-08-30 adversarial review
+/// (round 1 fixes), "Config readers: doctor emulates `awk`, launch uses the
+/// runtime's semantics."; pinned by
+/// tests::{the_shadowed_invalid_last_fixture_launches_on_its_valid_values,
+/// a_trailing_invalid_assignment_leaves_the_previous_valid_one_in_force}.
 fn read_toml_facts(toml_path: &Path) -> TomlFacts {
     let present = toml_path.is_file();
     // An unreadable-but-present file degrades to empty captures, exactly like
@@ -183,8 +134,8 @@ fn read_toml_facts(toml_path: &Path) -> TomlFacts {
     }
 }
 
-/// run.sh lines 85–91's `case "$ENCODER_PROC"`: does this configuration need
-/// the staged arm64 helper, and does the shell print a line about it first?
+/// run.sh's `case "$ENCODER_PROC"`: does this configuration need the staged
+/// arm64 helper, and does the shell print a line about it first?
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EncoderMode {
     /// `native|auto` — helper required, nothing printed.
@@ -210,16 +161,14 @@ impl EncoderMode {
     }
 }
 
-// ── the walk ──────────────────────────────────────────────────────────────────
-
 /// Why a slug was not evaluated at all. Rendered as the `Skipped` check row's
 /// message, so the reason reaches the UI instead of an unexplained blank.
 fn not_applicable_reason(ctx: &StageCtx, slug: &str, mode: EncoderMode) -> Option<&'static str> {
     match slug {
-        // run.sh line 103: the whole `--wired` block is inside
+        // run.sh evaluates the whole `--wired` block only inside
         // `if [ -n "${WINEVR_WIRED:-}" ]`.
         "run.wired-adb" if !ctx.opts.wired => Some("not --wired"),
-        // run.sh line 87: `inproc` never calls `ensure_helper_staged`.
+        // `inproc` never reaches run.sh's `ensure_helper_staged`.
         s if HELPER_SLUGS.contains(&s) && !mode.needs_helper() => {
             Some("encoder_process=inproc — the native helper is disabled")
         }
@@ -232,10 +181,11 @@ fn not_applicable_reason(ctx: &StageCtx, slug: &str, mode: EncoderMode) -> Optio
 /// Returns the config facts later steps branch on. Aborts with the shell's
 /// `die` text on the first `block` failure.
 pub async fn run(ctx: &StageCtx) -> Result<PreflightFacts> {
-    // run.sh line 6, one line above the tagged preflight block. This is what
-    // enforces `bottle.named` + `bottle.exists`; their registry rows are still
-    // emitted below (they cannot fail once this has passed), because a GUI
-    // preflight list with two silently-absent rows reads like a bug.
+    // Mirrors run.sh's own `require_bottle`, just above its tagged preflight
+    // block: this call is what enforces `bottle.named` + `bottle.exists`.
+    // Their registry rows are still emitted below (they cannot fail once this
+    // has passed), because a GUI preflight list with two silently-absent rows
+    // reads like a bug.
     require_bottle(ctx)?;
 
     let facts = read_toml_facts(&ctx.paths.toml_path);
@@ -243,11 +193,8 @@ pub async fn run(ctx: &StageCtx) -> Result<PreflightFacts> {
 
     let registry = crate::checks::registry();
     // The preflight checks the bottle **this stage resolved**, not one the
-    // check layer re-derives from `$HOME`: `require_bottle` above has already
-    // settled which bottle (and which `BS_DIR`) the launch is about, and a
-    // second, independent resolution is a way for the two to disagree. In a
-    // real run they are identical by construction; overriding makes that an
-    // invariant rather than a coincidence — and is what lets a test point the
+    // check layer re-derives from `$HOME`: a second, independent resolution is
+    // a way for the two to disagree. It is also what lets a test point the
     // whole preflight at a fixture bottle instead of the machine's real
     // `~/Library/Application Support/CrossOver/Bottles`.
     let check_ctx = {
@@ -324,15 +271,13 @@ const CHILD_PROBE_SLUGS: [&str; 1] = ["run.wired-adb"];
 ///
 /// Evaluators are synchronous `fn(&CheckCtx)` (the doctor's shape), so a slow
 /// one runs *inside* this future and the walk's cancellation checkpoint —
-/// which sits between evaluators — cannot interrupt it. For the child-probe
-/// slugs that matters: the stage holds [`crate::stages::OPERATION_LOCK`]
-/// throughout, so a wedged `adb devices` used to make Stop wait for it. Those
-/// run on a blocking thread raced against the launch's token; the probe's own
-/// deadline is what bounds the orphaned thread afterwards.
-///
-/// Everything else is evaluated inline, exactly as before: a `stat` is not
-/// worth a thread hop, and doctor (which has no token at all) keeps calling
-/// the same evaluators directly.
+/// which sits between evaluators — cannot interrupt it. The stage holds
+/// [`crate::stages::OPERATION_LOCK`] throughout, so the child-probe slugs run
+/// on a blocking thread raced against the launch's token and Stop stays
+/// responsive; the probe's own deadline bounds the orphaned thread. Everything
+/// else is evaluated inline — a `stat` is not worth a thread hop, and doctor
+/// keeps calling the same evaluators directly
+/// (tests::a_cancel_during_the_wired_adb_probe_stops_the_walk_promptly).
 async fn evaluate(
     ctx: &StageCtx,
     check: crate::checks::BoundCheck,
@@ -357,7 +302,7 @@ async fn evaluate(
     }
 }
 
-/// run.sh line 87's `info`, verbatim.
+/// run.sh's `inproc` `info` line, verbatim.
 /// `pub` (A1-3) so `sabrage-parity` can pin it against `run.sh` by calling the
 /// real renderer instead of copying the sentence.
 pub const INPROC_NOTICE: &str =
@@ -371,13 +316,13 @@ pub fn unrecognized_encoder_warn(encoder_process: &str) -> String {
     )
 }
 
-/// run.sh line 15's `warn` — the one `warn`-gated row's text, which is not
+/// run.sh's `warn` — the one `warn`-gated row's text, which is not
 /// doctor's. `pub` (A1-3), same reason as [`INPROC_NOTICE`].
 pub fn game_version_warn(version: &str) -> String {
     format!("Beat Saber version '{version}' != 1.29.4 — the Meta gate may block startup")
 }
 
-/// run.sh lines 87 / 89, verbatim.
+/// run.sh's `inproc` / unrecognized-encoder lines, verbatim.
 fn emit_encoder_notice(ctx: &StageCtx, mode: EncoderMode, facts: &TomlFacts) {
     let row = ctx.step(step::RUN_PREFLIGHT);
     match mode {
@@ -420,13 +365,12 @@ fn die(ctx: &StageCtx, spec: &CheckSpec, message: String, remedy: Option<String>
 fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFacts) -> Result<()> {
     let slug = spec.slug.as_str();
 
-    // ── per-slug override: dep.goldberg ────────────────────────────────────
-    //
-    // run.sh line 54: `sha256_ok "$GBE_DLL" … || [ -f "$GBE_DLL" ] || die`.
-    // The launch dies only when the dll is *gone*; a hash that differs from
-    // the pinned build is tolerated (a user-supplied Goldberg build is a
+    // run.sh's goldberg gate is `sha256_ok "$GBE_DLL" … || [ -f "$GBE_DLL" ] ||
+    // die`: the launch dies only when the dll is *gone*; a hash that differs
+    // from the pinned build is tolerated (a user-supplied Goldberg build is a
     // legitimate setup). Doctor is stricter on purpose, so its verdict is
-    // reported as-is and simply not gated when the file exists.
+    // reported as-is and simply not gated when the file exists
+    // (tests::goldberg_hash_mismatch_does_not_block_the_launch).
     if slug == "dep.goldberg" && ctx.paths.gbe_dll.is_file() {
         let outcome = if outcome.status == CheckStatus::Pass {
             outcome
@@ -443,11 +387,9 @@ fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFac
         return Ok(());
     }
 
-    // ── per-slug override: the two protocol rows ───────────────────────────
-    //
-    // Both are decided from the single `$PROTOCOL` read (run.sh line 57)
-    // rather than from the evaluator's own re-read, so the two rows can never
-    // disagree with each other or with `PreflightFacts`.
+    // Both protocol rows are decided from the single `$PROTOCOL` read rather
+    // than from the evaluator's own re-read, so they can never disagree with
+    // each other or with `PreflightFacts`.
     if slug == "cfg.protocol.supported" || slug == "cfg.protocol.legacy-oxrsys" {
         return protocol_gate(ctx, spec, outcome, facts);
     }
@@ -459,7 +401,7 @@ fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFac
         }
 
         CheckStatus::Warn => {
-            // run.sh line 15 is the only `warn`-gated row, and its text is
+            // `game.version` is the only `warn`-gated row, and its text is
             // *not* doctor's; every other Warn reaching a `block` gate is one
             // the shell's coarser test would have passed (`host.manifest`
             // pointing somewhere unexpected but present), so it is reported
@@ -488,13 +430,12 @@ fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFac
     }
 }
 
-/// "Applicable but unverifiable" — the row was emitted, and the launch stops.
+/// "Applicable but unverifiable" — the row is emitted, and then the launch
+/// stops (design-core §10's S11).
 ///
-/// A `Skipped` outcome that reached a gate is **not** a pass (design-core
-/// §10's S11): the probe reached no verdict, and launching on an unverified
-/// gate is exactly how a black window happens. The reason the check gave is
-/// carried into the die text, with its remedy appended when it has one, so the
-/// user reads why it could not be checked rather than a bare slug.
+/// The reason the check gave is carried into the die text, with its remedy
+/// appended when it has one, so the user reads why it could not be checked
+/// rather than a bare slug.
 fn cannot_verify(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome) -> SabrageError {
     let reason = outcome.message.clone();
     let remedy = outcome.remedy.clone();
@@ -507,7 +448,7 @@ fn cannot_verify(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome) -> Sab
     die(ctx, spec, message, remedy)
 }
 
-/// run.sh lines 56–63, decided from the single `$PROTOCOL` capture.
+/// run.sh's protocol gate, decided from the single `$PROTOCOL` capture.
 fn protocol_gate(
     ctx: &StageCtx,
     spec: &CheckSpec,
@@ -517,16 +458,14 @@ fn protocol_gate(
     let slug = spec.slug.as_str();
     let toml = ctx.paths.toml_path.display().to_string();
 
-    // Every branch below emits this same row and then decides, so it is
-    // emitted once, here: the row reports the check, the branch reports the
-    // gate.
-    //
-    // The row is the *doctor* evaluator's verdict (`awk -F'"'`, last raw
-    // assignment), and the gate below is this side's runtime-semantics fact —
-    // the divergence declared in `sabrage/PARITY.md`. When the two disagree
-    // and the launch proceeds anyway (an unquoted value; a valid assignment
-    // shadowed by a later junk one), the row would otherwise read as a red
-    // check the launch silently ignored, so it says why instead.
+    // Every branch below emits this same row and then decides: the row reports
+    // the *doctor* evaluator's verdict (`awk`, last raw assignment), the gate
+    // reports this side's runtime-semantics fact. When the two disagree and
+    // the launch proceeds anyway, the row would otherwise read as a red check
+    // the launch silently ignored, so it says why instead. PARITY.md
+    // § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+    // "Config readers: doctor emulates `awk`, launch uses the runtime's
+    // semantics."
     let outcome = if facts.present
         && facts.protocol == "alvr"
         && matches!(outcome.status, CheckStatus::Fail | CheckStatus::Warn)
@@ -561,10 +500,11 @@ fn protocol_gate(
         ("cfg.protocol.supported", "oxrsys") => Ok(()),
 
         // DECLARED DIVERGENCE (contract: shell_gate = warn, native_gate =
-        // block). run.sh line 60 warns and launches the legacy USB path;
-        // Sabrage v1 does not implement it, so it refuses rather than
-        // launching something it cannot supervise. The first line is run.sh's
-        // warn text verbatim; the second says what this side does instead.
+        // block) — PARITY.md § Run preflight (encoded in the contract's
+        // per-side gates), "Launch refuses `protocol=oxrsys` outright". The
+        // first line is run.sh's warn text verbatim; the second says what this
+        // side does instead
+        // (tests::an_oxrsys_protocol_blocks_the_launch_with_both_lines).
         ("cfg.protocol.legacy-oxrsys", "oxrsys") => Err(die(
             ctx,
             spec,
@@ -576,9 +516,9 @@ fn protocol_gate(
             Some(format!("set protocol = \"alvr\" in {toml}")),
         )),
 
-        // Anything else: run.sh lines 61–62's two-line die, attributed to the
-        // supported-set row. The legacy row is `tap … skipped` in the shell
-        // and never reached here (the die above aborts first).
+        // Anything else: run.sh's two-line die, attributed to the supported-set
+        // row. The legacy row is `tap … skipped` in the shell and never reached
+        // here (the die above aborts first).
         ("cfg.protocol.supported", other) => Err(die(
             ctx,
             spec,
@@ -601,10 +541,11 @@ fn protocol_gate(
 /// The `block`-gate die text for one slug — run.sh's `die` string verbatim,
 /// with its interpolations.
 ///
-/// Three of these have no shell counterpart at all
-/// (`overlay.dxmt-winemetal`, `overlay.woxr-dll`, `overlay.woxr-so`: run.sh
-/// `cmp`s only `d3d11.dll`, the contract records the divergence) and reuse the
-/// sentence shape of the `d3d11` die they extend.
+/// Three have no shell counterpart at all (`overlay.dxmt-winemetal`,
+/// `overlay.woxr-dll`, `overlay.woxr-so`) and reuse the sentence shape of the
+/// `d3d11` die they extend: PARITY.md § Run preflight (encoded in the
+/// contract's per-side gates), "Native preflight blocks on ALL four overlay
+/// files".
 /// `pub` (A1-3) so `sabrage-parity` can pin these against `run.sh` by calling
 /// the real renderer instead of copying a substring per slug.
 pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String, Option<String>) {
@@ -634,13 +575,11 @@ pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String,
             None,
         ),
 
-        // run.sh line 54.
         "dep.goldberg" => (
             "Goldberg dll missing — ./demo.sh setup".to_string(),
             Some("./demo.sh setup".to_string()),
         ),
 
-        // run.sh lines 10–12.
         "game.present" => (
             format!(
                 "Beat Saber not found at {}\n       download 1.29.4: {}\n       \
@@ -651,8 +590,7 @@ pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String,
             None,
         ),
 
-        // run.sh lines 32–33. `dxmt-winemetal` is the same overlay, so it
-        // reuses the same sentence.
+        // `dxmt-winemetal` is the same overlay, so it reuses the same sentence.
         "overlay.dxmt-d3d11" | "overlay.dxmt-winemetal" => (
             format!("CrossOver DXMT overlay stale (CrossOver update?) — {install}"),
             install_remedy,
@@ -664,30 +602,26 @@ pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String,
             install_remedy,
         ),
 
-        // run.sh line 25.
         "bottle.woxr-dll" => (
             format!("bottle wineopenxr.dll stale/missing — {install}"),
             install_remedy,
         ),
-        // run.sh line 27.
         "bottle.manifest" => (
             format!("bottle OpenXR manifest missing — {install}"),
             install_remedy,
         ),
-        // run.sh line 30.
         "bottle.registry" => (
             format!("bottle ActiveRuntime registry key missing — {install}"),
             install_remedy,
         ),
-        // run.sh line 21.
         "host.manifest" => (
             format!("host OpenXR registration missing — {install}"),
             install_remedy,
         ),
 
-        // run.sh lines 17, 19, 104, 105 — `checks::run_only` already carries
-        // each die string whole, because those slugs have no doctor row whose
-        // prose could compete with run.sh's.
+        // `checks::run_only` already carries each of these die strings whole,
+        // because those slugs have no doctor row whose prose could compete with
+        // run.sh's.
         "run.wine-exec" | "run.bridge-built" | "run.wired-adb" => {
             (outcome.message.clone(), outcome.remedy.clone())
         }
@@ -698,14 +632,11 @@ pub fn block_die(ctx: &StageCtx, slug: &str, outcome: &CheckOutcome) -> (String,
     }
 }
 
-// ── the two auto-fixes ────────────────────────────────────────────────────────
-
 /// The `autofix` gate: apply the mapped fix, re-evaluate, and only then decide.
 ///
 /// run.sh's two auto-fixing preflights are the `cxbottle.conf` backend rewrite
-/// (lines 38–52) and `ensure_helper_staged` (lines 72–91). Both are
-/// **permanent** mutations, never unwound — see [`super`]'s "permanent vs
-/// guarded".
+/// and `ensure_helper_staged`. Both are **permanent** mutations, never
+/// unwound — see [`super`]'s "permanent vs guarded".
 async fn autofix(
     ctx: &StageCtx,
     registry: &Registry,
@@ -760,21 +691,17 @@ async fn autofix(
 }
 
 /// The autofix itself failed — the fix's own error, turned back into the one
-/// `Check` + one `Fatal` this module promises.
+/// `Check` + one `Fatal` this module promises, so an event-only consumer never
+/// sees a failed stage with an unresolved row.
 ///
-/// Without this an `Err` out of [`apply_fix`] left the slug with **no** check
-/// row at all (the `?` returned above every emit), so an event-only consumer
-/// saw a failed `StageFinished` and an unresolved row. Three shapes:
-///
-/// * `Cancelled` — Stop, not a failure. Propagated untouched, exactly like the
-///   walk's own checkpoint: no row, no die.
-/// * `Fatal` — the fix already emitted its own `Fatal` (`ctx.fatal`, e.g.
-///   `helper::restage_helper`'s "neither the staged copy nor the build output
-///   is arm64"). Its text is run.sh's; only the missing `Check` is added.
-/// * anything else (a raw `Io` from `write_atomic` / `copy_if_changed`) — the
-///   io cause is surfaced as a stderr-shaped `Output` line and the die is
-///   run.sh's post-fix text (`could not force graphics backend to dxmt in …`),
-///   the same shape `actions::die_with_cause` uses.
+/// * `Cancelled` — Stop, not a failure. Propagated untouched: no row, no die.
+/// * `Fatal` — the fix already emitted its own (`helper::restage_helper`'s
+///   "neither the staged copy nor the build output is arm64"). Its text is
+///   run.sh's; only the missing `Check` is added.
+/// * anything else — the io cause is surfaced as a stderr-shaped `Output` line
+///   and the die is run.sh's post-fix text, the same shape
+///   `actions::die_with_cause` uses
+///   (tests::a_backend_autofix_that_cannot_write_still_emits_its_check_and_dies_run_shs_way).
 fn fix_failed(
     ctx: &StageCtx,
     spec: &CheckSpec,
@@ -852,8 +779,7 @@ async fn apply_fix(ctx: &StageCtx, spec: &CheckSpec) -> Result<FixReport> {
     }
 }
 
-/// run.sh's die text for "the auto-fix ran and the condition is still there"
-/// (lines 42/46/49 and line 78).
+/// run.sh's die text for "the auto-fix ran and the condition is still there".
 /// `pub` (A1-3), same reason as [`block_die`].
 pub fn post_fix_die(ctx: &StageCtx, slug: &str) -> (String, Option<String>) {
     match slug {
@@ -877,8 +803,6 @@ pub fn post_fix_die(ctx: &StageCtx, slug: &str) -> (String, Option<String>) {
         ),
     }
 }
-
-// ── small ctx helper ──────────────────────────────────────────────────────────
 
 trait BottleName {
     /// `$WINEVR_BOTTLE` as the die strings interpolate it. Always `Some` after
@@ -905,8 +829,6 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_util::sync::CancellationToken;
-
-    // ── the contract-derived slug list (unchanged from the frame) ───────────
 
     #[test]
     fn the_slug_list_is_unique_gating_only_and_includes_the_run_only_slugs() {
@@ -948,8 +870,6 @@ mod tests {
         }
     }
 
-    // ── the config reader ───────────────────────────────────────────────────
-
     /// The same file, read by this module and by the Settings view, must name
     /// the same backend — the bug was preflight validating `[streaming]`'s
     /// `alvr` while the runtime obeyed a later `oxrsys`.
@@ -977,9 +897,7 @@ mod tests {
 
         // A3b-1/A7-1: a *valid* assignment shadowed by a later INVALID one.
         // Config.cpp assigns only inside its whitelist, so the runtime keeps
-        // alvr/inproc — the raw-last reading (`banana`/`garbage`) refused a
-        // configuration the runtime accepts and demanded the arm64 helper for
-        // an in-process encode.
+        // alvr/inproc rather than the raw last value.
         std::fs::write(
             &toml,
             b"protocol = \"alvr\"\nencoder_process = \"inproc\"\n\n[tweaks]\nprotocol = \"banana\"\nencoder_process = \"garbage\"\n",
@@ -1020,21 +938,17 @@ mod tests {
         assert_eq!(facts.protocol, "");
         assert_eq!(facts.encoder_process, "auto", "${{ENCODER_PROC:-auto}}");
 
-        // Present, key absent.
         std::fs::write(&toml, "protocol = \"alvr\"\n").unwrap();
         let facts = read_toml_facts(&toml);
         assert!(facts.present);
         assert_eq!(facts.protocol, "alvr");
         assert_eq!(facts.encoder_process, "auto");
 
-        // Present, key set.
         std::fs::write(&toml, "protocol = \"alvr\"\nencoder_process = \"inproc\"\n").unwrap();
         assert_eq!(read_toml_facts(&toml).encoder_process, "inproc");
 
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    // ── fixtures ────────────────────────────────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
         let p = std::env::temp_dir().join(format!(
@@ -1064,15 +978,11 @@ mod tests {
 
     /// Copy the checkout's `contract/` and its generated shell mirror into a
     /// scratch root, so the walk's **first** slug — `meta.contract-sync`,
-    /// `block`-gated on this side — passes there.
+    /// `block`-gated on this side — passes there and every test below reaches
+    /// the row it is actually about instead of dying on row zero.
     ///
-    /// That evaluator reconciles three hashes: the scratch root's own
-    /// `contract/`, the `# contract-sha256:` header of its
-    /// `scripts/demo/contract.gen.sh`, and the contract THIS binary was
-    /// compiled with. Copying the live files satisfies all three at once
-    /// (the compiled-in copy came from the same checkout), which is what lets
-    /// every test below reach the row it is actually about instead of dying
-    /// on row zero.
+    /// The live files, not synthesised ones: the evaluator also compares the
+    /// contract compiled into THIS binary, which came from the same checkout.
     fn seed_contract(root: &Path) {
         let src = checkout_root();
         for rel in CONTRACT_FILES
@@ -1274,13 +1184,10 @@ mod tests {
         write(&p.toml_path, b"protocol = \"alvr\"\n");
     }
 
-    // ── applicability ───────────────────────────────────────────────────────
-
     #[test]
     fn applicability_table() {
         let mut f = fixture("applicability", true);
 
-        // --wired off: run.wired-adb is not applicable.
         assert_eq!(
             not_applicable_reason(&f.ctx, "run.wired-adb", EncoderMode::HelperRequired),
             Some("not --wired")
@@ -1313,8 +1220,6 @@ mod tests {
         );
     }
 
-    // ── require_bottle comes first ──────────────────────────────────────────
-
     /// Stop during the preflight aborts it without a die row — the walk is
     /// read-only, so there is nothing to unwind.
     #[tokio::test]
@@ -1343,8 +1248,6 @@ mod tests {
         assert!(f.checks().is_empty(), "no check row before require_bottle");
     }
 
-    // ── the happy path ──────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn a_clean_machine_walks_every_slug_in_contract_order() {
         let f = fixture("clean", true);
@@ -1357,8 +1260,7 @@ mod tests {
         let seen: Vec<String> = f.checks().into_iter().map(|(s, _)| s).collect();
         let want: Vec<String> = preflight_slugs().iter().map(|s| s.to_string()).collect();
         assert_eq!(seen, want, "one Check per slug, in contract order");
-        // Derived above, but named here because it is the newest gate and the
-        // one the fixture has to seed a whole scratch checkout to satisfy.
+        // Asserted separately: this gate forces the fixture to seed a whole scratch checkout.
         assert_eq!(
             seen.first().map(String::as_str),
             Some("meta.contract-sync"),
@@ -1384,15 +1286,13 @@ mod tests {
         );
     }
 
-    // ── the contract tripwire ───────────────────────────────────────────────
-
     /// `meta.contract-sync` is `native_gate = "block"`: a checkout whose
-    /// `contract.gen.sh` header no longer matches its `contract/` refuses to
-    /// launch, on the contract's very first slug, before the preflight has
-    /// probed — or auto-fixed — anything else.
+    /// `contract.gen.sh` header does not match its `contract/` refuses to launch
+    /// on the contract's very first slug, before the preflight has probed — or
+    /// auto-fixed — anything else.
     ///
-    /// The slug has no arm in [`block_die`], so the die text is the
-    /// evaluator's own message and remedy, through the fallback arm.
+    /// The slug has no arm in [`block_die`], so the die text is the evaluator's
+    /// own message and remedy, through the fallback arm.
     #[tokio::test]
     async fn a_stale_contract_gen_header_blocks_the_launch_on_the_first_slug() {
         let f = fixture("contract-stale", true);
@@ -1442,8 +1342,6 @@ mod tests {
         );
     }
 
-    // ── dep.goldberg tolerance ──────────────────────────────────────────────
-
     #[tokio::test]
     async fn goldberg_hash_mismatch_does_not_block_the_launch() {
         let f = fixture("gbe-warn", true);
@@ -1469,8 +1367,6 @@ mod tests {
         assert_eq!(err.to_string(), "Goldberg dll missing — ./demo.sh setup");
         assert_eq!(f.check("dep.goldberg").unwrap().status, CheckStatus::Fail);
     }
-
-    // ── game.version: the one warn gate ─────────────────────────────────────
 
     #[tokio::test]
     async fn a_wrong_game_version_warns_with_run_shs_text_and_continues() {
@@ -1504,8 +1400,6 @@ mod tests {
         );
         assert_eq!(err.to_string(), want);
     }
-
-    // ── protocol branches ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_missing_toml_dies_with_the_setup_remedy() {
@@ -1585,8 +1479,6 @@ mod tests {
         assert!(f.check("cfg.protocol.legacy-oxrsys").is_none());
     }
 
-    // ── encoder_process branches ────────────────────────────────────────────
-
     #[tokio::test]
     async fn inproc_prints_the_info_row_once_and_skips_both_helper_slugs() {
         let f = fixture("inproc", true);
@@ -1639,8 +1531,6 @@ mod tests {
         );
     }
 
-    // ── Skipped while applicable is never a pass ────────────────────────────
-
     #[tokio::test]
     async fn an_unverifiable_applicable_check_is_fatal_not_a_pass() {
         let f = fixture("unverifiable", true);
@@ -1679,8 +1569,6 @@ mod tests {
             "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
         );
     }
-
-    // ── the autofix path ────────────────────────────────────────────────────
 
     /// The real thing: a `cxbottle.conf` that says `auto`, a real (non-dry)
     /// executor over a fixture bottle. The fix must run, the re-check must
@@ -1784,8 +1672,8 @@ mod tests {
     }
 
     /// The repository's own "every key assigned twice, the second one junk"
-    /// fixture, driven through the whole preflight: what the launch judges and
-    /// what the Settings screen shows must be the same six values, and none of
+    /// fixture, driven through the whole preflight: the launch and the Settings
+    /// view must read the same `protocol` and `encoder_process`, and neither of
     /// them the junk. (`oxrsys-runtime.shadowed-invalid-last.toml` is the file
     /// `config::runtime_toml`'s tests pin the reader against.)
     #[tokio::test]
@@ -1819,11 +1707,11 @@ mod tests {
         );
     }
 
-    /// A7-1/A3b-1: a valid assignment shadowed by a later INVALID one is the
-    /// mirror image of the test above — the runtime keeps the *valid* value,
-    /// so the launch must too. The raw-last reading died on
-    /// `protocol='banana'` and demanded the arm64 helper for a runtime that
-    /// encodes in-process.
+    /// A7-1/A3b-1: a valid assignment shadowed by a later INVALID one — the
+    /// mirror of `the_shadowed_invalid_last_fixture_launches_on_its_valid_values`.
+    /// The runtime keeps the *valid* value, so the launch must too; the raw-last
+    /// reading died on `protocol='banana'` and demanded the arm64 helper for a
+    /// runtime that encodes in-process.
     #[tokio::test]
     async fn a_trailing_invalid_assignment_leaves_the_previous_valid_one_in_force() {
         let f = fixture("proto-invalid-tail", true);
@@ -1852,8 +1740,9 @@ mod tests {
             "no unrecognized-encoder warn for a value the runtime ignores: {:?}",
             f.lines()
         );
-        // The doctor evaluator still reports its own `awk` verdict (declared
-        // divergence, PARITY.md) — but the row says why the launch went on.
+        // The doctor evaluator still reports its own `awk` verdict (PARITY.md §
+        // Declared by the 2026-08-30 adversarial review (round 1 fixes),
+        // "Config readers: doctor emulates `awk`") — the row says why launch went on.
         let row = f.check("cfg.protocol.supported").unwrap();
         assert_eq!(row.status, CheckStatus::Fail);
         assert!(
@@ -1915,12 +1804,9 @@ mod tests {
             b"protocol = \"alvr\"\nencoder_process = \"inproc\"\n\n              [tweaks]\nencoder_process = \"native\"\n",
         );
 
-        // Dies on the missing helper — under the old first-match reading both
-        // helper rows would have been skipped and the launch would have gone
-        // ahead with no arm64 helper at all.
+        // Dies on the missing helper: the later `native` is the value the runtime
+        // uses, so both helper rows stay applicable.
         let err = run(&f.ctx).await.unwrap_err();
-        // (The value quoted in the die text comes from `fixes::helper`'s own
-        // reader, which is still first-match — a sibling fix, cross-area.)
         assert!(err.to_string().contains("needs the arm64 helper"), "{err}");
         assert!(
             !f.lines()
@@ -1930,8 +1816,6 @@ mod tests {
             f.lines()
         );
     }
-
-    // ── a failing auto-fix still reports its row ────────────────────────────
 
     /// A7-6: an `Err` out of the fix used to return through `?` before the
     /// slug's `Check` was emitted — an event-only consumer saw a failed stage
