@@ -1,30 +1,20 @@
 //! Every mutating primitive, behind one trait — so `--dry-run` is a real
 //! preview rather than a second, drifting code path (design-core §6.3).
 //!
-//! Two implementations:
-//!
 //! * [`RealExecutor`] does the thing.
 //! * [`DryRunExecutor`] records a [`PlannedAction`] and does not. **Read-only
 //!   probes still execute** — the byte compare behind `copy_if_changed`, the
 //!   sha256 behind `download` — so the plan says *unchanged* vs *installed*
 //!   truthfully instead of guessing.
 //!
-//! # Why `curl` and `tar` instead of crates
+//! `setup` execs `curl -fL --retry 3` and `tar -xzf` rather than linking
+//! `reqwest`/`flate2`/`tar`: same tool, same flags, same failure modes as
+//! `scripts/demo/setup.sh`. [`Executor::dir_copy`] shells out to `/bin/cp -R`
+//! because CrossOver's `lib/dxmt` tree contains symlinks a naive recursive
+//! walk would dereference.
 //!
-//! `setup` execs `curl -fL --retry 3` and `tar -xzf` exactly like
-//! `scripts/demo/setup.sh`. Same tool, same flags, same failure modes, same
-//! progress output — and three fewer dependency trees (`reqwest`, `flate2`,
-//! `tar`) in a binary whose whole point is to agree with a shell script.
-//! `cp -R` for [`Executor::dir_copy`] is the same argument with teeth: CrossOver's
-//! `lib/dxmt` tree contains symlinks, and `/bin/cp -R` preserves them where a
-//! naive recursive walk would dereference them.
-//!
-//! # Async shape
-//!
-//! Methods return a boxed future rather than being `async fn`, because
-//! [`crate::stages::StageCtx`] holds an `Arc<dyn Executor>` and `async fn` in a
-//! trait is not object-safe. One convention, used consistently — see
-//! [`BoxFuture`].
+//! Methods return a [`BoxFuture`] because [`crate::stages::StageCtx`] holds an
+//! `Arc<dyn Executor>` and `async fn` in a trait is not object-safe.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -48,23 +38,12 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn std::future::Future<Output = T> + Send +
 /// caller did not narrow it with [`Executor::with_step`].
 pub const EXECUTOR_STEP: StepId = "executor";
 
-// ── outcomes ──────────────────────────────────────────────────────────────────
-
-/// `install_if_changed`'s two branches.
+/// `install_if_changed`'s two branches (scripts/demo/lib.sh).
 ///
-/// The **caller** prints the row, exactly as `lib.sh` does:
-///
-/// ```zsh
-/// install_if_changed() { # src dst
-///   if cmp -s "$1" "$2" 2>/dev/null; then info "unchanged: $2"
-///   else cp "$1" "$2" || die "copy failed: $1 -> $2"; ok "installed: $2"; fi
-/// }
-/// ```
-///
-/// i.e. `info "unchanged: <dst>"` for [`Copied::Unchanged`] and
-/// `ok "installed: <dst>"` for [`Copied::Copied`], with `<dst>` the full
-/// destination path. Keeping the strings at the call site is what lets the dry
-/// run render "would install: …" from the same outcome.
+/// The **caller** prints the row: `info "unchanged: <dst>"` for
+/// [`Copied::Unchanged`], `ok "installed: <dst>"` for [`Copied::Copied`], with
+/// `<dst>` the full destination path. Keeping the strings at the call site is
+/// what lets the dry run render "would install: …" from the same outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum Copied {
@@ -124,18 +103,17 @@ pub enum PlannedKind {
     /// A child process would be spawned.
     Spawn,
     /// A child process would be spawned **detached** — surviving this process,
-    /// writing straight into a log file. Only the wine launch does this.
+    /// with its output going to a log file or to `/dev/null`.
     SpawnDetached,
 }
 
 impl PlannedAction {
     /// One human line: what would happen, and why.
     ///
-    /// This is what `--dry-run` prints after the stage's narrative rows, and it
-    /// is the reason the plan is recorded at all — the narrative says
-    /// `"install: <path>"` either way, only the plan distinguishes *would copy*
-    /// from *would skip because the bytes already match*. Paths are rendered
-    /// exactly as the executor received them (absolute, unabbreviated).
+    /// Paths are rendered exactly as the executor received them (absolute,
+    /// unabbreviated). A stage's narrative rows say `"install: <path>"` either
+    /// way; only this line distinguishes *would copy* from *would skip because
+    /// the bytes already match*, which is why the plan is recorded at all.
     pub fn describe(&self) -> String {
         let src = self
             .src
@@ -215,8 +193,6 @@ pub fn dry_run_plan_body(plan: &[PlannedAction]) -> Vec<String> {
     plan.iter().map(PlannedAction::describe).collect()
 }
 
-// ── the trait ─────────────────────────────────────────────────────────────────
-
 /// Every filesystem or process mutation the pipeline performs.
 ///
 /// Nothing outside this trait may write to disk or spawn a process on a stage's
@@ -236,9 +212,10 @@ pub trait Executor: Send + Sync + fmt::Debug {
         Vec::new()
     }
 
-    /// `install_if_changed`: copy `src` over `dst` only when the bytes differ.
-    /// Parent directories are **not** created (`cp` does not, and the shell
-    /// `mkdir -p`s explicitly where it needs to).
+    /// `install_if_changed`: copy `src` over `dst` when the bytes differ; when
+    /// only the mode differs, `dst`'s mode is repaired and the result is still
+    /// [`Copied::Copied`]. Parent directories are **not** created (`cp` does
+    /// not, and the shell `mkdir -p`s explicitly where it needs to).
     fn copy_if_changed<'a>(&'a self, src: &'a Path, dst: &'a Path)
         -> BoxFuture<'a, Result<Copied>>;
 
@@ -250,14 +227,11 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// when this call created it, `Ok(false)` when something else got there
     /// first (and the file was left untouched).
     ///
-    /// The write-once documents — `oxrsys-runtime.toml` above all — are
-    /// created through this rather than through [`Executor::write_atomic`],
-    /// because `exists()`-then-`write_atomic` is a race whose loser silently
-    /// replaces a hand-edited config that never got backed up. An exclusive
-    /// publish (`O_EXCL`, `link(2)`) makes "did I create it?" the kernel's
-    /// answer instead of a stale observation — and the bytes are complete
-    /// before the final name exists, so an interrupted create cannot strand an
-    /// empty file that later runs then refuse to replace.
+    /// Write-once documents (`oxrsys-runtime.toml` above all) go through this
+    /// rather than [`Executor::write_atomic`] because `exists()`-then-write is
+    /// a race whose loser silently replaces a hand-edited config; an exclusive
+    /// publish makes "did I create it?" the kernel's answer
+    /// (tests::create_new_never_clobbers_an_existing_file).
     ///
     /// The default implementation is the racy check-then-write, kept only so a
     /// decorating [`Executor`] (the test doubles) inherits sane behaviour; both
@@ -330,9 +304,9 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// * `info "downloading <label> ..."` then curl's progress on stderr,
     /// * `ok "fetched <label> (sha256 verified)"`.
     ///
-    /// Divergence (PARITY.md, "Setup"): the `.tmp` file is
-    /// removed when the download or the hash check fails. `fetch_pinned` leaves
-    /// it behind, where it confuses the next run.
+    /// Divergence: the `.tmp` file is removed when the download or the hash
+    /// check fails (PARITY.md § Setup, "A pinned download's `.tmp` file is
+    /// removed when curl or the sha256 check fails").
     fn download<'a>(
         &'a self,
         url: &'a str,
@@ -358,19 +332,14 @@ pub trait Executor: Send + Sync + fmt::Debug {
     /// process pumps, and — the whole point — `kill_on_drop(false)`, so it
     /// outlives Sabrage.
     ///
-    /// Exactly two callers, both in the run stage: the wine launch (with
-    /// [`DetachedStdio::LogFile`]) and the ALVR dashboard (with
-    /// [`DetachedStdio::Null`], mirroring run.sh's `>/dev/null 2>&1 &`).
-    /// Everything else uses [`Executor::run_child`].
+    /// Exactly two callers, both in the run stage: wine launch ([`DetachedStdio::LogFile`])
+    /// and ALVR dashboard ([`DetachedStdio::Null`]). Everything else uses [`Executor::run_child`].
     ///
-    /// This is the primitive [`crate::process::spawn_streamed`]'s header
-    /// forbids itself from being: that one sets `kill_on_drop(true)`, which
-    /// applied to the wine child would SIGKILL the CrossOver wine wrapper
-    /// mid-session the moment Sabrage quits — leaving wineserver and the game
-    /// running, orphaned, with the headset still streaming. Neither teardown
-    /// nor detach (design-core §3.3; critique.md, "app-quit semantics for a
-    /// live session"). App-quit runs the INT path *deliberately* or detaches
-    /// *deliberately*; it never happens as a side effect of a dropped future.
+    /// Never [`crate::process::spawn_streamed`] for those two: its
+    /// `kill_on_drop(true)` SIGKILLs the CrossOver wine wrapper the moment
+    /// Sabrage quits, orphaning wineserver and the game (design-core §3.3;
+    /// PARITY.md § Run (launch), "The wine child is spawned in its **own
+    /// process group**").
     ///
     /// Returns `Ok(None)` under [`DryRunExecutor`] — a dry run never spawns —
     /// so callers must treat "no child" as the planned case, not as failure.
@@ -403,8 +372,6 @@ pub struct DetachedChild {
     pub child: tokio::process::Child,
 }
 
-// ── real ──────────────────────────────────────────────────────────────────────
-
 /// The executor that actually mutates the machine.
 #[derive(Clone)]
 pub struct RealExecutor {
@@ -433,9 +400,8 @@ impl RealExecutor {
     ///
     /// Every filesystem primitive calls this first, so cancellation lands
     /// between two file copies and not only at the next child-spawn boundary
-    /// (`process::spawn_streamed`'s `select!`). Install's layers 1–3 are dozens
-    /// of copies with no child in between; without this, Cancel kept writing
-    /// DXMT dlls until the `reg add` child noticed.
+    /// (`process::spawn_streamed`'s `select!`): install's layers 1-3 are dozens
+    /// of copies with no child in between.
     fn guard(&self) -> Result<()> {
         if self.cancel.is_cancelled() {
             return Err(SabrageError::Cancelled);
@@ -469,21 +435,13 @@ impl Executor for RealExecutor {
             self.guard()?;
             if crate::util::cmp_files(src, dst) {
                 // Bytes match — but a staged file that lost its execute bit is
-                // *not* installed, and rebuilding cannot repair it because the
-                // bytes never change (checks/build.rs requires the bit;
-                // fixes/helper.rs restages through this primitive). Repair the
-                // mode and report it as work done.
-                //
-                // DIVERGENCE from lib.sh's `install_if_changed`, which compares
-                // with `cmp -s` alone and prints `info "unchanged: $2"` whenever
-                // the bytes match. Consequence, on every destination and not
-                // only the staged helper: a file whose bytes already match but
-                // whose mode does not is chmod'ed here and rendered as
-                // `installed: <dst>` where `./demo.sh install` says
-                // `unchanged: <dst>` — the DXMT dlls (0755 in
-                // `ext/dxmt-artifacts/`, 0644 once installed under
-                // `CrossOver.app`) are exactly that shape. Not yet a row in
-                // PARITY.md's "Install" table; adding it is the open item.
+                // *not* installed, and rebuilding cannot repair it (bytes never
+                // change; checks/build.rs requires the bit, fixes/helper.rs
+                // restages through this primitive). Repair the mode and report
+                // as work done, where lib.sh's `install_if_changed` would print
+                // `unchanged: <dst>` (PARITY.md § Install (the one privileged
+                // write), "`copy_if_changed` repairs the destination's mode
+                // when the bytes already match").
                 return match (mode_of(src), mode_of(dst)) {
                     (Some(want), Some(have)) if want != have => {
                         tokio::fs::set_permissions(dst, permissions(want))
@@ -724,8 +682,9 @@ async fn spawn_detached_real(spec: &ChildSpec, stdio: DetachedStdio) -> Result<D
         cmd.env("PATH", path);
     }
     // Own process group, like every other child — but NOT kill_on_drop: a
-    // detached child must survive this process exiting. That is the whole
-    // point of this function (design-core §3.3; critique.md's app-quit issue).
+    // detached child must survive this process exiting (design-core §3.3;
+    // PARITY.md § Run (launch), "The wine child is spawned in its **own
+    // process group**").
     cmd.process_group(0).kill_on_drop(false);
 
     let child = cmd.spawn().map_err(|e| {
@@ -892,10 +851,9 @@ async fn write_atomic_real(path: &Path, bytes: &[u8]) -> Result<()> {
         return result;
     }
     // The rename is only as durable as the directory entry it created, so the
-    // parent is synced too — and a failure there is *reported*. Swallowing it
-    // would let `write_atomic` answer "persisted" for a `session-state.json`
-    // whose entry can still be lost, which is precisely the answer the audio
-    // guard acts on when it goes on to switch the Mac's output device.
+    // parent is synced too — and a failure there is *reported*: the audio guard
+    // acts on "persisted" for `session-state.json` by switching the Mac's
+    // output device (tests::a_parent_that_cannot_be_synced_is_reported_not_swallowed).
     sync_parent_dir(path).await
 }
 
@@ -940,12 +898,12 @@ fn dir_fsync_unsupported(e: &std::io::Error) -> bool {
 /// The exclusive create happens on a **sibling temp** that is written, chmodded
 /// and `fsync`ed first, and the final name is then claimed with `link(2)` —
 /// which, like `O_EXCL`, refuses to replace an existing name, so "did I create
-/// it?" is still the kernel's answer rather than a stale `exists()`. Creating
-/// the final name first and writing afterwards (the shape this replaces) has a
-/// window in which a SIGKILL or a power loss strands an empty file that every
-/// later call answers `Ok(false)` for — and for `oxrsys-runtime.toml` an empty
-/// file is *valid TOML*, so setup would go on treating a zero-byte config as
-/// hand-edited content it must not overwrite.
+/// it?" is the kernel's answer rather than a stale `exists()`. Claiming the
+/// final name before the bytes are written would let a SIGKILL or a power loss
+/// strand an empty file that every later call answers `Ok(false)` for — and an
+/// empty `oxrsys-runtime.toml` is *valid TOML*, so setup would treat a
+/// zero-byte config as hand-edited content it must not overwrite
+/// (tests::create_new_publishes_finished_bytes_and_leaves_no_temp).
 async fn create_new_real(path: &Path, bytes: &[u8]) -> Result<bool> {
     use tokio::io::AsyncWriteExt;
 
@@ -987,8 +945,6 @@ async fn create_new_real(path: &Path, bytes: &[u8]) -> Result<bool> {
         Err(e) => Err(SabrageError::io(path, e)),
     }
 }
-
-// ── dry run ───────────────────────────────────────────────────────────────────
 
 /// Records what would happen. Read-only probes still run, so the plan is
 /// accurate rather than optimistic.
@@ -1467,11 +1423,8 @@ mod tests {
     }
 
     /// r2:A2-4 regression: the write-once config is published whole or not at
-    /// all. The final name appears only once the bytes behind it are complete:
-    /// the exclusive create happens on a sibling temp, and `link(2)` claims the
-    /// real name. A crash in the middle can therefore strand a temp, never a
-    /// zero-length `oxrsys-runtime.toml` that every later run reads as
-    /// hand-edited content it must not replace.
+    /// all. A crash strands a temp, never a zero-length `oxrsys-runtime.toml`
+    /// that later runs read as hand-edited content they must not replace.
     #[tokio::test]
     async fn create_new_publishes_finished_bytes_and_leaves_no_temp() {
         let dir = scratch("create-new-publish");
@@ -1489,8 +1442,7 @@ mod tests {
             .collect();
         assert_eq!(names, vec!["oxrsys-runtime.toml".to_string()]);
 
-        // A file already at the final name is never replaced — including the
-        // empty one the old create-then-write shape could strand.
+        // A file already at the final name is never replaced, including an empty one.
         let empty = dir.join("empty.toml");
         std::fs::write(&empty, b"").unwrap();
         assert!(!ex.create_new(&empty, b"template").await.unwrap());
@@ -1519,7 +1471,7 @@ mod tests {
         let captured = dir.join("oxrsys-runtime.toml.displaced");
         ex.hard_link(&live, &captured).await.unwrap();
         // The link holds the bytes that were live at that instant, even after
-        // the destination is replaced by a rename.
+        // the linked-from name is replaced by an atomic rename.
         ex.write_atomic(&live, b"sabrage wrote this").await.unwrap();
         assert_eq!(
             std::fs::read(&captured).unwrap(),
@@ -1670,7 +1622,6 @@ mod tests {
                 "expected Cancelled, got {e:?}"
             );
         }
-        // And nothing happened.
         assert!(!dst.exists() && !out.exists() && !sub.exists());
         assert!(victim.is_file() && dir.is_dir());
 
