@@ -1,11 +1,10 @@
 <script lang="ts">
-  // Mounted once at the app root (App.svelte). Answers critique.md's app-quit
-  // gap: a live session must never be silently SIGKILLed by a dropped future
-  // when the user quits Sabrage (Cmd-Q, window close, logout) — this is the
-  // three-way choice that decision requires, surfaced the moment the backend
-  // asks (`sessionStore.quitRequested`, driven by Tauri's
-  // `RunEvent::ExitRequested` holding the quit open until one of the three
-  // buttons resolves it).
+  // Three-way app-quit gate for a live session: stop and quit, keep running
+  // and quit, or cancel. Mounted once at the app root (App.svelte); shown
+  // when sessionStore.quitRequested (Rust side intercepts ExitRequested/
+  // CloseRequested to prevent a live session dying with the process). Buttons
+  // answer via sessionStore.resolveQuit; unanswered, ipc.ts gives up after
+  // 20 s. Exit policy: sabrage/docs/design/critique.md.
   import { sessionStore } from "../stores/session.svelte";
 
   let stoppingAndQuitting = $state(false);
