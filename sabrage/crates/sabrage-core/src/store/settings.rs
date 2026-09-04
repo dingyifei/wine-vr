@@ -1,33 +1,16 @@
-//! `settings.json` — Sabrage's own global preferences.
-//!
+//! `settings.json` — Sabrage's own global preferences, at
 //! `~/Library/Application Support/Sabrage/settings.json`
-//! ([`crate::paths::sabrage_support_dir`], [`settings_path`]). GUI-only state:
-//! demo.sh has no counterpart (design-core §4.2). Written through the
-//! [`Executor`] like every other mutation (`--dry-run` plans instead of
-//! writing); read with plain `std::fs`, matching every other store module's
-//! convention (`session::state::load`).
+//! ([`crate::paths::sabrage_support_dir`], [`settings_path`]). GUI-only state
+//! with no demo.sh counterpart (design-core §4.2); written through the
+//! [`Executor`] like every other mutation, read with plain `std::fs`.
 //!
-//! # Forward compatibility
-//!
-//! Every field carries `#[serde(default)]` (via the struct-level attribute on
-//! [`Settings`] and [`LaunchDefaults`]), so an older file — or a hand-trimmed
-//! one — still loads: a missing field falls back to its default. A file that
-//! fails to *parse* at all is a hard [`crate::error::SabrageError`], never a
-//! silent reset — a corrupt `settings.json` should be visible, not quietly
-//! replaced.
-//!
-//! Fields this binary does **not** know are not ignored either: they are
-//! captured into [`Settings::extra`] — and into [`LaunchDefaults::extra`] for
-//! the one nested object, since an unknown key added *inside* `launch` is
-//! caught by the outer map's flatten no more than a top-level one is caught by
-//! nothing — and written back out verbatim by the next [`save`]. Without that,
-//! running an older Sabrage once — and touching one toggle, which autosaves
-//! the whole object — would silently delete everything a newer build had
-//! written. [`SETTINGS_VERSION`] rides along for the case a future change
-//! cannot be expressed as "unknown keys, preserved": [`load`] **refuses** a
-//! file whose `version` is newer than this binary's, exactly as
-//! [`super::library::load`] does, rather than reading it half-way and
-//! autosaving the remains back.
+//! Unknown keys — top-level and inside `launch` — are preserved verbatim so an
+//! older build's autosave cannot delete what a newer one wrote, and [`load`]
+//! refuses a file whose `version` is newer than [`SETTINGS_VERSION`] rather
+//! than reading it half-way. See
+//! tests::{unknown_fields_survive_a_load_save_round_trip,
+//! unknown_nested_launch_keys_survive_a_load_save_round_trip,
+//! a_newer_version_is_refused_and_its_bytes_left_alone}.
 
 use std::path::{Path, PathBuf};
 
@@ -51,25 +34,20 @@ pub struct LaunchDefaults {
     pub wired: bool,
     pub verbose: bool,
     /// Keys of this object a newer Sabrage wrote and this one has no field
-    /// for — [`Settings::extra`]'s story one nesting level down, and the
-    /// reason this struct is no longer `Copy`/`Eq` (a [`Value`] is neither).
-    ///
-    /// The outer flattened map only ever collects *top-level* keys, so before
-    /// this existed a future `launch.someFlag` was dropped while
-    /// deserializing `LaunchDefaults` and deleted by the next autosave — the
-    /// same downgrade loss the outer map exists to prevent, one level deeper.
-    /// The UI hands the whole loaded object back on save
-    /// (`{ ...settings, ...patch }`, `{ ...settings.launch, … }`), so a key
-    /// preserved here survives the full GUI round trip.
+    /// for, kept exactly as read and written straight back out. The outer
+    /// flattened map on [`Settings`] collects top-level keys only, so without
+    /// this a `launch.someFlag` is dropped during deserialization and deleted
+    /// by the next autosave — the UI hands the whole object back on save
+    /// (tests::unknown_nested_launch_keys_survive_a_load_save_round_trip).
     #[serde(flatten, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
 }
 
-/// Schema version written by this Sabrage into `settings.json`. Bump it only
-/// for a change the [`Settings::extra`]/[`LaunchDefaults::extra`] verbatim
-/// round-trip cannot absorb — and *always* bump it for such a change, because
-/// [`load`] refusing a newer file is the only thing standing between it and an
-/// older build's autosave.
+/// Schema version this Sabrage writes into `settings.json`. Bump it only for
+/// a change the [`Settings::extra`]/[`LaunchDefaults::extra`] verbatim round
+/// trip cannot absorb, and always for such a change: [`load`] refusing a newer
+/// file is the only guard against an older build's autosave
+/// (tests::a_newer_version_is_refused_and_its_bytes_left_alone).
 pub const SETTINGS_VERSION: u32 = 1;
 
 /// Sabrage's global preferences.
@@ -82,9 +60,8 @@ pub const SETTINGS_VERSION: u32 = 1;
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Settings {
-    /// [`SETTINGS_VERSION`] at write time. A file without one (every file
-    /// written before this field existed) reads as the current version — its
-    /// shape *is* the current shape.
+    /// [`SETTINGS_VERSION`] at write time. A file without the key reads as the
+    /// current version: its shape *is* the current shape.
     pub version: u32,
     /// Persisted override for [`crate::paths::resolve_repo_root`]'s first
     /// precedence tier.
@@ -97,30 +74,26 @@ pub struct Settings {
     /// may override any of them individually.
     pub launch: LaunchDefaults,
     /// Whether doctor/preflight probes may shell out to `adb` (which starts its
-    /// daemon as a side effect). Defaults **true** (see [`Settings`]'s
-    /// `Default` impl) — matches [`crate::checks::CheckOptions::new`]'s
-    /// doctor-parity default, via the struct-level `#[serde(default)]`
-    /// pulling missing fields from that impl — so an absent or
-    /// freshly-created settings file behaves exactly like doctor always has.
+    /// daemon as a side effect). Defaults **true**, matching
+    /// [`crate::checks::CheckOptions::new`]'s doctor-parity default, so an
+    /// absent or freshly-created settings file behaves exactly like doctor.
     pub allow_adb_probes: bool,
     /// One-time acknowledgement of the runtime-config write-once override
-    /// (design-core §4.1 rule 2's UX decision): the Settings screen shows a
-    /// confirmation panel the first time it writes `oxrsys-runtime.toml`, and
-    /// this flag suppresses it afterward. Defaults **false** — an existing
-    /// deployed settings file (this field is new) must still show the panel
-    /// once.
+    /// (design-core §4.1 rule 2): the Settings screen shows a confirmation
+    /// panel the first time it writes `oxrsys-runtime.toml`, and this flag
+    /// suppresses it afterward. Defaults **false**, so a file without the key
+    /// still shows the panel once.
     pub runtime_config_edit_acknowledged: bool,
     /// Every top-level key this binary does not have a field for, kept exactly
     /// as read and written straight back out.
     ///
-    /// This is the whole downgrade-safety story: the UI autosaves a complete
-    /// `Settings` object on every control change, so anything not represented
-    /// here would be deleted the first time an older build touched one toggle.
-    /// Flattened, so the keys sit at the top level of the JSON where they were
-    /// found; skipped when empty, so an ordinary file's bytes are unchanged.
+    /// The UI autosaves a complete `Settings` object on every control change,
+    /// so a key not represented here would be deleted the first time an older
+    /// build touched one toggle. Flattened, so the keys sit at the top level
+    /// where they were found; skipped when empty, so an ordinary file's bytes
+    /// are unchanged (tests::an_ordinary_settings_file_carries_no_extra_keys).
     ///
-    /// (This is also why [`Settings`] is no longer `Eq`: [`Value`] is only
-    /// `PartialEq` — `f64` has no total equality.)
+    /// [`Settings`] is `PartialEq` but not `Eq`, because [`Value`] is not.
     #[serde(flatten, skip_serializing_if = "Map::is_empty")]
     pub extra: Map<String, Value>,
 }
@@ -164,23 +137,15 @@ pub fn settings_path(sabrage_appsup: &Path) -> PathBuf {
 
 /// Load `settings.json`.
 ///
-/// * absent → `Ok(Settings::default())` — the ordinary first-run case;
-/// * present but unparseable → `Err` — never silently reset a file the user
-///   (or a bug) actually wrote something into;
-/// * present but written by a **newer** Sabrage (`version` >
-///   [`SETTINGS_VERSION`]) → `Err`, the same refusal
-///   [`super::library::load`] makes for the same reason: the two flattened
-///   `extra` maps preserve unknown *keys*, and a version bump is by
-///   definition reserved for a change they cannot express. Reading such a file
-///   would drop whatever that change was and the next autosave — the UI writes
-///   the whole object on every toggle — would persist the loss. Refusing
-///   leaves the bytes alone and tells the user to update.
-///   (The flip side, as in `library`: any schema change here that `extra`
-///   cannot absorb **must** bump [`SETTINGS_VERSION`].)
-///
-/// The GUI never writes over a refusal: `get_settings` surfaces the `Err`, the
-/// settings store leaves its state unloaded, and its `update` rejects rather
-/// than autosaving anything.
+/// * absent → `Ok(Settings::default())`, the ordinary first-run case;
+/// * present but unparseable → `Err`, never a silent reset
+///   (tests::a_corrupt_file_is_an_error_never_a_silent_reset);
+/// * `version` newer than [`SETTINGS_VERSION`] → `Err` with the bytes left
+///   untouched, the same refusal [`super::library::load`] makes: the two
+///   `extra` maps preserve unknown *keys*, so a version bump is reserved for a
+///   change they cannot express, and reading such a file would let the next
+///   autosave persist the loss
+///   (tests::a_newer_version_is_refused_and_its_bytes_left_alone).
 pub fn load(path: &Path) -> Result<Settings> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -299,9 +264,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A13a-3 / A13b-4: the two ways a newer file used to lose data on a
-    /// downgrade — a key nested inside `launch`, and a version this binary
-    /// cannot read at all.
+    /// A13a-3 / A13b-4 regression: a key nested inside `launch` survives a
+    /// load/save round trip on a downgrade (the version half of the pair is
+    /// pinned by tests::a_newer_version_is_refused_and_its_bytes_left_alone).
     #[tokio::test]
     async fn unknown_nested_launch_keys_survive_a_load_save_round_trip() {
         let dir = scratch("nested-downgrade");
