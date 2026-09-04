@@ -2376,6 +2376,38 @@ mod tests {
     }
     // ── (10) repo-root spelling ──────────────────────────────────────────────
 
+    /// `tap` and `chk` in scripts/demo/lib.sh return 0 with the tap disabled:
+    /// lib.sh is sourced by `set -e` stages, and a bare `[ -n … ] && …` tail
+    /// would end the stage whenever `WINEVR_DOCTOR_TAP` is unset.
+    mod lib_sh_contract {
+        use super::repo_root;
+
+        const SCRIPT: &str = "set -e; source \"$WINEVR_ROOT/scripts/demo/lib.sh\"; tap demo.slug ok; chk ok demo.slug \"msg\"; exit 0";
+
+        #[test]
+        fn lib_sh_tap_and_chk_return_zero_when_tap_disabled() {
+            let root = repo_root();
+            let home = std::env::temp_dir()
+                .join(format!("sabrage-parity-lib-sh-home-{}", std::process::id()));
+            std::fs::remove_dir_all(&home).ok();
+            std::fs::create_dir_all(&home).unwrap();
+            let out = std::process::Command::new("zsh")
+                .args(["-c", SCRIPT])
+                .env("WINEVR_ROOT", &root)
+                .env("HOME", &home)
+                .env_remove("WINEVR_DOCTOR_TAP")
+                .output()
+                .expect("zsh runs");
+            std::fs::remove_dir_all(&home).ok();
+            assert!(
+                out.status.success(),
+                "tap/chk with the tap off must not end a set -e stage: status {:?}, stderr {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     /// Both front-ends embed the repo root as an absolute string inside the
     /// root-owned host manifest and compare those bytes **literally**
     /// (`install.sh`'s `[ "$(cat "$HOST_XR_JSON")" = "$WANT" ]`,
