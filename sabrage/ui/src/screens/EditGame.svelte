@@ -1,11 +1,11 @@
 <script lang="ts">
-  // Add/edit one library entry — Identity & paths (editable + debounced
-  // `validateGame`), Patches and Streaming (v1 trim: read-only display, the
-  // global runtime values live in Settings), and per-flag launch overrides.
-  // `gameId === null` is the "Add game" path (starts from
-  // `newGameTemplate()`); otherwise this edits a saved entry in place.
-  // Structure/classes follow the mockup (Sabrage.dc.html lines 132-222); the
-  // load/save/validate state pattern follows Doctor.svelte/Session.svelte.
+  // Add/edit one library entry: Identity & paths (editable, debounced
+  // `validateGame`), Patches and Streaming (read-only — global runtime values
+  // live in Settings), and per-flag launch overrides. Owns a deep-cloned draft
+  // and writes `libraryStore` only on Save; `gameId === null` is the "Add game"
+  // path (from `newGameTemplate()`), otherwise edits a saved entry in place.
+  // `isLivePhase` (shared with Session.svelte) gates Revert; Save is never
+  // phase-gated.
 
   import { onMount } from "svelte";
   import { errMsg } from "../lib/text";
@@ -30,10 +30,8 @@
   import type { Screen } from "../types";
 
   interface Props {
-    /** `null` = Add game (unsaved, from `newGameTemplate()`). Otherwise the
-     * saved entry's id — looked up in `libraryStore.rows` first (already
-     * fresh from the Library screen's own `refresh()`), falling back to a
-     * `refresh()` of our own if it isn't there yet. */
+    /** `null` = Add game (unsaved, from `newGameTemplate()`); otherwise the
+     * id of the saved entry to edit. */
     gameId: string | null;
     onDone: () => void;
     onNavigate?: (screen: Screen) => void;
@@ -48,18 +46,15 @@
     noDll: "no steam_api64.dll found yet",
   };
 
-  // ── load ─────────────────────────────────────────────────────────────────
 
   let loading = $state(true);
   let loadError = $state<string | null>(null);
   /** The working copy — deep-cloned off the store/template so edits here
    * never mutate `libraryStore.rows` before Save. */
   let entry = $state<GameEntry | null>(null);
-  /** `entry.bsDir` as loaded (persisted) — `revertOriginalSteamDll` mutates
-   * the row's *saved* `bsDir`, not this unsaved draft (see `doRevert`'s
-   * `expectedBsDir`, which the backend fails closed against on a mismatch).
-   * `null` for the Add-game path (`gameId === null`), where Revert never
-   * renders at all. */
+  /** `entry.bsDir` as persisted — Revert targets the *saved* row, not this
+   * unsaved draft (see `doRevert`'s `expectedBsDir`, which the backend fails
+   * closed against). `null` on the Add-game path, where Revert never renders. */
   let loadedBsDir = $state<string | null>(null);
 
   const bottles = $derived(bottlesStore.bottles);
@@ -94,7 +89,6 @@
     if (!settingsStore.loaded) void settingsStore.load();
   });
 
-  // ── validation (debounced 300 ms) ───────────────────────────────────────
 
   let validity = $state<GameValidity | null>(null);
   let validating = $state(false);
@@ -121,9 +115,9 @@
     void entry.bottle;
     if (validateTimer) clearTimeout(validateTimer);
     validateTimer = setTimeout(() => void runValidate(), 300);
-    // Disarm on teardown: Cancel/Save/"Open Settings" within 300 ms of the last
-    // keystroke would otherwise fire a `validate_game` for a screen that no
-    // longer exists and write `$state` on a destroyed component.
+    // Disarm on teardown: Cancel/Save/"Open Settings" within 300 ms of the
+    // last keystroke would otherwise validate for a destroyed component and
+    // write `$state` on it (timing-only; the UI has no test harness).
     return () => {
       if (validateTimer) clearTimeout(validateTimer);
       validateTimer = null;
@@ -133,9 +127,9 @@
   async function browseDir() {
     if (!entry) return;
     try {
-      // `open()` rejects (it does not resolve null) when the dialog capability
-      // is missing or the panel fails, so an unhandled rejection here would
-      // leave Browse… looking like a dead button.
+      // `pickFolder` rejects on a missing dialog capability or failed panel
+      // (a cancel resolves `null`, absorbed by the `if (picked)` below), so
+      // an unhandled rejection would leave Browse… as a dead button.
       // Start in the field's own dir, else the bottle's derived Beat Saber
       // path (nearest existing ancestor), never wherever macOS last was.
       const suggestion = await suggestBsDir(entry.bottle || null, entry.bsDir || null);
@@ -146,7 +140,6 @@
     }
   }
 
-  // ── launch overrides (three-way: use global / on / off) ────────────────
 
   type OverrideChoice = "global" | "on" | "off";
   function toChoice(v: boolean | null): OverrideChoice {
@@ -161,11 +154,9 @@
   let wiredChoice = $state<OverrideChoice>("global");
   let verboseChoice = $state<OverrideChoice>("global");
 
-  // Seed the four local selects once, the moment `entry` first resolves —
-  // not an $effect (which would also fire every time the choices themselves
-  // change and immediately overwrite `entry.launchOverrides` right back with
-  // its own `fromChoice`, which is harmless but pointless); a one-shot
-  // `$effect.pre`-free plain effect keyed on `entry` becoming non-null.
+  // Seed the four selects once, the moment `entry` first resolves. The
+  // `seeded` latch also gates the write-back effect below, which would
+  // otherwise stamp four `"global"` defaults over `entry.launchOverrides`.
   let seeded = false;
   $effect(() => {
     if (entry && !seeded) {
@@ -185,14 +176,10 @@
     entry.launchOverrides.verbose = fromChoice(verboseChoice);
   });
 
-  // ── revert original steam_api64.dll ─────────────────────────────────────
 
-  // The backend deliberately leaves `phase` at `"exited"` after a session
-  // ends until the next launch — `!== "idle"` disabled Revert forever after
-  // one clean run, even though that run is exactly what creates the
-  // `.orig-steam` backup this button restores. `isLivePhase` is the same
-  // shared predicate `blocksMutation`/Session.svelte use, and excludes
-  // `"exited"`.
+  // `phase` stays `"exited"` after a session ends until the next launch, so a
+  // `!== "idle"` gate would disable Revert forever after the very run that
+  // creates the `.orig-steam` backup it restores; `isLivePhase` excludes it.
   /** Has the draft path diverged from the persisted row Revert would
    * actually target? Purely advisory — a proactive hint, not the safety
    * boundary: the backend refuses the mismatch either way (see `doRevert`).
@@ -211,11 +198,9 @@
     reverting = true;
     revertError = null;
     try {
-      // `entry.bsDir` is the draft path this form validated and displayed —
-      // pass it as `expectedBsDir` so the backend fails closed if it differs
-      // from the *persisted* row's `bsDir` (what it would actually mutate),
-      // rather than silently reverting a different installation than the one
-      // on screen. See `revertOriginalSteamDll`'s doc comment.
+      // Pass the draft path this form validated and displayed as
+      // `expectedBsDir`: the backend fails closed when it differs from the
+      // persisted row's `bsDir`, rather than reverting an install not on screen.
       revertReport = await revertOriginalSteamDll(gameId, entry.bsDir);
       revertConfirm = false;
       void runValidate();
@@ -226,7 +211,6 @@
     }
   }
 
-  // ── save / cancel ────────────────────────────────────────────────────────
 
   let saving = $state(false);
   let saveError = $state<string | null>(null);
