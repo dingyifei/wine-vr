@@ -1,18 +1,9 @@
-//! Group `overlay` — doctor.sh section 10: the global bridge overlay inside CrossOver.app (a CrossOver update silently reverts it).
+//! Group `overlay` — the global bridge overlay inside CrossOver.app: the DXMT
+//! artifacts and the built `wineopenxr` binaries must match the copies under
+//! `$CX/lib` (a CrossOver update silently reverts them).
 //!
-//! Slugs owned here, in contract order:
-//!
-//! * `overlay.dxmt-d3d11` — `ext/dxmt-artifacts/x86_64-windows/d3d11.dll` ==
-//!   `$CX/lib/dxmt/x86_64-windows/d3d11.dll`
-//! * `overlay.dxmt-winemetal` — `ext/dxmt-artifacts/x86_64-unix/winemetal.so`
-//!   == `$CX/lib/dxmt/x86_64-unix/winemetal.so`
-//! * `overlay.woxr-dll` — built `wineopenxr.dll` ==
-//!   `$CX/lib/wine/x86_64-windows/wineopenxr.dll`
-//! * `overlay.woxr-so` — built `wineopenxr.so` ==
-//!   `$CX/lib/wine/x86_64-unix/wineopenxr.so`
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Owns `overlay.dxmt-d3d11`, `overlay.dxmt-winemetal`, `overlay.woxr-dll`,
+//! and `overlay.woxr-so` in contract order. Mirrors doctor.sh section 10.
 
 use std::path::Path;
 
@@ -20,25 +11,24 @@ use super::Evaluator;
 use super::{CheckCtx, CheckOutcome, SkipReason};
 use crate::util::cmp_files;
 
-/// `basename "$_dst"` — the destination's file name, used in both the
-/// current and stale/missing messages.
 fn basename(p: &Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
 
-/// Shared shape of the four `overlay.*` global-overlay-current checks:
-/// `cmp -s "$_src" "$_dst"`.
+/// Compares one overlay source against its destination under `$CX/lib`.
+///
+/// Passes when byte-identical; fails with the `./demo.sh install` remedy
+/// when they differ or either file is missing; skipped only when `dst` is
+/// `None` (no CrossOver.app).
 fn overlay_check(
     ctx: &CheckCtx,
     slug: &'static str,
     src: &Path,
     dst: Option<&Path>,
 ) -> CheckOutcome {
-    // doctor.sh section 10 guards the whole section with `[ -n "${CX_APP:-}" ]` and
-    // taps each slug as a bare `… skipped` with no `info` line (unlike sections
-    // 8/11), so there is no shell reason text to match verbatim — this one is ours.
+    // Skip reason is ours — doctor.sh section 10 taps bare `… skipped` with no `info` line.
     let Some(dst) = dst else {
         return CheckOutcome::skipped(slug, SkipReason::new("CrossOver.app not found"));
     };

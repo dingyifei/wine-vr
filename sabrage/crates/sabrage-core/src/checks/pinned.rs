@@ -58,11 +58,8 @@ fn dep_dxmt(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-/// One hash pass instead of two: the file used to be hashed once to decide
-/// pass/warn (`file_sha256_matches`) and, on the warn path, hashed *again* to
-/// put the actual digest in the detail — doubling a hash of a multi-megabyte
-/// dll on every doctor/preflight run. `sha256_file` runs exactly once here;
-/// its `Result` decides both the outcome and, when relevant, the detail text.
+/// Hash this multi-megabyte dll once and reuse the digest for the warn detail.
+/// Re-hashing to build it is the obvious edit; no test catches the added cost.
 fn dep_goldberg(ctx: &CheckCtx) -> CheckOutcome {
     let gbe = &ctx.paths.gbe_dll;
     let expected = &contract().deps.gbe_dll_sha256;

@@ -1,15 +1,11 @@
 //! Group `game` — doctor.sh section 8: the Beat Saber 1.29.4 install.
 //!
-//! Slugs owned here, in contract order:
+//! Binds `game.present` and `game.version` in contract order; every evaluator
+//! is `fn(&CheckCtx) -> CheckOutcome`, a read-only probe.
 //!
-//! * `game.present` — `<bs_dir>/Beat Saber.exe` exists; the remedy is the
-//!   pinned `DepotDownloader` line (`Contract::depot_command`). Whole section
-//!   skipped when there is neither a bottle nor `--bs-dir`
-//! * `game.version` — `util::bs_version` starts with `1.29.4` — WARN
-//!   otherwise (newer builds hit the Meta account gate)
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Printed strings are reproduced verbatim (`docs/troubleshooting.md` quotes
+//! them and nothing tests it). Tap-only strings are impl-owned prose, marked
+//! at their site.
 
 use std::path::PathBuf;
 
@@ -18,19 +14,15 @@ use super::{CheckCtx, CheckOutcome, SkipReason};
 use crate::contract::contract;
 use crate::util::bs_version;
 
-/// doctor.sh's `[ "$BOTTLE_OK" = 0 ] && [ -z "${WINEVR_BS_DIR:-}" ]` — the
-/// whole section is skipped only when there is neither a resolved bottle nor
-/// an explicit `--bs-dir` override.
+/// True when doctor skips the whole Beat Saber section: neither a resolved
+/// bottle nor an explicit `--bs-dir` override.
 fn section_skipped(ctx: &CheckCtx) -> bool {
     ctx.bottle.is_none() && ctx.opts.bs_dir_override.is_none()
 }
 
-/// The `info "Beat Saber check skipped (needs --bottle or --bs-dir)"` line,
-/// verbatim. doctor prints it once (no slug) and then taps both `game.*`
-/// slugs `skipped` with no text of their own; sabrage carries the same text
-/// as the [`SkipReason`] on both outcomes instead of dropping it entirely
-/// (design-core §10 divergence 11 — sabrage always says why a check was
-/// skipped, even where doctor stays silent per-slug).
+/// doctor's skip line, verbatim (doctor.sh section 8). doctor taps both
+/// `game.*` slugs skipped with no per-slug text; sabrage carries this text as
+/// the [`SkipReason`] on both (tests::no_bottle_no_override_skips_both_slugs_with_the_verbatim_reason).
 const SECTION_SKIP_REASON: &str = "Beat Saber check skipped (needs --bottle or --bs-dir)";
 
 fn exe_path(ctx: &CheckCtx) -> PathBuf {
@@ -42,9 +34,8 @@ fn game_present(ctx: &CheckCtx) -> CheckOutcome {
         return CheckOutcome::skipped("game.present", SkipReason::new(SECTION_SKIP_REASON));
     }
     if exe_path(ctx).is_file() {
-        // doctor.sh: `tap game.present ok` — no row is printed for the found
-        // case; the visible row is game.version's instead. The tap channel
-        // carries slug+status only (see `crate::tap`), so this message is
+        // doctor.sh taps `game.present ok` and prints no row for the found
+        // case; the tap channel carries slug+status only, so this message is
         // impl-owned prose, not a verbatim doctor.sh string.
         CheckOutcome::silent_pass(
             "game.present",

@@ -1,24 +1,12 @@
-//! Group `bottle-bridge` — doctor.sh section 11: the per-bottle half of the bridge install.
+//! Group `bottle-bridge` (doctor.sh section 11): the per-bottle half of the
+//! bridge install. Binds `bottle.woxr-dll`, `bottle.manifest` and
+//! `bottle.registry` in contract order; every evaluator is a read-only probe.
+//! With no bottle all three return `skipped` carrying doctor.sh's verbatim
+//! info line as the [`SkipReason`]. Message and remedy prose must match
+//! `scripts/demo/doctor.sh` verbatim.
 //!
-//! Slugs owned here, in contract order:
-//!
-//! * `bottle.woxr-dll` — built `wineopenxr.dll` == `<sys32>/wineopenxr.dll`
-//! * `bottle.manifest` — `<prefix>/drive_c/openxr/wineopenxr64.json` exists
-//! * `bottle.registry` — `<prefix>/system.reg` carries `ActiveRuntime`,
-//!   `openxr`, and `wineopenxr64.json` in that order on one line — the exact
-//!   shape of `grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json'`, reproduced
-//!   as an ordered substring scan (no regex metacharacters beyond `.*`, which
-//!   `str::find` chained left-to-right already captures)
-//!
-//! Whole section: doctor.sh only reaches these three checks when `BOTTLE_OK`
-//! is 1 (i.e. `CheckCtx::bottle` is `Some`); otherwise it prints one `info`
-//! line and taps all three slugs `skipped` with no text of their own.
-//! Following `checks::game`'s precedent (design-core §10 divergence 11),
-//! sabrage carries that verbatim `info` text as the [`SkipReason`] on every
-//! skipped slug instead of dropping it.
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! See tests::{ordered_substring_scan_matches_grep_semantics,
+//! no_bottle_skips_all_three_with_the_verbatim_reason}.
 
 use super::Evaluator;
 use super::{CheckCtx, CheckOutcome, SkipReason};
@@ -27,14 +15,13 @@ use crate::util::cmp_files;
 /// The `info "per-bottle bridge checks skipped (no bottle)"` line, verbatim.
 const SECTION_SKIP_REASON: &str = "per-bottle bridge checks skipped (no bottle)";
 
+/// Whether `text` carries `ActiveRuntime`, `openxr` and `wineopenxr64.json`
+/// in that order on one line: the semantics of doctor.sh's
 /// `grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json' "$PREFIX/system.reg"`.
 ///
-/// grep (no `-z`) matches per line, and `.` never spans a newline, so a match
-/// requires all three literals on **one** line, in order. `.*` is greedy but
-/// existence-only: the leftmost occurrence of each literal, searched after the
-/// end of the previous one, is always the least constraining choice for the
-/// remaining literals, so a simple left-to-right chained `find` decides
-/// existence exactly like the regex engine would.
+/// A left-to-right chained `find` decides that existence question exactly:
+/// `.*` is greedy but existence-only, and `.` never spans a newline.
+/// See tests::ordered_substring_scan_matches_grep_semantics.
 fn registry_has_active_runtime(text: &str) -> bool {
     text.lines().any(|line| {
         let needles = ["ActiveRuntime", "openxr", "wineopenxr64.json"];
@@ -121,13 +108,11 @@ mod tests {
 
     #[test]
     fn ordered_substring_scan_matches_grep_semantics() {
-        // A realistic wine system.reg line: "ActiveRuntime", then "openxr"
-        // (from the `C:\openxr\` segment), then "wineopenxr64.json" — all on
-        // one line, in order.
+        // A realistic wine system.reg line: the middle `openxr` comes from
+        // the `C:\openxr\` path segment, not from a key of its own.
         assert!(registry_has_active_runtime(
             r#""ActiveRuntime"="C:\openxr\wineopenxr64.json""#
         ));
-        // Out of order: openxr/wineopenxr64.json before ActiveRuntime -> no match.
         assert!(!registry_has_active_runtime(
             "openxr wineopenxr64.json ActiveRuntime"
         ));
@@ -135,7 +120,6 @@ mod tests {
         assert!(!registry_has_active_runtime(
             "ActiveRuntime openxr\nwineopenxr64.json"
         ));
-        // All three present, in order, on one line.
         assert!(registry_has_active_runtime(
             "junk ActiveRuntime=openxr/wineopenxr64.json trailing"
         ));

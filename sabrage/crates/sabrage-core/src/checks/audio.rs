@@ -15,15 +15,9 @@ use super::Evaluator;
 use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
 use crate::paths::which;
 
-/// doctor.sh section 15:
-/// ```sh
-/// if command -v SwitchAudioSource >/dev/null 2>&1; then
-///   if SwitchAudioSource -a -t output 2>/dev/null | grep -qx "BlackHole 2ch"; then chk ok …
-///   else chk warn … "BlackHole 2ch not present …"; fi
-/// else chk warn … "switchaudio-osx not installed …"; fi
-/// ```
-/// `grep -qx` is a *whole-line* match: `"BlackHole 2ch"` must be exactly one
-/// line of `-a -t output`'s device list, not a substring of a longer name.
+/// Warns when `SwitchAudioSource` is absent or `BlackHole 2ch` is not an
+/// exact line in `-a -t output` (`grep -qx`—a longer device name won't match).
+/// Reference: `scripts/demo/doctor.sh` section 15.
 fn audio_loopback(_ctx: &CheckCtx) -> CheckOutcome {
     let Some(bin) = which("SwitchAudioSource") else {
         return CheckOutcome::warn(

@@ -1,33 +1,24 @@
 //! Group `build` — doctor.sh section 9, 9b: build outputs, including the native-arm64 encoder helper.
 //!
-//! Slugs owned here, in contract order:
+//! Slugs owned here, in contract order: `build.oxr-dylib`, `build.alvr-core`,
+//! `build.runtime-json`, `build.woxr-dll`, `build.woxr-so`, `build.dashboard`,
+//! `build.helper-staged`, `build.helper-arm64`.
 //!
-//! * `build.oxr-dylib` — `build-x64/runtime/liboxrsys-runtime.dylib` exists
-//! * `build.alvr-core` — `build-x64/runtime/libalvr_server_core.dylib` exists
-//! * `build.runtime-json` — `build-x64/runtime/oxrsys-runtime.json` exists
-//! * `build.woxr-dll` — `ext/wineopenxr/build/src/pe/wineopenxr.dll` exists
-//! * `build.woxr-so` — `ext/wineopenxr/build/src/unix/wineopenxr.so` exists
-//! * `build.dashboard` — `ext/ALVR/target/release/alvr_dashboard` exists
-//! * `build.helper-staged` — `oxrsys-encoder-helper` staged next to the
-//!   runtime dylib (the x86_64 runtime locates it beside its own dylib)
-//! * `build.helper-arm64` — the staged helper is an executable with an arm64
-//!   slice — `arm64e` alone must NOT satisfy it, matching `lipo -archs … |
-//!   grep -qw arm64`; a wrong-arch binary here shadows the good one and
-//!   silently drops the session to in-process H.264
+//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a read-only probe whose
+//! message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
 //!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! `build.helper-arm64` must not accept `arm64e` alone: a wrong-arch binary
+//! staged next to the runtime dylib shadows the good one and silently drops the
+//! session to in-process H.264 (tests::helper_is_arm64_rejects_arm64e_only_binaries).
 
 use std::path::Path;
 
 use super::Evaluator;
 use super::{CheckCtx, CheckOutcome, SkipReason};
 
-// ── section 9: plain build-output presence ─────────────────────────────────────
-
-/// Shared shape of the six `build.*` output-presence checks: `[ -f "$_f" ]`,
-/// message is `"built: <relpath>"` / `"missing build output: <relpath>"` where
-/// `<relpath>` is doctor's `"${_f#$ROOT/}"` (`Paths::rel_display`).
+/// Shared shape of the six `build.*` output-presence checks: passes with
+/// `built: <relpath>`, fails with `missing build output: <relpath>` and the
+/// `./demo.sh build` remedy, where `<relpath>` is `Paths::rel_display`.
 fn built_output(ctx: &CheckCtx, slug: &'static str, path: &Path) -> CheckOutcome {
     let rel = ctx.paths.rel_display(path);
     if path.is_file() {
@@ -65,12 +56,9 @@ fn dashboard(ctx: &CheckCtx) -> CheckOutcome {
     built_output(ctx, "build.dashboard", &ctx.paths.alvr_dashboard)
 }
 
-// ── section 9b: native-arm64 encoder helper ─────────────────────────────────────
-
-/// `[ -x "$1" ]`: file exists and has *some* execute bit set. Mirrors the
-/// (deliberately simplified — not full euid/egid-aware) approximation
-/// `Paths`'s own `which()` uses for `command -v`, kept consistent here rather
-/// than re-deriving stricter POSIX semantics `lib.sh` never relied on either.
+/// True when `p` is a regular file with any execute bit set — `[ -x "$1" ]`
+/// to the same approximation the `paths` module's `which()` uses (no
+/// euid/egid resolution, which `lib.sh` never relied on either).
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
@@ -78,11 +66,9 @@ fn is_executable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `lipo -archs "$path" 2>/dev/null`, stdout only, trailing newlines stripped
-/// the way `$(...)` strips them. Empty when `lipo` cannot run at all (missing
-/// binary, missing `path`) or emits nothing to stdout — exactly the shell's
-/// `$(lipo -archs "$OXR_HELPER_BIN" 2>/dev/null)` in the FAIL message, which
-/// captures stdout regardless of `lipo`'s exit status.
+/// `lipo -archs <path>` stdout with trailing newlines stripped as `$(...)` does;
+/// empty when `lipo` cannot run or writes nothing. Exit status is ignored; the
+/// FAIL message of `build.helper-arm64` embeds this value.
 pub fn lipo_archs_stdout(path: &Path) -> String {
     match std::process::Command::new("lipo")
         .arg("-archs")
@@ -96,18 +82,13 @@ pub fn lipo_archs_stdout(path: &Path) -> String {
     }
 }
 
-/// lib.sh's `helper_is_arm64()`. This is its single home in the crate;
-/// `crate::util` re-exports it for the fix and stage layers (the build stage
-/// arch-gates the helper it just built, and `fix.restage-helper` arch-gates its
-/// source before staging it).
+/// True when `path` is executable and `lipo -archs` lists `arm64` as a whole
+/// word. Single home of lib.sh's `helper_is_arm64()`; `crate::util` re-exports
+/// it for the fix and stage layers.
 ///
-/// ```zsh
-/// helper_is_arm64() { [ -x "$1" ] && lipo -archs "$1" 2>/dev/null | grep -qw arm64; }
-/// ```
-/// `grep -w` requires `arm64` as a whole word — `lipo -archs` prints a
-/// space-separated arch list, so a fat `x86_64 arm64e` binary must NOT match
-/// (the `e` glues onto `arm64` as a word character) while `x86_64 arm64` and
-/// thin `arm64` must.
+/// A fat `x86_64 arm64e` binary must NOT match, while `x86_64 arm64` and thin
+/// `arm64` must (tests::helper_is_arm64_rejects_arm64e_only_binaries,
+/// tests::helper_is_arm64_is_true_for_the_thin_arm64_test_binary_itself).
 pub fn helper_is_arm64(path: &Path) -> bool {
     if !is_executable(path) {
         return false;
@@ -274,15 +255,13 @@ mod tests {
 
     #[test]
     fn helper_is_arm64_is_true_for_the_thin_arm64_test_binary_itself() {
-        // On this repo's target machine (Apple Silicon, per CLAUDE.md) the
-        // compiled test binary is itself a thin-arm64 Mach-O executable — a
-        // real positive case without shelling out to a compiler. Skip on
-        // machines that can't satisfy the precondition (Intel Mac, Linux CI:
-        // no lipo / non-arm64 build), like the sibling tests do.
+        // The compiled test binary is itself a thin-arm64 Mach-O on this
+        // repo's target machine: a real positive case with no compiler.
+        // Skipped where that cannot hold (Intel Mac, Linux CI, no usable lipo).
         let exe = std::env::current_exe().expect("current_exe resolves");
         let archs = lipo_archs_stdout(&exe);
         if !archs.split_ascii_whitespace().any(|a| a == "arm64") {
-            return; // not an arm64 build or no usable lipo — nothing to assert
+            return;
         }
         assert!(is_executable(&exe));
         assert!(helper_is_arm64(&exe), "lipo -archs {exe:?} = {archs:?}");
@@ -295,7 +274,7 @@ mod tests {
         // `grep -qw arm64` (the `e` makes it a different word).
         let ls = Path::new("/bin/ls");
         if !ls.is_file() {
-            return; // not on this machine; nothing to assert
+            return;
         }
         let archs = lipo_archs_stdout(ls);
         if archs.split_ascii_whitespace().any(|a| a == "arm64") {

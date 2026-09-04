@@ -1,27 +1,12 @@
-//! Group `bottle` — doctor.sh section 3: the bottle itself; resolves the context every later section consumes.
+//! Group `bottle` — doctor.sh section 3: resolves the bottle context every
+//! later section consumes. Slug order pinned by
+//! checks::tests::registry_binds_in_contract_order_and_covers_every_slug.
 //!
-//! Slugs owned here, in contract order:
-//!
-//! * `bottle.named` — a bottle name was supplied
-//!   (`--bottle`/`WINEVR_BOTTLE`); the remedy lists existing bottles
-//! * `bottle.exists` — `<prefix>/cxbottle.conf` exists
-//! * `bottle.template` — `"Template" = "win11_64"` — WARN, not FAIL, on
-//!   anything else
-//! * `bottle.gfx-dxmt` — `"CX_GRAPHICS_BACKEND" = "dxmt"` present verbatim
-//!   (anchored grep; the CrossOver GUI's `auto` no longer selects DXMT and
-//!   the game stalls before D3D11 init)
-//! * `bottle.zdrive` — only when the bottle resolved AND `BS_DIR` is outside
-//!   `<prefix>/drive_c/`: `dosdevices/z:` exists
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
-//!
-//! `bottle.template`/`bottle.gfx-dxmt`/`bottle.zdrive` all report
-//! [`CheckStatus::Skipped`] whenever `ctx.bottle` is `None` — doctor.sh emits
-//! a silent `tap … skipped` for the same three rows both when no bottle name
-//! was given at all and when a named bottle doesn't resolve
-//! ([`skip_reason_for_missing_bottle`] tells the two apart in the reason
-//! text, since doctor's bare tap can't).
+//! Every evaluator is a read-only `fn(&CheckCtx) -> CheckOutcome`.
+//! `bottle.template`/`bottle.gfx-dxmt`/`bottle.zdrive` report
+//! [`CheckStatus::Skipped`] whenever `ctx.bottle` is `None` — see
+//! `skip_reason_for_missing_bottle` for the reason text and
+//! tests::bottle_named_fail_without_a_name_skips_the_rest_of_the_section.
 
 use std::path::Path;
 
@@ -62,8 +47,6 @@ fn bs_dir_outside_drive_c(bottle: &Bottle, bs_dir: &Path) -> bool {
     let glob = format!("{}/drive_c/", bottle.prefix.display());
     !bs_dir.to_string_lossy().starts_with(&glob)
 }
-
-// ── evaluators ──────────────────────────────────────────────────────────────
 
 fn bottle_named(ctx: &CheckCtx) -> CheckOutcome {
     if ctx.bottle_requested {

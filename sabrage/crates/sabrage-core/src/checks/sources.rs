@@ -1,32 +1,21 @@
 //! Group `sources` — doctor.sh section 6: submodule checkouts and the ALVR patch set.
 //!
-//! Slugs owned here, in contract order:
-//!
-//! * `src.oxrsys` — `ext/oxrsys/.git` exists (file or dir)
-//! * `src.wineopenxr` — `ext/wineopenxr/.git` exists
-//! * `src.alvr` — `ext/ALVR/.git` exists
-//! * `src.alvr-patchset` — `ext/ALVR/alvr/server_core/src/connection.rs`
-//!   contains `is_streaming_nonblocking` — the pin sanity-check for the
-//!   oxrsys-v20.14.1 branch
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Slugs, in contract order: `src.oxrsys`, `src.wineopenxr`, `src.alvr`,
+//! `src.alvr-patchset` (`is_streaming_nonblocking` pin sanity-check for
+//! oxrsys-v20.14.1).
 
 use std::path::Path;
 
 use super::Evaluator;
 use super::{CheckCtx, CheckOutcome};
 
-/// doctor.sh's `[ -f "$_sm/.git" ] || [ -d "$_sm/.git" ]`: a submodule
-/// checkout is "present" when it has a `.git` entry at all — a file (a real
-/// git submodule) or a directory (a plain nested clone).
+/// True when the submodule has a `.git` entry — a file (gitlink) or a
+/// directory (nested clone).
 fn git_marker_present(submodule_dir: &Path) -> bool {
     let marker = submodule_dir.join(".git");
     marker.is_file() || marker.is_dir()
 }
 
-/// `basename $_sm` — the last path component, used in the "submodule <name>
-/// present / not initialized" message.
 fn basename(p: &Path) -> String {
     p.file_name()
         .map(|s| s.to_string_lossy().into_owned())
@@ -59,9 +48,9 @@ fn src_alvr(ctx: &CheckCtx) -> CheckOutcome {
     submodule_check("src.alvr", &ctx.paths.alvr)
 }
 
-/// `grep -q is_streaming_nonblocking "$ALVR/alvr/server_core/src/connection.rs"`
-/// — a plain substring search (the needle has no regex metacharacters, so
-/// basic-grep and `str::contains` agree).
+/// Passes when ALVR's `alvr/server_core/src/connection.rs` contains `is_streaming_nonblocking`;
+/// a missing or unreadable file fails (`tests::patchset_check_greps_connection_rs`). No regex
+/// metacharacters in the needle, so this substring search and doctor.sh's `grep -q` agree.
 fn src_alvr_patchset(ctx: &CheckCtx) -> CheckOutcome {
     let path = ctx.paths.alvr.join("alvr/server_core/src/connection.rs");
     let present = std::fs::read(&path)

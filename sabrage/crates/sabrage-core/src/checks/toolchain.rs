@@ -1,17 +1,12 @@
-//! Group `toolchain` — doctor.sh section 4-5: build tools and the rustup cross target.
+//! Group `toolchain` — the `tool.*` and `rust.x64-target` doctor rows.
 //!
-//! Slugs owned here, in contract order:
+//! Slug list and order live in `contract/pipeline.toml`; shell probes are in
+//! `scripts/demo/doctor.sh` sections `4.` and `5.`.
 //!
-//! * `tool.cmake` — `command -v cmake`
-//! * `tool.ninja` — `command -v ninja`
-//! * `tool.git` — `command -v git`
-//! * `tool.curl` — `command -v curl`
-//! * `tool.mingw` — `command -v x86_64-w64-mingw32-gcc`
-//! * `rust.x64-target` — `rustup` on PATH AND `rustup target list
-//!   --installed` contains `x86_64-apple-darwin` (Homebrew cargo lacks the
-//!   cross-target std)
+//! `rust.x64-target` requires a rustup toolchain because Homebrew's cargo
+//! ships no std for `x86_64-apple-darwin`.
 //!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
+//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a read-only probe.
 //! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
 
 use std::process::Command;
@@ -25,8 +20,8 @@ use crate::paths::which;
 /// prints it verbatim regardless of which binary in the list was missing.
 const TOOLCHAIN_REMEDY: &str = "brew install cmake ninja git mingw-w64";
 
-/// `command -v <bin> >/dev/null 2>&1` — pass message is the bare binary name
-/// (`${_t#*:}`), fail message is `"<bin> missing"`, shared remedy.
+/// Outcome for `slug` from whether `bin` resolves on `PATH`, carrying the
+/// shared toolchain remedy when it does not.
 fn tool_check(slug: &'static str, bin: &str) -> CheckOutcome {
     if which(bin).is_some() {
         CheckOutcome::pass(slug, bin)
@@ -55,12 +50,10 @@ fn tool_mingw(_ctx: &CheckCtx) -> CheckOutcome {
     tool_check("tool.mingw", "x86_64-w64-mingw32-gcc")
 }
 
-/// `rustup target list --installed 2>/dev/null | grep -q x86_64-apple-darwin`.
+/// Whether `rustup target list --installed` printed `x86_64-apple-darwin`.
 ///
-/// A pipeline's exit status is the last stage's (`grep -q`), so whether
-/// `rustup` itself succeeded is irrelevant beyond what it printed to stdout —
-/// this checks the same substring against whatever stdout was captured,
-/// without gating on `rustup`'s own exit code.
+/// `rustup`'s own exit status is ignored: the doctor.sh pipeline's status
+/// is `grep -q`'s, so only stdout decides.
 fn rustup_has_x86_64_darwin() -> bool {
     match Command::new("rustup")
         .args(["target", "list", "--installed"])
@@ -127,9 +120,6 @@ mod tests {
         // the shape is internally consistent with a direct `which` probe
         // rather than asserting a fixed pass/fail outcome.
         let c = ctx();
-        // `check_fn` is a `checks::Evaluator` function pointer (`fn(&CheckCtx)
-        // -> CheckOutcome`), not JavaScript/Python `eval()` — no string is
-        // ever interpreted as code here.
         for (check_fn, bin) in [
             (tool_cmake as Evaluator, "cmake"),
             (tool_ninja as Evaluator, "ninja"),

@@ -1,18 +1,14 @@
-//! Group `system, crossover` — doctor.sh section 1-2: hardware, OS version, and the CrossOver install.
+//! Group `system, crossover` — hardware, OS version, and the CrossOver install.
 //!
-//! Slugs owned here, in contract order:
+//! Slugs owned here, in contract order: `sys.arch`, `sys.macos27`,
+//! `cx.present` (silent when found), `cx.version`.
 //!
-//! * `sys.arch` — `uname -m` is arm64
-//! * `sys.macos27` — macOS >= 27 — below it the in-process BGRA-direct encode
-//!   emits all-zero chroma (green video); a hard FAIL on purpose, even on the
-//!   native-helper path, so the inproc fallback stays viable
-//! * `cx.present` — `CrossOver.app` found (`~/Applications` wins over
-//!   `/Applications`); silent-when-present (`tap cx.present ok`)
-//! * `cx.version` — `CFBundleShortVersionString` >= 26.2 — a real version
-//!   compare, not zsh's `sort -V | grep -qx` accident
+//! `sys.macos27` is a hard FAIL below macOS 27 even on the native-arm64
+//! encoder path, so the in-process fallback stays viable.
 //!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim.
+//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a read-only probe.
+//! Message and remedy strings must match scripts/demo/doctor.sh verbatim;
+//! `cx.present` is silent in doctor.sh, so its message is Sabrage-only.
 
 use std::path::Path;
 use std::process::{Command, Output};
@@ -20,11 +16,6 @@ use std::process::{Command, Output};
 use super::Evaluator;
 #[allow(unused_imports)]
 use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
-
-// ── subprocess probes ──────────────────────────────────────────────────────
-// Each probe below shells out to exactly the tool doctor.sh uses, with the
-// same stderr-discarding / fallback behavior. Read-only: nothing here spawns
-// a process that could mutate machine state.
 
 fn run(cmd: &str, args: &[&str]) -> Option<Output> {
     Command::new(cmd).args(args).output().ok()
@@ -34,7 +25,6 @@ fn stdout_trimmed(o: &Output) -> String {
     crate::util::strip_trailing_newlines(&String::from_utf8_lossy(&o.stdout)).to_string()
 }
 
-/// `$(uname -m)`.
 fn uname_m() -> String {
     run("uname", &["-m"])
         .as_ref()
@@ -42,8 +32,8 @@ fn uname_m() -> String {
         .unwrap_or_default()
 }
 
-/// `$(sysctl -n machdep.cpu.brand_string 2>/dev/null)` — stderr discarded, no
-/// `|| echo` fallback in the shell, so any failure yields an empty string.
+/// The CPU brand string, empty when the probe fails: doctor.sh discards stderr
+/// and has no `|| echo` fallback here.
 fn cpu_brand_string() -> String {
     match run("sysctl", &["-n", "machdep.cpu.brand_string"]) {
         Some(o) if o.status.success() => stdout_trimmed(&o),
@@ -51,7 +41,8 @@ fn cpu_brand_string() -> String {
     }
 }
 
-/// `$(sw_vers -productVersion 2>/dev/null || echo 0)`.
+/// The macOS product version, or `"0"` when the probe fails, matching
+/// doctor.sh's `|| echo 0` fallback.
 fn macos_product_version() -> String {
     match run("sw_vers", &["-productVersion"]) {
         Some(o) if o.status.success() => stdout_trimmed(&o),
@@ -59,7 +50,8 @@ fn macos_product_version() -> String {
     }
 }
 
-/// `$(defaults read "<plist>" CFBundleShortVersionString 2>/dev/null || echo 0)`.
+/// `CFBundleShortVersionString` from `plist`, or `"0"` when the read fails,
+/// matching doctor.sh's `|| echo 0` fallback.
 fn cf_bundle_short_version(plist: &Path) -> String {
     match run(
         "defaults",
@@ -74,12 +66,6 @@ fn cf_bundle_short_version(plist: &Path) -> String {
     }
 }
 
-// ── real version comparison ────────────────────────────────────────────────
-// design-core divergence 10: a genuine dotted-integer comparison, not
-// doctor.sh's `sort -n` / `sort -V | tail -1 | grep -qx` string-ordering
-// approximation. Must still agree with the shell on every observable machine
-// state — see the `dotted_ge_table` test.
-
 /// Each dot-separated component's leading digit run, parsed as `u64` (`0` for
 /// a component with no leading digits — e.g. a non-numeric build suffix, or
 /// the shell's `echo 0` fallback for a failed probe).
@@ -92,15 +78,14 @@ fn dotted_components(ver: &str) -> Vec<u64> {
         .collect()
 }
 
-/// True iff `a`'s dotted version is `>=` `b`'s: compare components left to
-/// right, treating a missing trailing component on either side as `0`.
+/// True iff `a`'s dotted version is `>=` `b`'s, treating a missing trailing
+/// component on either side as `0`; a single-component `b` (e.g. `"27"`)
+/// therefore pins only the major version, as doctor.sh's `${OSVER%%.*}`
+/// truncation does for `sys.macos27`.
 ///
-/// A single-component `b` (e.g. `"27"`) makes this exactly "the major version
-/// of `a` is >= that number" — doctor.sh truncates `$OSVER` to
-/// `${OSVER%%.*}` before comparing, so minor/patch digits never affect the
-/// `sys.macos27` verdict, and this falls out for free: once the leading
-/// component ties, every deeper component on `a`'s side can only push the
-/// result towards "greater or equal", never below it.
+/// design-core divergence 10: this is a numeric compare, not doctor.sh's
+/// string ordering, and the two must agree on every observable version —
+/// tests::dotted_ge_table.
 fn dotted_ge(a: &str, b: &str) -> bool {
     let ca = dotted_components(a);
     let cb = dotted_components(b);
@@ -116,8 +101,6 @@ fn dotted_ge(a: &str, b: &str) -> bool {
     }
     true
 }
-
-// ── evaluators ──────────────────────────────────────────────────────────────
 
 fn sys_arch(_ctx: &CheckCtx) -> CheckOutcome {
     let arch = uname_m();
@@ -213,7 +196,6 @@ mod tests {
 
     #[test]
     fn dotted_ge_table() {
-        // Equal / simple ordering.
         assert!(dotted_ge("27", "27"));
         assert!(dotted_ge("28", "27"));
         assert!(!dotted_ge("26", "27"));

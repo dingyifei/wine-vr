@@ -19,19 +19,10 @@ use super::Evaluator;
 #[allow(unused_imports)]
 use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
 
-/// doctor.sh section 12:
-/// ```sh
-/// if [ -f "$HOST_XR_JSON" ]; then
-///   LP="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["runtime"]["library_path"])' "$HOST_XR_JSON" 2>/dev/null)"
-///   PYRC=$?
-///   if [ $PYRC -ne 0 ]; then chk fail … "cannot parse … (broken python3 or malformed JSON)" …
-///   elif [ "$LP" = "$OXR_DYLIB" ] && [ -f "$LP" ]; then chk ok …
-///   elif [ -n "$LP" ] && [ -f "$LP" ]; then chk warn …
-///   else chk fail … "host registration points at a missing dylib" …
-///   fi
-/// else chk fail … "$HOST_XR_JSON missing" …
-/// fi
-/// ```
+/// `host.manifest`: the root-owned host OpenXR manifest exists and its
+/// `runtime.library_path` routes to the expected `oxr_dylib`.
+///
+/// Reference: scripts/demo/doctor.sh `# 12. host loader registration`
 fn host_manifest(ctx: &CheckCtx) -> CheckOutcome {
     let host_json = &ctx.paths.host_xr_json;
     if !host_json.is_file() {
@@ -82,22 +73,17 @@ fn host_manifest(ctx: &CheckCtx) -> CheckOutcome {
     outcome.with_detail(format!("parsed library_path = {lp:?}"))
 }
 
-/// `json.load(open(path))["runtime"]["library_path"]` — `None` covers every
-/// way the shell's `PYRC != 0` branch is reachable: the file cannot be read,
-/// the JSON does not parse, the top level is not an object, `"runtime"` is
-/// absent (or itself not an object), or `"library_path"` is absent under it.
+/// Parses `runtime.library_path` out of the host OpenXR manifest at `path`.
 ///
-/// Simplification, deliberate: a `library_path` value that parses but is not
-/// a JSON *string* (a number, bool, null, array, object) would NOT raise in
-/// real Python — `print()` stringifies anything — but a legitimate host
-/// manifest (install.sh's own template) never writes one, so this folds that
-/// synthetic case into "cannot parse" rather than reproducing CPython's
-/// `str()` for every JSON type. Either way the check ends up FAIL.
+/// Returns `None` for every way the shell's `PYRC != 0` branch is reachable:
+/// unreadable file, malformed JSON, missing or non-object `"runtime"`, or
+/// missing `"library_path"`. A non-string `library_path` also yields `None`
+/// (real Python would stringify it); `contract/active_runtime.x86_64.json.template`
+/// never writes one, and both routes end in FAIL.
 ///
-/// `pub` (Phase 4): `src-tauri/src/commands.rs`'s `get_repo_info` reuses this
-/// exact parse for its `hostManifestLibraryPath`/`hostManifestPointsHere`
-/// fields, rather than a second JSON-poking copy — the brief's one named
-/// exception to "nothing else in core" for the Tauri command-layer agent.
+/// `pub` because `src-tauri/src/commands.rs`'s `get_repo_info` reuses this
+/// parse for its `hostManifestLibraryPath`/`hostManifestPointsHere` fields
+/// rather than poking the JSON a second time.
 pub fn host_manifest_library_path(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
     let value: serde_json::Value = serde_json::from_str(&text).ok()?;
