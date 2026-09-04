@@ -3,119 +3,22 @@
 //! build systems are incremental).
 //!
 //! Reference: `scripts/demo/build.sh`. Six steps, in order:
+//! [`step::BUILD_TOOLS`], [`step::BUILD_OXRSYS`], [`step::BUILD_HELPER`],
+//! [`step::BUILD_WINEOPENXR`], [`step::BUILD_DASHBOARD`], [`step::BUILD_OUTPUTS`].
 //!
-//! 1. [`step::BUILD_TOOLS`] — `cmake`, `ninja`, `x86_64-w64-mingw32-gcc` on
-//!    `PATH`; `rustup target list --installed` contains `x86_64-apple-darwin`;
-//!    `ext/oxrsys/runtime` exists. Each failure has its own verbatim die text
-//!    (the shell's `for tool in …; do … || die "$tool missing — …"; done`
-//!    aborts on the *first* missing tool, in that exact order — so does this).
-//! 2. [`step::BUILD_OXRSYS`] — configure `build-x64` (Ninja, Debug, x86_64,
-//!    `OXRSYS_ENABLE_ALVR=ON`) then build.
-//! 3. [`step::BUILD_HELPER`] — configure `build-helper-arm64` (thin arm64,
-//!    `OXRSYS_BUILD_ENCODER_HELPER=ON`), build the `oxrsys_encoder_helper`
-//!    target, verify the product is arm64 ([`crate::util::helper_is_arm64`] —
-//!    `arm64e` alone must NOT satisfy), then stage it next to the runtime dylib
-//!    with `copy_if_changed`.
-//! 4. [`step::BUILD_WINEOPENXR`] — configure + build `ext/wineopenxr/build`
-//!    (no explicit generator — cmake's platform default, unlike the two Ninja
-//!    trees above).
-//! 5. [`step::BUILD_DASHBOARD`] — `cargo build -p alvr_dashboard --release`,
-//!    run **in** `ext/ALVR` (native arch, no cross target). The shell's only
-//!    explicit `die` in this file lives here.
-//! 6. [`step::BUILD_OUTPUTS`] — the seven expected artifacts must all exist.
+//! Children are spawned with [`crate::process::default_child_path`]; the tool gates
+//! probe that same list, so a Finder-launched `.app` missing `~/.cargo/bin` never
+//! reports a false "missing" for a tool the spawn finds.
 //!
-//! # `PATH`
+//! Under `--dry-run` nothing is compiled: the helper postconditions, destination-side
+//! validation, and seven-artifact sweep are skipped, and no row claims a build
+//! (tests::a_dry_run_stages_nothing_and_says_would_build,
+//! tests::narrate_built_swaps_the_verb_and_the_severity_under_dry_run).
 //!
-//! Every child here is spawned with [`crate::process::default_child_path`] as
-//! its `PATH` (Homebrew, `/usr/local`, `~/.cargo/bin`, ahead of whatever this
-//! process inherited): `demo.sh` runs from a login shell that already has
-//! cmake/ninja/mingw/rustup on `PATH`, but a GUI-launched Sabrage may not, and
-//! `rustup`/`cargo` specifically live in `~/.cargo/bin`, which a
-//! Finder-launched `.app` does not inherit. The tool-gate probes below search
-//! that same resolved list (not just this process's own inherited `PATH`) so
-//! they never report a false "missing" for a tool the spawn itself would have
-//! found.
-//!
-//! # Cancellation outside the executor
-//!
-//! [`rustup_gate_message`]'s probe is a bare `tokio::process::Command`, not a
-//! [`crate::stages::StageCtx::child`] routed through
-//! [`crate::executor::Executor::run_child`] (it is a plain read-only query, not
-//! a mutation the executor needs to plan or skip under `--dry-run`) — but a
-//! cold `rustup` invocation can itself be slow, so it still needs to notice a
-//! Cancel promptly rather than block the whole stage on it. It races the
-//! child's output against `ctx.cancel.cancelled()` with `tokio::select!`,
-//! exactly like `privilege.rs`'s child helpers of the same shape, and spawns
-//! with `kill_on_drop(true)` so losing that race actually kills the child.
-//!
-//! # No explicit `die` text for the six `cmake` calls
-//!
-//! Unlike `install.sh`'s `reg add` or this file's own `cargo build`, none of
-//! the `cmake`/`cmake --build` invocations has a bespoke `die "…"` — build.sh
-//! runs under a bare `set -e`, so the shell just stops on the child's exit
-//! code. [`run_child_ok`] is that shape (mirrors `setup.rs`'s helper of the
-//! same name and same empty-tail rationale: every line the child printed
-//! already reached the event stream as it ran, so re-capturing a tail buys
-//! nothing here).
-//!
-//! # Ninja progress
-//!
-//! The two `-G Ninja` trees (oxrsys, the encoder helper) get best-effort
-//! [`StageEvent::Progress`] derived from ninja's default `[n/m]` status
-//! prefix ([`parse_ninja_progress`]). `Executor::run_child`'s sink is fixed at
-//! construction (same `Arc` as `ctx.sink` — see `executor.rs`'s module doc),
-//! so there is no way to derive a second event stream from it without a
-//! second sink. [`run_ninja_build_ok`] gets one by calling
-//! [`crate::process::run_ok`] directly on the real-run path only, with a sink
-//! that forwards every event to `ctx.sink` unchanged and *additionally* emits
-//! Progress for a matching stdout chunk; the dry-run path is untouched
-//! (delegates straight to [`run_child_ok`], which is exactly `ctx.executor`),
-//! so `--dry-run` still plans instead of acting and nothing here duplicates
-//! the plan bookkeeping `Executor::planned()` owns.
-//!
-//! # Post-build assertions and `--dry-run`
-//!
-//! `[ -f "$OXR_HELPER_BIN_BUILT" ]`, the arm64 gate, and the final
-//! seven-artifact sweep all assert that *this stage's own* cmake/cargo
-//! invocations actually produced something. Under `DryRunExecutor` none of
-//! them ran, so on a checkout that has genuinely never been built these three
-//! checks would `die` for the sole reason that the dry run correctly did not
-//! build anything — the exact false negative `setup.rs`'s module doc names
-//! for its own postcondition checks. They are therefore skipped (not
-//! `die`'d) when [`crate::executor::Executor::is_dry_run`] is true.
-//!
-//! The narrative rows follow suit rather than claiming something that did
-//! not happen: the helper's `copy_if_changed` outcome swaps to `fixes/
-//! helper.rs`'s `restage_helper`-established "would install"/"installed"
-//! verb pair for `Copied::Copied` (its `Copied::Unchanged` text is
-//! reproduced unconditionally either way — that branch is trustworthy even
-//! under dry-run, since the executor's dry-run `copy_if_changed` still does
-//! the real byte compare); the closing "all build outputs present" row
-//! is skipped in favor of a plain dry-run notice, since — unlike a copy
-//! outcome — file existence has no honest hypothetical phrasing; and each of
-//! the four per-component completion rows (`"oxrsys built"`, the helper's
-//! closing line, `"wineopenxr built"`, `"ALVR dashboard built"`) swaps to its
-//! own future-tense `info` ([`narrate_built`]) under a dry run, so no `Ok` row
-//! ever says "built" in the same invocation that ends with "nothing was
-//! built".
-//!
-//! # The staged helper is validated at its *destination*, not only at its source
-//!
-//! A staged helper carrying the right bytes with its execute bit lost (an
-//! `unzip`ped or `rsync -rt --chmod`ed tree, a restore from a backup that
-//! dropped modes) is *not* installed — `checks/build.rs`'s `build.helper-arm64`
-//! and run's preflight both require `[ -x ]` — yet build used to arch-gate only
-//! `oxr_helper_built`, its own *source*, and then report success, leaving
-//! doctor FAILing with no stage able to repair it (a byte-only comparison sees
-//! nothing to do). [`crate::executor::Executor::copy_if_changed`] now repairs a
-//! mode mismatch itself, so the common case is fixed one layer down;
-//! [`stage_encoder_helper`] still re-validates `oxr_helper_staged` after the
-//! copy and, when it *still* fails, removes and re-copies it (a fresh copy takes
-//! the source's mode) before giving up with a remedy naming the staged path —
-//! this stage may not report a build as complete while the artifact it just
-//! staged is one doctor FAIL. The shell has neither half (`lib.sh`'s
-//! `install_if_changed` is `cmp -s` + `cp`); both are additive — no shell text
-//! changes, and a healthy tree behaves identically.
+//! The staged helper is validated at its *destination*, which build.sh never checks:
+//! a staged copy with the right bytes but no execute bit still FAILs doctor's
+//! `build.helper-arm64`, so `stage_encoder_helper` re-validates and re-copies
+//! (tests::a_byte_identical_but_non_executable_staged_helper_is_repaired).
 
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -129,8 +32,6 @@ use crate::executor::Copied;
 use crate::process::{self, ChildSpec};
 use crate::stages::{EventSink, StageCtx};
 use crate::util::{helper_is_arm64, lipo_archs_stdout};
-
-// ── verbatim die/message text (build.sh) ─────────────────────────────────────
 
 /// `die "rustup x86_64-apple-darwin target missing — …"`.
 const RUSTUP_TARGET_MISSING_MESSAGE: &str = "rustup x86_64-apple-darwin target missing — install rustup via https://rustup.rs and source ~/.cargo/env, then: rustup toolchain install stable && rustup target add x86_64-apple-darwin";
@@ -180,19 +81,11 @@ fn staged_helper_unusable_message(staged: &Path) -> String {
     )
 }
 
-// ── the build-x64 configure arguments ────────────────────────────────────────
-
-/// `cmake -S "$OXRSYS" -B "$OXR_BUILD" …` (build.sh).
+/// `cmake -S "$OXRSYS" -B "$OXR_BUILD" …` (build.sh), identical argument order.
 ///
-/// `-DOXRSYS_BUILD_ENCODER_HELPER=OFF` is load-bearing, not decoration: CMake
-/// `option()` is a no-op against an existing cache entry, so a `build-x64` tree
-/// that was ever configured with the helper enabled (its default for *every*
-/// Apple configure before the arch gate landed, and a failed configure still
-/// writes the cache) keeps `ON` forever and re-fatals on the thin-arm64 gate at
-/// every retry. Passing it explicitly repairs such a tree in place and makes
-/// CLAUDE.md's arch-gate invariant (2) — `OXRSYS_BUILD_ENCODER_HELPER:BOOL=OFF`
-/// in `build-x64` — true by construction. Kept identical, and in the same
-/// position, to build.sh's own argument list.
+/// `-DOXRSYS_BUILD_ENCODER_HELPER=OFF` (appended by `oxrsys_x64_configure_args`)
+/// repairs a `build-x64` cache stuck at `ON` — CMake `option()` cannot clear it, and it
+/// re-fatals on the thin-arm64 gate (r1:A5-2, tests::the_x64_configure_spec_renders_the_helper_off_flag).
 const OXRSYS_X64_CONFIGURE_ARGS: [&str; 5] = [
     "-G",
     "Ninja",
@@ -212,8 +105,6 @@ fn oxrsys_x64_configure_args() -> Vec<&'static str> {
     args
 }
 
-// ── narrative completion rows ────────────────────────────────────────────────
-
 /// `ok(built)` on a real run; `info(would)` under `--dry-run`, where nothing
 /// was compiled and an `Ok "… built"` row would contradict the stage's own
 /// closing "nothing was built" notice.
@@ -226,9 +117,8 @@ fn narrate_built(ctx: &StageCtx, step_id: StepId, dry_run: bool, built: &str, wo
     }
 }
 
-// ── tool gates ────────────────────────────────────────────────────────────────
-
-/// `for tool in cmake ninja x86_64-w64-mingw32-gcc`, in that order.
+/// `command -v <name>` searched over `search_path` (e.g.
+/// [`crate::process::default_child_path`]), not this process's inherited `PATH`.
 const REQUIRED_TOOLS: [&str; 3] = ["cmake", "ninja", "x86_64-w64-mingw32-gcc"];
 
 /// `command -v <name>` searched over `search_path` (a colon-joined list, e.g.
@@ -242,9 +132,8 @@ fn resolve_tool(name: &str, search_path: &str) -> Option<PathBuf> {
 }
 
 /// Is `path` an existing file with any execute bit set? (`command -v`
-/// semantics for one candidate path.) A private copy — `paths.rs` and
-/// `checks/build.rs` each already carry their own; a fourth is cheaper than a
-/// shared one three separate task owners would all have had to agree on.
+/// semantics for one candidate path.) Deliberately a private copy: `paths.rs`
+/// and `checks/build.rs` each keep their own.
 fn is_executable_file(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(path)
@@ -262,17 +151,12 @@ fn tool_gate_message(search_path: &str) -> Option<String> {
 }
 
 /// `rustup target list --installed 2>/dev/null | grep -q x86_64-apple-darwin`.
-/// A missing `rustup` binary and a present-but-target-less one produce the
-/// same die text, matching the shell (a failed command substitution pipes
-/// empty output into `grep -q`, which fails the same way either way).
+/// A missing `rustup` and a present-but-target-less one produce the same die text,
+/// matching the shell (tests::rustup_gate_dies_unless_the_x86_64_target_is_installed).
 ///
-/// Cancel-aware like `privilege.rs`'s child helpers of the same shape
-/// (`run_capturing`): a `tokio::select!` races the child's output against
-/// `cancel.cancelled()`, so a Cancel that lands while `rustup` is still
-/// spawning its own subprocess (it can be slow on a cold toolchain) returns
-/// [`SabrageError::Cancelled`] immediately instead of blocking the caller
-/// until `rustup` finishes on its own. `kill_on_drop(true)` means losing that
-/// race actually kills the child rather than leaking it.
+/// Cancel-aware: races the child against `cancel.cancelled()` with
+/// `kill_on_drop(true)`, so a Cancel during a cold `rustup` returns
+/// [`SabrageError::Cancelled`] at once (tests::rustup_gate_is_cancel_aware_and_kills_the_child).
 async fn rustup_gate_message(
     search_path: &str,
     cancel: &CancellationToken,
@@ -304,8 +188,6 @@ async fn rustup_gate_message(
     })
 }
 
-// ── ninja progress ────────────────────────────────────────────────────────────
-
 /// Best-effort parse of ninja's default status prefix (`[12/340] Building CXX
 /// object …`). `None` for anything else — a cmake configure line, a compiler
 /// warning, wineopenxr's Makefiles-style `[ 50%]` (that tree has no
@@ -318,8 +200,6 @@ fn parse_ninja_progress(line: &str) -> Option<(u64, u64)> {
     let total: u64 = den.trim().parse().ok()?;
     Some((current, total))
 }
-
-// ── child spec builders ───────────────────────────────────────────────────────
 
 fn configure_spec(
     ctx: &StageCtx,
@@ -355,13 +235,11 @@ fn build_spec(
         .env_path(search_path.to_string())
 }
 
-// ── spawn helpers (see module doc) ───────────────────────────────────────────
-
 /// Run `spec` through `ctx.executor`, mapping a non-zero real exit to
-/// [`SabrageError::ChildFailed`] with an empty tail — see the module doc for
-/// why there is no bespoke `die` text to reproduce here and why the tail is
-/// deliberately not re-captured (identical rationale to `setup.rs`'s helper
-/// of the same name and shape).
+/// [`SabrageError::ChildFailed`] with an empty tail: build.sh runs under a bare
+/// `set -e` and has no bespoke `die` text for the `cmake` calls, and every line
+/// the child printed already reached the event stream, so re-capturing a tail
+/// buys nothing (tests::run_child_ok_maps_a_real_failure_to_child_failed_with_no_tail).
 async fn run_child_ok(ctx: &StageCtx, spec: ChildSpec) -> Result<()> {
     let status = ctx.executor.run_child(&spec).await?;
     if status.success() {
@@ -375,9 +253,12 @@ async fn run_child_ok(ctx: &StageCtx, spec: ChildSpec) -> Result<()> {
     }
 }
 
-/// [`run_child_ok`], plus best-effort [`StageEvent::Progress`] derived from
-/// `spec`'s stdout (see the module doc's "Ninja progress" section for why
-/// this needs its own sink on the real-run path only).
+/// `run_child_ok`, plus best-effort [`StageEvent::Progress`] derived from
+/// `spec`'s stdout. It needs its own sink because `Executor::run_child`'s is
+/// fixed at construction, and it takes that path only on a real run so
+/// `--dry-run` keeps `Executor::planned()`'s bookkeeping
+/// (tests::run_ninja_build_ok_derives_progress_and_forwards_output_on_a_real_run,
+/// tests::run_ninja_build_ok_never_spawns_under_dry_run_either).
 async fn run_ninja_build_ok(ctx: &StageCtx, spec: ChildSpec) -> Result<()> {
     if ctx.executor.is_dry_run() {
         return run_child_ok(ctx, spec).await;
@@ -410,8 +291,6 @@ async fn run_ninja_build_ok(ctx: &StageCtx, spec: ChildSpec) -> Result<()> {
     process::run_ok(&spec, &sink, &ctx.cancel).await?;
     Ok(())
 }
-
-// ── encoder-helper staging ────────────────────────────────────────────────────
 
 /// Arch-gate the freshly built helper, stage it next to the runtime dylib, and
 /// — the part the shell has no counterpart for — make sure the *staged* file
@@ -446,10 +325,8 @@ async fn stage_encoder_helper(ctx: &StageCtx, dry_run: bool) -> Result<()> {
         Copied::Unchanged => ctx
             .step(step::BUILD_HELPER)
             .info(format!("unchanged: {}", staged.display())),
-        // Dry-run gets `fixes/helper.rs`'s "would install" verb (its own
-        // `restage_helper` uses the same swap for the same
-        // `copy_if_changed` outcome) rather than claiming a copy that did
-        // not happen.
+        // Dry run takes `fixes/helper.rs`'s "would install" verb rather than
+        // claiming a copy that did not happen.
         Copied::Copied => {
             let verb = if dry_run {
                 "would install"
@@ -462,9 +339,9 @@ async fn stage_encoder_helper(ctx: &StageCtx, dry_run: bool) -> Result<()> {
     }
 
     // `copy_if_changed` compares bytes, so `Unchanged` says nothing about the
-    // destination's mode — and a staged helper without its execute bit fails
-    // `build.helper-arm64` while build reports success (see the module doc).
-    // Remove and re-copy: `std::fs::copy` gives the new file the source's mode.
+    // destination's mode, and a staged helper without its execute bit FAILs
+    // doctor's `build.helper-arm64` (tests::a_byte_identical_but_non_executable_staged_helper_is_repaired).
+    // Remove first: a fresh `std::fs::copy` takes the source's mode.
     if !dry_run && !helper_is_arm64(staged) {
         exec.remove_file(staged).await?;
         exec.copy_if_changed(built, staged).await?;
@@ -487,14 +364,11 @@ async fn stage_encoder_helper(ctx: &StageCtx, dry_run: bool) -> Result<()> {
     Ok(())
 }
 
-// ── the stage ─────────────────────────────────────────────────────────────────
-
 /// Execute the stage.
 pub async fn run(ctx: &StageCtx) -> Result<()> {
     let search_path = process::default_child_path();
     let dry_run = ctx.executor.is_dry_run();
 
-    // ── 1. tool gates + submodules ────────────────────────────────────────
     if let Some(msg) = tool_gate_message(&search_path) {
         return Err(ctx.fatal(msg, None));
     }
@@ -506,7 +380,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     }
     let cmake_bin = resolve_tool("cmake", &search_path).expect("checked by tool_gate_message");
 
-    // ── 2. oxrsys: build-x64 (Debug, x86_64, ALVR on) ────────────────────────
     ctx.step(step::BUILD_OXRSYS)
         .info("building oxrsys (build-x64: Ninja, Debug, x86_64, ALVR on)...");
     run_child_ok(
@@ -542,7 +415,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         "would build oxrsys (build-x64)",
     );
 
-    // ── 3. native-arm64 encoder helper ───────────────────────────────────────
     ctx.step(step::BUILD_HELPER)
         .info("building oxrsys encoder helper (build-helper-arm64: Ninja, Debug, arm64)...");
     run_child_ok(
@@ -579,7 +451,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
 
     stage_encoder_helper(ctx, dry_run).await?;
 
-    // ── 4. wineopenxr (PE dll via mingw + unix .so) ──────────────────────────
     ctx.step(step::BUILD_WINEOPENXR)
         .info("building wineopenxr (PE dll via mingw + unix .so)...");
     let woxr_build = ctx.paths.woxr.join("build");
@@ -616,7 +487,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         "would build wineopenxr",
     );
 
-    // ── 5. ALVR server dashboard (native arch, release) ──────────────────────
     ctx.step(step::BUILD_DASHBOARD)
         .info("building ALVR server dashboard (release)...");
     let cargo_bin = resolve_tool("cargo", &search_path).unwrap_or_else(|| PathBuf::from("cargo"));
@@ -637,12 +507,9 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
         "would build the ALVR dashboard",
     );
 
-    // ── 6. final outputs presence sweep ──────────────────────────────────────
-    // Same dry-run exemption as the helper's postconditions above — "all
-    // build outputs present" is a hard factual claim a dry run cannot
-    // honestly make (nothing was actually built), so unlike the narrative
-    // "built" rows above, this row is skipped entirely rather than
-    // reproduced unconditionally.
+    // "all build outputs present" is a hard factual claim a dry run cannot
+    // honestly make, so unlike the narrative "built" rows this one is skipped
+    // entirely rather than swapped to a future-tense verb.
     if dry_run {
         ctx.step(step::BUILD_OUTPUTS)
             .info("build-output presence sweep skipped under --dry-run (nothing was built)");
@@ -692,8 +559,6 @@ mod tests {
         path
     }
 
-    // ── ninja progress parser ────────────────────────────────────────────────
-
     /// Row of the ninja-progress table: (label, input line, expected parse).
     type NinjaCase = (&'static str, &'static str, Option<(u64, u64)>);
 
@@ -740,8 +605,6 @@ mod tests {
             assert_eq!(parse_ninja_progress(line), *expected, "{label}");
         }
     }
-
-    // ── tool gate, fake PATH dir ─────────────────────────────────────────────
 
     #[test]
     fn resolve_tool_finds_an_executable_and_rejects_absent_or_non_executable_ones() {
@@ -852,8 +715,6 @@ mod tests {
         }
     }
 
-    // ── rustup gate ───────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn rustup_gate_dies_unless_the_x86_64_target_is_installed() {
         // (label, scratch tag, fake tool filename, script, expected). Row 1's
@@ -918,8 +779,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── encoder-helper arch-gate message texts ──────────────────────────────
-
     #[test]
     fn helper_missing_binary_message_is_verbatim() {
         let path = Path::new("/repo/ext/oxrsys/build-helper-arm64/runtime/oxrsys-encoder-helper");
@@ -958,8 +817,6 @@ mod tests {
              /repo/ext/oxrsys/build-x64/runtime/liboxrsys-runtime.dylib"
         );
     }
-
-    // ── configure_spec / build_spec argv shape ──────────────────────────────
 
     #[tokio::test]
     async fn configure_and_build_specs_render_the_exact_argv() {
@@ -1016,8 +873,6 @@ mod tests {
         assert_eq!(build.step, step::BUILD_HELPER);
     }
 
-    // ── build-x64 configure arguments ────────────────────────────────────────
-
     /// r1:A5-2 regression: the build-x64 configure passes the whole of build.sh's
     /// argument list, ending in `-DOXRSYS_BUILD_ENCODER_HELPER=OFF` — CMake
     /// `option()` cannot clear a cache already holding ON.
@@ -1043,8 +898,6 @@ mod tests {
              order"
         );
     }
-
-    // ── narrative rows never claim a build a dry run did not do ──────────────
 
     #[tokio::test]
     async fn narrate_built_swaps_the_verb_and_the_severity_under_dry_run() {
@@ -1088,8 +941,6 @@ mod tests {
             }
         }
     }
-
-    // ── the staged helper is validated at its destination ────────────────────
 
     /// A [`StageCtx`] with a real executor whose every path lives under `root`.
     fn real_ctx_at(root: &Path) -> (StageCtx, Arc<std::sync::Mutex<Vec<StageEvent>>>) {
@@ -1275,8 +1126,6 @@ mod tests {
              /repo/ext/oxrsys/build-x64/runtime/oxrsys-encoder-helper and re-run ./demo.sh build"
         );
     }
-
-    // ── run_child_ok / run_ninja_build_ok, dry-run and real ─────────────────
 
     fn dry_run_ctx() -> StageCtx {
         use crate::executor::{DryRunExecutor, Executor};
