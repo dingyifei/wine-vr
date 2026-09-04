@@ -1,7 +1,4 @@
-// Small text-formatting helpers shared across screens/components. Pulled out
-// of Doctor.svelte/GateModal.svelte (which had byte-identical copies) and the
-// ~25 `catch (e)` sites that all hand-rolled the same
-// `e instanceof Error ? e.message : String(e)` one-liner.
+// Small text-formatting helpers shared across screens, components, and stores.
 
 /** Capitalize the first character; empty string passes through unchanged. */
 export function cap(s: string): string {
@@ -16,8 +13,7 @@ export function titleCase(group: string): string {
     .join(" ");
 }
 
-/** The message text for a caught value that may or may not be an `Error` —
- * every `catch (e)` block in this UI wants exactly this. */
+/** The message text for a caught value that may or may not be an `Error`. */
 export function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
