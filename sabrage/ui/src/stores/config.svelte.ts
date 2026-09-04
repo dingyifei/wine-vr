@@ -17,9 +17,9 @@ function createConfigStore() {
   let loading = $state(false);
   let error = $state<string | null>(null);
 
-  /** Fetch the current `RuntimeConfigView`. Never rejects for a missing
-   * `oxrsys-runtime.toml` (`view.exists` is `false`, every value `null`) —
-   * only a genuine IPC-layer failure sets `error`. */
+  /** Fetch the current `RuntimeConfigView` into `view`; never rejects.
+   * A missing `oxrsys-runtime.toml` yields `view.exists` `false` with every value `null`.
+   * An IPC-layer failure leaves `view` untouched and sets `error`. */
   async function load(): Promise<void> {
     loading = true;
     error = null;
@@ -33,14 +33,11 @@ function createConfigStore() {
   }
 
   /**
-   * Apply `patch` and re-fetch `view` from the result — a write can create
-   * the file from template, resolve `shadowed` occurrences, or change
-   * `modifiedUnixMs`, so the backend's own reader stays the one source of
-   * truth for the resulting shape rather than patching `view` locally.
-   * Rejects (and sets `error`) when the file has a `parseError` or the patch
-   * fails validation — the Settings screen should already have caught an
-   * invalid value client-side before calling this (`validate`-shaped UI, not
-   * a surprise here), but this is the backstop.
+   * Apply `patch`, re-load `view`, and return the backend's `WriteReport`.
+   * Re-loading keeps the backend the source of truth: a write can create the
+   * file from template, resolve `shadowed` occurrences, or change `modifiedUnixMs`.
+   * Rejects and sets `error` on a `parseError`, failed validation, or a live
+   * session; the Settings screen validates client-side first, so this is the backstop.
    */
   async function write(patch: RuntimeConfigPatch): Promise<WriteReport> {
     error = null;

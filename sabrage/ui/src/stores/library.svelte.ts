@@ -34,11 +34,9 @@ function createLibraryStore() {
   }
 
   /**
-   * Upsert `entry` and splice the returned row into `rows` in place (by
-   * `entry.id`) — an existing entry updates where it sits, a new one is
-   * appended. Does not touch `loading`/`error`: EditGame's Save button is
-   * the caller and renders its own inline failure, not the list's shared
-   * error state.
+   * Upsert `entry` by `entry.id` and return the stored row; an existing row
+   * stays in place, a new one is appended. Leaves `loading`/`error`
+   * untouched — EditGame renders its own inline failure.
    */
   async function save(entry: GameEntry): Promise<GameRow> {
     const row = await ipcSaveGame(entry);

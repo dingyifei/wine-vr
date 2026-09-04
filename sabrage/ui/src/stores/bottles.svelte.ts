@@ -1,15 +1,10 @@
-// The `AppState` blob (`get_app_state` — one Tauri round trip) shared by
-// every screen that needs the bottle list: Session, Settings, EditGame,
-// StagesPanel, Doctor (via doctorStore, which composes this), and the
-// Sidebar (for `alvrVersion`). Previously each of those screens ran its own
-// `getAppState()` call and re-derived `bottles`/`bottlesLoaded` locally —
-// same shape, five separate copies. A plain Svelte 5 rune store —
-// module-scoped `$state`, same shape as doctor.svelte.ts/session.svelte.ts.
+// `AppState` from `get_app_state` (one Tauri round trip), shared by Session,
+// Settings, EditGame, StagesPanel, and Sidebar (for `alvrVersion`). Doctor is
+// not a consumer — doctorStore fetches its own copy. Module-scoped Svelte 5
+// rune store, same shape as doctor.svelte.ts and session.svelte.ts.
 //
-// `load()` always performs a fresh round trip (matching every call site's
-// previous per-mount behavior — this does not cache across screens, it only
-// removes the duplicated fetch/`bottlesLoaded` bookkeeping). Concurrent
-// callers within the same tick collapse onto one in-flight request.
+// `load()` re-fetches every call (not a cross-screen cache); concurrent callers
+// within the same tick share one in-flight request.
 
 import { getAppState, type AppState } from "../ipc";
 

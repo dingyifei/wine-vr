@@ -1,9 +1,5 @@
-// Doctor screen state, shared between Doctor.svelte (the writer) and the App
-// shell (the reader, for the sidebar failure badge). A plain Svelte 5 rune
-// store — module-scoped `$state`, no event bus, no persistence. Phase 1 keeps
-// this to exactly what the Doctor screen and the sidebar badge need; a
-// broader cross-screen event bus is explicitly future work (see the App
-// agent's task brief).
+// Doctor screen state: written by Doctor.svelte, read by the App shell for the
+// sidebar failure badge. Module-scoped `$state`, no event bus, no persistence.
 
 import { getAppState, runDoctor, type DoctorEvent, type DoctorSummary } from "../ipc";
 import { errMsg } from "../lib/text";
@@ -11,11 +7,9 @@ import { errMsg } from "../lib/text";
 /** One row as rendered — a `DoctorEvent` plus its streaming lifecycle. */
 export interface DoctorRow extends DoctorEvent {
   /**
-   * `"waiting"` — this slug was seen on a previous run but hasn't reported in
-   * for the current one yet (rendered dim, empty-square icon; the *first*
-   * waiting row also gets the spinner, standing in for "currently running"
-   * since the backend streams already-resolved outcomes with no separate
-   * start event per check).
+   * `"waiting"` — seen on a previous run but not yet reported by the current
+   * one; the first waiting row stands in for "currently running" because the
+   * backend streams resolved outcomes with no per-check start event.
    * `"done"` — the current run reported this slug.
    */
   phase: "waiting" | "done";
@@ -33,8 +27,8 @@ function createDoctorStore() {
   let lastRunAtMs = $state<number | null>(null);
   let bottles = $state<string[]>([]);
   let bottlesLoaded = $state(false);
-  /** `settings.json`'s `defaultBottle` as reported by `get_app_state` (Phase 4)
-   * — the Doctor screen's first choice before its hardcoded "Steam" fallback. */
+  /** `settings.json`'s `defaultBottle` as reported by `get_app_state` — the
+   * Doctor screen's first choice before its hardcoded "Steam" fallback. */
   let defaultBottle = $state<string | null>(null);
 
   /** The one row (if any) standing in for "currently running" — `$derived` so
@@ -82,10 +76,8 @@ function createDoctorStore() {
     } catch (e) {
       error = errMsg(e);
       // A rerun that rejects before reporting every slug must not leave the
-      // PREVIOUS run's rows sitting dim forever with no explanation — drop
-      // every placeholder this run never got to reporting on. Rows this run
-      // DID report before rejecting (`phase === "done"`, set by the callback
-      // above) stay.
+      // previous run's rows dim forever with no explanation; rows this run did
+      // report before rejecting stay.
       rows = rows.filter((r) => r.phase === "done");
     } finally {
       running = false;
@@ -122,7 +114,8 @@ function createDoctorStore() {
     get bottlesLoaded() {
       return bottlesLoaded;
     },
-    /** Sidebar badge: a completed run found at least one FAIL. */
+    /** FAIL count of the current summary — 0 whenever there is none (before the
+     * first run, during a run, and after a rejected one). Drives the sidebar badge. */
     get failCount() {
       return summary?.failCount ?? 0;
     },
