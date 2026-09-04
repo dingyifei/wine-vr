@@ -3,13 +3,9 @@
 </script>
 
 <script lang="ts">
-  // The status-row icon set, previously hand-duplicated (byte-identical SVGs,
-  // same stroke widths/colors) across CheckRow.svelte's `pass/warn/fail`
-  // dispatch and GateModal.svelte's `lineIcon`/`checkIcon` snippets.
   interface Props {
     kind: IconKind;
-    /** GateModal's rows render 13px icons; CheckRow's render 14px. The lock
-     * icon (admin-note) has always been 15px regardless of `size`. */
+    /** Size in px for ok/warn/fail SVGs only; lock is fixed at 15px, empty/spinner/info are CSS-sized. */
     size?: number;
   }
   let { kind, size = 14 }: Props = $props();
