@@ -1,24 +1,14 @@
-//! The seven ordered launch actions — run.sh's `# launch-action:` tags.
+//! The seven contract-ordered launch actions ([`LAUNCH_ACTION_IDS`]) —
+//! unconditional preparation steps, not checks: no pass/fail, no remedy, no gate.
+//! `audio-route` and `dashboard` are acquired in [`super::guards`] instead,
+//! because acquiring them is the same act as arming their undo. See
+//! tests::{the_guarded_actions_are_listed_and_launch_is_last,
+//! one_step_id_per_action_plus_the_three_run_only_phases}.
 //!
-//! Unlike checks these are **unconditional preparation steps**: no pass/fail,
-//! no remedy, no gate. The contract lists them (`[[launch_action]]`) purely so
-//! both implementations agree on *which* steps exist and in *what order*;
-//! [`LAUNCH_ACTION_IDS`] is this side's copy and the parity harness joins the
-//! two.
+//! Reference: scripts/demo/run.sh, the `# launch-action:` tags.
 //!
-//! Two of the seven are guarded rather than performed here — `audio-route` and
-//! `dashboard` live in [`super::guards`], because acquiring them is the same
-//! act as arming their undo.
-//!
-//! # Mutations vs probes
-//!
-//! Every mutation here goes through [`crate::executor::Executor`] (`adb
-//! forward`, `adb forward --remove`, `adb reverse --remove-all`,
-//! `wineserver -k`/`-w`, the Goldberg copies and writes, the wine spawn), so
-//! `--dry-run` plans them. The three probes whose *output* is the point —
-//! `adb devices` twice, and the log-name collision test — use
-//! [`crate::process::capture`] / a plain `exists()` and run in both modes,
-//! which is what makes the plan accurate rather than optimistic.
+//! Every mutation goes through [`crate::executor::Executor`], so `--dry-run` plans
+//! it; read-only probes run in both modes, keeping the plan accurate.
 
 use std::path::{Path, PathBuf};
 
@@ -61,13 +51,12 @@ const LOG_NAME_ATTEMPTS: u32 = 100;
 /// The device name run.sh routes the Mac's output to.
 pub(crate) const BLACKHOLE_DEVICE: &str = "BlackHole 2ch";
 
-// ── 1. adb forward hygiene ────────────────────────────────────────────────────
-
-/// `awk 'NR>1 && $2=="device"{print $1; exit}'` over `adb devices`' stdout.
+/// The first serial in `adb devices`' stdout whose state is exactly `device`.
 ///
-/// `NR>1` skips adb's `List of devices attached` header; a row whose state is
-/// anything but exactly `device` (`unauthorized`, `offline`) is skipped, and a
-/// blank line has no `$2` at all.
+/// Mirrors run.sh's `awk 'NR>1 && $2=="device"{print $1; exit}'`: the header row
+/// is skipped, and so is any row that is blank or in another state
+/// (`unauthorized`, `offline`). See
+/// tests::first_device_serial_matches_the_awk_program.
 pub(crate) fn first_device_serial(stdout: &str) -> Option<String> {
     stdout.lines().skip(1).find_map(|line| {
         let mut fields = line.split_whitespace();
@@ -77,14 +66,13 @@ pub(crate) fn first_device_serial(stdout: &str) -> Option<String> {
     })
 }
 
-/// `"$ADB" devices 2>/dev/null | awk …` — a read-only probe, so it bypasses
-/// the executor and runs under `--dry-run` too.
+/// The first `device`-state serial from `adb devices`, or `None`.
 ///
-/// Carries the launch's cancellation token: this is the one probe a user is
-/// likely to be waiting on (they hit Run before plugging the headset in), and
-/// a wedged `adb` here would otherwise hold the operation lock with Cancel
-/// unable to interrupt it. A cancelled or timed-out probe fails exactly like a
-/// missing binary — `None`, which is run.sh's empty `$WIRED_SER`.
+/// A read-only probe: bypasses the executor and runs under `--dry-run` too.
+/// Carries the launch's cancellation token because a wedged `adb` here would
+/// otherwise hold the operation lock with Cancel unable to interrupt it. A
+/// cancelled or timed-out probe returns `None`, matching run.sh's empty
+/// `$WIRED_SER`. See tests::a_cancel_during_the_device_probe_is_a_cancellation.
 async fn probe_device_serial(ctx: &StageCtx, adb: &Path, step_id: StepId) -> Option<String> {
     let spec = ctx
         .child(adb.to_path_buf(), step_id)
@@ -97,7 +85,8 @@ async fn probe_device_serial(ctx: &StageCtx, adb: &Path, step_id: StepId) -> Opt
 }
 
 /// `tcp:<port>` for each of the contract's `ports.stream` — never a literal
-/// `"tcp:9943"` (PARITY.md's "must NOT change" list).
+/// `"tcp:9943"` (PARITY.md § Invariants that must NOT change (byte/behavior
+/// parity), "adb `forward --remove` per-serial").
 fn stream_forward_specs() -> Vec<String> {
     contract()
         .ports
@@ -107,28 +96,20 @@ fn stream_forward_specs() -> Vec<String> {
         .collect()
 }
 
-/// run.sh:108 — remove **both** ports, never aborting on a failed removal, then
-/// bring the persisted record back in line.
+/// Remove both stream forwards, never aborting on a failed removal, then bring
+/// the persisted record back in line per port: a removal that succeeded drops its
+/// record, a removal that failed keeps it.
 ///
-/// "In line" is per port, not wholesale: a removal that **succeeded** drops its
-/// record, a removal that failed keeps it. A failed `--remove` is
-/// *indeterminate* (usually the device is simply gone, and the forward with
-/// it — but it may equally be a transient adb failure over a still-installed
-/// `tcp:9943`, the stale forward that silently breaks the next WiFi run), and
-/// the record is the only thing that would ever retry it. Clearing it
-/// unconditionally erased exactly the recovery path this record exists for.
-/// [`crate::session::reconcile`]'s `restore_forwards` makes the same
-/// distinction, for the same reason.
-///
-/// On a fresh, non-cancelled executor ([`super::teardown_ctx`]): the common
-/// reason to be rolling back is that Stop cancelled the token mid-loop, and
-/// the launch executor refuses every child (and every write) once it is
-/// cancelled — the removal and the record fix-up would be silent no-ops
-/// exactly when they matter most. Under `--dry-run` that ctx is the (dry)
-/// original, whose `run_child` reports success: a planned removal drops its
-/// planned record, which keeps the plan self-consistent. The save is
-/// best-effort: a failure here changes nothing about the error travelling out,
-/// and the next reconcile still finds no live wine child to protect the record.
+/// A failed `--remove` is indeterminate — usually the device is gone and the
+/// forward with it, but it may equally be a transient adb failure over a
+/// still-installed `tcp:9943` — and the record is the only thing that would ever
+/// retry it; [`crate::session::reconcile`]'s `restore_forwards` makes the same
+/// distinction. The removals run on a fresh, non-cancelled executor
+/// ([`super::teardown_ctx`]) because the usual reason to be rolling back is a
+/// cancelled launch, whose executor refuses every child and every write. The save
+/// is best-effort. See
+/// tests::{a_rollback_whose_removal_fails_keeps_the_forward_on_record,
+/// a_cancellation_mid_loop_still_rolls_the_first_forward_back}.
 async fn rollback_forwards(
     ctx: &StageCtx,
     adb: &Path,
@@ -156,23 +137,20 @@ async fn rollback_forwards(
     let _ = state::save(&*rb.executor, state_path, sess).await;
 }
 
-/// `launch-action: adb-forward-hygiene` — run.sh lines 93–124.
+/// `launch-action: adb-forward-hygiene`. Reference: scripts/demo/run.sh.
 ///
-/// `--wired`: create `tcp:9943` and `tcp:9944` on the first device whose state
-/// is exactly `device`; if either fails, remove **both** and die. Otherwise:
-/// walk `adb forward --list` and remove exactly those two local ports,
-/// per-serial. Never `--remove-all` — that would delete forwards this pipeline
-/// knows nothing about (PARITY.md; CLAUDE.md's `--wired` note; the distinction
-/// from `adb reverse --remove-all`, which *is* fine, is deliberate).
+/// `--wired`: create `tcp:9943` and `tcp:9944` on the first device whose state is
+/// exactly `device`; if either fails, remove both and die. Otherwise remove exactly
+/// those two local ports per serial — never `--remove-all`, which would delete
+/// forwards this pipeline knows nothing about (PARITY.md § Invariants that must NOT
+/// change (byte/behavior parity), "adb `forward --remove` per-serial").
 ///
-/// Persists each intended forward into `sess.wired_forwards` (and saves
-/// `state_path`) **before** running the `adb forward` that creates it —
-/// [`crate::session::state`]'s write-before-mutate invariant, row 3. A crash
-/// between the two ports therefore always leaves the just-attempted forward
-/// named on disk, even when the port itself never actually came up: an
-/// over-recorded forward costs one harmless `adb forward --remove` that finds
-/// nothing to remove, where an under-recorded one is the stale forward that
-/// silently breaks the next WiFi run (CLAUDE.md's `--wired` note).
+/// Each intended forward is persisted to `state_path` before the `adb forward` that
+/// creates it: an over-recorded forward costs one harmless `--remove` that finds
+/// nothing, where an under-recorded one is the stale forward that silently breaks
+/// the next WiFi run. See
+/// tests::{wired_plans_both_forwards_and_reports_them,
+/// a_failed_forward_removes_both_ports_and_dies_with_run_shs_text}.
 pub async fn adb_forward_hygiene(
     ctx: &StageCtx,
     sess: &mut SessionState,
@@ -182,13 +160,9 @@ pub async fn adb_forward_hygiene(
     let adb = ctx.paths.adb.clone();
 
     if !ctx.opts.wired {
-        // run.sh's `elif [ -n "$ADB" ]` branch is `fix.remove-adb-forwards`
-        // verbatim — same per-serial removal, same `info` text, same tolerant
-        // "a failed removal prints nothing" rule. No adb at all: nothing to do.
-        //
-        // `_at`, not the plain fix: this is the run stage's step 2, and its
-        // rows must be attributed to it. The fix's own `fix.remove-adb-forwards`
-        // step id belongs to the doctor's fix list, where no stage is running.
+        // `_at`, not the plain fix: these rows must be attributed to the run
+        // stage's own step, not to the doctor fix list's `fix.remove-adb-forwards`.
+        // See tests::the_non_wired_forward_cleanup_is_stamped_with_the_run_stages_step.
         if adb.is_some() {
             crate::fixes::adb::remove_adb_forwards_at(ctx, &ctx.sink, step::RUN_ADB_FORWARDS)
                 .await?;
@@ -196,14 +170,12 @@ pub async fn adb_forward_hygiene(
         return Ok(());
     }
 
-    // run.sh:104
     let Some(adb) = adb else {
         return Err(st.fatal(
             "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk",
             None,
         ));
     };
-    // run.sh:105
     let serial = match probe_device_serial(ctx, &adb, step::RUN_ADB_FORWARDS).await {
         Some(serial) => serial,
         // Stop landing on the probe is a cancellation, not a verdict about the
@@ -242,12 +214,9 @@ pub async fn adb_forward_hygiene(
             .arg("forward")
             .arg(local)
             .arg(local);
-        // Every non-success leaves through the same door. run.sh's `if !
-        // "$ADB" … forward` catches a failed *exec* too (a missing or
-        // unrunnable adb is just a nonzero exit to the shell), and a
-        // cancellation between the two ports would otherwise leave the first
-        // forward on the device with nothing on disk naming it — the exact
-        // stale forward that silently breaks the next WiFi run.
+        // Every non-success leaves through the same door, a failed *exec*
+        // included: a cancellation between the two ports would otherwise leave
+        // the first forward on the device with nothing on disk naming it.
         let failure = match ctx.executor.run_child(&spec).await {
             Ok(status) if status.success() => None,
             Ok(_) => Some(None),
@@ -255,7 +224,6 @@ pub async fn adb_forward_hygiene(
         };
         if let Some(cause) = failure {
             rollback_forwards(ctx, &adb, &serial, &specs, sess, state_path).await;
-            // run.sh:109.
             let die = wired_forward_failed_die(local, &serial);
             return Err(match cause {
                 // A cancelled launch is not a failed one: Stop's own error
@@ -268,13 +236,11 @@ pub async fn adb_forward_hygiene(
             });
         }
     }
-    // run.sh:112 — the port list is rendered from the contract so the literal
-    // `tcp:9943/tcp:9944` in the shell string cannot drift from `ports.stream`.
     st.info(wired_forwards_up_line(&specs, &serial));
     Ok(())
 }
 
-/// run.sh:109's die, for one port on one device.
+/// The die run.sh prints when one port's `adb forward` fails on one device.
 /// `pub` (A1-3) so `sabrage-parity` can pin it against run.sh by calling the
 /// real renderer instead of copying the sentence.
 pub fn wired_forward_failed_die(local: &str, serial: &str) -> String {
@@ -284,8 +250,8 @@ pub fn wired_forward_failed_die(local: &str, serial: &str) -> String {
     )
 }
 
-/// run.sh:112 — the port list is rendered from the contract so the literal
-/// `tcp:9943/tcp:9944` in the shell string cannot drift from `ports.stream`.
+/// The `wired mode: adb forward … up` info line; the caller passes the contract's
+/// `ports.stream` specs, so the shell string's `tcp:9943/tcp:9944` cannot drift.
 /// `pub` (A1-3), same reason as [`wired_forward_failed_die`].
 pub fn wired_forwards_up_line(specs: &[String], serial: &str) -> String {
     format!(
@@ -294,15 +260,13 @@ pub fn wired_forwards_up_line(specs: &[String], serial: &str) -> String {
     )
 }
 
-// ── 2. wineserver reset ───────────────────────────────────────────────────────
-
 /// `"<pid> <exe-basename>"` per process, space-joined with a trailing space —
-/// the shape of `pgrep -lf wineserver | tr '\n' ' '` (one `pid name` pair per
-/// line, each line's newline becoming a trailing space).
+/// the shape of `pgrep -lf wineserver | tr '\n' ' '`, and the same rendering
+/// `stop`'s private `format_survivors` produces.
 ///
-/// Same rendering as `stop`'s private `format_survivors`, with this call
-/// site's own fallback name for a process whose exe path has no file name.
-/// (PARITY.md, "Stop": pid+basename rather than `pgrep -lf`'s full argv.)
+/// `fallback` names a process whose exe path has no file name. (PARITY.md § Stop,
+/// "The survivor warning lists".) See
+/// tests::survivors_render_as_pid_basename_pairs_with_a_trailing_space.
 fn format_survivors(procs: &[ProcInfo], fallback: &str) -> String {
     let mut out = String::new();
     for p in procs {
@@ -319,26 +283,22 @@ fn format_survivors(procs: &[ProcInfo], fallback: &str) -> String {
     out
 }
 
-/// `launch-action: wineserver-reset` — run.sh lines 126–138.
+/// `launch-action: wineserver-reset`. Reference: scripts/demo/run.sh.
 ///
 /// `wineserver -k` (failure ignored), then a bounded `-w` wait of
-/// [`crate::stages::RUN_WINESERVER_WAIT`] — **fatal** on timeout, unlike
-/// `stop`'s 4 s advisory wait. The timeout path warns with the survivor list
-/// (`pgrep -lf wineserver`, i.e.
-/// [`crate::process::find_processes_by_cmdline`]) and then dies:
-///
-/// ```text
-/// wineserver still alive after 5s: <pid name >…
-/// kill the listed wineserver(s) manually, then re-run
-/// ```
+/// [`crate::stages::RUN_WINESERVER_WAIT`] — fatal on timeout, unlike `stop`'s 4 s
+/// advisory wait. The timeout path warns with the survivor list
+/// ([`wineserver_still_alive_warn`] over
+/// [`crate::process::find_processes_by_cmdline`]) before dying. See
+/// tests::wineserver_reset_plans_k_then_w_and_reports_down.
 pub async fn wineserver_reset(ctx: &StageCtx, bottle: &Bottle) -> Result<()> {
     let st = ctx.step(step::RUN_WINESERVER);
     ctx.section(format!("resetting wineserver for bottle '{}'", bottle.name));
 
-    // No CrossOver on this machine means `$WINESERVER` is empty: the shell
-    // "runs" it, swallows the command-not-found, and reaches `ok` anyway. The
-    // `run.wine-exec` preflight has already died by then, so this is
-    // unreachable in practice — reproduced rather than special-cased.
+    // No CrossOver means `$WINESERVER` is empty: the shell "runs" it, swallows
+    // the command-not-found and reaches `ok` anyway. The `run.wine-exec`
+    // preflight has already died by then, so this branch is reproduced rather
+    // than special-cased. See tests::wineserver_reset_without_crossover_still_reports_down.
     let Some(wineserver) = ctx.paths.wineserver.clone() else {
         st.ok("wineserver down");
         return Ok(());
@@ -368,8 +328,6 @@ pub async fn wineserver_reset(ctx: &StageCtx, bottle: &Bottle) -> Result<()> {
     st.ok("wineserver down");
     Ok(())
 }
-
-// ── 3. Goldberg ───────────────────────────────────────────────────────────────
 
 /// `"$API.orig-steam"` — a suffix on the whole file name, not an extension swap.
 fn orig_steam_path(api: &Path) -> PathBuf {
@@ -425,8 +383,8 @@ async fn record_goldberg_backup(ctx: &StageCtx, backup: &Path) {
 }
 
 /// `$BS_DIR/Beat Saber_Data/Plugins/x86_64/steam_api64.dll`, else
-/// `$BS_DIR/steam_api64.dll` — the second is returned even when it is absent,
-/// so the caller produces run.sh:145's die text for it.
+/// `$BS_DIR/steam_api64.dll` — the second is returned even when it is absent, so
+/// the caller produces [`steam_api_missing_die`] for it.
 pub(crate) fn steam_api_path(bs_dir: &Path) -> PathBuf {
     let plugin = bs_dir.join("Beat Saber_Data/Plugins/x86_64/steam_api64.dll");
     if plugin.is_file() {
@@ -443,7 +401,8 @@ pub(crate) const GOLDBERG_FLAG_FILES: [&str; 3] = [
     "disable_overlay.txt",
 ];
 
-/// run.sh:135's warn — the survivor list is [`format_survivors`]' rendering.
+/// The `wineserver still alive after <n>s` warn; the survivor list is
+/// [`format_survivors`]' rendering.
 /// `pub` (A1-3), same reason as [`wired_forward_failed_die`].
 pub fn wineserver_still_alive_warn(survivors: &str) -> String {
     format!(
@@ -471,28 +430,25 @@ pub fn goldberg_installed_line(api: &Path) -> String {
     format!("installed goldberg -> {}", api.display())
 }
 
-/// `launch-action: goldberg-stage` — run.sh lines 140–152.
+/// `launch-action: goldberg-stage`. Reference: scripts/demo/run.sh.
 ///
-/// Byte-exact artifacts, all four of them:
+/// Stages four byte-exact artifacts: `steam_api64.dll` (under
+/// `Beat Saber_Data/Plugins/x86_64/` or at the game root); `<api>.orig-steam`,
+/// created once and never overwritten (the only copy of the real Steam dll on the
+/// machine); the Goldberg dll copied over the live dll when bytes differ, hash
+/// mismatch tolerated unlike in setup (parity decision 20); and `steam_appid.txt`
+/// (appid digits, no trailing newline) plus the three `steam_settings/` flag files.
 ///
-/// * `steam_api64.dll` found under `Beat Saber_Data/Plugins/x86_64/` or at the
-///   game root, dying when neither exists;
-/// * `<api>.orig-steam` created **once** and never overwritten (it is the only
-///   copy of the real Steam dll on the machine) — and, when that reserved name
-///   is occupied by something that is not a regular file, the launch is
-///   refused rather than installing Goldberg over an unbacked-up dll;
-/// * the Goldberg dll copied over it when the bytes differ — a hash mismatch
-///   is *tolerated* here, unlike in setup (parity decision 20);
-/// * `steam_appid.txt` = the appid digits with **no trailing newline**
-///   (`printf '%s'`), and `steam_settings/{offline,disable_networking,
-///   disable_overlay}.txt` truncate-created empty (`: >`).
+/// Fatal when no `steam_api64.dll` exists, when `.orig-steam` is not a regular
+/// file, or when any copy/write fails. See
+/// tests::{goldberg_backs_up_once_installs_and_writes_the_exact_artifacts,
+/// goldberg_refuses_when_the_backup_name_is_not_a_regular_file}.
 pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
     let st = ctx.step(step::RUN_GOLDBERG);
     ctx.section("Goldberg");
 
     let api = steam_api_path(&ctx.bs_dir);
     if !api.is_file() {
-        // run.sh:145
         return Err(st.fatal(steam_api_missing_die(&ctx.bs_dir), None));
     }
     let api_dir = api
@@ -500,24 +456,21 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
         .map(Path::to_path_buf)
         .unwrap_or_else(|| PathBuf::from("."));
 
-    // run.sh:147 — the backup is made once and never refreshed; overwriting it
-    // with an already-Goldberged dll would destroy the only copy of the real
-    // Steam library on this machine.
+    // Made once, never refreshed: overwriting it with an already-Goldberged dll
+    // would destroy the only copy of the real Steam library on this machine. See
+    // tests::goldberg_installs_the_dll_and_flag_files_and_never_refreshes_the_backup.
     let backup = orig_steam_path(&api);
     if backup.is_file() {
         // The ordinary post-first-launch state: a usable backup is already
         // there (a symlink resolving to a regular file counts — the copy would
         // read through it just the same).
     } else if std::fs::symlink_metadata(&backup).is_ok() {
-        // DIVERGENCE (Sabrage-only, no shell counterpart): something that is
-        // not a regular file occupies the reserved backup name — a directory,
-        // a fifo, a dangling symlink. run.sh's `[ ! -f "$API.orig-steam" ]` is
-        // also false-y there, so the shell runs `cp "$API" "$API.orig-steam"`
-        // and either copies *into* the directory or follows the symlink; it
-        // then installs Goldberg over the live dll regardless. Sabrage refuses
-        // BEFORE touching the live dll instead: the alternative is destroying
-        // the only copy of the real Steam library to satisfy bug-for-bug
-        // parity on a state no correct run produces.
+        // Sabrage-only refusal: run.sh's `-f` fails on non-regular names too,
+        // so `[ ! -f "$API.orig-steam" ]` fires, `cp` writes into the directory
+        // or through the symlink, and Goldberg goes over the live dll with no
+        // usable backup (PARITY.md § Declared by the 2026-08-30 adversarial
+        // review (round 1 fixes), "A non-regular `.orig-steam` refuses the
+        // launch"). See tests::goldberg_refuses_when_the_backup_name_is_not_a_regular_file.
         return Err(st.fatal(
             format!(
                 "{} is not a regular file — it is the reserved name for the original \
@@ -528,12 +481,10 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
             Some(format!("move or delete {}", backup.display())),
         ));
     } else {
-        // Sabrage-only row, no shell counterpart (run.sh is silent here): the
-        // live dll is ALREADY the Goldberg build, so the backup this line
-        // mints holds Goldberg, not Steam. The bytes are run.sh's either way —
-        // saying so is the only honest thing left, because
-        // `store::goldberg::revert_original_steam_dll` would otherwise copy
-        // these bytes back and call it a restore.
+        // Sabrage-only row (run.sh is silent here): the live dll is ALREADY the
+        // Goldberg build, so the backup this line mints holds Goldberg, not
+        // Steam — and `store::goldberg::revert_original_steam_dll` would
+        // otherwise copy these bytes back and call it a restore.
         let already_goldberg = util::cmp_files(&ctx.paths.gbe_dll, &api);
         if let Err(e) = ctx.executor.copy_if_changed(&api, &backup).await {
             return Err(die_with_cause(
@@ -553,8 +504,8 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
         }
     }
 
-    // run.sh:148-149 — `cmp -s`, not a hash: run tolerates a Goldberg dll that
-    // does not match setup's pin (parity decision 20).
+    // `cmp -s`, not a hash: run tolerates a Goldberg dll that does not match
+    // setup's pin (parity decision 20).
     if util::cmp_files(&ctx.paths.gbe_dll, &api) {
         st.info(GOLDBERG_ALREADY_INSTALLED);
     } else {
@@ -569,7 +520,7 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
         st.ok(goldberg_installed_line(&api));
     }
 
-    // run.sh:150 — `printf '%s' "$BS_APPID"`: the digits, no trailing newline.
+    // `printf '%s' "$BS_APPID"`: the digits, no trailing newline.
     let appid = contract().game.appid.to_string();
     if let Err(e) = ctx
         .executor
@@ -584,9 +535,9 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
         ));
     }
 
-    // run.sh:151-152 — `mkdir -p` then three `: >` truncate-creates. The shell
-    // has no `|| die` on either, but a failure here is propagated rather than
-    // swallowed (design-core §6.6: no silent aborts, no silent successes).
+    // `mkdir -p` then three `: >` truncate-creates. The shell has no `|| die` on
+    // either; a failure here is propagated rather than swallowed
+    // (docs/design/design-core.md §6.6: no silent aborts, no silent successes).
     let gset = api_dir.join("steam_settings");
     ctx.executor.create_dir_all(&gset).await?;
     for name in GOLDBERG_FLAG_FILES {
@@ -598,11 +549,11 @@ pub async fn goldberg_stage(ctx: &StageCtx) -> Result<()> {
 /// `die "<text>"` for a failed executor primitive, with the io cause surfaced
 /// first as a stderr-shaped [`StageEvent::Output`] line.
 ///
-/// Same shape `install`'s `install_if_changed` uses (PARITY.md, "Install"):
-/// the shell shows `cp`'s own stderr and then dies, and Sabrage has no `cp`
-/// child to borrow stderr from, so a plain `PermissionDenied`, a read-only
-/// volume and `ENOSPC` stay distinguishable instead of collapsing into one
-/// die string.
+/// The shell shows `cp`'s own stderr and then dies, and Sabrage has no `cp` child
+/// to borrow stderr from, so a plain `PermissionDenied`, a read-only volume and
+/// `ENOSPC` stay distinguishable instead of collapsing into one die string
+/// (PARITY.md § Install (the one privileged write), "A copy failure prints the OS
+/// error").
 fn die_with_cause(
     ctx: &StageCtx,
     step_id: StepId,
@@ -619,21 +570,15 @@ fn die_with_cause(
     ctx.fatal(message.to_string(), None)
 }
 
-// ── 6. adb reverse cleanup ────────────────────────────────────────────────────
-
-/// `launch-action: adb-reverse-cleanup` — run.sh lines 219–237.
+/// `launch-action: adb-reverse-cleanup`. Reference: scripts/demo/run.sh.
 ///
-/// `protocol = "alvr"`: `adb reverse --remove-all` on the connected device, if
-/// any — oxrsys-era reverse tunnels squat the ALVR client's stream port
-/// (`EADDRINUSE`).
-///
-/// The legacy `protocol = "oxrsys"` branch (warn when no device, else
-/// remove-all + re-create the `legacy_reverse` tunnels + `am start` the
-/// Android client) is **unreachable on this side**: the contract gates
-/// `cfg.protocol.legacy-oxrsys` as `block` natively where the shell only warns
-/// (PARITY.md, "Run preflight"), so the preflight has already died before this
-/// runs. It is deliberately not written here rather than written and dead —
-/// v1 keeps the legacy USB path in `./demo.sh run` territory.
+/// Under `protocol = "alvr"`, runs `adb reverse --remove-all` on the connected
+/// device if there is one: oxrsys-era reverse tunnels squat the ALVR client's
+/// stream port (`EADDRINUSE`). The legacy `protocol = "oxrsys"` branch is
+/// deliberately absent: the contract gates `cfg.protocol.legacy-oxrsys` as `block`
+/// natively, so the preflight has already died (PARITY.md § Run preflight (encoded
+/// in the contract's per-side gates), "Launch refuses `protocol=oxrsys` outright").
+/// See tests::adb_reverse_cleanup_is_silent_without_adb_or_on_the_legacy_protocol.
 pub async fn adb_reverse_cleanup(ctx: &StageCtx, facts: &PreflightFacts) -> Result<()> {
     if facts.protocol != "alvr" {
         return Ok(());
@@ -644,9 +589,10 @@ pub async fn adb_reverse_cleanup(ctx: &StageCtx, facts: &PreflightFacts) -> Resu
     let Some(serial) = probe_device_serial(ctx, &adb, step::RUN_ADB_REVERSE).await else {
         return Ok(());
     };
-    // `reverse --remove-all` IS correct here — unlike `forward --remove-all`,
-    // which PARITY.md forbids. The two are different namespaces and the ALVR
-    // client owns every reverse tunnel it needs.
+    // `reverse --remove-all` IS correct here, unlike `forward --remove-all`:
+    // different namespaces, and the ALVR client owns every reverse tunnel it
+    // needs (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+    // "adb `forward --remove` per-serial").
     let spec = ctx
         .child(adb, step::RUN_ADB_REVERSE)
         .arg("-s")
@@ -665,19 +611,16 @@ pub fn adb_reverse_cleared_line(serial: &str) -> String {
     format!("Quest {serial}: cleared adb reverse tunnels (ALVR manages its own)")
 }
 
-// ── 7. launch ─────────────────────────────────────────────────────────────────
-
-/// The wine child's spec: program, argv, cwd, env. Pure — builds nothing and
-/// spawns nothing, so the "copy the equivalent command" affordance and the
-/// tests can both read it.
+/// The wine child's spec: program, argv, cwd, env. Pure — builds and spawns
+/// nothing, so the "copy the equivalent command" affordance and tests can both
+/// read it.
 ///
-/// argv is run.sh's exactly:
+/// argv matches run.sh exactly:
 /// `"$WINE" --bottle "$WINEVR_BOTTLE" --no-update --cx-app "$BS_WIN"`, where
-/// `BS_WIN` is [`crate::util::win_path`] of `<bs_dir>/Beat Saber.exe`.
-///
-/// `paths.wine` is `Option` (no CrossOver on the machine); the bare name
-/// `wine` stands in, which is what the shell's empty `"$WINE"` amounts to.
-/// The `run.wine-exec` preflight blocks long before this.
+/// `BS_WIN` is [`bs_win_path`]. `paths.wine` is `Option` (no CrossOver); the bare
+/// name `wine` stands in, matching the shell's empty `"$WINE"`, and the
+/// `run.wine-exec` preflight blocks long before this. See
+/// tests::wine_spec_is_run_shs_argv.
 pub fn wine_spec(ctx: &StageCtx, bottle: &Bottle) -> ChildSpec {
     let wine = ctx
         .paths
@@ -711,21 +654,15 @@ pub fn bs_win_path(ctx: &StageCtx, bottle: &Bottle) -> String {
     util::win_path(Some(&bottle.prefix), &ctx.bs_dir.join("Beat Saber.exe"))
 }
 
-/// The launch environment — run.sh lines 245–251. Pure and table-testable.
+/// The launch environment: `XR_RUNTIME_JSON`, `CX_GRAPHICS_BACKEND=dxmt`,
+/// `WINEDEBUG`, and `SteamAppId`/`SteamGameId`. Pure and table-testable.
+/// Reference: scripts/demo/run.sh's `# launch-action: launch-wine` block.
 ///
-/// ```zsh
-/// export XR_RUNTIME_JSON="$OXR_RUNTIME_JSON"
-/// export CX_GRAPHICS_BACKEND=dxmt
-/// if [ -n "${WINEVR_VERBOSE:-}" ]; then export WINEDEBUG="${WINEDEBUG:-fixme-all,+openxr}"
-/// else export WINEDEBUG="${WINEDEBUG:--all}"; fi
-/// export SteamAppId=$BS_APPID SteamGameId=$BS_APPID
-/// ```
-///
-/// The load-bearing detail is `WINEDEBUG`: **the caller's preset wins in both
-/// branches** (`${WINEDEBUG:-…}`), so `WINEDEBUG=+d3d11 ./demo.sh run` keeps
-/// `+d3d11` whether or not `--verbose` was passed (parity decision 21).
-/// `inherited_winedebug` is that preset — `None`, or `Some("")`, takes the
-/// default for the branch (zsh's `:-` treats unset and empty alike).
+/// The load-bearing detail is `WINEDEBUG`: the caller's preset wins in both
+/// branches (`${WINEDEBUG:-…}`), so `WINEDEBUG=+d3d11` survives `--verbose`
+/// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+/// "`WINEDEBUG` caller-precedence"). `inherited_winedebug` is that preset; `None`
+/// and `Some("")` both take the branch default (zsh's `:-` treats unset and empty alike).
 pub fn wine_env(
     verbose: bool,
     inherited_winedebug: Option<&str>,
@@ -750,12 +687,13 @@ pub fn wine_env(
     ]
 }
 
-/// run.sh lines 255–263, verbatim, as the exact event sequence the CLI
-/// reproduces byte-for-byte.
+/// The six-line launch banner, verbatim, as the exact event sequence the CLI
+/// reproduces byte-for-byte (PARITY.md § Invariants that must NOT change
+/// (byte/behavior parity), "the six-line launch banner text").
 ///
-/// The `-- launching …` line is a [`StageEvent::Section`] (the CLI renders it
-/// as `-- <title>`); the rest are [`StageEvent::Text`], leading spaces and
-/// empty lines included.
+/// The `-- launching …` line is a [`StageEvent::Section`]; the rest are
+/// [`StageEvent::Text`], leading spaces and empty lines included. See
+/// tests::the_banner_is_one_section_with_every_text_row_on_the_launch_step.
 ///
 /// `pub` (A1-3) so `sabrage-parity` can pin this banner against `run.sh` by
 /// calling the real renderer instead of copying a substring per line.
@@ -811,22 +749,18 @@ fn pick_log_path(logs_dir: &Path, start: u32) -> (PathBuf, u32) {
     }
 }
 
-/// `launch-action: launch-wine` — run.sh lines 239–266.
+/// `launch-action: launch-wine`. Reference: scripts/demo/run.sh.
 ///
-/// Prints the six-line banner block verbatim as
-/// [`crate::events::StageEvent::Text`], picks a non-colliding log name
-/// ([`crate::logs::wine_log_candidate`]), and spawns **detached**
+/// Emits the banner ([`banner_events`]) before the spawn, picks a non-colliding
+/// log name ([`crate::logs::wine_log_candidate`]), and spawns **detached**
 /// ([`crate::executor::Executor::spawn_detached`] — never
-/// [`crate::process::spawn_streamed`], whose `kill_on_drop(true)` would SIGKILL
-/// the game when Sabrage quits). Returns the child and the log path it is
-/// writing to, or `Ok(None)` under a dry run.
+/// [`crate::process::spawn_streamed`], whose `kill_on_drop(true)` would SIGKILL the
+/// game when Sabrage quits). Returns the child and log path, or `Ok(None)` under a
+/// dry run. See tests::the_banner_is_one_section_with_every_text_row_on_the_launch_step.
 ///
-/// The banner is emitted **before** the spawn, exactly where the shell prints
-/// it. If the spawn still loses the `create_new` race (a `./demo.sh run` in
-/// the same second), the next candidate is taken and a corrected
-/// `   log: <path>` line is emitted so the printed path is never a lie — the
-/// shell's `tee` simply truncates the older run's log instead (declared
-/// divergence, PARITY.md).
+/// If the spawn loses the `create_new` race, the next candidate is taken and a
+/// corrected `   log: <path>` line is emitted (PARITY.md § Run (launch), "The wine
+/// console log is a plain file").
 pub async fn launch_wine(
     ctx: &StageCtx,
     bottle: &Bottle,
@@ -874,8 +808,6 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use tokio_util::sync::CancellationToken;
     use uuid::Uuid;
-
-    // ── fixtures ─────────────────────────────────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -935,8 +867,6 @@ mod tests {
             .collect()
     }
 
-    // ── contract join ────────────────────────────────────────────────────────
-
     #[test]
     fn the_guarded_actions_are_listed_and_launch_is_last() {
         // The two guarded ones are in the list but implemented in `guards`.
@@ -956,8 +886,6 @@ mod tests {
             "run's step list and the contract's action list must stay aligned"
         );
     }
-
-    // ── adb devices parsing ──────────────────────────────────────────────────
 
     #[test]
     fn first_device_serial_matches_the_awk_program() {
@@ -981,8 +909,6 @@ mod tests {
             None
         );
     }
-
-    // ── adb forward hygiene ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_non_wired_run_without_adb_does_nothing_at_all() {
@@ -1089,14 +1015,12 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A `/bin/sh` script standing in for `adb`, so the wired branch is
-    /// exercised without an Android SDK, a device, or any real forward.
+    /// A `/bin/sh` script standing in for `adb`, so the adb branches run
+    /// without an Android SDK, a device, or any real forward.
     ///
-    /// `forward_exit` models a failure to **create** a forward;
-    /// `forward --remove` always succeeds, which is the ordinary shape of the
-    /// rollback (the port really does come back down). The other shape — a
-    /// removal that fails too, leaving the forward indeterminate — is
-    /// [`every_call_fails_adb`].
+    /// `forward_exit` controls the exit status of `adb forward` calls;
+    /// `--remove` always succeeds. For a rollback whose removal also fails,
+    /// use [`every_call_fails_adb`].
     fn fake_adb(dir: &Path, devices_stdout: &str, forward_exit: i32) -> PathBuf {
         use std::os::unix::fs::PermissionsExt;
         let path = dir.join("adb");
@@ -1248,7 +1172,8 @@ mod tests {
         (ctx, seen)
     }
 
-    /// run.sh:108 — a nonzero `adb forward` removes BOTH ports before dying.
+    /// A nonzero `adb forward` removes both ports before dying, matching
+    /// scripts/demo/run.sh # launch-action: adb-forward-hygiene.
     #[tokio::test]
     async fn a_failed_forward_removes_both_ports_and_dies_with_run_shs_text() {
         let root = scratch("wired-fail");
@@ -1324,7 +1249,7 @@ mod tests {
             "adb forward tcp:9943 tcp:9943 failed on 1WMHH0X — check the USB connection \
              (adb devices)"
         );
-        // Both removals were still attempted (run.sh:108 removes both).
+        // Both removals still attempted (scripts/demo/run.sh # launch-action: adb-forward-hygiene).
         let calls = adb_calls(&root);
         for port in ["tcp:9943", "tcp:9944"] {
             assert!(
@@ -1372,10 +1297,9 @@ mod tests {
             "List of devices attached\n1WMHH0X\tdevice\n",
         ));
 
-        // Cancel once the fake adb is *inside* the second port's `forward`
-        // (it drops a marker before sleeping) — an event, not a wall-clock
-        // guess: a fixed timer either fires too early under a loaded test run
-        // (before the first forward exists) or wastes real seconds.
+        // Cancel once the fake adb is *inside* the second port's `forward` (it
+        // drops a marker before sleeping): a fixed timer either fires before the
+        // first forward exists or wastes real seconds.
         let cancel = ctx.cancel.clone();
         let marker = root.join("adb.second");
         tokio::spawn(async move {
@@ -1412,12 +1336,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The write-before-mutate save inside the loop leaves through the same
-    /// door as a failed `adb forward`: when the record for the SECOND port
-    /// cannot be written — here the state directory turns read-only the
-    /// moment `tcp:9943` is up — the first forward still comes back down and
-    /// the in-memory record says so, instead of the error returning through
-    /// `?` over a live forward nothing on disk names.
+    /// A failed write-before-mutate save for the SECOND port leaves through the
+    /// same door as a failed `adb forward`: the first forward comes back down
+    /// and the in-memory record says so.
     #[tokio::test]
     async fn a_failed_save_between_the_ports_still_rolls_the_first_forward_back() {
         let root = scratch("wired-save-fail");
@@ -1565,8 +1486,6 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
     }
-
-    // ── goldberg ─────────────────────────────────────────────────────────────
 
     /// `bs_dir` with a `steam_api64.dll` under the Plugins path, plus the
     /// Goldberg dll at `third_party/gbe/`.
@@ -1902,8 +1821,6 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // ── wine env / spec / banner ─────────────────────────────────────────────
-
     #[test]
     fn wine_spec_is_run_shs_argv() {
         let root = scratch("wine-spec");
@@ -1959,7 +1876,6 @@ mod tests {
                 .count(),
             1
         );
-        // Every Text row is attributed to the launch step.
         for ev in &evs {
             if matches!(ev, StageEvent::Text { .. }) {
                 assert_eq!(ev.step(), Some(step::RUN_LAUNCH));
@@ -2001,8 +1917,6 @@ mod tests {
         assert_eq!(format_survivors(&[], "wineserver"), "");
     }
 
-    // ── wineserver reset ─────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn wineserver_reset_plans_k_then_w_and_reports_down() {
         let root = scratch("ws-reset");
@@ -2043,8 +1957,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
-
-    // ── adb reverse cleanup ──────────────────────────────────────────────────
 
     #[tokio::test]
     async fn adb_reverse_cleanup_is_silent_without_adb_or_on_the_legacy_protocol() {
@@ -2105,7 +2017,7 @@ mod tests {
             Some(step::RUN_ADB_REVERSE),
             "rows are attributed to their launch action's step"
         );
-        // Severity is `info`, exactly as run.sh:227.
+        // Severity is `info`, matching scripts/demo/run.sh # launch-action: adb-reverse-cleanup.
         assert!(matches!(
             &seen.lock().unwrap()[0],
             StageEvent::Line {
