@@ -1,37 +1,13 @@
-//! The live session: what is running, who owns it, and how to reach it.
+//! Session state has three surfaces: a status other screens read
+//! ([`SessionStatus`], broadcast on `session://status`), an in-process handle
+//! for stop and detach ([`LiveSessionHandle`]), and a record written to disk
+//! before each guarded mutation ([`state::SessionState`]) so a `SIGKILL` or
+//! power loss still leaves enough to restore the Mac's audio device.
 //!
-//! `run.sh` has no concept of a session — the shell script *is* the session,
-//! and everything it knows lives in shell locals that vanish with the process.
-//! Sabrage needs three things the shell does not:
-//!
-//! 1. **A status other screens can read.** The sidebar dot, the Session pill,
-//!    and every Stop button read one [`SessionStatus`] (design-app §3's
-//!    `session://status` global event).
-//! 2. **A handle the *rest of the app* can act on.** [`LiveSessionHandle`] is
-//!    how `stop_session()` reaches a running launch that is being supervised on
-//!    another task, and how app-quit runs the INT path instead of letting a
-//!    dropped future SIGKILL the game (critique.md's app-quit issue).
-//! 3. **State that survives this process.** [`state::SessionState`] is written
-//!    to disk *before* each guarded mutation, so a `SIGKILL` or a power loss
-//!    still leaves enough behind to put the Mac's audio device back — the one
-//!    thing `stop.sh` can only warn about (design-core §3.2, §4.2).
-//!
-//! # Two cancellation tokens, on purpose
-//!
-//! [`LiveSessionHandle`] carries `cancel` **and** `detach`, and they mean
-//! opposite things:
-//!
-//! * `cancel` — the INT/TERM path. Stop wine (`wineserver -k` + bounded wait),
-//!   then release every guard: restore the audio device, close the dashboard,
-//!   reap a stray helper. What Ctrl-C does to `demo.sh run`.
-//! * `detach` — stop *supervising* and **leak the guards on purpose**. The
-//!   session keeps running, the dashboard stays open, the audio device stays
-//!   on BlackHole, and `session-state.json` stays on disk with `detached:
-//!   true` so a later Sabrage (or `stop`) can finish the job. This is what
-//!   app-quit offers as the alternative to killing the user's game.
-//!
-//! Conflating them is the bug critique.md names: a `Drop` that tears the
-//! session down is neither a clean teardown nor a clean detach.
+//! The handle's two tokens are independent on purpose: `cancel` is the
+//! INT/TERM path (stop wine, release every guard); `detach` leaks the guards
+//! so the session keeps running (PARITY.md § Session (detach / reconcile)).
+//! See tests::the_two_tokens_are_independent.
 
 pub mod reconcile;
 pub mod state;
@@ -47,15 +23,11 @@ use tokio_util::sync::CancellationToken;
 use crate::events::RunId;
 use crate::process::ProcInfo;
 
-// ── status ────────────────────────────────────────────────────────────────────
-
 /// Where a session is in its life.
 ///
 /// Derived from several signals at once, never from one
-/// ([`watcher::SessionMonitor`]): wine-child liveness, `runtime_status.json`
-/// **freshness** (never its mere existence — the file outlives the process),
-/// and the encoder/battery log cadence behind the standby-freeze heuristic
-/// (design-core §7).
+/// ([`watcher::SessionMonitor::snapshot`]): `runtime_status.json` **freshness** counts,
+/// its mere existence does not — the file outlives the process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum SessionPhase {
@@ -80,15 +52,11 @@ pub enum SessionPhase {
     Detached,
     /// A session **nothing in Sabrage started**: no live handle, no
     /// `session-state.json`, but `runtime_status.json` is fresh and the
-    /// process it names is alive. That is a `demo.sh run` in another terminal,
-    /// which is a supported way to run this pipeline — reporting it as
-    /// [`SessionPhase::Idle`] ("No session running") invites a second launch
-    /// over a live game.
-    ///
-    /// Derived conservatively and never from file freshness alone
-    /// ([`watcher::SessionMonitor::snapshot`]); it carries the runtime's pid
-    /// and nothing else, because nothing else about that session is knowable
-    /// from here.
+    /// process it names is alive — a `demo.sh run` in another terminal.
+    /// Reporting it as [`SessionPhase::Idle`] invites a second launch over a
+    /// live game. Derived conservatively and never from freshness alone
+    /// ([`watcher::SessionMonitor::snapshot`]); carries only the runtime's
+    /// pid, because nothing else is knowable from here.
     External,
 }
 
@@ -97,9 +65,8 @@ pub enum SessionPhase {
 /// Parsed from the oxrsys log line
 /// `OXRSys/ALVR: encoder ready {w}x{h} @{hz}Hz {mbps}Mbps ({codec}, {path})`,
 /// e.g. `… (HEVC, native helper)` or `… (H.264, in-process)`. The `path` half
-/// is the one that matters operationally: `in-process` means the arm64 helper
-/// did not take, and the session silently downgraded to Rosetta H.264 — the
-/// regression CLAUDE.md records as having reached a live session once.
+/// is the operational one: `in-process` means the arm64 helper did not take
+/// and the session downgraded to Rosetta H.264.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct EncoderInfo {
@@ -144,8 +111,6 @@ pub struct SessionStatus {
     /// place deliberately.
     pub detached: bool,
 }
-
-// ── live handle ───────────────────────────────────────────────────────────────
 
 /// The in-process handle to a running session.
 ///
@@ -202,10 +167,9 @@ pub fn set_live_session(handle: LiveSessionHandle) {
 
 /// The live session's run id, without cloning the rest of the handle.
 ///
-/// [`LiveSessionHandle`] carries two [`CancellationToken`]s, a [`PathBuf`] and
-/// a [`String`]; a caller that only needs to compare identities — a detach
-/// poll loop, a reconcile that only asks "is this the session I own?" —
-/// should not pay for cloning those on every check.
+/// For callers that only compare identities — a detach poll, a reconcile —
+/// without cloning two [`CancellationToken`]s, a [`PathBuf`] and a [`String`].
+/// See tests::the_live_slot_is_set_and_cleared_by_run_id.
 pub fn live_session_run_id() -> Option<RunId> {
     LIVE_SESSION
         .lock()
@@ -231,24 +195,17 @@ pub fn clear_live_session(run_id: RunId) {
     }
 }
 
-// ── the run stage's published phase ───────────────────────────────────────────
-
 /// The run stage's own account of where a launch currently is, with the
 /// identity that goes with it.
 ///
 /// [`SessionPhase::Preflight`], [`SessionPhase::Launching`] and
-/// [`SessionPhase::Stopping`] exist **only** in [`crate::stages::run`]'s head:
-/// preflight has spawned nothing, so there is no [`LIVE_SESSION`] handle and no
-/// `session-state.json` to derive them from, and teardown has already started
-/// clearing both. Publishing them here is what lets
-/// [`watcher::SessionMonitor::snapshot`] report a launch in progress instead of
-/// "No session" for the whole of it.
+/// [`SessionPhase::Stopping`] exist only in [`crate::stages::run`]'s head,
+/// so publishing them here lets [`watcher::SessionMonitor::snapshot`] report
+/// a launch in progress instead of "No session".
 ///
-/// The identity fields are not decoration. A phase with no `run_id`/`bottle`
-/// is a Session screen that offers a Stop button it cannot wire up — it would
-/// take the operation lock and then die on "bottle name required". Anything
-/// that publishes a phase publishes who it belongs to, in one value, so the
-/// two can never be out of step.
+/// A phase always carries its `run_id` and `bottle` in one value: without
+/// them it is a Stop button that cannot be wired up. See
+/// tests::the_run_phase_slot_carries_identity_and_clears_only_for_its_own_run.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunPhaseInfo {
     pub phase: SessionPhase,
@@ -261,13 +218,10 @@ pub struct RunPhaseInfo {
 
 /// The at-most-one phase the run stage is currently reporting.
 ///
-/// `None` means "the run stage has nothing to say right now": `snapshot()`
-/// then falls back to whatever [`LIVE_SESSION`] and `session-state.json`
-/// describe. Deliberately **not** serialized anywhere — it is in-process state
-/// about a launch this process is running, and a launch that outlives this
-/// process is described by `session-state.json` instead.
-///
-/// A `std::sync::Mutex` for the same reason [`LIVE_SESSION`] is one: every
+/// `None` means the run stage has nothing to say: `snapshot()` falls back to
+/// [`LIVE_SESSION`] and `session-state.json`. Not serialized — a launch that
+/// outlives this process is described by `session-state.json` instead.
+/// `std::sync::Mutex` for the same reason [`LIVE_SESSION`] is one: every
 /// access is a short get/set, never held across an `.await`.
 static RUN_PHASE: Mutex<Option<RunPhaseInfo>> = Mutex::new(None);
 
@@ -302,40 +256,18 @@ pub(crate) fn clear_run_phase(run_id: RunId) {
     }
 }
 
-// ── one answer to "is a session live?" ────────────────────────────────────────
-
-/// Why a mutating operation must not start right now, or `None` when nothing on
-/// this machine looks like a live session.
+/// Why a mutating operation must not start right now, or `None` when nothing
+/// on this machine looks like a live session.
 ///
 /// Seven signals, cheapest first, and deliberately **not** just the in-process
-/// [`live_session`] slot: the session a Settings save or a Doctor button would
-/// break may have been launched by the other front-end, by an earlier run of
-/// this process, or by `./demo.sh run`, none of which publish anything here.
+/// [`live_session`] slot: the session a Settings save or a Doctor fix would
+/// break may belong to the other front-end, to an earlier run of this process,
+/// or to `./demo.sh run`, none of which publish anything here (A4-1). See
+/// tests::ensure_idle_refuses_for_every_source_that_can_know_about_a_session.
 ///
-/// 1. this process's own live-session handle;
-/// 2. the run stage's published phase — a launch that has not spawned yet;
-/// 3. `session-state.json`, when its recorded wine identity is still
-///    [`reconcile::Classification::Live`] (or
-///    [`reconcile::Classification::Unverifiable`], which is alive as far as
-///    anyone can tell) — the other front-end, or a session that outlived the
-///    process that started it;
-/// 4. the same record's `owner_pid`, for the window *before* that front-end's
-///    launch has spawned anything ([`state::has_live_foreign_owner`]);
-/// 5. that record being present but unparseable — it may be describing a live
-///    session, and nothing here can prove it is not;
-/// 6. a **fresh** `runtime_status.json` naming a live pid
-///    ([`watcher::runtime_status_live`], the same predicate
-///    [`watcher::SessionMonitor`] derives [`SessionPhase::External`] from, so
-///    the door and the phase cannot disagree);
-/// 7. a live `Beat Saber.exe` on the process table ([`running_game_pid`]) —
-///    the only signal that needs nothing to have been *written*, and therefore
-///    the only one that covers a `./demo.sh run` between its wine spawn and
-///    its first streaming status.
-///
-/// A live CrossOver `wineserver` is deliberately *not* a signal: it is alive for
-/// any CrossOver app the user has open, and blocking `build` on that would be
-/// wrong. The two fixes whose file a CrossOver process really can clobber keep
-/// their own narrower wineserver probes.
+/// A live CrossOver `wineserver` is deliberately **not** one of the seven —
+/// it is alive for any CrossOver app; the two fixes whose file a CrossOver
+/// process can clobber keep narrower probes.
 pub fn live_session_reason(paths: &crate::paths::Paths) -> Option<String> {
     live_session_block(paths).map(|b| b.reason)
 }
@@ -357,13 +289,13 @@ pub struct SessionBlock {
 
 /// [`live_session_reason`] with the bottle kept.
 ///
-/// **The** live-session predicate: every "not while the game is running" door —
-/// [`crate::stages::live_session_block`] (stage refusals and every gated
+/// **The** live-session predicate: every "not while the game is running" door
+/// — [`crate::stages::live_session_block`] (stage refusals and every gated
 /// Doctor fix), [`crate::config::blocking_session`] (the Settings writer) and
-/// `store::goldberg`'s revert — goes through this one function, so a state that
-/// blocks one of them blocks all of them. They used to carry three weaker
-/// copies each missing a different signal, which is how a `./demo.sh run`
-/// session could have its `steam_api64.dll` replaced underneath it.
+/// `store::goldberg`'s revert — goes through this one function, so a state
+/// that blocks one of them blocks all of them. A door with its own weaker copy
+/// is how a `./demo.sh run` session gets its `steam_api64.dll` replaced
+/// underneath it (A13a-2).
 pub fn live_session_block(paths: &crate::paths::Paths) -> Option<SessionBlock> {
     session_block_at(
         &paths.session_state_path(),
@@ -435,13 +367,9 @@ pub(crate) fn session_block_at(
                 );
             }
         }
-        // A record that exists but will not parse is the one case where the
-        // conservative answer is the only safe one: it may still be describing
-        // a live session, and the question every caller is asking is "may I
-        // overwrite something a running game has open". `store::goldberg`'s
-        // predicate always read it this way; folding the predicates together
-        // gives every other door the same conservatism, with a remedy the
-        // `./demo.sh stop` line cannot offer.
+        // A record that exists but will not parse may still be describing a
+        // live session, and the question every caller is asking is "may I
+        // overwrite something a running game has open" — so refuse.
         Err(_) => {
             return block(
                 format!(
@@ -457,10 +385,9 @@ pub(crate) fn session_block_at(
 
     if let Ok(text) = std::fs::read_to_string(runtime_status_path) {
         if let Some(rs) = watcher::parse_runtime_status(&text) {
-            // [`watcher::runtime_status_live`], not a second local reading of
-            // the same file: the phase the Session screen renders and the door
-            // this function is have to agree, or Sabrage says "No session
-            // running" while Settings refuses to save (A10-8).
+            // Reuse [`watcher::runtime_status_live`] so this door and the
+            // phase the Session screen renders cannot disagree — otherwise
+            // Sabrage says "No session running" while Settings refuses (A10-8).
             if watcher::runtime_status_live(&rs, now_unix_ms()) {
                 return block(
                     format!(
@@ -499,18 +426,15 @@ const GAME_EXE: &str = "Beat Saber.exe";
 
 /// The pid of a running Beat Saber, if there is one.
 ///
-/// The signal none of the other six can replace: a `./demo.sh run` writes no
-/// session record, publishes no handle, and — crucially — its runtime does not
-/// write `runtime_status.json` until *streaming* begins, which is minutes after
-/// Goldberg has been installed and the game spawned. In that window every
-/// file-based signal reads idle, so Settings, a Doctor fix, or the Goldberg
-/// revert would happily rewrite files the running game has open (A13a-2). This
-/// closes it from the wine spawn onward.
+/// The signal none of the others can replace: a `./demo.sh run` writes no
+/// session record and publishes no handle, and its runtime does not write
+/// `runtime_status.json` until *streaming* begins, so every file-based signal
+/// reads idle for the minutes between the wine spawn and the first status
+/// (A13a-2). See tests::a_running_game_is_a_live_session_even_with_nothing_on_disk.
 ///
-/// What it cannot close is the window *before* the spawn — Goldberg is
-/// installed several steps earlier — which needs a marker both front-ends take;
-/// that is a shared-pipeline change (contract + `scripts/demo/run.sh` + here),
-/// not something this function can do alone.
+/// Limitation: the window *before* the wine spawn — Goldberg is installed
+/// several steps earlier — stays open; closing it needs a marker both
+/// front-ends take (contract + `scripts/demo/run.sh` + here).
 pub(crate) fn running_game_pid() -> Option<u32> {
     crate::process::find_processes_by_cmdline(GAME_EXE)
         .first()
@@ -519,16 +443,14 @@ pub(crate) fn running_game_pid() -> Option<u32> {
 
 /// Refuse `action` while any session is live — the single policy every "not
 /// while the game is running" caller shares, over [`live_session_reason`]'s
-/// seven signals.
+/// seven signals. The error carries `stop.sh`'s own remedy, so a GUI caller
+/// renders the same row the config and doctor refusals render.
 ///
-/// The error carries `stop.sh`'s own remedy, so a GUI caller renders the same
-/// row the config and doctor refusals already render.
-///
-/// This form reads the machine's real support directories: both paths it needs
-/// are derived from `$HOME`, so the empty repo root below is never consulted.
-/// Anything that already has a [`crate::paths::Paths`] — and every test — must
-/// call [`ensure_idle_in`] instead, or it will consult the developer's own
-/// session.
+/// This form reads the machine's real support directories: both paths it
+/// needs derive from `$HOME`, so the empty repo root below is never
+/// consulted. Anything that already has a [`crate::paths::Paths`] — and every
+/// test — must call [`ensure_idle_in`] instead, or it consults the
+/// developer's own session.
 pub fn ensure_idle(action: &str) -> std::result::Result<(), crate::error::SabrageError> {
     ensure_idle_in(&crate::paths::Paths::new(PathBuf::new()), action)
 }
@@ -614,8 +536,6 @@ pub fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-// ── the audio device to fall back to ──────────────────────────────────────────
-
 /// Substrings that mark an output device as *not a speaker*.
 ///
 /// `BlackHole` is the loopback `run` routed the Mac to — restoring onto it is
@@ -630,21 +550,14 @@ const BUILT_IN_OUTPUT: &str = "Built-in Output";
 
 /// Which device to restore the Mac's output to when the **recorded** one is
 /// gone — the AirPods that disconnected while the session was running, which
-/// makes `SwitchAudioSource -t output -s "…AirPods Pro"` exit non-zero with
-/// `Could not find an audio device named … Nothing was changed.` and leaves the
-/// Mac on `BlackHole 2ch`, silent.
+/// makes `SwitchAudioSource -t output -s "…AirPods Pro"` exit non-zero and
+/// leaves the Mac on `BlackHole 2ch`, silent.
 ///
-/// `devices` is `SwitchAudioSource -a -t output`, in its own order. Two tiers:
-///
-/// 1. the built-in output — the first `Mac… Speakers` (MacBook Pro/Air, Mac
-///    Studio, Mac mini) or exactly `Built-in Output`. It is the one device that
-///    is always physically there, so it is always a safe landing;
-/// 2. failing that, the first device that is not one of
-///    [`VIRTUAL_OUTPUT_MARKERS`] — some real output beats no output.
-///
-/// `None` means every device on offer was virtual (or there were none): the
-/// caller must then say so and print the remedy rather than switch to
-/// something that stays silent.
+/// `devices` is `SwitchAudioSource -a -t output`, in its own order. Returns
+/// the built-in output when the list has one, else the first device that is
+/// not one of `VIRTUAL_OUTPUT_MARKERS`, else `None` — and `None` obliges
+/// the caller to print the remedy rather than switch to something that stays
+/// silent. See tests::the_fallback_picks_the_built_in_output_then_any_real_one.
 pub fn fallback_output_device(devices: &[String]) -> Option<String> {
     devices
         .iter()
@@ -678,8 +591,8 @@ pub fn audio_fallback_line(dry_run: bool, previous: &str, fallback: &str) -> Str
 /// The row printed when there is nothing to fall back to either: what failed,
 /// and the two commands that fix it by hand.
 ///
-/// Naming the recorded device is the whole point — the failure this replaces
-/// left the user on `BlackHole 2ch` with no record at all of what to restore.
+/// It names the recorded device because that is the only record left of what
+/// to restore once the Mac is stranded on `BlackHole 2ch`.
 pub fn audio_unrestorable_line(previous: &str) -> String {
     format!(
         "could not restore the audio output (recorded device '{previous}' is not connected) — \
@@ -688,26 +601,18 @@ pub fn audio_unrestorable_line(previous: &str) -> String {
     )
 }
 
-/// Serializes — and resets — [`RUN_PHASE`] for the tests that touch it.
+/// Serializes — and resets — `RUN_PHASE` for the tests that touch it.
 ///
-/// Unit tests share one process and the standard harness runs them on several
-/// threads at once, so a test asserting "nothing is published" genuinely races
-/// a test that legitimately publishes — observed as a real flake, not a
-/// theoretical one. **Every** test that reads or writes the published run phase
-/// must hold this guard, not just the ones that expect emptiness: a writer that
-/// skips it is exactly what the readers are being protected from.
+/// The harness runs unit tests on several threads in one process, so **every**
+/// test that reads or writes the run phase must hold this guard: a writer
+/// that skips it is exactly what the readers are being protected from.
+/// Acquiring empties the slot so a test starts from Idle whatever its
+/// predecessor left — including the `Exited` a normal teardown ends on.
+/// Poisoning is ignored: a panicking test has already failed.
 ///
-/// Acquiring also empties the slot, so a test starts from Idle whatever its
-/// predecessor left behind — including the deliberately surviving `Exited`
-/// publication [`crate::stages::run`]'s normal teardown ends on. Poisoning is
-/// ignored: a panicking test has already failed, and its neighbours must still
-/// be able to run.
-///
-/// [`LIVE_SESSION`] is deliberately **not** reset here. Tests in other modules
-/// set that slot without holding this guard (`logs`'s live-session resolution
-/// test, for one), and blanking it on every acquisition would pull it out from
-/// under them. Serializing that slot too is worth doing — it needs those tests
-/// to take this guard first.
+/// [`LIVE_SESSION`] is deliberately **not** reset here: tests in other modules
+/// set that slot without holding this guard, and blanking it on every
+/// acquisition would pull it out from under them.
 #[cfg(test)]
 pub(crate) fn lock_session_globals() -> SessionGlobalsGuard {
     static LOCK: Mutex<()> = Mutex::new(());
@@ -718,15 +623,13 @@ pub(crate) fn lock_session_globals() -> SessionGlobalsGuard {
     SessionGlobalsGuard(guard)
 }
 
-/// What [`lock_session_globals`] hands back.
+/// What `lock_session_globals` hands back.
 ///
-/// A newtype around the `MutexGuard` rather than the guard itself, because
-/// async tests hold it across `.await` points and `clippy::await_holding_lock`
-/// flags a raw guard there. The concern behind that lint — a std lock blocking
-/// an async runtime's worker — cannot arise: `#[tokio::test]` drives one future
-/// to completion on the test's own thread, so no other task on that runtime can
-/// be waiting for this lock. The contention is between the test harness's OS
-/// threads, which is exactly what a std `Mutex` is for.
+/// A newtype around the `MutexGuard` because async tests hold it across
+/// `.await` points and `clippy::await_holding_lock` flags a raw guard there.
+/// The lint's concern cannot arise: `#[tokio::test]` drives one future to
+/// completion on the test's own thread, so the contention is between the
+/// harness's OS threads, which is what a std `Mutex` is for.
 #[cfg(test)]
 pub(crate) struct SessionGlobalsGuard(#[allow(dead_code)] std::sync::MutexGuard<'static, ()>);
 
@@ -801,8 +704,6 @@ mod tests {
             assert_eq!(serde_json::to_value(phase).unwrap(), word);
         }
     }
-
-    // ── the one liveness policy ──────────────────────────────────────────────
 
     fn state_dir(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -907,11 +808,9 @@ mod tests {
         std::fs::remove_file(&path).unwrap();
 
         // 5: a `demo.sh run` session — nothing of ours anywhere, but the
-        // runtime is reporting in right now, naming a process that is alive.
-        // Both halves, because this is `watcher::runtime_status_live`, the
-        // same predicate the Session screen derives `External` from (A10-8): a
-        // door that refused on freshness alone said "a session is live" over a
-        // file the UI was calling Idle.
+        // runtime is reporting in right now, naming a live process. Both
+        // halves are asserted because a door that refused on freshness alone
+        // said "a session is live" over a file the UI was calling Idle (A10-8).
         let write_status = |pid: Option<u32>, at: u64| {
             let pid = pid
                 .map(|p| format!(r#""process_id":{p},"#))
@@ -1155,25 +1054,21 @@ mod tests {
         assert!(now_unix_ms() > 1_600_000_000_000);
     }
 
-    // ── the audio fallback ───────────────────────────────────────────────────
-
     fn devices(names: &[&str]) -> Vec<String> {
         names.iter().map(|n| n.to_string()).collect()
     }
 
-    /// Every case of the two-tier fallback policy in one table: tier 1 (a
-    /// built-in output wherever it sits in the list, in all four Mac naming
-    /// shapes plus `Built-in Output`), tier 2 (the first non-virtual device),
-    /// and `None` when every candidate is virtual or there are none — `None`
-    /// is what makes the caller print the remedy instead of switching the Mac
-    /// to something that stays silent.
+    /// Both tiers of the fallback policy in one table: a built-in output
+    /// wherever it sits in the list, else the first non-virtual device, and
+    /// `None` when every candidate is virtual or there are none — `None` is
+    /// what makes the caller print the remedy instead of switching the Mac to
+    /// something that stays silent.
     #[test]
     fn the_fallback_picks_the_built_in_output_then_any_real_one() {
         let cases: &[(&str, &[&str], Option<&str>)] = &[
             (
-                // The live `SwitchAudioSource -a -t output` list of the
-                // 2026-08-29 finding, in its own order: the recorded AirPods
-                // are simply not on it any more.
+                // A live `SwitchAudioSource -a -t output` list, in its own
+                // order: the recorded AirPods are simply not on it any more.
                 "observed 2026-08-29 list: built-in among the virtuals",
                 &[
                     "BlackHole 2ch",
