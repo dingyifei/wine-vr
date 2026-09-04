@@ -1,6 +1,5 @@
-//! Primitives shared by checks, fixes, and stages. Every function here is a
-//! deliberate port of one shell idiom, and each documents the idiom it mirrors —
-//! that is what keeps the two front-ends from drifting.
+//! Primitives shared by checks, fixes, and stages: byte-level ports of the
+//! shell pipeline's idioms.
 
 pub mod hash;
 pub mod winpath;
@@ -8,14 +7,9 @@ pub mod winpath;
 pub use hash::{file_sha256_matches, sha256_bytes, sha256_file};
 pub use winpath::win_path;
 
-/// lib.sh's `helper_is_arm64` and the `lipo -archs` capture behind it.
-///
-/// They live in [`crate::checks::build`] — that is the single implementation —
-/// and are re-exported here because the fix and stage layers need them too
-/// (`build` arch-gates the helper it produced; `fix.restage-helper` arch-gates
-/// the source before staging it). Re-export rather than a second copy: the
-/// `arm64e`-must-not-satisfy rule is a parity invariant, and two copies of a
-/// rule are one copy too many.
+/// Re-exported from [`crate::checks::build`] so the fix and stage layers share the
+/// one implementation: the `arm64e`-must-not-satisfy rule is a parity invariant
+/// (PARITY.md § Doctor / checks, "`helper_is_arm64` currently shells out to `lipo`").
 pub use crate::checks::build::{helper_is_arm64, lipo_archs_stdout};
 
 use std::io::Read;
@@ -25,12 +19,9 @@ use crate::contract::{contract, CONTRACT_FILES, CONTRACT_GEN_REL_PATH, HOST_MANI
 use crate::paths::Paths;
 
 /// `cmp -s "$1" "$2"`: true iff both files exist, are readable, and are
-/// byte-identical. Any error (missing, permission, directory) is `false`,
-/// exactly like the shell's non-zero exit.
-///
-/// Used everywhere the pipeline asks "is this overlay current?" — install's
-/// `install_if_changed` and doctor sections 10/11 both hinge on it, so it must
-/// never report "equal" for a file it could not read.
+/// byte-identical. Any error (missing, permission, directory) returns `false`,
+/// so it never reports "equal" for a file it could not read.
+/// See tests::cmp_files_matches_cmp_s_semantics.
 pub fn cmp_files(a: &Path, b: &Path) -> bool {
     fn open(p: &Path) -> Option<(std::fs::File, u64)> {
         let f = std::fs::File::open(p).ok()?;
@@ -88,28 +79,13 @@ pub fn strip_trailing_newlines(s: &str) -> &str {
     s.trim_end_matches('\n')
 }
 
-// ── Beat Saber version ────────────────────────────────────────────────────────
-
-/// lib.sh's `bs_version()`: best-effort Beat Saber version for `bs_dir`.
+/// Best-effort Beat Saber version for `bs_dir`, reproducing lib.sh's
+/// `bs_version()` quirks: the marker file wins even when empty; otherwise every
+/// stamp on the first matching line of `globalgamemanagers`, newline-joined, else
+/// `?`. Trailing newlines are stripped (doctor captures via `$(bs_version)`).
 ///
-/// ```zsh
-/// bs_version() {
-///   cat "$BS_DIR/BeatSaberVersion.txt" 2>/dev/null && return
-///   grep -a -o -E -m1 '[0-9]{1,2}\.[0-9]{1,3}\.[0-9]{1,3}_[0-9]{6,}' \
-///     "$BS_DIR/Beat Saber_Data/globalgamemanagers" 2>/dev/null || echo '?'
-/// }
-/// ```
-///
-/// Reproduced quirks:
-/// * the marker file wins even when it is **empty** (`cat` succeeds, so the
-///   shell returns an empty string rather than falling through to the scan);
-/// * `grep -o -m1` emits *every* match on the *first matching line*, so a line
-///   with two stamps yields both, newline-joined;
-/// * the caller-visible value has trailing newlines stripped, because doctor
-///   captures it with `$(bs_version)`.
-///
-/// The scan is hand-rolled rather than `regex`-backed on purpose: sabrage-core
-/// stays dependency-light, and the pattern is a fixed digit/separator shape.
+/// See tests::bs_version_falls_back_to_question_mark and
+/// tests::version_stamp_scan_matches_grep.
 pub fn bs_version(bs_dir: &Path) -> String {
     if let Ok(bytes) = std::fs::read(bs_dir.join("BeatSaberVersion.txt")) {
         let text = String::from_utf8_lossy(&bytes).into_owned();
@@ -197,29 +173,14 @@ fn version_stamp_at(b: &[u8], i: usize) -> Option<usize> {
     Some(j + n4)
 }
 
-// ── byte-shared artifacts ─────────────────────────────────────────────────────
-
-/// Render the host OpenXR manifest for `dylib_path`.
+/// Render the host OpenXR manifest for `dylib_path` in its *comparison* form:
+/// the template with the placeholder replaced by the JSON-escaped path, minus the
+/// template's trailing newline (install.sh reads with `$(<file)`, which strips it).
 ///
-/// install.sh:
-/// ```zsh
-/// OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
-/// OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
-/// WANT="${$(<"$ROOT/contract/active_runtime.x86_64.json.template")//@OXR_DYLIB@/$OXR_DYLIB_JSON}"
-/// ```
-/// `$(<file)` strips the template's trailing newline, so the returned string has
-/// **no** trailing newline — it is the *comparison* form, the exact bytes
-/// install.sh's `[ "$(cat "$HOST_XR_JSON")" = "$WANT" ]` test compares against.
-/// Use [`host_manifest_file_bytes`] for what actually lands on disk.
-///
-/// This is the single most drift-sensitive artifact in the pipeline: one extra
-/// byte and the two front-ends thrash each other with sudo prompts.
-///
-/// The path lands **inside a JSON string literal**, so it goes through
-/// [`json_escape_string`] first — install.sh escapes `$OXR_DYLIB` the same way
-/// before its own `//@OXR_DYLIB@/` substitution, and an ordinary path (no `\`,
-/// no `"`) renders byte-identically to the unescaped form, so no artifact on
-/// any existing machine changes.
+/// Use [`host_manifest_file_bytes`] for what lands on disk — one extra byte and the
+/// two front-ends thrash each other with sudo prompts. See
+/// sabrage-parity tests::artifact_goldens::render_host_manifest_matches_the_on_disk_template,
+/// sabrage-parity tests::artifact_goldens::render_host_manifest_json_escapes_the_dylib_path.
 pub fn render_host_manifest(dylib_path: &Path) -> String {
     strip_trailing_newlines(crate::contract::HOST_MANIFEST_TEMPLATE).replace(
         HOST_MANIFEST_PLACEHOLDER,
@@ -228,24 +189,14 @@ pub fn render_host_manifest(dylib_path: &Path) -> String {
 }
 
 /// Escape `s` for embedding in a JSON string literal, byte-for-byte the way
-/// install.sh does it:
+/// install.sh does: backslash first (so introduced escapes are not re-escaped),
+/// then double quote, nothing else. The escaped path lands in the root-owned host
+/// manifest (PARITY.md § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+/// "Control characters in the checkout path.").
 ///
-/// ```zsh
-/// OXR_DYLIB_JSON="${OXR_DYLIB//\\/\\\\}"
-/// OXR_DYLIB_JSON="${OXR_DYLIB_JSON//\"/\\\"}"
-/// ```
-///
-/// i.e. backslash first (so the escapes it introduces are not re-escaped), then
-/// the double quote — and **nothing else**. A checkout path containing either
-/// character would otherwise produce invalid or misdirected JSON in the
-/// root-owned host manifest, which breaks OpenXR until another privileged
-/// install repairs it.
-///
-/// Deliberately *not* a full JSON encoder: control characters (a literal
-/// newline or tab in a path) stay unescaped because the zsh side leaves them
-/// unescaped too, and artifact-byte parity between the two front-ends outranks
-/// being correct for a path no checkout has ever had. Widening this must land
-/// on both sides in the same commit.
+/// Not a full JSON encoder: control characters stay unescaped, as on the zsh side,
+/// so widening this must land on both sides in the same commit. See
+/// tests::json_escape_string_is_install_shs_two_substitutions.
 pub fn json_escape_string(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
@@ -270,27 +221,20 @@ pub fn host_manifest_is_current(path: &Path, want: &str) -> bool {
     }
 }
 
-/// The `oxrsys-runtime.toml` first-write template, byte-for-byte.
+/// The `oxrsys-runtime.toml` first-write template, byte-for-byte: exactly the
+/// bytes setup writes, including the trailing newline and every comment (comments
+/// are load-bearing — the pre-2026-08 runtime parser choked on a same-line `#`).
 ///
-/// setup.sh writes it with `cat template > "$TOML"`, so these are exactly the
-/// bytes that must land on disk — including the trailing newline and every
-/// comment (comments are load-bearing; the pre-2026-08 runtime parser choked on
-/// same-line `#`). **Write-once**: never regenerate, never migrate.
+/// **Write-once**: never regenerate, never migrate. See
+/// sabrage-parity tests::artifact_goldens::toml_template_matches_the_on_disk_contract_file.
 pub fn toml_template() -> &'static str {
     crate::contract::RUNTIME_TOML_TEMPLATE
 }
 
-// ── DXMT artifact set ─────────────────────────────────────────────────────────
-
-/// lib.sh's `dxmt_files_ok()`: every `[dxmt] files` entry present under
-/// `ext/dxmt-artifacts/`.
-///
-/// ```zsh
-/// dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
-/// ```
-///
-/// ALL of them, never a subset: `install` refuses to half-apply the overlay,
-/// and a partial overlay black-windows the game with no error of its own.
+/// True when every `[dxmt] files` entry is present under `ext/dxmt-artifacts/` —
+/// ALL of them, never a subset. A partial overlay black-windows the game with no
+/// error of its own, so `install` refuses to half-apply it.
+/// See tests::dxmt_helpers_need_every_file_and_a_current_marker.
 pub fn dxmt_files_ok(paths: &Paths) -> bool {
     contract()
         .dxmt
@@ -299,45 +243,32 @@ pub fn dxmt_files_ok(paths: &Paths) -> bool {
         .all(|f| paths.dxmt_art.join(f).is_file())
 }
 
-/// lib.sh's `dxmt_ok()`: the `.sha256` provenance marker matches the pin **and**
-/// every file is present.
-///
-/// ```zsh
-/// dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
-/// ```
-///
-/// The marker is compared through command-substitution semantics, so trailing
-/// newlines are irrelevant — a marker written by either front-end reads as
-/// current to the other. See [`contract_marker_bytes`] for the write side.
+/// True when the `.sha256` provenance marker matches the contract pin **and**
+/// every `[dxmt] files` entry is present. Trailing newlines are irrelevant
+/// (command-substitution semantics), so a marker written by either front-end
+/// reads as current to the other. See [`contract_marker_bytes`] for the write
+/// side and tests::dxmt_helpers_need_every_file_and_a_current_marker.
 pub fn dxmt_ok(paths: &Paths) -> bool {
     let marker = std::fs::read_to_string(paths.dxmt_art.join(".sha256")).unwrap_or_default();
     strip_trailing_newlines(&marker) == contract().deps.dxmt_tgz_sha256 && dxmt_files_ok(paths)
 }
 
-/// The exact bytes of the `.sha256` provenance marker `setup` writes:
+/// The exact bytes of the `.sha256` provenance marker `setup` writes: the pin
+/// plus **one** trailing newline.
 ///
-/// ```zsh
-/// print -r -- "$DXMT_TGZ_SHA256" > "$DXMT_ART/.sha256"
-/// ```
-///
-/// i.e. the pin plus **one** trailing newline. `print -r --` adds exactly one;
-/// writing zero or two would still *read* as current (command substitution eats
-/// them) but would make the two front-ends write different bytes for the same
-/// state, which is the drift this crate exists to prevent.
+/// Zero or two would still *read* as current (command substitution eats them) but
+/// would make the two front-ends write different bytes for the same state; see
+/// tests::marker_bytes_are_the_pin_plus_exactly_one_newline.
 pub fn contract_marker_bytes(sha: &str) -> String {
     format!("{sha}\n")
 }
 
-// ── contract sync ─────────────────────────────────────────────────────────────
-
-/// The `meta.contract-sync` hash over contract bytes already in memory —
+/// The `meta.contract-sync` hash over contract bytes already in memory:
 /// `cat <parts…> | shasum -a 256`, in the order given.
 ///
-/// The one place the recipe is spelled out for in-memory inputs, so the
-/// compiled-in identity ([`crate::contract::COMPILED_CONTRACT_SHA256`]) and the
-/// on-disk recompute ([`contract_hash`], which streams the same three files off
-/// `repo_root`) cannot drift apart in *how* they hash — only in *what* they
-/// hash, which is exactly the skew the two are meant to expose.
+/// Same recipe as [`contract_hash`], so the compiled-in identity
+/// ([`crate::contract::COMPILED_CONTRACT_SHA256`]) and the on-disk recompute
+/// can differ only in *what* they hash, which is the skew they exist to expose.
 pub fn contract_sha256_from(parts: &[&str]) -> String {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -348,20 +279,15 @@ pub fn contract_sha256_from(parts: &[&str]) -> String {
 }
 
 /// The `meta.contract-sync` hash, recomputed from the contract files **on disk**
-/// under `repo_root`.
+/// under `repo_root`, concatenated in `CONTRACT_FILES` order.
 ///
-/// Recipe pinned by doctor.sh section 0 and by the `# contract-sha256:` header of
-/// the generated shell file:
+/// # Errors
+/// Any contract file that cannot be opened or read.
 ///
-/// ```sh
-/// cat contract/pipeline.toml \
-///     contract/oxrsys-runtime.toml.template \
-///     contract/active_runtime.x86_64.json.template | shasum -a 256
-/// ```
-///
-/// Runtime reads, not [`include_str!`], on purpose: this compares the *checkout*
-/// against its own generated file, so a stale compiled-in copy would defeat the
-/// entire point of the tripwire.
+/// Pinned by doctor.sh section 0 and the `# contract-sha256:` header of the
+/// generated shell file. Runtime reads, not [`include_str!`]: this compares
+/// the *checkout* against its own generated file, so a stale compiled-in copy
+/// would defeat the tripwire. See tests::contract_hash_matches_the_generated_header.
 pub fn contract_hash(repo_root: &Path) -> std::io::Result<String> {
     use sha2::{Digest, Sha256};
     let mut h = Sha256::new();
@@ -394,7 +320,7 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    /// The repo root, four levels above this crate's manifest.
+    /// The repo root, three directories above this crate's manifest directory.
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
