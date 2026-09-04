@@ -1,4 +1,16 @@
 <script lang="ts">
+  /*
+    Navigation chrome: item list, active-screen highlight, and footer session
+    line.  The parent owns `screen`; this component only reports clicks via
+    `onNavigate`.
+
+    Loads `bottlesStore` on mount because the sidebar stays mounted while
+    screens swap, keeping the list warm before any bottle-showing screen
+    appears.  Other screens still call `bottlesStore.load()` themselves.
+
+    `PHASE_DOT` and `footerLabel` are exhaustive over `SessionStatus["phase"]`
+    by type, so adding a phase in `ipc.ts` breaks this file at compile time.
+  */
   import { onMount } from "svelte";
   import NavItem from "./NavItem.svelte";
   import { bottlesStore } from "../stores/bottles.svelte";
@@ -14,7 +26,7 @@
   interface Props {
     screen: Screen;
     onNavigate: (screen: Screen) => void;
-    /** Sidebar nav dot on Doctor — wired to doctor://badge once Doctor is real (Phase 1). Static false for now. */
+    /** Shows the attention dot on the Doctor nav item. */
     doctorBadge?: boolean;
   }
 
