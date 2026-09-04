@@ -1,41 +1,23 @@
 //! `fix.delete-session-json` — delete ALVR's `session.json` to clear stale
 //! manual client IP pins.
 //!
-//! **This remedy is known to be broken** and is marked `destructive` for that
-//! reason: deleting the file has been observed to leave the client at an
-//! 800x900 black screen (the runtime recreates a session with no display
-//! parameters). Editing the pinned IPs in place is the recovery that works, and
-//! it supersedes this fix once the comment-preserving config editor lands
-//! (design-core §4.1).
+//! Known-bad remedy, marked `destructive`: deleting the file has been observed
+//! to leave the client at an 800x900 black screen; editing the pinned IPs in
+//! place is the recovery that works. Listed in
+//! [`crate::fixes::DEFERRED_CONTRACT_FIX_IDS`], so no GUI Doctor row offers a
+//! button for it.
 //!
-//! It is also **withheld from the GUI**: `fix.delete-session-json` is in
-//! [`crate::fixes::DEFERRED_CONTRACT_FIX_IDS`], so no Doctor row renders a
-//! button for it, and [`crate::fixes::FixDef::consequence`] carries the
-//! black-screen warning for any door that does offer it.
-//!
-//! Implementation notes for the fixes agent:
-//! * the file is [`crate::paths::Paths::alvr_session_json`]
-//!   (`~/Library/Application Support/OXRSys/alvr/session.json`);
-//! * back it up under `ctx.paths.sabrage_appsup`'s `backups/` before removing
-//!   anything, under a name no existing backup owns;
-//! * every write **and the removal itself** go through
-//!   [`crate::executor::Executor`], so a dry run plans them and mutates
-//!   nothing;
-//! * absent file ⇒ [`FixReport::unchanged`], never an error;
-//! * refuse while a session is live (the server core reads the file once at
-//!   init and rewrites it at shutdown).
-//!
-//! There is no shell equivalent to port byte-for-byte here — `run.sh` never
-//! deletes this file itself; deletion is a manual troubleshooting step this
-//! fix merely automates (with a backup the shell-driven workflow never took).
-//! Nothing in this module's message text is a verbatim shell string.
-//!
-//! `session.json` is machine-global (`~/Library/Application Support/OXRSys/`
-//! is not per-bottle), so unlike [`crate::fixes::backend`]'s edit — which can
-//! narrow its liveness probe to one bottle's `WINEPREFIX` — this fix refuses
-//! while **any** CrossOver wineserver is alive, via `backend::any_wineserver_alive`
-//! (that module is this crate's one home for wineserver-liveness scanning; see
-//! its header).
+//! Backs [`crate::paths::Paths::alvr_session_json`] up under
+//! `ctx.paths.sabrage_appsup`'s `backups/`, routes every write and the removal
+//! through [`crate::executor::Executor`], treats an absent file as
+//! [`FixReport::unchanged`], and refuses while any CrossOver wineserver is
+//! alive — `session.json` is machine-global, so there is no per-bottle
+//! narrowing as in [`crate::fixes::backend`] (`backend::any_wineserver_alive`
+//! is this crate's one home for wineserver-liveness scanning). See
+//! tests::{deletes_after_backing_up_and_reports_the_backup_location,
+//! refuses_while_any_wineserver_is_alive}. No shell equivalent: `run.sh`
+//! never deletes this file, and no message text here is a verbatim shell
+//! string.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -51,19 +33,17 @@ const STEP: StepId = "fix.delete-session-json";
 
 /// Remove ALVR's `session.json` (after backing it up).
 ///
-/// Backup and removal both go through [`crate::executor::Executor`]
-/// (`create_dir_all` + `write_atomic` + [`crate::executor::Executor::remove_file`]),
-/// so what mutates is decided by the executor the context carries and by
-/// nothing else. Reading `ctx.opts.dry_run` here instead would be a real,
-/// irreversible delete for any caller that built a preview context with
-/// [`StageCtx::with_executor`] — and the backup, which *does* go through the
-/// executor, would have been planned rather than written. `remove_file` exists
-/// on the trait precisely so this fix is not an exception: `remove_dir_all` on
-/// `alvr/` would take the trusted-client state with it.
+/// Backup and removal both go through [`crate::executor::Executor`], so
+/// mutation is decided by the executor, never by `ctx.opts.dry_run`: a preview
+/// context built with [`StageCtx::with_executor`] plans both. See
+/// tests::a_preview_executor_beats_opts_dry_run_false. The removal uses
+/// `Executor::remove_file`, not `remove_dir_all` on `alvr/`, which would take
+/// the trusted-client state with it. A dry run says what it *would* do and
+/// still reports `changed`.
 ///
-/// Only the wording branches on the executor's mode: a dry run says what it
-/// *would* do, at `info`, and reports `changed` all the same so the caller can
-/// show what a real apply would achieve.
+/// # Errors
+/// Fails when `ctx.paths.wineserver` is known and any CrossOver wineserver is
+/// alive, and on a read, backup, or removal I/O failure.
 pub async fn delete_session_json(ctx: &StageCtx, sink: &EventSink) -> Result<FixReport> {
     let path = ctx.paths.alvr_session_json();
     if !path.is_file() {
@@ -91,9 +71,8 @@ pub async fn delete_session_json(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
     // carries the real byte count the backup would have.
     let bytes = std::fs::read(&path).map_err(|e| SabrageError::io(&path, e))?;
     // `ctx.paths.sabrage_appsup`, not the global `sabrage_support_dir()`: the
-    // field exists so a caller (a test above all) can redirect Sabrage's own
-    // store away from the real `$HOME`, and the crate's other backup writer
-    // (`config::runtime_toml`) already uses it.
+    // field exists so a caller can redirect Sabrage's own store away from the
+    // real `$HOME` without mutating the process environment.
     let backup_dir = ctx.paths.sabrage_appsup.join("backups");
 
     let executor = ctx.executor_for(STEP);
@@ -129,17 +108,15 @@ pub async fn delete_session_json(ctx: &StageCtx, sink: &EventSink) -> Result<Fix
 
 /// Write the backup under a name **no existing backup owns**, and return it.
 ///
-/// The suffix is whole seconds, so two deletions inside one second — a
-/// restore/recreate/delete cycle, or two front-ends at once — collide. The
-/// earlier file is the one the user is most likely to want back (it is the
-/// recovery from this fix's own known-bad outcome), and `write_atomic` is
-/// replace-by-rename, so it would be the one lost.
+/// The `session.json.<secs>` suffix is whole seconds, so two deletions inside
+/// one second collide; [`Executor::create_new`] (`O_EXCL`) makes the kernel
+/// allocate the `-2`, `-3`, … name instead of a probe another writer can win,
+/// so the earlier backup — the one that recovers this fix's known-bad outcome
+/// — is never replaced. See
+/// tests::a_second_deletion_in_the_same_second_does_not_overwrite_the_first_backup.
 ///
-/// [`Executor::create_new`] makes "did I create it?" the kernel's answer
-/// (`O_EXCL`) rather than a probe another process can win between, so the loop
-/// is a real allocation of names, not a check-then-write race. Same
-/// `<name>.<secs>`, `-2`, `-3`, … shape as `config::runtime_toml`'s
-/// `next_backup_path`, which the toml writer uses for the same reason.
+/// # Errors
+/// Propagates the executor's write failures.
 async fn write_backup(executor: &dyn Executor, backup_dir: &Path, bytes: &[u8]) -> Result<PathBuf> {
     let base = format!("session.json.{}", unix_timestamp());
     for n in 1u32.. {
@@ -184,11 +161,6 @@ mod tests {
 
     /// A ctx whose OXRSys store **and** Sabrage store live under a scratch
     /// dir — never the real `~/Library/Application Support`.
-    ///
-    /// `sabrage_appsup` is a field rather than a call precisely so this is a
-    /// redirection and not a process-global `$HOME` swap: the fix reads the
-    /// field, so nothing here has to mutate the environment other tests are
-    /// reading at the same instant.
     fn ctx_with_session_json(root: &Path, dry_run: bool) -> (StageCtx, PathBuf) {
         let mut paths = Paths::new(root);
         paths.oxr_appsup = root.join("OXRSys");
@@ -311,10 +283,8 @@ mod tests {
     }
 
     /// Two deletions inside one wall-clock second: the second backup must not
-    /// overwrite the first. Restoring a backup is the documented recovery from
-    /// this fix's own known-bad outcome, so the copy it silently replaced was
-    /// the one the user most needed — a `session.json.<secs>` name derived from
-    /// whole seconds and written with replace-by-rename semantics lost it.
+    /// overwrite the first. Restoring that backup is the documented recovery
+    /// from this fix's own known-bad outcome.
     #[tokio::test]
     async fn a_second_deletion_in_the_same_second_does_not_overwrite_the_first_backup() {
         let root = scratch("backup-collision");
@@ -351,18 +321,15 @@ mod tests {
             !shared_second || backups[1].0.ends_with("-2"),
             "expected a `-2` suffix: {backups:?}"
         );
-        // Each report names the backup it actually wrote.
         assert!(first.description.contains(&backups[0].0));
         assert!(second.description.contains(&backups[1].0));
 
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The mutation decision belongs to the executor, never to `opts.dry_run`.
-    ///
-    /// [`StageCtx::with_executor`] lets the two disagree — `build.rs`'s tests
-    /// already build contexts exactly this way — and when they did, this fix
-    /// really deleted `session.json` while its backup was merely *planned*.
+    /// The mutation decision belongs to the executor, never to `opts.dry_run`:
+    /// with a preview executor and `dry_run: false` this fix deleted
+    /// `session.json` for real while its backup was only planned.
     #[tokio::test]
     async fn a_preview_executor_beats_opts_dry_run_false() {
         let root = scratch("preview-executor");
@@ -417,10 +384,8 @@ mod tests {
         std::fs::write(&session_json, b"{}").unwrap();
 
         // Stand in for a live wineserver with this test binary's own running
-        // process, exactly like `fixes::backend`'s equivalent test — no
-        // spawning needed, and `any_wineserver_alive` does not care about
-        // WINEPREFIX at all, so there is no environment ambiguity to reason
-        // about here.
+        // process, as `fixes::backend`'s equivalent test does:
+        // `any_wineserver_alive` ignores WINEPREFIX, so no spawn is needed.
         ctx.paths.wineserver = Some(std::env::current_exe().expect("current_exe resolves"));
 
         let sink: EventSink = Arc::new(|_| {});
