@@ -1,58 +1,20 @@
-//! Tauri commands for the Doctor screen, the pipeline stage runner, fixes, and
-//! the sidebar's app-state footer.
+//! Tauri commands over `sabrage-core`: doctor, pipeline stages, fixes,
+//! sessions, logs, settings, library, and runtime config.
 //!
-//! Bridges `sabrage-core`'s synchronous, read-only check engine
-//! ([`sabrage_core::checks::run_doctor`]) and its mutating stage/fix layer
-//! ([`sabrage_core::stages`], [`sabrage_core::fixes`]) to the frontend:
+//! `sabrage_core::StageEvent` is forwarded to the frontend verbatim — it is
+//! already the wire shape design-core §3.1 specifies (internally tagged on
+//! `kind`, camelCase fields), so there is no second event type to keep in
+//! sync. Streaming commands take an IPC [`Channel`]; the settings, library and
+//! config commands do not stream and mutate through a bare [`RealExecutor`]
+//! rather than a [`StageCtx`].
 //!
-//! * `run_doctor` streams one [`DoctorEvent`] per resolved `CheckOutcome` over
-//!   an IPC [`Channel`] and resolves to the aggregate [`DoctorSummary`].
-//! * `run_stage`, `fix`, and `stop_session` stream `sabrage_core::StageEvent`
-//!   straight over the channel — it is already the wire shape design-core
-//!   §3.1 specifies (internally tagged on `kind`, camelCase fields), so there
-//!   is no second event type to keep in sync — and resolve once the
-//!   stage/fix settles.
-//! * `cancel_stage` interrupts an in-flight `run_stage`/`stop_session` by the
-//!   `runId` its first `StageStarted` event carried.
-//! * `get_app_state` is the small always-fresh snapshot the sidebar footer
-//!   renders.
+//! [`launch`]'s promise does not resolve until the session ends, which can be
+//! hours — every command's promise is a secondary confirmation, never the
+//! liveness signal a screen renders off of.
 //!
-//! Phase 3 (session/run) adds:
-//!
-//! * `launch` — `run_stage(Stage::Run)` under a name that says what it does;
-//!   its promise does not resolve until the session ends (design-core §3.2's
-//!   state machine runs to Teardown), which can be hours.
-//! * `get_session_status` / the 1 Hz `session://status` broadcaster
-//!   ([`spawn_session_status_broadcaster`]) — both read the one managed
-//!   [`SessionMonitorState`].
-//! * `stop_session` grows a second branch: a session *this process*
-//!   supervises ([`sabrage_core::live_session`]) is stopped by firing its
-//!   `cancel` token rather than by running the `stop` stage over it.
-//! * `detach_session` / `resolve_quit` are critique.md's "app-quit semantics
-//!   for a live session" answer — see `lib.rs`'s `ExitRequested`/
-//!   `CloseRequested` handlers, which open the dialog these resolve.
-//! * `reconcile_session` runs [`sabrage_core::session::reconcile::reconcile`]
-//!   over a `Vec<String>`-collecting sink instead of a `Channel` — a
-//!   request/response call, not a stream.
-//! * `start_log_tail`/`stop_log_tail`/`list_past_runs`/`get_log_source_path`
-//!   back the Logs screen; tails run on blocking tasks, exactly like
-//!   `run_doctor`'s evaluators, because [`sabrage_core::logs::Tailer`] is
-//!   synchronous file I/O.
-//!
-//! Phase 4 (settings/library/config — the section above `mod tests`) adds
-//! eleven more: `read_runtime_config`/`write_runtime_config` over
-//! [`sabrage_core::config`], `get_settings`/`save_settings`/`get_repo_info`
-//! over [`sabrage_core::store::settings`], and
-//! `get_library`/`new_game_template`/`save_game`/`remove_game`/
-//! `validate_game`/`revert_original_steam_dll` over
-//! [`sabrage_core::store::library`] and [`sabrage_core::store::goldberg`].
-//! None of the eleven stream over an IPC `Channel` (no `on_event` in the
-//! brief's IPC contract table), so their mutations go through a bare
-//! [`RealExecutor`] ([`real_executor`]) rather than a [`StageCtx`] — see that
-//! section's own module note. `launch` additionally grows a `gameId` and,
-//! when one is supplied and the run actually reaches
-//! [`StageEvent::Launched`], records a [`sabrage_core::store::library::LastSession`]
-//! into `library.json` once the run settles ([`last_session_to_record`]).
+//! [`detach_session`]/[`resolve_quit`] are the app-quit-while-a-session-is-live
+//! answer: `lib.rs`'s `ExitRequested`/`CloseRequested` handlers open the dialog
+//! they resolve, and that comment cites this one for why they exist.
 //!
 //! `ui/src/ipc.ts` hand-mirrors every serde shape here 1:1 — keep both sides in
 //! sync when either changes.
@@ -84,26 +46,16 @@ use tauri::{ipc::Channel, AppHandle, Emitter, Manager, State};
 /// not machine state.
 const ALVR_VERSION: &str = "v20.14.1";
 
-// ── doctor ────────────────────────────────────────────────────────────────────
-
 /// One streamed doctor row: a `CheckOutcome` plus the `group` the contract
-/// attaches to its `slug`, and — when the contract names one — the `fix` id
-/// (`CheckOutcome` itself carries neither; see `checks/mod.rs`'s doc comment
-/// on the group → module mapping, and `fixes/mod.rs` for the id vocabulary).
-/// `fix` is the bare contract id (`"fix.set-graphics-backend"`) — and only
-/// ever one this build actually offers: every id is projected through
-/// [`offered_fix_id`] before it goes on the wire, so a deliberately withheld
-/// one ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]:
-/// `fix.create-z-drive`, and the known-bad `fix.delete-session-json`) reaches
-/// no client at all. The frontend still maps the id it *does* receive to a
-/// [`FixAction`] wire value itself (`ipc.ts`'s `contractFixIdToAction`,
-/// mirroring [`FixAction::from_contract_id`], deferred set included), but that
-/// mirror is now defence in depth rather than the policy: a hand-maintained
-/// TypeScript table could otherwise render a Fix button for a remedy Rust
-/// withholds, which is exactly how `cfg.session-pins` kept offering the
-/// black-screen `delete-session-json` button. `fix.edit-protocol` is no longer
-/// deferred (Phase 4, `sabrage_core::fixes::FixAction::EditProtocol`): it
-/// round-trips through `from_contract_id` like every other fix.
+/// attaches to its `slug` and, when the contract names one, the `fix` id
+/// (`CheckOutcome` itself carries neither).
+///
+/// `fix` is the bare contract id (`"fix.set-graphics-backend"`), projected
+/// through `offered_fix_id`, so an id this build withholds
+/// ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]) reaches no client at
+/// all: `ipc.ts`'s own fix table is a hand-maintained mirror and cannot be
+/// trusted to withhold it. See
+/// tests::a_withheld_fix_reaches_no_doctor_row_and_no_fix_call.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DoctorEvent {
@@ -117,18 +69,11 @@ pub struct DoctorEvent {
 }
 
 /// The fix id a [`DoctorEvent`] may carry, given the one the contract names
-/// for that check (`None` when it names none).
-///
-/// [`FixAction::from_contract_id`] is the single source of truth for "does
-/// this build offer that remedy as a button": it returns `None` both for an
-/// id no [`FixAction`] models and for one that is modelled but withheld
-/// ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]). Projecting through it
-/// here keeps a withheld id off the wire entirely, so no frontend — however
-/// its own fix table drifted — can offer the button.
-///
-/// The id is round-tripped back out of the parsed action rather than passed
-/// through verbatim, so what the client receives is by construction a
-/// spelling [`FixAction::from_contract_id`] accepts.
+/// for that check — `None` when it names none, and `None` for an id this build
+/// models but withholds ([`sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS`]).
+/// [`FixAction::from_contract_id`] is the single source of truth for both, and
+/// the id is round-tripped back out of the parsed action, so what the client
+/// receives is by construction a spelling that function accepts.
 fn offered_fix_id(contract_fix: Option<&str>) -> Option<String> {
     FixAction::from_contract_id(contract_fix?).map(FixAction::to_contract_id)
 }
@@ -145,11 +90,10 @@ pub struct DoctorSummary {
 
 /// Sidebar footer snapshot.
 ///
-/// `default_bottle`/`default_bs_dir` (Phase 4) are `settings.json`'s stored
-/// defaults, straight through — letting the Sidebar/Session screens prefill
-/// without a second `get_settings` round trip. `None` means "nothing
-/// configured yet", same as on [`sabrage_core::store::settings::Settings`]
-/// itself.
+/// `default_bottle`/`default_bs_dir` are `settings.json`'s stored defaults,
+/// straight through, so the Sidebar/Session screens prefill without a second
+/// `get_settings` round trip. `None` means "nothing configured yet", same as on
+/// [`sabrage_core::store::settings::Settings`] itself.
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppState {
@@ -174,9 +118,8 @@ pub async fn run_doctor(
     bs_dir: Option<String>,
     on_event: Channel<DoctorEvent>,
 ) -> Result<DoctorSummary, String> {
-    // settings.repo_root plumbing (Phase 4): a persisted override — or a
-    // corrupt/missing settings file, which [`load_settings`] already
-    // degrades to `None` for, logged rather than failing doctor outright.
+    // A corrupt or missing settings file degrades to defaults inside
+    // `load_settings` rather than failing doctor outright.
     let settings = load_settings();
     let repo_root = match resolve_repo_root(settings.repo_root.as_deref()) {
         Ok(p) => p,
@@ -200,13 +143,10 @@ pub async fn run_doctor(
     };
 
     // Precedence, highest first: explicit GUI args > `WINEVR_*` env (parity
-    // with the CLI and demo.sh) > the persisted `settings.json` defaults
-    // (Phase 4 — a Finder-launched .app has no environment at all, so without
-    // this tier the Doctor screen could never find a Beat Saber dir the user
-    // had set on the Settings screen).
+    // with the CLI and demo.sh) > the persisted `settings.json` defaults — a
+    // Finder-launched .app has no environment at all, so the last tier is the
+    // only one that can supply what the Settings screen configured.
     let mut opts = CheckOptions::from_env();
-    // settings.allow_adb_probes (Phase 4): this used to be hard-coded `true`
-    // regardless of the toggle on the Settings screen.
     opts.allow_adb_probes = settings.allow_adb_probes;
     if opts.bottle_name.is_none() {
         opts.bottle_name = settings.default_bottle.clone().filter(|s| !s.is_empty());
@@ -264,8 +204,8 @@ pub async fn run_doctor(
 }
 
 /// Sidebar footer snapshot: repo root (if resolvable), bottles present on this
-/// machine, the pinned ALVR client version, and (Phase 4) `settings.json`'s
-/// default bottle/Beat Saber dir.
+/// machine, the pinned ALVR client version, and `settings.json`'s default
+/// bottle/Beat Saber dir.
 #[tauri::command]
 pub fn get_app_state() -> AppState {
     let settings = load_settings();
@@ -280,28 +220,11 @@ pub fn get_app_state() -> AppState {
     }
 }
 
-// ── pipeline stages + fixes ──────────────────────────────────────────────────
-//
-// # Why no `tokio_util` / `uuid` appear here
-//
-// [`StageCtx::new`] wants a `tokio_util::sync::CancellationToken`, and its
-// `run_id` is a `uuid::Uuid` — neither crate is a direct dependency of
-// `sabrage-app` (only the Frame agent may edit a `Cargo.toml`; see this
-// crate's task brief). Both are reached without ever naming them:
-//
-// * `Default::default()` builds the `CancellationToken` `StageCtx::new`
-//   wants — the expected parameter type is enough for inference to pick the
-//   right `Default` impl without a `use` for the crate that defines it.
-//   `CancellationToken::cancel(&self)` is then called as an ordinary inherent
-//   method, which Rust resolves on any value regardless of whether its
-//   concrete type is nameable in the caller's module (inherent methods need
-//   no `use`, only trait methods do).
-// * The run id is threaded as its `.to_string()` form everywhere on this
-//   side ([`RunRegistry`]'s key — the same bytes `StageEvent`'s `runId` field
-//   serializes as), so `Uuid` itself is never named.
-//
-// [`RunRegistry`] therefore stores an opaque `Box<dyn Fn() + Send + Sync>`
-// canceller per run rather than the concrete token.
+// `tokio_util::sync::CancellationToken` and `uuid::Uuid` are reached without
+// either crate being a direct dependency of `sabrage-app`: `Default::default()`
+// builds the token `StageCtx::new` wants, and the run id is threaded in its
+// `.to_string()` form (the same bytes `StageEvent`'s `runId` serializes as), so
+// [`RunRegistry`] stores an opaque canceller rather than the concrete token.
 
 /// Options shared by [`run_stage`] and [`stop_session`] — the stage-facing
 /// slice of the `WINEVR_*` mirror ([`StageOptions`]) plus Sabrage's own
@@ -328,10 +251,9 @@ pub struct FixRunOpts {
 /// (`WINEVR_NO_AUDIO`/`_NO_DASHBOARD`/`_WIRED`/`_VERBOSE`), which is why they
 /// have no home on [`StageRunOpts`] — every other stage ignores them.
 ///
-/// `game_id` (Phase 4) is the library entry this launch came from, if any —
-/// the Library screen's "Run through bridge" sets it, the Session screen's ad
-/// hoc launch leaves it `None`. See [`last_session_to_record`] for what it
-/// unlocks.
+/// `game_id` is the library entry this launch came from, if any: the Library
+/// screen's "Run through bridge" sets it, an ad hoc launch leaves it `None`.
+/// See `last_session_to_record` for what it unlocks.
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LaunchOpts {
@@ -398,12 +320,10 @@ fn channel_sink(channel: Channel<StageEvent>) -> EventSink {
     })
 }
 
-/// [`channel_sink`], plus a `tap` called with every event before it is
+/// `channel_sink`, plus a `tap` called with every event before it is
 /// forwarded — [`launch`]'s way of observing whether `StageEvent::Launched`
-/// fired for this run (Phase 4's last-session recording,
-/// [`last_session_to_record`]) without a second event type or a second
-/// subscription: `StageEvent` is already the wire shape design-core §3.1
-/// specifies (this module's own doc comment).
+/// fired for this run (`last_session_to_record`) without a second event type
+/// or a second subscription.
 fn channel_sink_tee(
     channel: Channel<StageEvent>,
     tap: impl Fn(&StageEvent) + Send + Sync + 'static,
@@ -442,20 +362,13 @@ fn emit_early_failure(sink: &EventSink, stage: Stage, err: &SabrageError) {
     });
 }
 
-/// Merge GUI-supplied stage options onto the `WINEVR_*` environment — the
-/// same precedence [`run_doctor`] already gives [`CheckOptions`] ("WINEVR_*
-/// env is the base ... explicit GUI args override"): start from
-/// [`StageOptions::from_env`], then let `bottle`/`bs_dir` override field-by-
-/// field only when the caller actually supplied one. `dry_run` is the one
-/// field this does not set — [`execute_stage`] and [`fix`] each decide it
-/// themselves afterward, since a fix is never a dry run regardless of the
-/// environment.
-///
-/// Before this existed, `execute_stage`/`fix` built a bare
-/// `StageOptions { bottle_name: opts.bottle, .. }` from scratch, so a GUI
-/// invocation with no bottle selected (`bottle: null`) silently ignored a
-/// `WINEVR_BOTTLE` set in Sabrage's own environment — the CLI's `cmd_stage`
-/// never had this bug (it already called `StageOptions::from_env()` first).
+/// Merge GUI-supplied stage options onto the `WINEVR_*` environment — the same
+/// precedence [`run_doctor`] gives [`CheckOptions`]: start from
+/// [`StageOptions::from_env`], then let `bottle`/`bs_dir` override
+/// field-by-field only when the caller supplied one. `dry_run` is the one
+/// field this does not set — `execute_stage` and [`fix`] each decide it
+/// afterwards, since a fix is never a dry run regardless of the environment.
+/// See tests::stage_options_from_env_and_gui_honours_winevr_bottle_when_the_gui_passes_none.
 fn stage_options_from_env_and_gui(bottle: Option<String>, bs_dir: Option<String>) -> StageOptions {
     let mut opts = fill_stage_options_from_settings(StageOptions::from_env(), &load_settings());
     if let Some(b) = bottle {
@@ -467,13 +380,14 @@ fn stage_options_from_env_and_gui(bottle: Option<String>, bs_dir: Option<String>
     opts
 }
 
-/// The lowest precedence tier of [`stage_options_from_env_and_gui`] (and of
+/// The lowest precedence tier of `stage_options_from_env_and_gui` (and of
 /// [`run_doctor`]'s `CheckOptions`): `settings.json`'s `default_bottle` /
 /// `default_bs_dir` fill a bottle or Beat Saber dir that neither the
-/// environment nor the caller supplied. Phase 4 — a Finder-launched .app has
-/// no `WINEVR_*` environment, so this tier is what makes the Settings
-/// screen's "Paths" card actually reach setup/build/install/doctor/stop.
-/// Pure (settings passed in) so it is testable without touching `$HOME`.
+/// environment nor the caller supplied — a Finder-launched .app has no
+/// `WINEVR_*` environment, so this tier is what makes the Settings screen's
+/// "Paths" card reach setup/build/install/doctor/stop at all. Pure (settings
+/// passed in) so it is testable without touching `$HOME`. See
+/// tests::settings_defaults_fill_only_what_env_and_gui_left_unset.
 fn fill_stage_options_from_settings(
     mut opts: StageOptions,
     settings: &settings::Settings,
@@ -523,27 +437,18 @@ pub struct QueuedStage {
     pub stage: Stage,
 }
 
-/// Announce a run that is about to queue behind another operation.
+/// Announce a run that is about to queue behind another operation, so the
+/// frontend can name it (and offer Cancel) during the wait.
 ///
-/// A stage that has to wait for the operation lock reaches the frontend twice
-/// over: `sabrage_core::run_stage` now emits its `StageStarted` *before* the
-/// wait (so the run id — and with it Cancel — exists for the whole of it), and
-/// this event names the wait as a wait. The run is already registered with
-/// [`RunRegistry`] by this point ([`sabrage_core::executor::RealExecutor`]
-/// fails every filesystem primitive with `Cancelled` once its token fires, and
-/// the lock wait itself is cancellable), so Cancel during the queue is real.
-///
-/// The probe is [`sabrage_core::stages::operation_in_progress_anywhere`], not
-/// the in-process half alone: the wait this notice exists for is most often the
-/// one behind a `sabrage` CLI build in **another process**, which the
-/// in-process mutex cannot see at all.
-///
-/// Emitted as an app event rather than on the stage channel because
-/// `StageEvent::StageStarted` is documented as "always the first event of a
-/// run" — a queue notice is not part of the run's own event stream.
-/// Best-effort in both directions: the probe is racy (it can only over- or
-/// under-report a lock that is about to change hands), and a failed emit is
-/// dropped exactly as a failed channel send is.
+/// Emitted as an app event rather than on the stage channel, because
+/// `StageEvent::StageStarted` is always the first event of a run and a queue
+/// notice is not part of the run's own stream. The probe is
+/// [`sabrage_core::stages::operation_in_progress_anywhere`], not the in-process
+/// half alone: the wait is most often behind a `sabrage` CLI build in another
+/// process, which the in-process mutex cannot see. Best-effort in both
+/// directions — the probe is racy, and a failed emit is dropped like a failed
+/// channel send. See
+/// stages::tests::a_queued_stage_announces_itself_and_cancels_out_of_the_wait.
 fn announce_if_queued(app: &AppHandle, run_id: &str, stage: Stage) {
     if !sabrage_core::stages::operation_in_progress_anywhere() {
         return;
@@ -557,17 +462,15 @@ fn announce_if_queued(app: &AppHandle, run_id: &str, stage: Stage) {
     );
 }
 
-/// [`execute_stage`]/[`launch`]'s shared body, taking an already-built
-/// [`EventSink`] rather than a raw `Channel` — the seam [`launch`] uses to
-/// pass a tapped sink ([`channel_sink_tee`]) instead of a plain forwarding
-/// one, so it can observe `StageEvent::Launched` without a second
-/// subscription. Resolves the repo root, builds a [`StageCtx`] from an
-/// already-merged [`StageOptions`], registers its cancellation handle, runs
-/// the stage, and unregisters on the way out (success or failure alike).
+/// `execute_stage`/[`launch`]'s shared body, taking an already-built
+/// [`EventSink`] rather than a raw `Channel` — the seam [`launch`] uses to pass
+/// a tapped sink (`channel_sink_tee`) instead of a plain forwarding one, so
+/// it can observe `StageEvent::Launched` without a second subscription.
 ///
-/// settings.repo_root plumbing (Phase 4): resolves through
-/// [`resolve_repo_root_via_settings`] rather than a bare `resolve_repo_root(None)`
-/// — see that function's doc comment.
+/// Resolves the repo root through `resolve_repo_root_via_settings`, builds a
+/// [`StageCtx`] from an already-merged [`StageOptions`], registers its
+/// cancellation handle, runs the stage, and unregisters on the way out,
+/// success or failure alike.
 async fn execute_stage_with_sink(
     stage: Stage,
     stage_opts: StageOptions,
@@ -615,24 +518,18 @@ async fn execute_stage(
     execute_stage_with_sink(stage, stage_opts, channel_sink(on_event), registry, app).await
 }
 
-/// Trailing "plan (dry run)" rows, so the GUI's Dry-run button delivers the
-/// thing a plan exists for: which copies would happen and which would be
+/// Trailing "plan (dry run)" rows: which copies would happen and which would be
 /// skipped because the bytes already match — a distinction the narrative rows
-/// do not draw. Before this, `planned()` never left the backend and a GUI dry
-/// run looked exactly like a real one.
+/// do not draw.
 ///
 /// Emitted as a [`StageEvent::Section`] plus one `info` row per action, using
-/// `sabrage-core`'s shared [`sabrage_core::dry_run_plan_body`] — the same text
-/// the CLI prints under its own `-- plan (dry run)` header, so the two
-/// front-ends say the same thing word for word.
-///
-/// Runs on the failure path too (it is called before `result` is inspected),
-/// matching the CLI, which prints the section after a `FATAL` as well —
-/// `(nothing planned)` when the stage died before its first mutating step.
-/// Keyed on `executor.is_dry_run()` rather than `opts.dry_run`, the
-/// source-of-truth precedent the rest of the crate follows, so a real run's
-/// event stream is untouched. These rows land after `StageFinished`, which is
-/// exactly where the CLI prints them.
+/// [`sabrage_core::dry_run_plan_body`] — the same text the CLI prints under its
+/// own `-- plan (dry run)` header, so the two front-ends say the same thing
+/// word for word, after `StageFinished` and on the failure path too
+/// (`(nothing planned)` when the stage died before its first mutating step).
+/// Keyed on `executor.is_dry_run()` rather than `opts.dry_run`, so a real run's
+/// event stream is untouched. See
+/// tests::a_dry_run_emits_the_shared_plan_rows_and_a_real_run_emits_none.
 fn emit_dry_run_plan(ctx: &StageCtx) {
     if !ctx.executor.is_dry_run() {
         return;
@@ -646,20 +543,15 @@ fn emit_dry_run_plan(ctx: &StageCtx) {
 /// Run one pipeline stage (`setup`/`build`/`install`/`stop`/`run`), streaming
 /// every [`StageEvent`] to `on_event` as it happens.
 ///
-/// `run` is fully dispatched here too (`stages::dispatch` -> `stages::run::run`
-/// — there is no `Fatal` shortcut, that note is Phase-1-era and stale) and
-/// behaves identically to calling [`launch`] below with the same options: both
-/// ultimately call [`sabrage_core::run_stage`] through
-/// [`execute_stage_with_sink`]. [`launch`] is still the intended UI entry
-/// point for `run` — it is named for what it does, and the doc comment a
-/// caller actually reads before awaiting something that can take hours should
-/// say so up front.
+/// `run` behaves identically to [`launch`] with the same options — both reach
+/// [`sabrage_core::run_stage`] through `execute_stage_with_sink` — but
+/// [`launch`] is the intended UI entry point for it: it is named for what it
+/// does, and its doc comment warns that the call can take hours.
 ///
 /// The returned promise does not resolve until the stage finishes (or fails);
-/// callers drive their UI off the event stream (in particular
-/// `StageFinished`) and treat the resolved/rejected promise as a secondary
-/// confirmation — the same shape `run_doctor` already uses for its channel
-/// plus return value.
+/// callers drive their UI off the event stream (in particular `StageFinished`)
+/// and treat the resolved/rejected promise as a secondary confirmation — the
+/// same shape [`run_doctor`] already uses.
 #[tauri::command]
 pub async fn run_stage(
     stage: Stage,
@@ -691,10 +583,10 @@ pub async fn launch(
 ) -> Result<StageOutcome, String> {
     let stage_opts = launch_stage_options_from_env_and_gui(&opts);
 
-    // Phase 4: tee the channel so a `StageEvent::Launched` for *this* run is
-    // observed, win or lose — `last_session_to_record` below is the pure
-    // decision of whether that (plus `game_id`, plus a settled outcome) adds
-    // up to something worth writing into `library.json`.
+    // Tee the channel so a `StageEvent::Launched` for *this* run is observed,
+    // win or lose — `last_session_to_record` below is the pure decision of
+    // whether that (plus `game_id`, plus a settled outcome) is worth writing
+    // into `library.json`.
     let launched: Arc<Mutex<Option<LaunchedInfo>>> = Arc::new(Mutex::new(None));
     let tap_launched = launched.clone();
     let sink = channel_sink_tee(on_event, move |ev| {
@@ -743,14 +635,14 @@ pub fn cancel_stage(run_id: String, registry: State<'_, RunRegistry>) -> bool {
 /// *try* waiting for it to finish.
 const LIVE_SESSION_STOP_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// What [`stop_live_session_and_wait`]'s bounded wait actually observed.
+/// What `stop_live_session_and_wait`'s bounded wait actually observed.
 ///
-/// The distinction is the whole point: before this existed the wait returned
-/// `()`, so a teardown that hung past [`LIVE_SESSION_STOP_TIMEOUT`] was
-/// indistinguishable from one that finished — [`stop_session`] reported
-/// `ok: true` and [`resolve_quit`]'s `Stop` arm approved the quit and exited,
-/// skipping the detach fallback in `lib.rs`'s `RunEvent::Exit` arm and leaving
-/// the game (and its guards) unsupervised.
+/// The distinction is the whole point: a teardown that hung past
+/// `LIVE_SESSION_STOP_TIMEOUT` must never be reported as one that finished,
+/// or [`stop_session`] answers `ok: true` and [`resolve_quit`]'s `Stop` arm
+/// approves the quit and exits, skipping the detach fallback in `lib.rs`'s
+/// `RunEvent::Exit` arm and leaving the game and its guards unsupervised. See
+/// tests::the_stop_and_quit_refusal_claims_only_what_happened.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TeardownWait {
     /// Nothing was live: there was nothing to stop, which is success.
@@ -770,23 +662,19 @@ pub(crate) enum TeardownWait {
 /// What [`resolve_quit`]'s `Stop` arm must tell the user about a teardown that
 /// did not simply finish — `None` when it did.
 ///
-/// Pure, and deliberately says only what happened. It used to claim a detach
-/// on [`TeardownWait::TimedOut`] ("Sabrage detached from it and quit") and then
-/// call `detach_live_session()` to make it true; that call is a provable
-/// no-op in both refusal arms, so the message was a lie:
+/// Pure, and deliberately says only what happened: it may not claim a detach,
+/// because detaching is a no-op in both refusal arms — a `TimedOut` stop has
+/// already fired the session's `cancel` token, and
+/// [`sabrage_core::session::reconcile::detach`] then returns `Ok(())` without
+/// disarming a guard or marking the record, while a `Detached` slot is already
+/// clear so `detach_live_session` finds no live handle at all.
 ///
-/// * `TimedOut` — the stop already fired the session's `cancel` token, and
-///   [`sabrage_core::session::reconcile::detach`] returns `Ok(())` without
-///   disarming a guard or marking the record once that token is set;
-/// * `Detached` — the slot is already clear, so [`detach_live_session`] finds
-///   no live handle at all.
-///
-/// Not detaching is also the *better* outcome, which is why this only fixes
-/// the wording: `detached: true` means "leave every guard in place, and no
-/// later reconcile may undo that" (`session::reconcile`'s module doc), whereas
-/// a record left `detached: false` with a dead owner is exactly the shape
-/// `reconcile::classify` recovers on the next Sabrage start — restoring the
-/// audio device and removing the `--wired` forwards.
+/// Not detaching is also the better outcome: `detached: true` means "leave
+/// every guard in place, and no later reconcile may undo that"
+/// (`session::reconcile`'s module doc), whereas a record left `detached: false`
+/// with a dead owner is exactly the shape `reconcile::classify` recovers on the
+/// next Sabrage start — restoring audio and removing the `--wired` forwards.
+/// See tests::the_stop_and_quit_refusal_claims_only_what_happened.
 pub(crate) fn quit_stop_refusal(waited: TeardownWait) -> Option<String> {
     match waited {
         TeardownWait::NothingLive | TeardownWait::Cleared => None,
@@ -825,18 +713,17 @@ fn wait_for_slot_clear(is_clear: impl Fn() -> bool, timeout: Duration) -> Teardo
 const LIVE_SESSION_STOP_POLL: Duration = Duration::from_millis(100);
 
 /// Fire the live session's `cancel` token — the INT path: stop wine, then
-/// restore every guard (see [`sabrage_core::session`]'s module doc) — and
-/// wait, bounded at [`LIVE_SESSION_STOP_TIMEOUT`], for
+/// restore every guard (see [`sabrage_core::session`]'s module doc) — and wait,
+/// bounded at `LIVE_SESSION_STOP_TIMEOUT`, for
 /// [`sabrage_core::live_session`] naming that same run to go back to `None`.
 /// [`TeardownWait::NothingLive`] when nothing is live.
 ///
 /// Shared by [`stop_session`]'s live-session branch and [`resolve_quit`]'s
-/// `Stop` arm, so the two can never disagree on what "stop the session"
-/// means — including on what *failing* to stop it means. Runs its wait inside
-/// [`tauri::async_runtime::spawn_blocking`]: this crate has no `tokio::time`
-/// re-export to `.await` a sleep with (only `tokio::sync` items reach it, via
-/// [`tauri::async_runtime`] — see that module's own doc comment), and only the
-/// Frame agent may add a direct `tokio` dependency to pull one in.
+/// `Stop` arm, so the two can never disagree on what "stop the session" means —
+/// including on what *failing* to stop it means. The wait runs inside
+/// [`tauri::async_runtime::spawn_blocking`] because no `tokio::time` is
+/// reachable from this crate to `.await` a sleep with; only `tokio::sync` items
+/// arrive, via [`tauri::async_runtime`].
 async fn stop_live_session_and_wait() -> TeardownWait {
     let Some(handle) = live_session() else {
         return TeardownWait::NothingLive;
@@ -868,9 +755,8 @@ async fn stop_live_session_and_wait() -> TeardownWait {
 /// race; this is what stops [`stop_session`] from reporting `ok: true` for a
 /// session that is in fact still running.
 ///
-/// Best-effort: an unresolved repo root or an unreadable record answers
-/// "no" — the caller then reports the ordinary stop, which is what it did
-/// before this check existed.
+/// Best-effort: an unresolved repo root or an unreadable record answers "no",
+/// and the caller then reports the ordinary stop.
 fn slot_was_released_by_a_detach(run_id: sabrage_core::events::RunId) -> bool {
     let Ok(repo_root) = resolve_repo_root_via_settings() else {
         return false;
@@ -882,20 +768,16 @@ fn slot_was_released_by_a_detach(run_id: sabrage_core::events::RunId) -> bool {
     )
 }
 
-/// Detach from the live session, if any — [`sabrage_core::session::reconcile::detach`]:
-/// mark `session-state.json` `detached`, fire the handle's `detach` token
-/// (stop supervising, leak every guard on purpose), and leave the session
-/// running. A no-op, `Ok(())`, when nothing is live.
+/// Apply the "keep running" answer to a quit nobody could be asked about
+/// (AppKit `terminate:` — Dock-menu Quit, logout, AppleScript `quit` — which
+/// tao cannot intercept): when a session this process supervises is still live
+/// and no dialog answer approved this exit, detach synchronously —
+/// `detach_live_session` fires the handle's detach token and waits (bounded,
+/// inside `reconcile::detach`) for the supervise loop to disarm its guards and
+/// mark `session-state.json` `detached`.
 ///
-/// Shared by [`detach_session`] and [`resolve_quit`]'s `Keep` arm.
-/// `RunEvent::Exit` for a quit that was never asked about (AppKit
-/// `terminate:` — Dock-menu Quit, logout, AppleScript `quit` — which tao
-/// cannot intercept): if a session this process supervises is still live and
-/// no dialog answer approved this exit, apply the "keep running" answer
-/// synchronously — [`detach_live_session`] fires the handle's detach token and
-/// waits (bounded, inside `reconcile::detach`) for the supervise loop to disarm
-/// its guards and mark the record `detached`. Best-effort: an error here must
-/// not stop the process from exiting, and there is nobody left to show it to.
+/// Best-effort: an error here must not stop the process from exiting, and there
+/// is nobody left to show it to.
 pub(crate) fn detach_on_terminate(quit_approved: bool) {
     if quit_approved || live_session().is_none() {
         return;
@@ -1176,26 +1058,23 @@ fn gui_fix_refusal(action: FixAction, confirmed: bool) -> Option<String> {
     None
 }
 
-/// Apply one fix ([`FixAction`]). Destructive fixes ([`FixAction::def`];
-/// `DeleteSessionJson` is the only one today, and it is *also* withheld — see
-/// below) require `confirmed: true`; the frontend shows its own in-app confirm
-/// dialog first (never `window.confirm`, which blocks the webview) and this
-/// check is the backend's half of that contract, not a substitute for it.
+/// Apply one fix ([`FixAction`]). A destructive fix ([`FixAction::def`]) needs
+/// `confirmed: true`; the frontend shows its own in-app confirm dialog first
+/// (never `window.confirm`, which blocks the webview) and this check is the
+/// backend's half of that contract, not a substitute for it.
 ///
 /// A fix whose [`FixAction::as_stage`] is `Some` (`RunSetup`/`RunBuild`/
-/// `RunInstall`) still works through this command — it delegates to
-/// [`sabrage_core::run_stage`] internally, exactly like a user-initiated
-/// stage (see [`fixes::apply`]'s doc comment) — but the intended UI path for
-/// those three is calling [`run_stage`] directly so the GateModal it opens is
-/// the same one a plain stage run uses.
+/// `RunInstall`) works through this command too — it delegates to
+/// [`sabrage_core::run_stage`] internally — but the intended UI path for those
+/// three is [`run_stage`], so the GateModal they open is the one a plain stage
+/// run uses.
 ///
-/// An action this build **withholds** ([`FixAction::is_deferred`]) is refused
-/// here outright, whatever the frontend believed: the GUI's own fix table is a
-/// hand-maintained mirror, and `cfg.session-pins` was still rendering a button
-/// for the known-bad `delete-session-json` remedy after Rust stopped offering
-/// it. The `sabrage fix <id>` CLI path is deliberately *not* gated the same
-/// way — a user who has read [`sabrage_core::fixes::FixDef::consequence`] can
-/// still ask for it explicitly there.
+/// An action this build withholds ([`FixAction::is_deferred`]) is refused here
+/// whatever the frontend believed, because the GUI's fix table is a
+/// hand-maintained mirror; the `sabrage fix <id>` CLI path is deliberately not
+/// gated the same way, for a user who has read
+/// [`sabrage_core::fixes::FixDef::consequence`]. See
+/// tests::a_withheld_fix_reaches_no_doctor_row_and_no_fix_call.
 #[tauri::command]
 pub async fn fix(
     action: FixAction,
@@ -1208,16 +1087,10 @@ pub async fn fix(
         return Err(refusal);
     }
     // A fix waits on the same operation lock a stage does, and its whole-stage
-    // forms (`run-setup`/`run-build`/`run-install`) run for minutes — so it
-    // needs the same cancellation handle a stage gets. Without this
-    // registration a fix, queued or running, could not be cancelled at all.
-    // The handle is reachable because `fixes::apply` emits a row carrying
-    // `ctx.run_id` *before* it waits for the lock (see its doc comment), so
-    // the frontend can name — and cancel — a fix that is still queued; the
-    // `forget` below therefore also covers the cancelled path.
-    // (The live-session refusal `FixDef::forbidden_while_session_live`
-    // describes is enforced inside `fixes::apply`: once before the lock as an
-    // immediate rejection, and again with it held.)
+    // forms run for minutes, so it needs a stage's cancellation handle:
+    // `fixes::apply` emits a row carrying `ctx.run_id` *before* it waits for
+    // the lock, so a queued fix can be named — and cancelled — and the `forget`
+    // below therefore covers the cancelled path too.
     let repo_root = resolve_repo_root_via_settings().map_err(|e| e.to_string())?;
     let paths = Paths::new_checked(repo_root).map_err(|e| e.to_string())?;
     let mut stage_opts = stage_options_from_env_and_gui(opts.bottle, opts.bs_dir);
@@ -1231,8 +1104,6 @@ pub async fn fix(
     registry.forget(&run_id);
     result.map_err(|e| e.to_string())
 }
-
-// ── session status ────────────────────────────────────────────────────────────
 
 /// Managed: the one [`SessionMonitor`] this process polls from, behind a
 /// tokio [`Mutex`][tauri::async_runtime::Mutex] — [`get_session_status`] and
@@ -1287,20 +1158,17 @@ pub async fn get_session_status(
 /// and broadcast it on `session://status` **when it changed**. Runs for the
 /// app's lifetime; there is nothing to stop it with.
 ///
-/// The dedup is here rather than in the frontend store: an idle Sabrage sat
-/// serializing and emitting an identical `SessionStatus` to every window once
-/// a second forever, and the claim that the store deduped it was simply false
-/// (`stores/session.svelte.ts` assigns each payload straight through). The
-/// first snapshot after startup is always emitted — a listener that attaches
-/// late gets a value within a second either way, since
-/// [`get_session_status`] is the poll fallback for exactly that window.
+/// The dedup is here rather than in the frontend store, which assigns every
+/// payload straight through (`stores/session.svelte.ts`); the first snapshot
+/// after startup is always emitted, and [`get_session_status`] is the poll
+/// fallback for a listener that attached late.
 ///
 /// The 1 s sleep runs on a blocking task with a synchronous `block_on` of the
-/// lock+snapshot, for the same reason [`stop_live_session_and_wait`]'s wait
-/// does: no `tokio::time` re-export is reachable from this crate without a
-/// direct `tokio` dependency (Frame-agent-only), and
-/// [`tauri::async_runtime::spawn_blocking`] plus [`tauri::async_runtime::block_on`]
-/// is the primitive that is.
+/// lock+snapshot, for the same reason `stop_live_session_and_wait`'s wait
+/// does: no `tokio::time` is reachable from this crate, and
+/// [`tauri::async_runtime::spawn_blocking`] plus
+/// [`tauri::async_runtime::block_on`] is the primitive that is. See
+/// tests::the_status_broadcast_skips_repeats_but_never_the_first_one.
 pub fn spawn_session_status_broadcaster(app: AppHandle) {
     tauri::async_runtime::spawn_blocking(move || loop {
         std::thread::sleep(Duration::from_secs(1));
@@ -1318,8 +1186,6 @@ pub fn spawn_session_status_broadcaster(app: AppHandle) {
         let _ = app.emit("session://status", &status);
     });
 }
-
-// ── reconcile ─────────────────────────────────────────────────────────────────
 
 /// Extract one human line from a [`StageEvent`] emitted during
 /// [`reconcile_session`]'s pass. [`sabrage_core::session::reconcile::reconcile`]'s
@@ -1414,8 +1280,6 @@ pub async fn reconcile_session(bottle: Option<String>) -> Result<ReconcileReport
     Ok(ReconcileReport { kind, rows })
 }
 
-// ── logs ──────────────────────────────────────────────────────────────────────
-
 /// How often a live tail re-polls its file.
 const LOG_TAIL_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
@@ -1430,14 +1294,15 @@ type TailMap = Arc<Mutex<HashMap<u64, Arc<AtomicBool>>>>;
 
 /// Tracks in-flight [`start_log_tail`] pollers by an opaque id. Stopping one
 /// flips its [`AtomicBool`] rather than aborting the task outright: the task
-/// notices on its own next wake (at most [`LOG_TAIL_POLL_INTERVAL`] later) and
+/// notices on its own next wake (at most `LOG_TAIL_POLL_INTERVAL` later) and
 /// exits between polls instead of being cut off mid-read.
 ///
-/// Every registration is paired with a [`TailGuard`] that is moved into the
-/// polling task, so *every* way that task can end — the stop flag, a send
-/// error, an unreadable file — removes its entry. Without it the map kept ids
-/// whose task had already died and [`stop_log_tail`] answered `true` for them,
-/// contradicting its own "no longer tracked" contract.
+/// Every registration is paired with a `TailGuard` moved into the polling
+/// task, so *every* way that task can end — the stop flag, a send error, an
+/// unreadable file — removes its entry; without it the map keeps ids whose task
+/// is already dead and [`stop_log_tail`] answers `true` for them, contradicting
+/// its own "no longer tracked" contract. See
+/// tests::a_tail_unregisters_itself_when_its_task_ends.
 #[derive(Default)]
 pub struct TailRegistry {
     next_id: AtomicU64,
@@ -1492,11 +1357,11 @@ impl TailRegistry {
     }
 
     /// Stop every tracked tail. `lib.rs` calls this from the builder's
-    /// `on_page_load` hook: a webview reload (vite HMR in dev, any
-    /// navigation) runs no Svelte `onDestroy`, so the tails that page started
-    /// would otherwise poll their files every 250 ms for the rest of the
-    /// app's life — a `Channel::send` on macOS is a `webview.eval`, which
-    /// keeps succeeding after a reload, so the task cannot notice on its own.
+    /// `on_page_load` hook: a webview reload runs no Svelte `onDestroy`, and a
+    /// `Channel::send` on macOS is a `webview.eval` that keeps succeeding after
+    /// a reload, so a tail cannot notice on its own and would poll its file
+    /// every 250 ms for the rest of the app's life. See
+    /// tests::stop_all_stops_every_tracked_tail.
     pub(crate) fn stop_all(&self) {
         let entries: Vec<Arc<AtomicBool>> = self
             .tails
@@ -1548,12 +1413,9 @@ pub fn start_log_tail(
         while !stop.load(Ordering::SeqCst) {
             match tailer.poll() {
                 Ok(batch) if batch.rotated || batch.truncated || !batch.lines.is_empty() => {
-                    // A send error means the channel is gone for good. It is
-                    // NOT a reliable webview-reload signal: on macOS
-                    // `Channel::send` is a `webview.eval`, which succeeds as
-                    // long as the webview object exists — `TailRegistry::stop_all`
-                    // from `lib.rs`'s `on_page_load` hook is what covers a
-                    // reload.
+                    // A send error means the channel is gone for good; it is
+                    // NOT a reload signal (on macOS `Channel::send` is a
+                    // `webview.eval`) — `TailRegistry::stop_all` covers those.
                     if on_batch.send(batch).is_err() {
                         break;
                     }
@@ -1594,26 +1456,22 @@ pub fn get_log_source_path(source: LogSource) -> Option<String> {
     sabrage_core::logs::resolve_source(&paths, &source).map(|p| p.display().to_string())
 }
 
-// ── Phase 4: settings, library, runtime config ──────────────────────────────
-//
-// The eleven commands below back the Settings/Library/Edit-game screens.
-// None streams over an IPC `Channel` — the brief's IPC contract table gives
-// none of them an `on_event` parameter — so every mutation goes through a
-// bare `RealExecutor` ([`real_executor`]) rather than a `StageCtx`: there is
-// no multi-step stage here, nothing to cancel, and no live listener for a
-// single small JSON/TOML write to stream to. Every mutation still goes
-// through the `Executor` trait (the crate-wide rule), it just never needs the
-// dry-run/stage machinery layered on top of it.
+// The commands below back the Settings/Library/Edit-game screens. None of them
+// streams over an IPC `Channel`, so every mutation goes through a bare
+// `RealExecutor` (`real_executor`) rather than a `StageCtx`: there is no
+// multi-step stage here, nothing to cancel, and no live listener for a single
+// small JSON/TOML write to stream to. Every mutation still goes through the
+// `Executor` trait (the crate-wide rule); it just never needs the
+// dry-run/stage machinery layered on top.
 //
 // `settings.json`/`library.json`/`oxrsys-runtime.toml` all live under paths
-// derived from `$HOME` alone — [`sabrage_core::paths::sabrage_support_dir`]
-// and `Paths::oxr_appsup`/`toml_path`, never from the repo root — so
-// [`SettingsPathsCache`] tolerates an unresolved repo root (falling back to
-// an empty one; `Paths::new` never fails and does no validation of it) rather
-// than erroring out: the Settings/Library/Config screens must keep working
-// before a wine-vr checkout is even configured. Only [`get_repo_info`] (and
-// doctor/stage execution, unchanged above) reports whether the repo root
-// itself actually resolved.
+// derived from `$HOME` alone — [`sabrage_core::paths::sabrage_support_dir`] and
+// `Paths::oxr_appsup`/`toml_path`, never from the repo root — so
+// [`SettingsPathsCache`] tolerates an unresolved repo root (falling back to an
+// empty one) rather than erroring out: these screens must keep working before a
+// wine-vr checkout is even configured. Of the commands in this section only
+// [`get_repo_info`] reports whether the repo root itself actually resolved;
+// doctor and stage execution above already fail loudly on it.
 
 /// Load `settings.json`, tolerantly.
 ///
@@ -1637,40 +1495,33 @@ fn load_settings() -> settings::Settings {
     }
 }
 
-/// [`resolve_repo_root`], honoring `settings.json`'s persisted override — the
-/// brief's "settings.repo_root plumbing into EVERY resolve_repo_root call in
-/// commands.rs", and every prior bare `resolve_repo_root(None)` call site
-/// above is now this. Built on [`load_settings`], so a corrupt settings file
-/// degrades to `None` (the env/executable-walk precedence tiers still apply
-/// underneath) rather than turning every command that resolves a repo root
-/// into a hard failure.
+/// [`resolve_repo_root`], honoring `settings.json`'s persisted override — what
+/// every call site that has no override of its own resolves through. Built on
+/// `load_settings`, so a corrupt settings file degrades to `None` (the env
+/// and executable-walk precedence tiers still apply underneath) rather than
+/// turning every command that resolves a repo root into a hard failure.
 fn resolve_repo_root_via_settings() -> std::result::Result<PathBuf, SabrageError> {
     resolve_repo_root(load_settings().repo_root.as_deref())
 }
 
-/// Cached `settings.json` + the [`Paths`] derived from it, for the handful of
-/// Phase 4 commands (`read_runtime_config`, `write_runtime_config`,
-/// `save_settings`, `get_repo_info`, `get_library`, `new_game_template`,
-/// `save_game`, `remove_game`, `validate_game`, `revert_original_steam_dll`,
-/// `launch`'s last-session recording) that only ever read `settings.json`
-/// and the `$HOME`-derived halves of [`Paths`] (`sabrage_appsup`,
-/// `oxr_appsup`/`toml_path`) — never the machine-probed halves (`cx_app`,
-/// `wine`, `adb`, …), which stay live-probed by [`run_doctor`]/`get_app_state`
-/// (unchanged, uncached — a doctor row or the sidebar footer must reflect a
-/// CrossOver reinstall or a freshly plugged `adb` without a restart).
+/// Cached `settings.json` + the [`Paths`] derived from it, for the settings,
+/// library and config commands (and [`launch`]'s last-session recording) that
+/// only ever read `settings.json` and the `$HOME`-derived halves of [`Paths`]
+/// (`sabrage_appsup`, `oxr_appsup`/`toml_path`) — never the machine-probed
+/// halves (`cx_app`, `wine`, `adb`, …), which stay live-probed by
+/// [`run_doctor`]/[`get_app_state`], because a doctor row or the sidebar footer
+/// must reflect a CrossOver reinstall or a freshly plugged `adb` without a
+/// restart.
 ///
-/// [`Paths::new`] re-probes the machine (three `stat`s and a `$PATH` walk)
-/// and `settings::load` re-reads and re-parses `settings.json` on every call;
-/// finding E-C3-settings-paths-cache measured a single Settings-screen mount
-/// paying that cost four times over. `SessionMonitorState`'s
-/// `Mutex<Option<...>>` is the precedent this follows: empty until first use,
-/// filled on demand, dropped — not eagerly recomputed — by whatever
-/// invalidates it. The only writer of `settings.json` through this app is
-/// [`save_settings`], which calls [`SettingsPathsCache::invalidate`] after
-/// every successful save; an edit from outside this app (or a bottle
-/// added/removed on disk) can still leave this stale until the next save,
-/// same caveat `SessionMonitorState` already accepts for its own
-/// externally-changed case.
+/// [`Paths::new`] re-probes the machine (three `stat`s and a `$PATH` walk) and
+/// `settings::load` re-reads and re-parses `settings.json` on every call;
+/// E-C3-settings-paths-cache measured a single Settings-screen mount paying
+/// that cost four times over. Empty until first use, filled on demand, and
+/// dropped by [`save_settings`] — the only writer of `settings.json` through
+/// this app — so an edit from outside (or a bottle added on disk) can leave it
+/// stale until the next save. See
+/// tests::{cache_hit_returns_the_stored_pair_without_reloading,
+/// invalidate_drops_the_cached_pair}.
 #[derive(Default)]
 pub struct SettingsPathsCache(std::sync::Mutex<Option<(settings::Settings, Paths)>>);
 
@@ -1740,18 +1591,14 @@ static SETTINGS_LOCK: LazyLock<tauri::async_runtime::Mutex<()>> =
     LazyLock::new(tauri::async_runtime::Mutex::default);
 
 /// A [`RealExecutor`] for the small, non-stage mutations this section adds —
-/// see the module note above for why no [`StageCtx`] applies. `run_id`/the
-/// cancellation token are the same `Default::default()` trick this file's
-/// "Why no `tokio_util` / `uuid` appear here" note (above,
-/// [`RunRegistry`]'s section) already relies on to reach `Uuid`/
-/// `CancellationToken` without either being a direct dependency of
-/// `sabrage-app`; the sink is [`null_sink`], since none of these eleven
-/// commands stream events.
+/// see the module note above for why no [`StageCtx`] applies. `run_id` and the
+/// cancellation token are `Default::default()`, the same way [`RunRegistry`]'s
+/// section reaches `Uuid`/`CancellationToken` without either crate being a
+/// direct dependency of `sabrage-app`; the sink is [`null_sink`], since none of
+/// these commands stream events.
 fn real_executor() -> RealExecutor {
     RealExecutor::new(Default::default(), null_sink(), Default::default())
 }
-
-// ── runtime config (oxrsys-runtime.toml) ────────────────────────────────────
 
 /// The Settings screen's one read: everything [`sabrage_core::config::read`]
 /// already assembles. Never fails — an absent or unparseable file are both
@@ -1763,39 +1610,34 @@ pub fn read_runtime_config(
     runtime_config::read(&cache.paths().toml_path)
 }
 
-/// Patch `oxrsys-runtime.toml`'s six editable keys, creating it from the
-/// shared template first if it does not exist yet
-/// ([`runtime_config::write`]'s write-once-on-create rule).
+/// Patch `oxrsys-runtime.toml`'s six editable keys, creating it from the shared
+/// template first if it does not exist yet ([`runtime_config::write`]'s
+/// write-once-on-create rule).
 ///
 /// Refuses **before** calling [`runtime_config::write`] when the file is one
 /// Sabrage must not rewrite ([`runtime_config::RuntimeConfigView::parse_error`]):
 /// either `toml_edit` cannot parse it at all, or its physical lines and the
 /// parsed document disagree about where an editable key is assigned (a
-/// `"""…"""` block containing `protocol = …`, a BOM in front of a key) — an
-/// edit would then land somewhere the runtime's own line reader does not look.
-/// `apply_patch` refuses on both counts too, so `write` is safe on its own;
-/// checking here first only buys the message the *view* already computed,
-/// without a redundant disk read. The two refusals must therefore stay
-/// equivalent — `parse_error` and `apply_patch` share `line_document_mismatch`
-/// precisely so they cannot drift.
+/// `"""…"""` block containing `protocol = …`, a BOM in front of a key), so an
+/// edit would land somewhere the runtime's own line reader does not look.
+/// `apply_patch` refuses on both counts too — checking here only buys the
+/// message the view already computed — and the two refusals share
+/// `line_document_mismatch` precisely so they cannot drift.
 ///
-/// Two guards this command did not use to have:
+/// A live session refuses the write ([`sabrage_core::session::ensure_idle_in`],
+/// the policy `runtime_config::write` also enforces): `Config.cpp` re-reads the
+/// file every 250 ms and the ALVR frame path rebuilds the encoder when
+/// `encoder_process`/`video_codec` move, so a save mid-stream is a live
+/// reconfiguration. Checked here as well so the error text comes from one place
+/// and nothing — not even the backup — is written on the way to the refusal.
 ///
-/// * **a live session refuses the write** ([`sabrage_core::session::ensure_idle_in`],
-///   the same policy `runtime_config::write` enforces on its own). The old
-///   note here — "the runtime only reads this file at the next game start" —
-///   was wrong: `Config.cpp` re-reads it every 250 ms and the ALVR frame path
-///   rebuilds the encoder when `encoder_process`/`video_codec` move, so a
-///   Settings save mid-stream is a live reconfiguration. Checked here as well
-///   as in the core so the error text and the remedy come from one place, and
-///   so nothing is written (not even the backup) on the way to the refusal.
-/// * **the operation lock** ([`sabrage_core::stages::acquire_operation_lock`]),
-///   held across the whole read-modify-write. `stages::setup` independently
-///   checks `oxrsys-runtime.toml`'s existence and writes the template while
-///   holding that same lock, so without this a `setup` running concurrently
-///   could overwrite a patch that had just reported success — the write-once
-///   contract in reverse. It also serializes this against the `edit-protocol`
-///   fix, which re-enters the same writer.
+/// The operation lock ([`sabrage_core::stages::acquire_operation_lock`]) is
+/// held across the whole read-modify-write: `stages::setup` writes the template
+/// while holding the same lock, so without it a concurrent `setup` could
+/// overwrite a patch that had just reported success. It also serializes this
+/// against the `edit-protocol` fix, which re-enters the same writer. See
+/// config::runtime_toml::tests::{a_key_inside_a_multiline_string_reads_live_and_refuses_the_write,
+/// write_refuses_while_a_session_is_live_and_touches_nothing}.
 #[tauri::command]
 pub async fn write_runtime_config(
     patch: runtime_config::RuntimeConfigPatch,
@@ -1824,8 +1666,6 @@ pub async fn write_runtime_config(
     .map_err(|e| e.to_string())
 }
 
-// ── settings.json ────────────────────────────────────────────────────────────
-
 /// Read `settings.json` — unlike [`load_settings`], a corrupt file is
 /// surfaced as `Err` rather than degraded to defaults: this is the one
 /// screen that exists to let the user see and fix it.
@@ -1835,8 +1675,8 @@ pub fn get_settings() -> Result<settings::Settings, String> {
     settings::load(&path).map_err(|e| e.to_string())
 }
 
-/// Persist `settings.json`, returning it back as-saved (the brief's `Settings`
-/// return — there is nothing this side derives beyond what was sent).
+/// Persist `settings.json`, returning it back as-saved — nothing on this side
+/// is derived beyond what was sent.
 #[tauri::command]
 pub async fn save_settings(
     settings: settings::Settings,
@@ -1853,8 +1693,6 @@ pub async fn save_settings(
     cache.invalidate();
     Ok(settings)
 }
-
-// ── repo info ─────────────────────────────────────────────────────────────────
 
 /// Which precedence tier of [`resolve_repo_root`] actually supplied a
 /// resolved root. `explicit_present`/`env_present` are "was that tier's input
@@ -1929,9 +1767,8 @@ pub struct BsDirSuggestion {
     /// fallback is a quirk, not a suggestion).
     pub derived: String,
     /// The nearest **existing** directory at or above `current` (when given),
-    /// else at or above `derived`, else `$HOME` — an NSOpenPanel handed a
-    /// path that does not exist just opens wherever it last was, which is
-    /// how "Browse… doesn't start in the bottle" looked to the user.
+    /// else at or above `derived`, else `$HOME` — an NSOpenPanel handed a path
+    /// that does not exist just opens wherever it last was.
     pub browse_start: String,
 }
 
@@ -2048,8 +1885,6 @@ pub fn get_repo_info(cache: State<'_, SettingsPathsCache>) -> RepoInfo {
         binary_contract_matches,
     }
 }
-
-// ── library.json ─────────────────────────────────────────────────────────────
 
 /// One row of the Library screen: a stored [`library::GameEntry`] plus a
 /// fresh [`library::GameValidity`] snapshot — recomputed on every
@@ -2193,8 +2028,6 @@ pub async fn revert_original_steam_dll(
         .map_err(|e| e.to_string())
 }
 
-// ── last-session recording (launch) ──────────────────────────────────────────
-
 /// What [`launch`]'s tapped sink ([`channel_sink_tee`]) captured from a
 /// `StageEvent::Launched`, if the run got that far.
 #[derive(Debug, Clone)]
@@ -2273,13 +2106,11 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    /// `std::env::set_var`/`remove_var` are process-global; serialize every
-    /// test in this module that touches any `WINEVR_*` variable against each
-    /// other (mirrors `fixes::session_json`'s `HOME_MUTEX` pattern for the
-    /// same reason, one level up since these tests are synchronous). Named
-    /// for `WINEVR_BOTTLE` (the first test to need it) but not scoped to it —
-    /// [`launch_stage_options_layers_the_launch_flags_with_gui_precedence`]
-    /// below holds it too.
+    /// Serializes every test in this module that touches a `WINEVR_*`
+    /// variable: `std::env::set_var`/`remove_var` are process-global. Named
+    /// for `WINEVR_BOTTLE` but not scoped to it —
+    /// `launch_stage_options_layers_the_launch_flags_with_gui_precedence`
+    /// holds it for the four launch flags too.
     static WINEVR_BOTTLE_MUTEX: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -2354,12 +2185,9 @@ mod tests {
 
     #[test]
     fn stage_options_from_env_and_gui_honours_winevr_bottle_when_the_gui_passes_none() {
-        // Finding #4: `execute_stage`/`fix` used to build `StageOptions`
-        // straight from the GUI's own args, so `WINEVR_BOTTLE` set in
-        // Sabrage's environment was invisible to them (unlike `run_doctor`,
-        // which already calls `CheckOptions::from_env()` first) — a Session
-        // screen's `stop_session(None)` would die with "bottle name required"
-        // even with `WINEVR_BOTTLE` set.
+        // Finding #4: the env base is read before the GUI's own args, so a
+        // GUI `None` still picks up `WINEVR_BOTTLE`; without it a Session
+        // screen's `stop_session(None)` dies with "bottle name required".
         let _guard = WINEVR_BOTTLE_MUTEX.lock().expect("mutex poisoned");
         let prev = std::env::var("WINEVR_BOTTLE").ok();
 
@@ -2437,8 +2265,8 @@ mod tests {
 
     #[test]
     fn stop_targets_live_session_matches_none_or_the_same_bottle_only() {
-        // Finding #8: `stop_session`'s live branch used to be unscoped by
-        // bottle — stopping bottle B tore down a live session on bottle A.
+        // Finding #8: the live branch is scoped by bottle, so stopping bottle
+        // B can never tear down a live session on bottle A.
         assert!(
             stop_targets_live_session(None, "Steam"),
             "no bottle requested means \"stop whatever session is live\""
@@ -2452,9 +2280,9 @@ mod tests {
 
     #[test]
     fn wait_for_slot_clear_reports_the_deadline_it_hit() {
-        // A11-1: the wait used to return `()`, so "teardown finished" and
-        // "teardown is still running 30 s later" were the same answer — and
-        // `stop_session` reported `ok: true` for both.
+        // A11-1: `TeardownWait` separates a finished teardown from one still
+        // running at the deadline, so `stop_session` cannot report both as
+        // success.
         let flips = Arc::new(AtomicU64::new(0));
         let f = flips.clone();
         assert_eq!(
@@ -2476,11 +2304,9 @@ mod tests {
 
     #[test]
     fn the_stop_and_quit_refusal_claims_only_what_happened() {
-        // A11-1 (round 2): the `TimedOut` arm used to say "Sabrage detached
-        // from it and quit" and call `detach_live_session()` to back that up
-        // — but the stop has already fired the session's cancel token, and
-        // `reconcile::detach` returns `Ok(())` without detaching once it is
-        // set. The claim was unbackable; the message must not make it.
+        // A11-1 (round 2): the stop has already fired the session's cancel
+        // token and `reconcile::detach` returns `Ok(())` once it is set, so
+        // the `TimedOut` message may not claim a detach it cannot back.
         assert_eq!(quit_stop_refusal(TeardownWait::NothingLive), None);
         assert_eq!(
             quit_stop_refusal(TeardownWait::Cleared),
@@ -2505,10 +2331,9 @@ mod tests {
 
     #[test]
     fn a_withheld_fix_reaches_no_doctor_row_and_no_fix_call() {
-        // A4-2 / A12-1: `DEFERRED_CONTRACT_FIX_IDS` was enforced only in
-        // `FixAction::from_contract_id`, which the GUI mirrored by hand in
-        // TypeScript — so `cfg.session-pins` still rendered a Fix button for
-        // the known-bad `delete-session-json`. Both IPC doors now refuse it.
+        // A4-2 / A12-1: `DEFERRED_CONTRACT_FIX_IDS` is enforced at both IPC
+        // doors, not only in `FixAction::from_contract_id`, so a row such as
+        // `cfg.session-pins` cannot render a Fix button for a withheld id.
         for id in sabrage_core::fixes::DEFERRED_CONTRACT_FIX_IDS {
             assert_eq!(
                 offered_fix_id(Some(id)),
@@ -2553,9 +2378,8 @@ mod tests {
     #[test]
     fn quit_is_intercepted_once_and_given_up_on_when_nobody_answers() {
         // A11-4: the dialog has exactly one responder (the webview's
-        // `app://quit-requested` listener). A webview that is reloading,
-        // crashed, or died before subscribing never answers, and without a
-        // bound every Cmd-Q and window close stays prevented forever.
+        // `app://quit-requested` listener), so without the deadline a webview
+        // that never answers leaves every Cmd-Q and window close prevented.
         assert_eq!(
             quit_intercept_decision(false, true, None),
             QuitIntercept::Ask,
@@ -2605,9 +2429,9 @@ mod tests {
 
     #[test]
     fn a_tail_unregisters_itself_when_its_task_ends() {
-        // A11-5: only `stop_log_tail` used to remove entries, so a tail that
-        // died on a send/poll error stayed in the map and `stop_log_tail`
-        // answered `true` for a task that no longer existed.
+        // A11-5: a tail unregisters itself when its task ends, not only via
+        // `stop_log_tail`, so `stop_log_tail` cannot answer `true` for a
+        // dead task.
         let registry = TailRegistry::default();
         let stop = Arc::new(AtomicBool::new(false));
         let (id, guard) = registry.register(stop.clone());
@@ -2653,8 +2477,8 @@ mod tests {
 
     #[test]
     fn the_status_broadcast_skips_repeats_but_never_the_first_one() {
-        // /simplify E-A11: the 1 Hz broadcast emitted unconditionally, and the
-        // "the frontend store dedups" claim in its doc comment was false.
+        // E-A11: the 1 Hz broadcast drops repeats in the backend; the
+        // frontend store is not relied on to dedup.
         let state = SessionMonitorState::default();
         let idle = SessionStatus::default();
         assert!(
@@ -2676,10 +2500,9 @@ mod tests {
 
     #[test]
     fn a_dry_run_emits_the_shared_plan_rows_and_a_real_run_emits_none() {
-        // Finding #13's GUI half: `planned()` never left the backend, so a
-        // GUI dry run showed exactly the narrative rows a real run shows —
-        // with no way to tell "would copy" from "would skip (bytes already
-        // match)", the distinction the plan exists for.
+        // Finding #13 (GUI half): `planned()` rows reach the GUI so a dry run
+        // can tell "would copy" from "would skip (bytes already match)", the
+        // distinction the plan exists for.
         fn events_for(dry_run: bool) -> Vec<StageEvent> {
             let seen = Arc::new(Mutex::new(Vec::new()));
             let s = seen.clone();
@@ -2749,24 +2572,11 @@ mod tests {
         assert!(!fired.load(Ordering::SeqCst));
     }
 
-    // ── Phase 4 ───────────────────────────────────────────────────────────
-    //
-    // `sabrage-app` carries no JSON-format crate as a direct dependency
-    // (`Cargo.toml` is off-limits to this agent, and only `sabrage-core`
-    // depends on `serde_json` — see that crate's own store/config tests for
-    // the wire-format round trips), so these exercise the pure decision
-    // functions and helpers at the Rust level rather than a serialized-JSON
-    // comparison.
-    // Every new `#[serde(rename_all = "camelCase")]`/`"lowercase"` attribute
-    // below follows the exact pattern already established on every sibling
-    // struct/enum in this file (`AppState`, `DoctorEvent`, `FixAction`, …).
-
     #[test]
     fn classify_repo_root_source_follows_resolve_repo_roots_own_precedence() {
-        // Finding: `resolve_repo_root`'s explicit-override and env tiers
-        // never themselves fail (`paths.rs`'s own doc comment) — an explicit
-        // setting wins regardless of whether the walk would also have
-        // succeeded, and likewise for env over the walk.
+        // `resolve_repo_root`'s explicit-override and env tiers cannot
+        // themselves fail (`paths.rs`), so an explicit setting wins whether or
+        // not the walk would also have succeeded, and env likewise over the walk.
         assert_eq!(
             classify_repo_root_source(true, true, true),
             RepoRootSource::Settings
@@ -2795,11 +2605,9 @@ mod tests {
 
     #[test]
     fn game_row_reflects_a_freshly_computed_validity_not_a_stored_one() {
-        // Exercises the private `game_row` helper directly: a `GameEntry`
-        // pointing at a bs_dir/bottle that do not exist on disk must come
-        // back `NotFound`, regardless of whatever the entry itself claims —
-        // `get_library`/`save_game`'s whole point is that validity is never
-        // trusted from the stored JSON.
+        // Validity is recomputed, never trusted from the stored JSON: an
+        // entry whose bs_dir and bottle do not exist comes back `NotFound`
+        // whatever the entry itself claims.
         let paths = Paths::new("/nonexistent/sabrage-commands-game-row-test");
         let entry = library::GameEntry {
             name: "Beat Saber 1.29.4".to_string(),
@@ -2813,15 +2621,11 @@ mod tests {
         assert!(!row.validity.exe_present);
     }
 
-    // ── E-C3-settings-paths-cache ────────────────────────────────────────────
-
     #[test]
     fn cache_hit_returns_the_stored_pair_without_reloading() {
-        // Seeds the cache directly (rather than through `snapshot`'s
-        // load-on-miss path, which would touch the real `settings.json`) so
-        // this stays hermetic: a populated cache must serve exactly what was
-        // stored, proving `snapshot`'s early return is reached before any
-        // reload.
+        // E-C3-settings-paths-cache: seeds the cache directly rather than
+        // through `snapshot`'s load-on-miss path, which would touch the real
+        // `settings.json`; a populated cache must serve exactly what was stored.
         let settings = settings::Settings {
             default_bottle: Some("Steam".to_string()),
             ..Default::default()
