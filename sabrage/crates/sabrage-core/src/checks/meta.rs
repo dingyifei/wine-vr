@@ -2,19 +2,16 @@
 //!
 //! Slugs owned here, in contract order:
 //!
-//! * `meta.contract-sync` — recompute the contract sha256 from `contract/` on
-//!   disk and compare it against the `# contract-sha256:` header of
-//!   `scripts/demo/contract.gen.sh` (`util::contract_hash` /
-//!   `util::contract_gen_recorded_hash`), **and** (Sabrage-only, see below)
+//! * `meta.contract-sync` — compares the sha256 recomputed from `contract/` on disk against
+//!   the `# contract-sha256:` header of `scripts/demo/contract.gen.sh`
+//!   (`util::contract_hash` / `util::contract_gen_recorded_hash`), and (Sabrage-only)
 //!   against the contract this binary was compiled from.
 //!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim —
-//! this holds for the on-disk-vs-generated-header comparison, which is the
-//! only half of this check the shell side can perform (doctor.sh has no
-//! compiled-in contract to compare against). The compiled-vs-checkout half
-//! below is Sabrage-only; its message/remedy prose has no shell counterpart
-//! and is declared as an intentional divergence in `sabrage/PARITY.md`.
+//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a read-only probe.
+//! Message and remedy strings of the on-disk half must match `scripts/demo/doctor.sh`
+//! verbatim; the compiled-vs-checkout half has no shell counterpart and is declared in
+//! PARITY.md § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+//! "**Contract identity.**".
 
 use super::Evaluator;
 #[allow(unused_imports)]
@@ -22,44 +19,19 @@ use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
 
 use crate::util;
 
-/// doctor.sh section 0:
-/// ```sh
-/// _want="$(cat "$ROOT/contract/pipeline.toml" \
-///              "$ROOT/contract/oxrsys-runtime.toml.template" \
-///              "$ROOT/contract/active_runtime.x86_64.json.template" \
-///          2>/dev/null | shasum -a 256 | awk '{print $1}')"
-/// _have="$(sed -n 's/^# contract-sha256: //p' "$ROOT/scripts/demo/contract.gen.sh" | head -1)"
-/// if [ -n "$_have" ] && [ "$_want" = "$_have" ]; then chk ok …
-/// else chk fail …
-/// ```
+/// Doctor row `meta.contract-sync`: Pass only when the sha256 recomputed from
+/// `contract/` under `ctx.paths.root` equals both `contract.gen.sh`'s
+/// `# contract-sha256:` header and this binary's compiled-in contract hash.
 ///
-/// `_have` empty (missing header, or the generated file missing entirely) is a
-/// FAIL, same as a hash mismatch — the `[ -n "$_have" ]` guard is load-bearing.
-///
-/// # A1-4: what this catches, and what it does not
-///
-/// `have` is the `# contract-sha256:` **header line**, never the generated
-/// file's body — this evaluator (like doctor.sh's own `_have` capture) reads
-/// one `sed -n 's/^# contract-sha256: //p'` line and nothing else. A
-/// `contract.gen.sh` whose header is current but whose *body* was hand-edited
-/// (or regenerated from a different `contract/` than the header names) is
-/// therefore invisible to this check at runtime: `have == want` still holds,
-/// because `want` is recomputed from `contract/` on disk and never reads
-/// `contract.gen.sh`'s body either. That drift is caught only by tier-1's
-/// `sabrage-contract-gen::generate() == include_str!("contract.gen.sh")`
-/// test (`scripts/dev/parity.sh`, `.github/workflows/parity.yml`) — a
-/// hand-edited body is a red CI run, not a red doctor row.
-///
-/// This on-disk comparison only verifies that `contract.gen.sh`'s header is
-/// **fresh relative to the checkout** — it says nothing about whether *this
-/// binary* was itself compiled from that same checkout. A Sabrage binary
-/// embeds its contract at compile time ([`crate::contract`]'s `include_str!`s);
-/// a build from an older/newer checkout than the one `repo_root` now points at
-/// would pass this half of the check while still running stale check logic
-/// against a contract it silently disagrees with. So, Sabrage-only (the shell
-/// has no compiled-in contract to compare against — see `sabrage/PARITY.md`),
-/// once the checkout is internally consistent this evaluator additionally
-/// compares the checkout's hash against [`crate::contract::COMPILED_CONTRACT_SHA256`].
+/// A missing or empty header is a Fail — doctor.sh's `[ -n "$_have" ]` guard;
+/// only the missing case is pinned
+/// (tests::fails_closed_when_the_repo_root_is_wrong). Neither side reads the
+/// body of `contract.gen.sh`, so a hand-edited body under a current header
+/// passes this row (A1-4); tier-1's `sabrage-contract-gen::generate() ==
+/// include_str!` test catches that drift. The compiled-vs-checkout half is
+/// Sabrage-only, finding A1-1
+/// (tests::fails_when_the_binary_was_compiled_from_a_different_contract).
+/// Reference: scripts/demo/doctor.sh section 0.
 fn meta_contract_sync(ctx: &CheckCtx) -> CheckOutcome {
     let root = &ctx.paths.root;
     let have = util::contract_gen_recorded_hash(root);
@@ -119,25 +91,20 @@ const STALE_BINARY_MESSAGE: &str = "this Sabrage binary was built from a differe
 const STALE_BINARY_REMEDY: &str = "rebuild it from this checkout (cd sabrage && cargo build) or \
      point Settings \u{203a} Repository at the checkout it was built from";
 
-/// Sabrage-only compiled-vs-checkout identity guard, factored out of
-/// [`meta_contract_sync`] so that callers *other* than Doctor can refuse to
-/// act on a mismatch instead of merely reporting it. Round-1 finding A1-1: the
-/// Doctor row for this existed, but Setup/Build/Install/Run dispatched
-/// regardless of it — only the launch preflight (which runs this whole check
-/// group) actually stopped anything. This packet's cross-area half
-/// (`stages::run_stage` / `run_stage_holding_lock` calling this before
-/// dispatch, owned by area A4) closes that gap; this function is the reusable
-/// predicate those call sites need, kept here so its message/remedy strings
-/// can never drift from the Doctor row's.
+/// Sabrage-only compiled-vs-checkout identity guard, usable outside Doctor so
+/// callers can refuse to act on a mismatch (round-1 finding A1-1).
 ///
-/// Returns `Err((message, remedy))` — never a `CheckOutcome`, so this has no
-/// [`CheckCtx`] dependency and callers outside `checks::` don't need one just
-/// to ask "is it safe to mutate?". Fails closed (`Err`) when `contract/`
-/// itself can't be read/hashed under `root`, using the same message the
-/// Doctor row would show in that case; a self-consistent checkout that
-/// disagrees with [`crate::contract::COMPILED_CONTRACT_SHA256`] is the other
-/// `Err` case. `Ok(())` only when `root`'s `contract/` hashes to exactly what
-/// this binary was compiled from.
+/// Returns `Ok(())` only when `root`'s `contract/` hashes to exactly the
+/// contract this binary was compiled from. Returns `(message, remedy)` rather
+/// than `CheckOutcome` so callers outside `checks::` need no [`CheckCtx`];
+/// the strings are the Doctor row's own, preventing drift.
+///
+/// # Errors
+///
+/// `Err((message, remedy))` when `contract/` under `root` cannot be read or
+/// hashed (fails closed with the Doctor row's message), and when a
+/// self-consistent checkout disagrees with
+/// [`crate::contract::COMPILED_CONTRACT_SHA256`].
 pub fn assert_binary_matches_checkout(root: &std::path::Path) -> Result<(), (String, String)> {
     let Some(want) = util::contract_hash(root).ok() else {
         return Err((
@@ -167,8 +134,7 @@ mod tests {
     use crate::paths::Paths;
     use std::path::PathBuf;
 
-    /// The repo root, four levels above this crate's manifest — same recipe
-    /// `util`'s own tests use.
+    /// The repo root: three levels above this crate's manifest directory.
     fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
@@ -272,11 +238,10 @@ mod tests {
         );
     }
 
-    /// [`assert_binary_matches_checkout`] is the reusable predicate area A4's
-    /// `stages::run_stage` / `run_stage_holding_lock` call before dispatching a
-    /// mutating stage (packet counterpart of A1-1). `Ok(())` against the live
-    /// checkout, with the same message/remedy strings `meta_contract_sync`
-    /// uses for its two `Err` shapes.
+    /// [`assert_binary_matches_checkout`] returns `Ok(())` against the live
+    /// checkout — the predicate behind `stages::deny_on_contract_skew`, run by
+    /// every mutating door (`stages::run_stage`, `stages::run_stage_holding_lock`,
+    /// `crate::fixes::apply`) before dispatch; Stop is ungated (round-1 finding A1-1).
     #[test]
     fn assert_binary_matches_checkout_passes_against_the_live_checkout() {
         assert!(assert_binary_matches_checkout(&repo_root()).is_ok());
