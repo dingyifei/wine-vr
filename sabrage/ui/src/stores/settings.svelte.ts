@@ -1,8 +1,6 @@
 // App-wide Settings state (`~/Library/Application Support/Sabrage/settings.json`),
 // shared between the Settings screen (the writer) and every screen that reads
 // a default (Sidebar's bottle prefill, Session's/Library's launch defaults).
-// A plain Svelte 5 rune store — module-scoped `$state`, same shape as
-// doctor.svelte.ts/session.svelte.ts.
 
 import { errMsg } from "../lib/text";
 import {
@@ -17,22 +15,17 @@ function createSettingsStore() {
   let loadOk = $state(false);
   let error = $state<string | null>(null);
 
-  /** Bumped synchronously (before any `await`) every time `save`/`update`
-   * queues a write — i.e. it already reflects *this* write by the time the
-   * call that queued it returns control. Callers use it to detect whether a
-   * newer write was queued behind theirs while they were in flight: if
-   * `writeSeq` has moved past `capturedBefore + 1` by the time their own
-   * write settles, a later write superseded it and the caller should not act
-   * on its (now-stale) result — see Settings.svelte's `persistSettings`. */
+  /** Write counter, bumped synchronously when `save`/`update` queues a write,
+   * so it already reflects the caller's own write on return. If `writeSeq`
+   * exceeds `capturedBefore + 1` once a write settles, a later write
+   * superseded it and the result is stale. */
   let writeSeq = $state(0);
 
-  /** Serializes every write (`save`/`update`) onto one chain so overlapping
-   * autosaves settle in call order — at most one `saveSettings` round-trip is
-   * ever in flight, and each queued write merges/re-converges against the
-   * result of the one before it rather than a snapshot captured before that
-   * write even started. A queued step's own rejection does not break the
-   * chain for callers still waiting behind it; it still rejects to its own
-   * caller. */
+  /** Serializes every write (`save`/`update`) onto one chain, so overlapping
+   * autosaves settle in call order: at most one `saveSettings` round-trip is
+   * ever in flight, and each queued write merges against the result of the one
+   * before it. A queued step's rejection reaches its own caller without
+   * breaking the chain for writes behind it. */
   let chain: Promise<void> = Promise.resolve();
   function enqueue<T>(fn: () => Promise<T>): Promise<T> {
     writeSeq++;
@@ -44,13 +37,11 @@ function createSettingsStore() {
     return run;
   }
 
-  /** Fetch `Settings` from disk. A missing file resolves to field defaults
-   * (not an error — see `getSettings`'s doc comment). A corrupt file or IPC
-   * failure quarantines the store instead of retaining a stale snapshot:
-   * `settings` is cleared and `loadOk` drops to `false`, so every control
-   * gated on `loadOk` (not `loaded` — see that getter's doc) disables rather
-   * than autosaving over a value nothing here has verified is current, and a
-   * later successful `load()`/`save()` is what re-arms them. */
+  /** Fetch `Settings` from disk. A missing file resolves to field defaults,
+   * not an error. A corrupt file or IPC failure quarantines the store —
+   * `settings` cleared, `loadOk` false — so controls gated on `loadOk` disable
+   * rather than autosave over a value nothing has verified; a later successful
+   * `load()`/`save()` re-arms them. */
   async function load(): Promise<void> {
     error = null;
     try {
@@ -67,15 +58,12 @@ function createSettingsStore() {
   }
 
   /**
-   * Persist `next` optimistically — `settings` updates immediately, before
-   * the round-trip resolves, so a bound control never visibly snaps back
-   * while the save is in flight. On rejection, `error` is set and the store
-   * re-`load()`s from disk rather than rolling back to a `previous` snapshot
-   * captured before this call: under `enqueue`'s serialization a rollback is
-   * still safe against *this* store's own writes, but not against a write
-   * from another process (setup, the CLI) landing in between — re-reading is
-   * the only way `settings` converges on what is actually on disk. Queued
-   * through `enqueue`, so a direct call still serializes against `update`.
+   * Persist `next` optimistically: `settings` updates before the round-trip
+   * resolves, so bound controls never snap back. On rejection `error` is set
+   * and the store re-`load()`s from disk; it does not roll back, because that
+   * would discard a write another process (setup, the CLI) landed in between,
+   * and the UI has no test harness to catch such interleavings. Queued through
+   * `enqueue`, so a direct call still serializes against `update`.
    */
   async function save(next: Settings): Promise<void> {
     return enqueue(() => performSave(next));
@@ -95,24 +83,18 @@ function createSettingsStore() {
   }
 
   /**
-   * Shallow-merge `patch` onto the current `settings` and save the result,
-   * serialized against every other in-flight `update`/`save` (see
-   * `enqueue`). Rejects — rather than silently no-oping — when nothing has
-   * successfully loaded yet: the old no-op let a caller flash "Saved" for a
-   * write that never happened (every autosave handler in Settings.svelte
-   * awaits this and only flashes on success, so the rejection now suppresses
-   * that). `patch.launch`, if present, replaces the whole `LaunchDefaults`
-   * object (this merge is shallow) — pass a full `{ ...settings.launch, … }`
-   * object to change one flag.
+   * Shallow-merge `patch` onto `settings` and save, serialized through
+   * `enqueue`. Rejects when nothing has loaded yet, so callers cannot report
+   * success for a write that never happened. `patch.launch` replaces the whole
+   * `LaunchDefaults` object — pass `{ ...settings.launch, … }` to change one
+   * flag.
    *
-   * `patch` may also be a function of the *current* `settings` — resolved
-   * inside the queued step, i.e. against whatever `settings` is when this
-   * write actually runs (which may already reflect an earlier queued
-   * write's failure-triggered `load()`), not a snapshot from whenever the
-   * caller happened to build the patch. Callers building a patch from a
-   * nested sub-object (e.g. `launch`) should prefer this form — otherwise a
-   * stale field captured before an earlier write's rollback can ride along
-   * into this write. */
+   * `patch` may be a function of the current `settings`, resolved inside the
+   * queued step against whatever `settings` is when this write runs. Prefer
+   * this form when building a patch from a nested sub-object (e.g. `launch`):
+   * otherwise a field captured before an earlier write's failure-triggered
+   * `load()` rides along into this write.
+   */
   async function update(patch: Partial<Settings> | ((current: Settings) => Partial<Settings>)): Promise<void> {
     return enqueue(() => {
       if (!settings) {
@@ -130,11 +112,9 @@ function createSettingsStore() {
     get loaded() {
       return loaded;
     },
-    /** `true` only after a load that actually succeeded. `loaded` alone
-     * (kept for "a load has been attempted") is not safe to gate controls
-     * on: a corrupt/unreadable settings.json also sets it, and gating there
-     * used to leave every control enabled over a `null` `settings` — see
-     * `load`'s doc comment. */
+    /** `true` only after a load that actually succeeded. Gate controls on this,
+     * not on `loaded` ("a load was attempted"), which a corrupt or unreadable
+     * settings.json also sets while `settings` stays `null`. */
     get loadOk() {
       return loadOk;
     },
