@@ -42,14 +42,11 @@ pub type RunId = Uuid;
 /// A stable step id, e.g. `"install.4.host-manifest"`. See [`step`].
 pub type StepId = &'static str;
 
-// ── stage ─────────────────────────────────────────────────────────────────────
-
 /// The five mutating pipeline stages.
 ///
-/// `all` is deliberately absent: demo.sh implements it by re-executing itself
-/// once per stage (`for stage in setup build install run`), and the native side
-/// mirrors that as a *caller-level* loop over fresh contexts, not as a sixth
-/// stage. Doctor is absent too — it is read-only and lives in [`crate::checks`].
+/// `all` is deliberately absent: it is a caller-level loop over fresh contexts,
+/// one per stage of [`Stage::ALL_CHAIN`], not a sixth stage. Doctor is absent
+/// too — it is read-only and lives in [`crate::checks`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Stage {
@@ -125,8 +122,6 @@ impl FromStr for Stage {
     }
 }
 
-// ── row vocabulary ────────────────────────────────────────────────────────────
-
 /// The four `lib.sh` row kinds. Serialized lowercase, matching the tap channel's
 /// words (`crate::tap::tap_word`) for `ok`/`warn`/`fail`/`info`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -169,8 +164,6 @@ pub enum Stream {
     Stdout,
     Stderr,
 }
-
-// ── the event ─────────────────────────────────────────────────────────────────
 
 /// One thing that happened inside a stage.
 ///
@@ -260,27 +253,13 @@ pub enum StageEvent {
     /// A raw `print -r --` line, reproduced **verbatim** — leading spaces and
     /// all, and possibly empty (`print ""`).
     ///
-    /// [`StageEvent::Line`] cannot carry these: they are outside `lib.sh`'s
-    /// `info`/`ok`/`warn`/`fail` vocabulary, so a renderer must print them with
-    /// no marker, no colour, and no indent of its own. `run.sh` is where they
-    /// live — every one of these is a literal:
-    ///
-    /// ```zsh
-    /// print ""
-    /// print -r -- "-- launching Beat Saber through the bridge"
-    /// print -r -- "   put the headset ON and open the ALVR client; first frame can take ~30s."
-    /// print -r -- "   exe: $BS_WIN"
-    /// print -r -- "   log: $LOG"
-    /// print -r -- "audio: default output -> BlackHole 2ch (was: $PREV_AUDIO_OUT)"
-    /// print "audio: restored output -> $PREV_AUDIO_OUT"
-    /// print "dashboard: closed"
-    /// print "encoder helper: reaped (left over from the runtime)"
-    /// print -r -- "wine exited with status $rc (log: $LOG)"
-    /// ```
-    ///
-    /// (The `-- launching …` banner is *not* a [`StageEvent::Section`]: the
-    /// four indented lines under it are part of the same block and the CLI
-    /// must reproduce all five byte-for-byte.)
+    /// [`StageEvent::Line`] cannot carry these: they fall outside `lib.sh`'s
+    /// `info`/`ok`/`warn`/`fail` vocabulary, so a renderer prints them with no
+    /// marker, colour, or indent. Source: scripts/demo/run.sh
+    /// `print`/`print -r --` lines; the `# launch-action: launch-wine` block
+    /// is the largest. Its `-- launching Beat Saber through the bridge` line is
+    /// *not* a [`StageEvent::Section`]: the indented lines under it belong to
+    /// the same block and the CLI reproduces it byte-for-byte.
     Text {
         run_id: RunId,
         /// `None` for lines a stage prints outside any step.
@@ -414,8 +393,6 @@ impl StageEvent {
     }
 }
 
-// ── step ids ──────────────────────────────────────────────────────────────────
-
 /// Stable step ids, one per numbered block of the shell stage scripts.
 ///
 /// The numbers mirror the comments in `scripts/demo/*.sh` (`# 1. submodules`,
@@ -461,10 +438,9 @@ pub mod step {
     pub const INSTALL_HOST_MANIFEST: StepId = "install.4.host-manifest";
 
     // run.sh
-    /// The ordered preflight block (`# preflight:` / `# preflight-autofix:`
-    /// tags) — game presence/version, wine, bridge outputs, host manifest,
-    /// bottle currency, the DXMT overlay compare, the `cxbottle.conf` backend
-    /// autofix, Goldberg presence, `protocol`, and the helper arch autofix.
+    /// The ordered preflight block: every `# preflight:` / `# preflight-warn:` /
+    /// `# preflight-autofix:` tagged check of `scripts/demo/run.sh`, in that
+    /// script's order.
     pub const RUN_PREFLIGHT: StepId = "run.1.preflight";
     /// `launch-action: adb-forward-hygiene` — `--wired` creates
     /// `tcp:9943`/`tcp:9944` per-serial; a normal run removes exactly those two.
@@ -598,7 +574,6 @@ mod tests {
                 );
             }
         }
-        // Every stage now owns steps — run landed in Phase 3.
         assert_eq!(Stage::Run.steps(), step::RUN);
         assert_eq!(Stage::Run.steps().len(), 10);
         assert_eq!(Stage::Run.steps().first(), Some(&step::RUN_PREFLIGHT));
@@ -740,7 +715,6 @@ mod tests {
         ];
         for ev in &evs {
             assert_eq!(ev.run_id(), rid());
-            // Round-trips through JSON unchanged.
             let text = serde_json::to_string(ev).unwrap();
             assert_eq!(&serde_json::from_str::<StageEvent>(&text).unwrap(), ev);
         }
