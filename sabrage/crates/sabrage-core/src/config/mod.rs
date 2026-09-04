@@ -1,18 +1,16 @@
-//! The user-facing configuration layer (Phase 4).
+//! User-facing configuration: [`runtime_toml`], the typed, format-preserving
+//! editor for `~/Library/Application Support/OXRSys/oxrsys-runtime.toml`,
+//! written once by `demo.sh` and never touched again.
 //!
-//! One module today: [`runtime_toml`], the typed, format-preserving editor for
-//! `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` — the file
-//! `demo.sh` writes exactly once and then never touches again.
+//! Sabrage owns the six `EDITABLE_KEYS` values and nothing else: ordering, spacing,
+//! unknown keys, the provenance header and comments survive byte-for-byte because the
+//! file is shared with a human and a line-oriented C++ parser that is not a TOML
+//! implementation (`runtime_toml::tests::a_real_edit_preserves_crlf_a_bom_and_a_missing_final_newline`).
+//! The one exception: a same-line `#` comment is relocated above its key by [`runtime_toml`]
+//! (`runtime_toml::tests::a_same_line_comment_moves_to_its_own_line_above_the_key`).
+//! See `sabrage/docs/design/design-core.md` §4.1.
 //!
-//! This is the layer's boundary in one sentence: **Sabrage owns the six
-//! streaming keys' values and nothing else about that file.** Comments,
-//! ordering, spacing, unknown keys and the hand-written provenance header all
-//! survive an edit byte-for-byte, because the file is shared with a human and
-//! with a line-oriented C++ parser that is not a TOML implementation. See
-//! `sabrage/docs/design/design-core.md` §4.1 and [`runtime_toml`]'s header.
-//!
-//! Sabrage's *own* state — settings, the game library — is not configuration in
-//! this sense and lives in [`crate::store`].
+//! Sabrage's own state — settings, the game library — lives in [`crate::store`].
 
 pub mod runtime_toml;
 
