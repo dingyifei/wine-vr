@@ -28,14 +28,12 @@
     if (!settingsStore.loaded) void settingsStore.load();
   });
 
-  // Goldberg is applied during the run stage, before the wine child comes up
-  // — well before `sessionStore.launch(opts)` settles (that promise doesn't
-  // resolve until the session ENDS, possibly hours later). Without this, a
-  // row's `validity.goldberg`/status stay at their pre-launch snapshot for
-  // the whole session if the user stays on Library. `launchedAt` is the
-  // launch-local "the game is up" signal (session.svelte.ts), set well after
-  // Goldberg staging; the settlement refresh in `runGame` above still runs,
-  // for `lastSession`.
+  // Goldberg is staged during run, well before `sessionStore.launch` settles
+  // (that promise resolves only when the session ends), so a row's
+  // `validity.goldberg`/status would stay at their pre-launch snapshot for the
+  // whole session. `launchedAt` (session.svelte.ts) is the launch-local
+  // "game is up" signal, set after Goldberg staging; this refresh does not
+  // replace `runGame`'s settlement refresh, which updates `lastSession`.
   let lastRefreshedLaunchAt = $state<number | null>(null);
   $effect(() => {
     const at = sessionStore.launchedAt;
@@ -65,7 +63,6 @@
     noDll: "no steam_api64.dll found yet",
   };
 
-  // ── expand / collapse ────────────────────────────────────────────────────
 
   let expandedId = $state<string | null>(null);
 
@@ -73,31 +70,21 @@
     expandedId = expandedId === id ? null : id;
   }
 
-  // ── run ──────────────────────────────────────────────────────────────────
-  // `settings.launch` ⊕ `entry.launchOverrides`, mirroring
-  // `store::library::effective_options` on the Rust side (a per-field
-  // `override ?? global default`) — the client, not the backend, is the
-  // source of truth for the actual `LaunchOpts` flags sent over IPC.
+  // `effectiveLaunchOpts` mirrors `store::library::effective_options` on the
+  // Rust side (per field, `override ?? global default`); the client, not the
+  // backend, is the source of truth for the `LaunchOpts` flags sent over IPC.
 
-  // `isLivePhase` excludes `"exited"` — the backend deliberately leaves that
-  // phase published until the next launch (the row is the last session's
-  // epitaph, not a live one), so a plain `phase !== "idle"` test here used to
-  // keep every Run button disabled, and every row sharing the bottle showing
-  // "Running", for the rest of the app's life after one session ended.
+  // `isLivePhase` excludes `"exited"`: the backend leaves that phase published
+  // until the next launch, so a bare `phase !== "idle"` would hold every Run
+  // button disabled for the rest of the app's life after one session ended.
   //
-  // `!settingsStore.loadOk` also holds Run disabled until settings.json has
-  // actually loaded successfully: `effectiveLaunchOpts` below falls back to
-  // `?? false` for every global launch flag it can't read, and that fallback
-  // is only correct for the backend's successful "no settings.json yet"
-  // default — not for a corrupt/unreadable file or a failed IPC round-trip,
-  // which would otherwise silently launch with the wrong audio/dashboard/
-  // wired/verbose behavior instead of stopping at a visible error.
-  // `stageStore.running` covers the stage whose dialog was Hidden: Hide clears
-  // `gate` but not the `runStage` invocation behind it, and a Run started on
-  // top of one queues a second `openGate` GateModal refuses to adopt — the
-  // dialog reopens over the hidden stage while the launch runs behind the
-  // operation lock with nothing to cancel it with (the guard StagesPanel and
-  // Doctor already carry).
+  // `!settingsStore.loadOk` holds Run disabled until settings.json loads: the
+  // `?? false` fallback in `effectiveLaunchOpts` is right only for the backend's
+  // "no settings.json yet" default — a corrupt file would launch wrong flags.
+  //
+  // `stageStore.running` covers a Hidden stage (the guard StagesPanel and
+  // Doctor carry too): Hide clears `gate`, not the `runStage` behind it, and
+  // GateModal won't adopt a second `openGate` — nothing is left to cancel it.
   const busy = $derived(
     sessionStore.launching ||
       isLivePhase(sessionStore.status.phase) ||
@@ -122,16 +109,12 @@
 
   function runGame(entry: GameEntry) {
     const opts = effectiveLaunchOpts(entry);
-    // Both calls fire together, same as Session.svelte's `doLaunch`: the
-    // store owns the actual launch (and the rows GateModal reads), the gate
-    // is just this same launch's window.
-    // `launch` resolves only after the backend has already written this run's
-    // `lastSession` into library.json (commands.rs awaits `record_last_session`
-    // before returning), so re-reading here is the earliest point at which the
-    // Last session column can stop showing the previous run — and Run is
-    // invoked from this very screen, so without it the row the user just
-    // launched stays stale until they navigate away and back.
-    // Both settlements refresh; the gate is what renders a failure.
+    // Both calls fire together, same as Session.svelte's `doLaunch`: the store
+    // owns the launch (and the rows GateModal reads), the gate is this launch's
+    // window and renders any failure.
+    // `launch` settles only after the backend records this run's `lastSession`
+    // (when there is one), so refreshing on either settlement is the earliest
+    // the row can show the current run in Last session.
     void sessionStore.launch(opts).then(
       () => void libraryStore.refresh(),
       () => void libraryStore.refresh(),
@@ -140,15 +123,14 @@
   }
 
   function isRunningFor(entry: GameEntry): boolean {
-    // `isLivePhase` (not a bare `!== "idle"`) is what keeps this `false` once
-    // the session settles into `"exited"` — otherwise every row sharing the
-    // bottle would keep reading "Running" long after the game closed.
+    // `"exited"` stays published until the next launch, so a bare `!== "idle"`
+    // here would leave every row sharing the bottle reading "Running" long
+    // after the game closed.
     if (!isLivePhase(sessionStore.status.phase)) return false;
     // A session this process launched remembers its Library entry, so two
     // entries sharing a bottle don't both read "Running". `SessionStatus`
-    // itself carries no gameId, so a session Sabrage did not start (external
-    // or re-attached) falls back to the bottle match — the best proxy the
-    // wire shape gives us.
+    // carries no gameId, so a session Sabrage did not start (external or
+    // re-attached) falls back to the bottle match.
     const launched = sessionStore.launchedGameId;
     if (launched !== null) return launched === entry.id;
     return sessionStore.status.bottle === entry.bottle;
@@ -179,7 +161,6 @@
     return `${entry.bottle || "—"} · ${template} · ${backend}`;
   }
 
-  // ── remove (inline two-step confirm — never window.confirm) ────────────
 
   let removeConfirmId = $state<string | null>(null);
   let removing = $state(false);
