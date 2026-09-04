@@ -3,7 +3,7 @@
 //! `contract/`).
 //!
 //! This crate carries **no runtime surface** — see `Cargo.toml`: every
-//! dependency is a dev-dependency, and everything below is a tier-1 hermetic
+//! dependency is a dev-dependency, and every test in `tests` is a tier-1 hermetic
 //! `cargo test` per `docs/design/design-parity.md` §4 ("always-on pure tests,
 //! no env gate, no machine state" beyond reading the repo tree the crate is
 //! built from). Tier 2 (the live doctor diff) and the pre-push hook are
