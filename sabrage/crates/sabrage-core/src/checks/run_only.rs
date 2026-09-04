@@ -1,37 +1,18 @@
-//! Group `run-only` — doctor.sh section n/a: preflights that exist only in the launch path (no doctor row).
+//! Group `run-only` — preflights that exist only in the launch path, so
+//! doctor prints no row for them ([`super::NO_DOCTOR_ROW_GROUP`]).
 //!
-//! Slugs owned here, in contract order:
+//! Slugs owned here, in contract order: `run.wine-exec`, `run.bridge-built`
+//! (one gate over the pair doctor splits across `build.oxr-dylib` and
+//! `build.woxr-dll`), `run.wired-adb` (evaluated only for `--wired`, which
+//! needs a connected device for the `tcp:9943`/`tcp:9944` forwards). Every
+//! evaluator is a read-only `fn(&CheckCtx) -> CheckOutcome`.
 //!
-//! * `run.wine-exec` — the CrossOver `wine` binary is present and executable
-//! * `run.bridge-built` — both bridge build outputs exist — run covers the
-//!   `build.woxr-dll`/`build.woxr-so` pair with this single gate
-//! * `run.wired-adb` — only evaluated for `--wired`: an adb device is
-//!   connected so the `tcp:9943`/`tcp:9944` forwards can be created
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//!
-//! # These three have no doctor row, so their prose comes from `run.sh`
-//!
-//! The module-level rule elsewhere in [`crate::checks`] is "message and remedy
-//! strings must match `scripts/demo/doctor.sh` verbatim". doctor.sh never
-//! prints these slugs at all ([`super::NO_DOCTOR_ROW_GROUP`]), so the text to
-//! match is `run.sh`'s `die` string instead — and it is carried whole in
-//! `message`, with no separate `remedy`, because that is the shape `run.sh`
-//! prints:
-//!
-//! ```zsh
-//! # preflight: run.wine-exec
-//! [ -x "$WINE" ] || die "CrossOver wine not found at $WINE — is CrossOver installed?"
-//! # preflight: run.bridge-built
-//! [ -f "$OXR_DYLIB" ] && [ -f "$WOXR_DLL" ] || die "bridge not built — ./demo.sh build"
-//! # preflight: run.wired-adb
-//! [ -n "$ADB" ] || die "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
-//! [ -n "$WIRED_SER" ] || die "--wired: no Quest over adb — connect USB and check 'adb devices'"
-//! ```
-//!
-//! The launch preflight ([`crate::stages::run::preflight`]) turns a FAIL here
-//! into [`crate::error::SabrageError::Fatal`] carrying exactly that text, so
-//! the two front-ends abort with the same sentence.
+//! Reference: `scripts/demo/run.sh`, the `# preflight: run.*` tags. With no
+//! doctor row, each `message` carries run.sh's whole `die` sentence and no
+//! `remedy`; the launch preflight turns a FAIL into
+//! [`crate::error::SabrageError::Fatal`] with that text. See
+//! `checks::tests::registry_binds_in_contract_order_and_covers_every_slug` and
+//! tests::wine_exec_fails_with_run_shs_verbatim_die_text_when_the_file_is_not_executable.
 
 use std::io::Read;
 use std::path::Path;
@@ -57,23 +38,15 @@ fn is_executable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-// ── run.wine-exec ────────────────────────────────────────────────────────────
-
-/// `run.sh` line 17: `[ -x "$WINE" ] || die "CrossOver wine not found at $WINE
-/// — is CrossOver installed?"`.
+/// `run.wine-exec`: passes when `ctx.paths.wine` exists and is executable;
+/// otherwise fails with run.sh's `# preflight: run.wine-exec` die sentence,
+/// except in the declared divergence below.
 ///
-/// **Declared divergence — the CrossOver-absent message.** lib.sh builds
-/// `CX="${CX_APP:-}/Contents/SharedSupport/CrossOver"` unconditionally, so with
-/// no CrossOver.app installed the shell's `$WINE` is the bogus absolute path
-/// `/Contents/SharedSupport/CrossOver/bin/wine` and the die reads "CrossOver
-/// wine not found at /Contents/SharedSupport/CrossOver/bin/wine". [`crate::paths`]
-/// deliberately models that case as `wine: None` rather than reproducing a path
-/// that looks real (design-core §1), so there is no path to interpolate. Rather
-/// than fabricate the shell's misleading one, this branch says what is actually
-/// true — `CrossOver.app not found` — inside the same sentence. The
-/// CrossOver-**present** branch (a `wine` that exists but is not executable, or
-/// is missing from an installed CrossOver) is `run.sh`'s string verbatim, which
-/// is the case that actually happens.
+/// Declared divergence — no CrossOver.app: there is no path to interpolate
+/// ([`crate::paths`] models that case as `wine: None` rather than reproducing
+/// lib.sh's bogus `/Contents/SharedSupport/CrossOver/bin/wine`), so the
+/// sentence names the missing app instead. See
+/// tests::wine_exec_says_crossover_app_not_found_when_there_is_no_path_at_all.
 fn run_wine_exec(ctx: &CheckCtx) -> CheckOutcome {
     match ctx.paths.wine.as_deref() {
         Some(wine) if is_executable(wine) => CheckOutcome::pass(
@@ -94,14 +67,11 @@ fn run_wine_exec(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-// ── run.bridge-built ─────────────────────────────────────────────────────────
-
-/// `run.sh` line 19: `[ -f "$OXR_DYLIB" ] && [ -f "$WOXR_DLL" ] || die "bridge
-/// not built — ./demo.sh build"`.
-///
-/// One gate over the pair doctor splits across `build.oxr-dylib` and
-/// `build.woxr-dll`; the `detail` names whichever half is actually missing,
-/// which the shell's single message cannot.
+/// `run.bridge-built`: passes when both bridge outputs exist, otherwise fails
+/// with run.sh's `# preflight: run.bridge-built` die sentence. One gate over
+/// the pair doctor splits across `build.oxr-dylib` and `build.woxr-dll`; the
+/// `detail` names whichever half is missing, which the shell's single message
+/// cannot. See tests::bridge_built_needs_both_halves.
 fn run_bridge_built(ctx: &CheckCtx) -> CheckOutcome {
     let dylib = &ctx.paths.oxr_dylib;
     let dll = &ctx.paths.woxr_dll;
@@ -126,8 +96,6 @@ fn run_bridge_built(ctx: &CheckCtx) -> CheckOutcome {
         .with_detail(format!("missing: {}", missing.join(", ")))
 }
 
-// ── run.wired-adb ────────────────────────────────────────────────────────────
-
 /// Deadline for the one evaluator in this crate's check layer that spawns a
 /// child — the same bound the launch action's twin probe applies
 /// ([`crate::process::DEFAULT_PROBE_TIMEOUT`], via
@@ -141,21 +109,14 @@ const ADB_PROBE_POLL: Duration = Duration::from_millis(20);
 
 /// `"$ADB" devices` stdout, or empty when the binary is missing, fails to run,
 /// or does not answer within `timeout`. Same probe `checks::headset` makes;
-/// duplicated rather than shared because that one is private to a module this
-/// one does not own.
+/// duplicated because that module is private.
 ///
-/// **Bounded**, and that is the whole reason this is not `Command::output()`:
-/// evaluators are synchronous `fn(&CheckCtx)`, so a wedged `adb` (a server
-/// that stopped answering, a device in a bad state) blocked *inside* the
-/// registry evaluator — holding the launch's operation lock with the
-/// preflight's cancellation checkpoint, which sits between evaluators, unable
-/// to interrupt it. On expiry the child is killed and the probe fails exactly
-/// like a missing binary does, which is the case the caller already handles
-/// (run.sh's empty `$WIRED_SER`).
+/// The bound is load-bearing (A7-4): evaluators are synchronous, so a wedged
+/// `adb` would hold the launch's operation lock past every cancellation
+/// checkpoint. tests::the_devices_probe_gives_up_on_a_wedged_adb_instead_of_blocking_forever.
 ///
-/// `timeout` is a parameter rather than the constant so a test can pin the
-/// deadline behaviour in milliseconds instead of ten seconds; the one
-/// production call site passes [`ADB_PROBE_TIMEOUT`].
+/// `timeout` is a parameter so that test can pin the deadline in milliseconds;
+/// the one production call site passes [`ADB_PROBE_TIMEOUT`].
 fn adb_devices_output(adb: &Path, timeout: Duration) -> String {
     let mut child = match Command::new(adb)
         .arg("devices")
@@ -194,8 +155,9 @@ fn adb_devices_output(adb: &Path, timeout: Duration) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `awk 'NR>1 && $2=="device"{print $1; exit}'` over `adb devices` output —
-/// `run.sh` line 102's `WIRED_SER`.
+/// The first serial marked `device` in `adb devices` output, or `None` —
+/// run.sh's `WIRED_SER` awk (`NR>1 && $2=="device"`) under
+/// `# preflight: run.wired-adb`.
 fn first_connected_serial(devices_output: &str) -> Option<String> {
     for line in devices_output.lines().skip(1) {
         let mut fields = line.split_whitespace();
@@ -209,17 +171,12 @@ fn first_connected_serial(devices_output: &str) -> Option<String> {
     None
 }
 
-/// `run.sh` lines 103–105, the two `--wired` preconditions:
-///
-/// ```zsh
-/// if [ -n "${WINEVR_WIRED:-}" ]; then
-///   [ -n "$ADB" ] || die "--wired needs adb (Android platform-tools) on PATH or under ~/Library/Android/sdk"
-///   [ -n "$WIRED_SER" ] || die "--wired: no Quest over adb — connect USB and check 'adb devices'"
-/// ```
-///
-/// Without `--wired` the shell evaluates neither, so this reports
+/// `run.wired-adb`: with `--wired`, fails with run.sh's two
+/// `# preflight: run.wired-adb` die sentences when adb is absent or no device
+/// answers. Without `--wired` the shell evaluates neither, so this reports
 /// [`CheckStatus::Skipped`] — "not applicable", which the launch preflight
-/// treats as a non-blocking row rather than as an unverifiable gate.
+/// treats as a non-blocking row rather than as an unverifiable gate. See
+/// tests::wired_adb_is_skipped_unless_wired.
 fn run_wired_adb(ctx: &CheckCtx) -> CheckOutcome {
     if !ctx.opts.wired {
         return CheckOutcome::skipped("run.wired-adb", SkipReason::new("not --wired"));
@@ -297,8 +254,6 @@ mod tests {
         std::fs::write(p, b"x").unwrap();
     }
 
-    // ── run.wine-exec ────────────────────────────────────────────────────────
-
     #[test]
     fn wine_exec_passes_for_an_executable_wine() {
         let root = scratch("wine-ok");
@@ -354,8 +309,6 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    // ── run.bridge-built ─────────────────────────────────────────────────────
-
     #[test]
     fn bridge_built_needs_both_halves() {
         let root = scratch("bridge");
@@ -382,8 +335,6 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
-
-    // ── run.wired-adb ────────────────────────────────────────────────────────
 
     #[test]
     fn wired_adb_is_skipped_unless_wired() {
@@ -474,11 +425,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// A7-4: the probe used to be an unbounded `Command::output()`, so a
-    /// wedged `adb` blocked inside the evaluator — and with it the launch
-    /// preflight, which holds the operation lock and can only check for
-    /// cancellation *between* evaluators. The deadline is what makes that
-    /// hang finite; the child must not be left running either.
+    /// A7-4 regression: an unbounded probe let a wedged `adb` block inside the
+    /// evaluator, and with it the launch preflight, which holds the operation
+    /// lock and can only check for cancellation between evaluators. Pins that
+    /// the deadline fires and that the timed-out child is not left running.
     #[test]
     fn the_devices_probe_gives_up_on_a_wedged_adb_instead_of_blocking_forever() {
         let root = scratch("wired-wedged");
