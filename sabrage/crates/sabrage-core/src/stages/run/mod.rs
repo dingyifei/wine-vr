@@ -1,67 +1,33 @@
 //! `demo.sh run` — launch Beat Saber through the bridge.
 //!
 //! Reference: `scripts/demo/run.sh` (270 lines). Unlike the other four stages
-//! this one is a **state machine**, because its structure is the subtle part
-//! (design-core §3.2):
+//! this one is a state machine: preflight and prepare, then the guarded region
+//! (`guarded`) that the shell's traps cover, then exactly one `teardown`.
 //!
-//! ```text
-//! Preflight  — the ordered check set + its two permanent auto-fixes  (preflight.rs)
-//! Reconcile  — adopt / finish / refuse a previous session            (session::reconcile)
-//! Prepare    — adb forward hygiene, wineserver reset, Goldberg        (actions.rs)
-//! Guards     — AudioGuard + DashboardGuard, each persisted first      (guards.rs)
-//! Launch     — detached wine spawn into logs/beatsaber-<ts>.log       (actions.rs)
-//! Supervise  — wait on the child ∥ cancel ∥ detach                    (mod.rs)
-//! Teardown   — Normal: guards only. Cancelled: stop_wine, then guards (mod.rs)
-//! ```
-//!
-//! # Permanent vs guarded (parity decision 17 — do not blur it)
-//!
-//! Preflight and Prepare mutations are **permanent and never unwound**: the
+//! Preflight and Prepare mutations are permanent and never unwound — the
 //! `cxbottle.conf` backend fix, the helper restage, the adb forward
-//! create/clear, the Goldberg swap. run.sh installs its traps at line 179 —
-//! *after* all of them — so a Ctrl-C one second later leaves every one of them
-//! in place. Only what the traps cover is guarded: the audio device and the
-//! dashboard. [`guarded`] is exactly the region below that line; everything
-//! [`run`] does before calling it dies without any undo, on purpose.
+//! create/clear, the Goldberg swap — because run.sh installs its traps after
+//! all of them (parity decision 17). Only the audio device and the dashboard
+//! are guarded. A normal exit leaves the bottle's wineserver alive, as run.sh's
+//! EXIT trap does; only the INT/TERM path calls `stop_wine`.
 //!
-//! # Normal exit leaves wineserver alive
+//! [`run`] takes `Option<OperationGuard>` and drops it as soon as the wine
+//! child is up (see [`crate::stages`]'s "Lock policy for `run`"); `None` means
+//! the caller owns the lock. Every teardown runs against `teardown_ctx`, a
+//! fresh token and a fresh executor, because [`crate::executor::RealExecutor`]
+//! refuses to mutate once its token has fired and the cancellation teardown
+//! still has to run `wineserver -k`, restore audio and close the dashboard.
 //!
-//! run.sh's `EXIT` trap is `stop_dashboard; stop_helper; restore_audio` — no
-//! `stop_wine`. Quitting the game from its own menu therefore leaves the
-//! bottle's wineserver running, and that is deliberate parity, not an
-//! oversight: `./demo.sh stop` is the thing that kills wineserver. Only the
-//! INT/TERM path calls `stop_wine` first.
+//! run.sh keeps no session record at all, so everything built on
+//! `session-state.json` is Sabrage-only: the live-session refusal is declared
+//! in PARITY.md § Session (detach / reconcile), "A recorded **Live** session",
+//! and detach in that same section's "Cmd-Q on a live session" row. The
+//! teardown token and the early lock release are Sabrage-only concurrency
+//! constructs with no ledger row of their own.
 //!
-//! # The lock
-//!
-//! [`run`] takes `Option<OperationGuard>` and **drops it as soon as the wine
-//! child is up** — see [`crate::stages`]'s "Lock policy for `run`". `None`
-//! means the caller owns the lock and it is not ours to release.
-//!
-//! # Teardown runs on a fresh cancellation token
-//!
-//! [`crate::executor::RealExecutor`] refuses to mutate once its token has
-//! fired, and [`crate::process::spawn_streamed`] signals any child it spawns
-//! under a fired token. Both are correct for a stage being cancelled and fatal
-//! for *the cancellation teardown itself*, which must still run
-//! `wineserver -k`, restore the audio device and close the dashboard. Every
-//! teardown therefore runs against [`teardown_ctx`] — the same paths, options
-//! and sink, a fresh token, a fresh executor of the same kind. The shell has
-//! no equivalent problem: its traps run in a process whose signal has already
-//! been delivered.
-//!
-//! # Declared divergences (`sabrage/PARITY.md`)
-//!
-//! * **A live session blocks a second launch.** run.sh would reset wineserver
-//!   (killing the running game) and relaunch; [`run`] refuses with a `Fatal`
-//!   naming the running pid. The shell has no session record to consult, so
-//!   this is a capability rather than a changed behaviour — but it *is* a
-//!   different outcome for the same command, so it is declared.
-//! * **Detach.** `demo.sh run` cannot leave a supervised session running;
-//!   [`SessionPhase::Detached`](crate::session::SessionPhase::Detached) has no
-//!   shell counterpart (critique.md's app-quit issue).
-//! * The teardown token and the early lock release above, both Sabrage-only
-//!   concurrency constructs.
+//! See tests::{a_normal_exit_prints_the_blank_line_then_the_status,
+//! the_cancelled_path_announces_itself_stops_wine_and_exits_130,
+//! detaching_marks_the_state_leaves_the_guards_and_keeps_the_file}.
 
 pub mod actions;
 pub mod guards;
@@ -88,9 +54,7 @@ use guards::{AudioGuard, DashboardGuard};
 /// `wineserver -k` before giving up on reaping it.
 ///
 /// The game dies *with* its wineserver, so this is a generous bound on an
-/// event that normally lands in well under a second — not a budget the shell
-/// has a counterpart for (`wait $WINE_PID` is unbounded, and the INT trap
-/// re-signals `$$` rather than waiting at all).
+/// event that normally lands in well under a second.
 const WINE_EXIT_WAIT: Duration = Duration::from_secs(10);
 
 /// The two config facts the preflight reads out of `oxrsys-runtime.toml`, and
@@ -118,28 +82,20 @@ pub struct PreflightFacts {
 /// when the caller holds the lock itself. Releasing it is not optional: a
 /// session lasts hours, and `stop` must stay reachable throughout.
 pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
-    // run.sh:6 — before anything else, and with lib.sh's die text.
+    // Before anything else, and with lib.sh's die text.
     let bottle = require_bottle(ctx)?.clone();
 
-    // From here on the Session screen has something to show. Nothing else can
-    // report `Preflight`/`Launching`/`Stopping` — there is no live handle yet
-    // and no state file — and the RAII guard is what makes every one of the
-    // early returns below (`?` out of preflight, the already-running refusal,
-    // a cancelled checkpoint) end in a cleared slot rather than a phase that
-    // outlives its launch. See [`RunPhaseScope`].
+    // Nothing else can report `Preflight`/`Launching`/`Stopping` this early —
+    // there is no live handle yet and no state file — and the RAII guard makes
+    // every early return end in a cleared slot rather than a phase that outlives
+    // its launch.
+    // tests::run_publishes_preflight_and_clears_it_when_the_preflight_fails
     let mut phase = RunPhaseScope::new(ctx.run_id, &bottle.name);
 
-    // ── The live-session gate (A8-1) ─────────────────────────────────────────
-    // Asked BEFORE the phase below is published, so this launch's own
-    // `Preflight` cannot self-block through `session_block_at`'s run-phase
-    // arm — and before `reconcile`, which is not a substitute for it:
-    // `reconcile` reads `session-state.json`, and the signals it cannot see
-    // are exactly the ones a second launch runs into. This process's own live
-    // handle, another launch already in flight here, and above all a **fresh
-    // `runtime_status.json`** — the only signal a `./demo.sh run` session
-    // produces at all. Without this, Launch (or ⌘R) during a shell-started
-    // session walked all the way to `wineserver_reset` and took that running
-    // game down with it.
+    // The live-session gate (A8-1): asked before this launch’s own `Preflight`
+    // (cannot self-block through `session_block_at`’s run-phase arm) and before
+    // `reconcile`, which cannot see the `runtime_status.json` only `./demo.sh run` produces.
+    // tests::a_shell_started_session_refuses_the_launch_before_anything_permanent
     if let Some(block) = launch_block(ctx) {
         let owner = block.bottle.as_deref().unwrap_or(&bottle.name);
         return Err(refuse_launch(
@@ -150,32 +106,21 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
         ));
     }
 
-    // ── Reconcile ────────────────────────────────────────────────────────────
     // Sabrage-only, and deliberately *before* anything permanent — the
-    // preflight's two auto-fixes (the `cxbottle.conf` backend line, the helper
-    // restage) included, which is why this runs ABOVE `preflight::run` and not
-    // between it and Prepare: PARITY.md promises that a launch refused for a
-    // live session changed nothing, and an auto-fix that rewrites the bottle
-    // config of a *running* game is exactly the mutation that promise is
-    // about. A stale record's guards are restored here (reconcile emits its
-    // own rows) so this launch starts from a clean machine; a live one refuses
-    // rather than taking the running game's wineserver down under it.
+    // preflight's two auto-fixes included — because PARITY.md § Session
+    // (detach / reconcile), "A recorded **Live** session" promises that a
+    // launch refused for a live session changed nothing.
     phase.publish(SessionPhase::Preflight);
     let reconciled = session::reconcile::reconcile(ctx).await?;
     if let Reconciled::Live { state } = &reconciled {
         return Err(already_running(ctx, &bottle, state));
     }
     // A record that is not ours to *touch* is not ours to launch over either
-    // (A9-1 / A9-8). `reconcile` reported it and did nothing else: a live
-    // foreign owner still holds the guards that record describes, and a
-    // newer-schema record names guards this binary cannot even parse. Falling
-    // through used to reach `wineserver_reset`, which takes down the very
-    // session the classification exists to protect — so the outcome that
-    // means "somebody else's" is fatal here, before one permanent mutation.
-    //
-    // `silent: false` is the whole of "somebody else's": the one silent shape
-    // is this process's own in-flight launch, which cannot reach a launch that
-    // has written no record of its own yet.
+    // (A9-1 / A9-8): falling through reaches `wineserver_reset`, which takes
+    // down the very session the classification exists to protect. `silent:
+    // false` is the whole of "somebody else's" — the one silent shape is this
+    // process's own in-flight launch.
+    // tests::a_record_another_live_front_end_owns_refuses_the_launch
     if let Reconciled::Busy {
         state,
         reason,
@@ -203,12 +148,11 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     };
     checkpoint(ctx)?;
 
-    // ── Preflight (run.sh:8-91) ──────────────────────────────────────────────
     let facts = preflight::run(ctx).await?;
     checkpoint(ctx)?;
 
-    // ── Prepare (run.sh:93-152) ──────────────────────────────────────────────
-    // Everything here is permanent: run.sh installs no trap until line 179.
+    // Everything from here to the guards is permanent: run.sh installs no
+    // trap until after all of it.
     let state_path = ctx.paths.session_state_path();
     let mut sess = SessionState::new(
         ctx.run_id,
@@ -236,11 +180,10 @@ pub async fn run(ctx: &StageCtx, lock: Option<OperationGuard>) -> Result<i32> {
     actions::goldberg_stage(ctx).await?;
     checkpoint(ctx)?;
 
-    // ── Guards → Launch → Supervise (run.sh:154-266) ─────────────────────────
     // Everything above was `Preflight` by [`SessionPhase::Preflight`]'s own
     // definition ("checks, wineserver reset, Goldberg"); the guards and the
     // spawn are `Launching`. Once the wine child is up, `guarded` clears the
-    // slot: the live handle carries the phase from there.
+    // slot and the live handle carries the phase from there.
     phase.publish(SessionPhase::Launching);
     let mut held = Guards::default();
     let outcome = guarded(
@@ -281,16 +224,10 @@ fn checkpoint(ctx: &StageCtx) -> Result<()> {
 /// The output device a reconciled record still has pending, if any.
 ///
 /// [`session::reconcile::finish_record`](crate::session::reconcile) keeps
-/// `session-state.json` when a guard could not be released — the recorded
-/// device had disconnected, so nothing switched back and the Mac is still on
-/// `BlackHole 2ch`. The next launch used to start from a bare
-/// [`SessionState::new`] and overwrite that record with the current reading
-/// (the loopback), losing the only note of what to restore. Carrying the name
-/// forward is what makes the retry the kept record was kept for actually
-/// happen.
-///
-/// A `Dead` / `IdentityMismatch` record whose restore succeeded has
-/// `audio_restored` set and carries nothing; only the kept ones do.
+/// `session-state.json` when a guard could not be released, and carrying the
+/// name forward lets the retry that record was kept for actually happen
+/// (A9-2; tests::a_teardown_with_an_unrestorable_guard_keeps_the_record).
+/// A record whose restore succeeded has `audio_restored` set and carries nothing.
 fn unfinished_audio_restore(state: &SessionState) -> Option<String> {
     // The kept-record condition, asked of the state rather than of the
     // outcome enum: a restore that succeeded sets the flag, and that record is
@@ -373,30 +310,22 @@ fn refuse_launch(ctx: &StageCtx, headline: &str, reason: &str, bottle: &str) -> 
     )
 }
 
-// ── the published run phase ───────────────────────────────────────────────────
-
 /// Publishes [`session::RunPhaseInfo`] for the three phases only this stage
 /// can know about, and guarantees the slot is emptied however [`run`] leaves.
 ///
-/// Without this, [`crate::session::watcher::SessionMonitor::snapshot`] has
-/// nothing to report between `./demo.sh run` starting and the wine child being
-/// published — no live handle, no `session-state.json` — so a launch reads as
-/// "No session" for its entire preflight, and a teardown reads as `Running`
-/// until the handle is cleared.
+/// Without it [`crate::session::watcher::SessionMonitor::snapshot`] has nothing
+/// to report between the stage starting and the wine child being published, so
+/// a launch reads as “No session” for its entire preflight. Every publication
+/// names its `run_id` and bottle — without them the Session screen offers a
+/// Stop that takes the operation lock then dies on “bottle name required” —
+/// and `Drop` clears the slot only while it belongs to this run, since `run`
+/// releases the lock at the launch boundary and a detached or cancelled run
+/// can still be unwinding while the next launch publishes its own `Preflight`.
+/// `finalize_exited`(Self::finalize_exited) is the one publication meant to
+/// outlive `run`, so the Session screen can say “Exited (code N)”.
 ///
-/// **Identity travels with the phase.** Every publication names its `run_id`
-/// and its bottle, because a phase without them is a Session screen that
-/// offers a Stop button which takes the operation lock and then dies on
-/// "bottle name required".
-///
-/// `Drop` clears the slot — but only when it still belongs to this run
-/// ([`session::clear_run_phase`]): `run` releases the operation lock at the
-/// launch boundary, so a detached or cancelled run can still be unwinding
-/// while the next launch has already published its own `Preflight`.
-///
-/// The one exception is [`finalize_exited`](Self::finalize_exited): that
-/// publication is *meant* to outlive `run`, so the Session screen can say
-/// "Exited (code N)" until the next launch overwrites it.
+/// See tests::{the_scope_publishes_identity_and_drop_clears_only_its_own_run,
+/// a_normal_teardown_reports_stopping_then_a_surviving_exited_code}.
 struct RunPhaseScope {
     run_id: RunId,
     bottle: String,
@@ -443,8 +372,6 @@ impl Drop for RunPhaseScope {
         }
     }
 }
-
-// ── the guarded region ────────────────────────────────────────────────────────
 
 /// The guards this run holds, released in run.sh's trap order.
 #[derive(Default)]
@@ -513,10 +440,11 @@ enum Reason {
     Failed(SabrageError),
 }
 
-/// run.sh from the trap installation (line 179) to `wait $WINE_PID` (line 266).
+/// The undoable half of run.sh's launch: from its trap installation to
+/// `wait $WINE_PID`.
 ///
 /// Everything this function does is undoable, and everything above it is not.
-/// It never tears anything down itself — [`teardown`] owns every exit path, so
+/// It never tears anything down itself — `teardown` owns every exit path, so
 /// there is exactly one place the guards come off.
 #[allow(clippy::too_many_arguments)]
 async fn guarded(
@@ -528,14 +456,11 @@ async fn guarded(
     held: &mut Guards,
     lock: Option<OperationGuard>,
 ) -> Result<Reason> {
-    // run.sh:154-200 — in two halves on purpose (A8-3). `arm` does everything
-    // that is not a mutation, up to and including the pre-mutation save; the
-    // guard is installed HERE, and only then does `apply_switch` run the child
-    // that can come back `Cancelled` after CoreAudio has already changed. An
-    // `Err` out of the switch therefore unwinds with the guard in `held`,
-    // where `teardown` releases it through the bounded, executor-routed path
-    // that sets `guards.audio_restored` and saves — rather than through
-    // `Drop`, which restores the device but can record neither.
+    // In two halves on purpose (A8-3): the guard is installed HERE, before
+    // `apply_switch` runs the child that can come back `Cancelled` with
+    // CoreAudio already changed — so the switch unwinds through `teardown`,
+    // which sets `guards.audio_restored` and saves, rather than through `Drop`,
+    // which restores the device but can record neither.
     held.audio = Some(AudioGuard::arm(ctx, facts, sess).await?);
     if let Some(audio) = held.audio.as_mut() {
         audio.apply_switch(ctx, sess).await?;
@@ -543,18 +468,15 @@ async fn guarded(
     if ctx.cancel.is_cancelled() {
         return Ok(Reason::Cancelled { child: None });
     }
-    // run.sh:202-217
     held.dashboard = Some(DashboardGuard::acquire(ctx, facts, sess).await?);
     if ctx.cancel.is_cancelled() {
         return Ok(Reason::Cancelled { child: None });
     }
-    // run.sh:219-237
     actions::adb_reverse_cleanup(ctx, facts).await?;
     if ctx.cancel.is_cancelled() {
         return Ok(Reason::Cancelled { child: None });
     }
 
-    // run.sh:239-265
     let Some((child, log)) = actions::launch_wine(ctx, bottle).await? else {
         // `--dry-run`: the launch was planned, not performed. No session, no
         // supervision, and the inert guards still come off in `teardown`.
@@ -565,12 +487,11 @@ async fn guarded(
     sess.wine = Some(identity.clone());
     sess.log_path = log.clone();
 
-    // ── the game becomes reachable HERE ──────────────────────────────────────
-    // `spawn_detached` sets `kill_on_drop(false)`, so from the spawn until this
-    // line a running Beat Saber is reachable by *nothing*: no live handle for
-    // `stop_session()` / app-quit, no record on disk. Publishing the handle is
-    // infallible and in-process, so it goes first and that window closes
-    // immediately; everything fallible follows it.
+    // The game becomes reachable HERE: `spawn_detached` sets
+    // `kill_on_drop(false)`, so from the spawn until this line a running Beat
+    // Saber is reachable by *nothing* — no live handle, no record on disk.
+    // Publishing the handle is infallible and in-process, so it goes first and
+    // everything fallible follows it.
     let detach = CancellationToken::new();
     session::set_live_session(LiveSessionHandle {
         run_id: ctx.run_id,
@@ -601,20 +522,18 @@ async fn guarded(
         started_at_unix_ms: sess.started_at_unix_ms,
     });
 
-    // ── the lock goes back HERE ──────────────────────────────────────────────
     // A session lasts hours; holding the operation lock through it would block
     // `stop` exactly when the user reaches for it. See `crate::stages`'s "Lock
     // policy for `run`". `None` means the caller owns it and it is not ours.
     drop(lock);
 
-    // run.sh:266 — `wait $WINE_PID`.
+    // run.sh's `wait $WINE_PID`.
     let mut proc = child.child;
     // `biased` on purpose: an unbiased `select!` picks at random among ready
-    // branches, and Stop losing that coin toss to a Detach the user fired a
-    // moment earlier disarms the guards and leaves the game running while
-    // `stop_session` watches the live slot empty and reports success. Stop is
-    // terminal here — the cancel branch is checked first, and the detach arm
-    // re-checks the token below, so a Stop that fired at ANY point wins.
+    // branches, and a Stop losing that coin toss to a Detach would disarm the
+    // guards and leave the game running while `stop_session` reports success.
+    // Stop is terminal here — cancel is checked first and the detach arm
+    // re-checks the token below — so a Stop that fired at ANY point wins.
     let how = tokio::select! {
         biased;
         _ = ctx.cancel.cancelled() => Supervised::Cancelled,
@@ -644,16 +563,11 @@ async fn guarded(
 /// already published** — deliberately best effort.
 ///
 /// The file exists for a *later* process: a reconcile after a crash, a second
-/// Sabrage, `./demo.sh stop`. This process needs nothing from it — it holds the
-/// live handle. Propagating a write failure would unwind out of [`guarded`]
-/// with Beat Saber running and `kill_on_drop(false)` on its child, and
-/// [`teardown`]'s `Failed` arm would then release the guards and clear the
-/// (never written) state around a game the user has no way to stop from
-/// Sabrage. So: warn, naming the one thing actually lost, and carry on
-/// supervising.
+/// Sabrage, `./demo.sh stop`. Propagating a write failure would unwind out of
+/// `guarded` with Beat Saber running and no way to stop it from Sabrage, so
+/// this warns and carries on supervising.
 ///
-/// Sabrage-only by construction — run.sh has no session record to fail to
-/// write.
+/// See tests::a_failed_state_write_warns_instead_of_orphaning_the_running_game.
 async fn record_launched_session(ctx: &StageCtx, state_path: &Path, sess: &SessionState) {
     if let Err(e) = state::save(&*ctx.executor, state_path, sess).await {
         ctx.step(step::RUN_LAUNCH).warn(format!(
@@ -663,8 +577,6 @@ async fn record_launched_session(ctx: &StageCtx, state_path: &Path, sess: &Sessi
         ));
     }
 }
-
-// ── teardown ──────────────────────────────────────────────────────────────────
 
 /// The one place the guards come off, for every exit path.
 async fn teardown(
@@ -689,15 +601,12 @@ async fn teardown(
         Err(e) => Reason::Failed(e),
     };
 
-    // Teardown is a phase of its own, and it has to be visible *before*
-    // `clear_live_session` runs — which is why published `Stopping` outranks a
-    // live handle in `snapshot()`'s precedence table. Without it the Session
-    // screen reads `Running` through the whole of `wineserver -k` and the
-    // guard release, then blinks straight to nothing.
-    //
-    // Not `Reason::Detached` — that arm's phase is `Detached`, derived from
-    // the state file it deliberately leaves behind — and not `Reason::DryRun`,
-    // where nothing ran and so nothing is stopping.
+    // Teardown is a phase of its own and has to be visible *before*
+    // `clear_live_session` runs, which is why published `Stopping` outranks a
+    // live handle in `snapshot()`'s precedence table. Not `Detached` (that
+    // phase is derived from the state file the arm leaves behind) and not
+    // `DryRun`, where nothing ran.
+    // tests::a_normal_teardown_reports_stopping_then_a_surviving_exited_code
     if matches!(
         reason,
         Reason::Normal { .. } | Reason::Cancelled { .. } | Reason::Failed(_)
@@ -709,15 +618,11 @@ async fn teardown(
         Reason::Detached { log } => {
             // Leak the guards on purpose: the dashboard stays open, the audio
             // device stays on BlackHole, and `session-state.json` keeps
-            // describing both so a later reconcile can finish the job.
-            //
-            // The record goes down FIRST. Disarming is what makes the guards
-            // unrecoverable by this process, and doing it before the write
-            // meant a failed write left the device on BlackHole with nothing
-            // on disk naming it — the exact state `session-state.json` exists
-            // to prevent. A write that fails therefore keeps the guards armed:
-            // `run` drops them on the way out and each `Drop` fallback undoes
-            // what it can, which is a worse detach but a recoverable machine.
+            // describing both so a later reconcile can finish the job. The
+            // record goes down FIRST — a write that fails keeps the guards
+            // armed, because disarming before the write left the device on
+            // BlackHole with nothing on disk naming it.
+            // tests::a_detach_that_cannot_write_its_record_keeps_the_guards_armed
             sess.detached = true;
             match state::save(&*tctx.executor, state_path, sess).await {
                 Ok(()) => held.disarm(),
@@ -727,11 +632,10 @@ async fn teardown(
                     state_path.display()
                 )),
             }
-            // The row that closes the Supervise phase — `step::RUN_SUPERVISE`
-            // is attributed to exactly this: detach is the one way supervision
-            // ends without a teardown, and the announcement belongs to the
-            // step that was running, not to the guard release that never
-            // happens here.
+            // Detach is the one way supervision ends without a teardown, so
+            // the announcement belongs to `step::RUN_SUPERVISE`, the step that
+            // was running, not to a guard release that never happens here.
+            // tests::the_detach_row_belongs_to_the_supervise_step
             tctx.emit(StageEvent::text(
                 ctx.run_id,
                 Some(step::RUN_SUPERVISE),
@@ -745,21 +649,19 @@ async fn teardown(
         }
 
         Reason::Normal { rc, log } => {
-            // run.sh:268-270 — the two closing prints come FIRST. The EXIT trap
-            // (`stop_dashboard; stop_helper; restore_audio`) does not fire until
-            // `exit $rc` on line 270, below both, so `audio: restored output ->
+            // The two closing prints come FIRST: run.sh's EXIT trap does not
+            // fire until `exit $rc`, below both, so `audio: restored output ->
             // …` and `dashboard: closed` land *after* the status line, never
             // before it.
+            // tests::a_normal_exits_guards_come_off_after_the_status_line_not_before_it
             tctx.emit(StageEvent::text(
                 ctx.run_id,
                 Some(step::RUN_TEARDOWN),
                 String::new(),
             ));
-            // The status line and the phase say the same thing at the same
-            // moment — and this publication is the one that OUTLIVES `run`
-            // (see [`RunPhaseScope::finalize_exited`]), so the Session screen
-            // can show "Exited (code N)" until the next launch publishes its
-            // own `Preflight` over it.
+            // This publication is the one that OUTLIVES `run` (see
+            // [`RunPhaseScope::finalize_exited`]), so the Session screen can
+            // show "Exited (code N)" until the next launch publishes over it.
             phase.finalize_exited(rc);
             tctx.emit(StageEvent::text(
                 ctx.run_id,
@@ -769,15 +671,12 @@ async fn teardown(
             // That EXIT trap: no `stop_wine`. The bottle's wineserver stays up
             // on a clean quit — `./demo.sh stop` is what kills it.
             //
-            // #202: best effort, exactly as the `Failed` arm below is. These
-            // two calls can only fail on `session-state.json` (the guards save
-            // it on release; `clear_state` removes it), and a `?` here would
-            // (a) skip `clear_live_session`, leaking the handle for the app's
-            // lifetime so the next `stop_session` burns its 30 s timeout on an
-            // already-fired token, and (b) turn a clean quit into `Err` —
-            // exit 1 — where run.sh's EXIT trap cannot change `exit $rc`. The
-            // record is a convenience for a *later* process; wine has already
+            // #202: both calls are best effort. A `?` would skip
+            // `clear_live_session`, leaking the handle so the next
+            // `stop_session` burns its 30 s timeout on an already-fired token,
+            // and would turn a clean quit into exit 1 — but wine has already
             // exited with `rc`, and that is the number to report.
+            // tests::a_normal_exit_survives_a_failed_state_save
             if let Err(e) = held.release(&tctx, sess).await {
                 tctx.step(step::RUN_TEARDOWN).warn(format!(
                     "could not save the session record while releasing the guards ({e}) — \
@@ -796,7 +695,7 @@ async fn teardown(
         }
 
         Reason::Cancelled { child } => {
-            // run.sh:180 — the INT trap, verbatim and in order.
+            // run.sh's INT trap, verbatim and in order.
             tctx.emit(StageEvent::text(
                 ctx.run_id,
                 Some(step::RUN_TEARDOWN),
@@ -806,11 +705,10 @@ async fn teardown(
             stop_wine(&tctx, bottle).await;
             // Best effort, exactly as the `Normal` arm above is (#202): the
             // shell's INT trap runs every one of its commands and only then
-            // re-signals itself, so a `?` here — which could only come from the
-            // `session-state.json` write — must not skip the reap, the record
-            // or the live handle. Leaking the handle is the expensive one: the
-            // next `stop_session` would spend its whole 30 s timeout on an
-            // already-fired token.
+            // re-signals itself, so a failed `session-state.json` write must
+            // not skip the reap, the record or the live handle — leaking the
+            // handle costs the next `stop_session` its whole 30 s timeout.
+            // tests::a_cancelled_teardown_survives_a_failed_state_save
             if let Err(e) = held.release(&tctx, sess).await {
                 tctx.step(step::RUN_TEARDOWN).warn(format!(
                     "could not save the session record while releasing the guards ({e}) — \
@@ -877,20 +775,11 @@ fn teardown_ctx(ctx: &StageCtx) -> StageCtx {
 
 /// `lib.sh`'s `stop_wine`, on the 4 s advisory budget
 /// ([`crate::stages::STOP_WINESERVER_WAIT`] — deliberately *not* the 5 s fatal
-/// one this stage's own reset uses):
+/// one this stage's own reset uses).
 ///
-/// ```zsh
-/// stop_wine() {
-///   WINEPREFIX="$PREFIX" "$WINESERVER" -k 2>/dev/null || true
-///   ( WINEPREFIX="$PREFIX" "$WINESERVER" -w 2>/dev/null ) &
-///   for _i in {1..40}; do kill -0 $_wp 2>/dev/null || break; sleep 0.1; done
-///   kill $_wp 2>/dev/null || true
-/// }
-/// ```
-///
-/// Duplicates `stages::stop`'s private function of the same name (a different
-/// step id, and that one is not `pub(crate)`); folding the two together is a
-/// one-liner for whoever next owns `stop.rs`.
+/// Reference: `scripts/demo/lib.sh`. Duplicates `stages::stop`'s function of
+/// the same name: both are module-private, and the two differ in step id and
+/// in return type (that one propagates, this one is best effort).
 async fn stop_wine(ctx: &StageCtx, bottle: &Bottle) {
     let Some(wineserver) = ctx.paths.wineserver.clone() else {
         return;
@@ -910,22 +799,15 @@ async fn stop_wine(ctx: &StageCtx, bottle: &Bottle) {
     let _ = tokio::time::timeout(STOP_WINESERVER_WAIT, ctx.executor.run_child(&wait)).await;
 }
 
-/// run.sh's `stop_helper`:
-///
-/// ```zsh
-/// stop_helper() {
-///   reap_stray "$OXR_HELPER_BIN" && print "encoder helper: reaped (left over from the runtime)"
-/// }
-/// ```
-///
-/// A safety net only — the runtime spawns and owns the helper, which dies with
-/// the game. `reap_stray` returns 0 exactly when it found something, so the
-/// line is printed only then.
+/// run.sh's `stop_helper`, a safety net only — the runtime spawns and owns the
+/// helper, which dies with the game — so the reaped line is printed exactly
+/// when something was found.
 ///
 /// Matches on the **resolved executable path**
 /// ([`crate::process::find_processes_by_exe`]), never `pkill -f`'s argv
-/// substring (PARITY.md, "Stop"), and kills through the executor as
-/// `/bin/kill -TERM <pid>`, once per matched process.
+/// substring (PARITY.md § Stop, "Each reap (leftover encoder helper"), and
+/// kills through the executor as `/bin/kill -TERM <pid>`, once per matched
+/// process.
 async fn reap_helper(ctx: &StageCtx) {
     let procs = process::find_processes_by_exe(&ctx.paths.oxr_helper_staged);
     if procs.is_empty() {
@@ -953,13 +835,13 @@ async fn clear_state(ctx: &StageCtx, path: &Path, expected: RunId) -> Result<()>
     if !path.exists() {
         return Ok(());
     }
-    // …and only when it is still OUR record (A9-3). A teardown that lands
-    // after the next launch has written its own — detach, relaunch, late
-    // unwind — would otherwise delete a live session's only description:
-    // `state::clear` compares the *owner*, which on this machine is this very
-    // process, so run identity is the only thing that can tell the two apart.
-    // An unreadable record is removed as before; it describes nothing anyone
-    // can act on, and leaving it would block the next reconcile forever.
+    // …and only when it is still OUR record (A9-3): a teardown landing after
+    // the next launch wrote its own would delete a live session’s only
+    // description. `state::clear` compares the *owner*, which on this machine
+    // is this process, so run identity is the only discriminant. An unreadable
+    // record is still removed; it describes nothing anyone can act on, and
+    // leaving it blocks the next reconcile.
+    // tests::a_late_teardown_never_clears_a_newer_runs_record
     if let Ok(Some(existing)) = state::load(path) {
         if existing.run_id != expected {
             ctx.step(step::RUN_TEARDOWN).info(format!(
@@ -976,10 +858,9 @@ async fn clear_state(ctx: &StageCtx, path: &Path, expected: RunId) -> Result<()>
 ///
 /// Deliberately **not** [`SessionState::has_pending_guards`]: that one also
 /// counts `wired_forwards`, which `run` records as it creates them and never
-/// removes (the permanent-vs-guarded boundary — run.sh's traps do not clear
-/// them either), so it would keep a stale record after every single `--wired`
-/// launch. The audio device and the dashboard are what the traps cover, and
-/// they are what this asks about.
+/// removes, so it would keep a stale record after every `--wired` launch.
+///
+/// See tests::a_wired_run_whose_guards_came_off_still_clears_the_record.
 fn teardown_pending(sess: &SessionState) -> bool {
     (sess.prev_audio_output.is_some() && !sess.guards.audio_restored)
         || (sess.dashboard.is_some() && !sess.guards.dashboard_closed)
@@ -993,12 +874,11 @@ const RECORD_KEPT_LINE: &str = "session record kept for a later restore (a guard
 /// Clear `session-state.json` — or keep it, when a guard is still pending.
 ///
 /// The teardown counterpart of `session::reconcile::finish_record`, and the
-/// same guarantee PARITY.md states for `AudioGuard::release`: "the record is
-/// only cleared once every guard that was recorded is released". A recorded
-/// output device that could not be switched back (disconnected Bluetooth
-/// headphones) leaves `audio_restored` false on purpose — clearing the record
-/// anyway left the Mac on `BlackHole 2ch` with nothing on disk saying what to
-/// restore, which is the exact failure the fallback was written to prevent.
+/// same guarantee PARITY.md § Session (detach / reconcile), "A **Dead** or
+/// **IdentityMismatch** recorded session" states for `AudioGuard::release`:
+/// the record is only cleared once every recorded guard is released.
+///
+/// See tests::a_teardown_with_an_unrestorable_guard_keeps_the_record.
 async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Result<()> {
     if !teardown_pending(sess) {
         return clear_state(ctx, path, sess.run_id).await;
@@ -1008,20 +888,18 @@ async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Resu
     Ok(())
 }
 
-// ── verbatim text ─────────────────────────────────────────────────────────────
-
-/// run.sh:177.
+/// The line run.sh's `stop_helper` prints when it reaps a leftover helper.
 ///
 /// `pub` (A1-3) so `sabrage-parity` can pin it against `run.sh` by calling the
 /// real constant rather than copying a substring.
 pub const HELPER_REAPED_LINE: &str = "encoder helper: reaped (left over from the runtime)";
 
-/// run.sh:183 — the INT trap's first line, before `stop_wine` runs.
+/// run.sh's INT trap prints this first, before `stop_wine` runs.
 ///
 /// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
 pub const INT_TEARDOWN_LINE: &str = "interrupted: stopping wine";
 
-/// run.sh:272 — `print -r -- "wine exited with status $rc (log: $LOG)"`.
+/// run.sh's `print -r -- "wine exited with status $rc (log: $LOG)"`.
 ///
 /// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
 pub fn wine_exit_line(rc: i32, log: &Path) -> String {
@@ -1040,8 +918,9 @@ fn detached_line(log: &Path) -> String {
 }
 
 /// The refusal when [`session::reconcile`] finds a session that is still
-/// running. Sabrage-only (declared in PARITY.md): run.sh has no session record
-/// and would simply reset wineserver under the running game.
+/// running. Sabrage-only (PARITY.md § Session (detach / reconcile), "A
+/// recorded **Live** session"): run.sh has no session record and would simply
+/// reset wineserver under the running game.
 fn already_running(ctx: &StageCtx, bottle: &Bottle, sess: &SessionState) -> SabrageError {
     let pid = sess.wine.as_ref().map_or(0, |w: &ProcInfo| w.pid);
     ctx.fatal(
@@ -1138,15 +1017,13 @@ mod tests {
             .collect()
     }
 
-    // ── verbatim strings ─────────────────────────────────────────────────────
-
     #[test]
     fn the_closing_lines_are_run_shs_verbatim() {
         assert_eq!(
             wine_exit_line(0, Path::new("/repo/logs/beatsaber-20260829-101112.log")),
             "wine exited with status 0 (log: /repo/logs/beatsaber-20260829-101112.log)"
         );
-        // wine's own status is propagated, sign and all.
+        // wine's own status is propagated unchanged.
         assert_eq!(
             wine_exit_line(139, Path::new("/l.log")),
             "wine exited with status 139 (log: /l.log)"
@@ -1196,8 +1073,6 @@ mod tests {
         assert_eq!(iso_local(far), far.to_string());
     }
 
-    // ── teardown context ─────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn teardown_gets_an_executor_a_fired_token_cannot_veto() {
         let root = scratch("teardown-ctx");
@@ -1222,8 +1097,6 @@ mod tests {
         assert_eq!(t.paths, ctx.paths);
         std::fs::remove_dir_all(&root).unwrap();
     }
-
-    // ── teardown paths ───────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_normal_exit_prints_the_blank_line_then_the_status() {
@@ -1263,13 +1136,9 @@ mod tests {
 
     #[tokio::test]
     async fn a_normal_exits_guards_come_off_after_the_status_line_not_before_it() {
-        // run.sh:
-        //     wait $WINE_PID; rc=$?
-        //     print ""
-        //     print -r -- "wine exited with status $rc (log: $LOG)"
-        //     exit $rc          ← only HERE does the EXIT trap
-        //                         (`stop_dashboard; stop_helper; restore_audio`) run
-        // so the restore row is the LAST line of a clean quit, never the first.
+        // run.sh's EXIT trap fires only after the status line, so the restore
+        // row is the LAST line of a clean quit, never the first.
+        // Reference: scripts/demo/run.sh; trap order is on `Guards::release`.
         let root = scratch("teardown-normal-order");
         let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
         ctx.paths.wineserver = Some(PathBuf::from("/cx/bin/wineserver"));
@@ -1427,12 +1296,11 @@ mod tests {
         }
     }
 
-    /// #202: a clean quit whose `session-state.json` save fails must still be
-    /// a clean quit. Before the fix, `held.release(…)?` propagated, so
-    /// `clear_live_session` never ran — the handle leaked for the app's
-    /// lifetime, `stop_session` then spent its whole 30 s timeout on an
-    /// already-fired token, and `run` returned `Err` (exit 1) for a wine
-    /// process that had exited 0.
+    /// #202: a clean quit whose `session-state.json` save fails stays a clean
+    /// quit. If `held.release(…)?` propagated, `clear_live_session` would never
+    /// run: the handle leaks for the app's lifetime, the next `stop_session`
+    /// spends its whole 30 s timeout on an already-fired token, and `run`
+    /// returns exit 1 for a wine process that exited 0.
     #[tokio::test]
     async fn a_normal_exit_survives_a_failed_state_save() {
         let root = scratch("teardown-normal-save-fails");
@@ -1502,10 +1370,11 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A8-1: the record is only cleared once every guard that was recorded is
-    /// released (PARITY.md). An output device that could not be switched back
-    /// leaves `audio_restored` false — deleting the record then leaves the Mac
-    /// on `BlackHole 2ch` with nothing on disk naming what to restore.
+    /// A8-1: the record is only cleared once every guard it recorded is
+    /// released (PARITY.md § Session (detach / reconcile), "A **Dead** or
+    /// **IdentityMismatch** recorded session"). A device that could not be
+    /// switched back leaves `audio_restored` false — deleting the record then
+    /// leaves the Mac on `BlackHole 2ch` with nothing on disk to restore from.
     #[tokio::test]
     async fn a_teardown_with_an_unrestorable_guard_keeps_the_record() {
         let root = scratch("teardown-keeps-record");
@@ -1734,10 +1603,11 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    /// A7-1: PARITY.md promises a launch refused for a live session changed
-    /// nothing. Reconciliation therefore runs BEFORE `preflight::run`, whose
-    /// two auto-fixes (the `cxbottle.conf` backend line, the helper restage)
-    /// are permanent and never unwound.
+    /// A7-1: a launch refused for a live session must change nothing
+    /// (PARITY.md § Session (detach / reconcile), "A recorded **Live**
+    /// session"). Reconciliation therefore runs BEFORE `preflight::run`,
+    /// whose two auto-fixes (the `cxbottle.conf` backend line, the helper
+    /// restage) are permanent and never unwound.
     #[tokio::test]
     async fn a_live_session_refuses_before_the_preflight_runs_a_single_check() {
         let _g = session::lock_session_globals();
@@ -1788,8 +1658,8 @@ mod tests {
 
     /// A8-1: `reconcile` reads `session-state.json`, and a `./demo.sh run`
     /// session writes no such file — the only trace it leaves on this machine
-    /// is a fresh `runtime_status.json`. Launch used to walk straight past it
-    /// into `wineserver_reset` and take that running game down.
+    /// is a fresh `runtime_status.json`. A launch that ignored that trace would
+    /// walk into `wineserver_reset` and take the running game down.
     #[tokio::test]
     async fn a_shell_started_session_refuses_the_launch_before_anything_permanent() {
         let _g = session::lock_session_globals();
@@ -1846,8 +1716,8 @@ mod tests {
     }
 
     /// A9-1 / A9-8: `reconcile` classifies a record it may not touch as
-    /// `Busy` and leaves the file alone. Launch used to read that as "nothing
-    /// to carry" and keep going — through the bottle-scoped `wineserver -k`
+    /// `Busy` and leaves the file alone. A launch that read that as "nothing
+    /// to carry" would keep going — through the bottle-scoped `wineserver -k`
     /// that kills the very session the classification protects.
     #[tokio::test]
     async fn a_record_another_live_front_end_owns_refuses_the_launch() {
@@ -1949,8 +1819,6 @@ mod tests {
         done.guards.audio_restored = true;
         assert_eq!(carry_forward(&done), Carried::default());
 
-        // The other end of the same rule: a session that never touched
-        // audio or forwards has nothing to hand on.
         assert_eq!(
             carry_forward(&fresh(&root)),
             Carried::default(),
@@ -2139,14 +2007,10 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
-    // ── guard release and disarm ─────────────────────────────────────────────
-
     #[tokio::test]
     async fn releasing_the_guards_consumes_both_slots_and_is_idempotent() {
-        // `Guards::release` takes both slots and is safe to call twice. Its
-        // run.sh trap order (`stop_dashboard; stop_helper; restore_audio`) is
-        // stated on the method itself; this all-inert fixture emits nothing,
-        // so it pins consumption and idempotence, not order.
+        // Both guards are inert here, so this pins consumption and idempotence
+        // only — not `Guards::release`'s trap order.
         let root = scratch("guard-order");
         let (ctx, seen) = dry_ctx(
             &root,
@@ -2202,8 +2066,6 @@ mod tests {
         assert!(held.audio.is_none() && held.dashboard.is_none());
         std::fs::remove_dir_all(&root).unwrap();
     }
-
-    // ── prepare-phase cancellation ───────────────────────────────────────────
 
     #[tokio::test]
     async fn a_cancelled_token_short_circuits_before_any_launch_action() {
@@ -2306,10 +2168,6 @@ mod tests {
         assert!(!ctx.paths.logs_dir().exists(), "no log file, no logs dir");
         std::fs::remove_dir_all(&root).unwrap();
     }
-
-    // ── the launch record ────────────────────────────────────────────────────
-
-    // ── the published run phase (#2 / #7 / #100) ─────────────────────────────
 
     /// The published run phase **at the moment each row was emitted**.
     ///
