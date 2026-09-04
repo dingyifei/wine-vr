@@ -1,38 +1,24 @@
 //! The typed port of `scripts/demo/lib.sh`'s derived-path block.
 //!
-//! lib.sh is declared "the single source of truth for paths, sha256 pins, and
-//! helpers" (CLAUDE.md); this module is its Rust mirror. Two shell traps are
-//! fixed at the type level, per design-core §1:
+//! Two shell traps are closed at the type level: `cx`/`wine`/`wineserver` are
+//! `None` when CrossOver is absent, where lib.sh builds the bogus absolute
+//! `/Contents/SharedSupport/CrossOver` from an unset `CX_APP`; `adb` is `None`,
+//! where lib.sh leaves `ADB=""` and every call site guards with `[ -n "$ADB" ]`.
 //!
-//! * **`CX` is `Option`.** lib.sh leaves `CX_APP` unset when CrossOver is absent
-//!   and then unconditionally builds `CX="${CX_APP:-}/Contents/SharedSupport/CrossOver"`,
-//!   i.e. the bogus absolute path `/Contents/SharedSupport/CrossOver`. Here
-//!   `cx`/`wine`/`wineserver` are `None` when CrossOver is absent — never a path
-//!   that looks real and silently fails every comparison.
-//! * **`adb` is `Option`.** lib.sh leaves `ADB=""` when no adb is found, and
-//!   every call site has to remember `[ -n "$ADB" ]` first.
-//!
-//! Unlike demo.sh (`ROOT="$(dirname $0)"`), Sabrage's binary lives somewhere
-//! unrelated to the repo, so `repo_root` is **explicit input** (persisted in
-//! Sabrage settings). Changing it invalidates install state, because the host
-//! OpenXR manifest embeds the absolute dylib path under it.
+//! Sabrage's binary can sit anywhere, so [`Paths`] takes `repo_root` as explicit
+//! input (persisted in Sabrage settings). Changing it invalidates install state:
+//! the host OpenXR manifest embeds the absolute dylib path under it.
 
 use std::path::{Path, PathBuf};
 
 use crate::contract::contract;
 use crate::error::SabrageError;
 
-/// `$HOME`, or `/` if the environment has none (a headless edge case; every
-/// derived path is then obviously wrong, which is better than panicking inside
-/// a read-only probe).
+/// `$HOME`, or `/` if the environment has none.
 ///
-/// **Read-only probes only.** Anything that is about to *write* under the user
-/// store must go through [`home_dir_checked`] (or [`Paths::new_checked`]) and
-/// fail closed: an empty `HOME` here yields *relative* paths
-/// (`PathBuf::from("").join("Library/Application Support/OXRSys")`), which a
-/// mutating stage would then create under the process's working directory.
-/// The shell has no such hole — `set -u` aborts on an unset `HOME`, and an
-/// empty one still expands to the absolute `/Library/...`.
+/// Read-only probes only: with an empty `HOME` every derived path comes out
+/// *relative* to the working directory, so a stage that writes must go through
+/// [`home_dir_checked`] (tests::home_is_required_to_be_absolute_and_non_empty).
 pub fn home_dir() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
@@ -78,12 +64,9 @@ pub fn bottles_root() -> PathBuf {
 /// `~/Library/Application Support/Sabrage` — Sabrage's own store.
 ///
 /// GUI-only state lives here and **never** in the repo or in OXRSys's
-/// directory (CLAUDE.md, "Sabrage ⇄ demo.sh parity"): settings, the game
-/// library, `oxrsys-runtime.toml` backups, per-run event logs, the staging
-/// file for the one privileged write ([`crate::privilege::sabrage_support_dir`]
-/// is a thin alias for this), and `session-state.json`
-/// ([`Paths::session_state_path`]). demo.sh knows nothing about any of it, so
-/// nothing here is a parity artifact.
+/// directory (CLAUDE.md, "Sabrage ⇄ demo.sh parity"), so nothing under it is
+/// a parity artifact. [`crate::privilege::sabrage_support_dir`] is a thin
+/// alias for this.
 pub fn sabrage_support_dir() -> PathBuf {
     home_dir().join("Library/Application Support/Sabrage")
 }
@@ -121,8 +104,6 @@ pub fn which(name: &str) -> Option<PathBuf> {
         .find(|cand| is_executable(cand))
 }
 
-// ── repo-root discovery ───────────────────────────────────────────────────────
-
 /// Environment override for the repo root, checked by [`resolve_repo_root`].
 pub const REPO_ROOT_ENV: &str = "SABRAGE_REPO_ROOT";
 
@@ -132,31 +113,22 @@ pub const REPO_ROOT_ENV: &str = "SABRAGE_REPO_ROOT";
 /// dispatcher itself relies on (`source "$ROOT/scripts/demo/lib.sh"`).
 pub const REPO_ROOT_MARKERS: [&str; 2] = ["demo.sh", "scripts/demo/lib.sh"];
 
-/// Resolve the wine-vr checkout root, in precedence order:
+/// Resolve the wine-vr checkout root: `override_root` when the caller has one
+/// (CLI `--repo-root`, the GUI's persisted `settings.repo_root`), else a
+/// non-empty `SABRAGE_REPO_ROOT`, else the first ancestor of
+/// `std::env::current_exe()` holding both [`REPO_ROOT_MARKERS`].
 ///
-/// 1. `override_root`, when the caller has one (CLI `--repo-root`, the GUI's
-///    persisted `settings.repo_root`);
-/// 2. the `SABRAGE_REPO_ROOT` environment variable, when non-empty;
-/// 3. a walk up from `std::env::current_exe()`'s ancestors, looking for the
-///    first directory holding both [`REPO_ROOT_MARKERS`].
+/// The first two are normalized logically ([`logical_absolute`]) to match
+/// demo.sh's `ROOT="$(cd "$(dirname "$0")" && pwd)"`: canonicalizing would make
+/// the front-ends write different host-manifest bytes and thrash with sudo (A2-6;
+/// tests::a_relative_root_becomes_absolute_without_resolving_symlinks).
 ///
-/// Cases 1 and 2 are normalized *logically* ([`logical_absolute`]): made
-/// absolute against the working directory and stripped of `.`/`..`, with
-/// symlinks left exactly as the user spelled them. That is `demo.sh`'s own
-/// spelling — `ROOT="$(cd "$(dirname "$0")" && pwd)"`, where zsh's `cd`/`pwd`
-/// are logical — and the two must agree to the byte: the host OpenXR manifest
-/// embeds this root as an absolute string and `install.sh` compares those
-/// bytes literally, so a divergent spelling makes the two front-ends thrash
-/// each other with sudo prompts. Resolving symlinks here (which this function
-/// used to do) is exactly that divergence on a symlinked checkout.
+/// An explicit root skips [`REPO_ROOT_MARKERS`] validation so scratch and fixture
+/// trees work (tests::explicit_override_wins_and_is_canonicalized).
 ///
-/// An explicit root is **not** validated against [`REPO_ROOT_MARKERS`]: pointing
-/// at a scratch tree is exactly how the dry-run and fixture tests work, and
-/// doctor's own rows report a wrong root far more legibly than a Fatal here.
+/// # Errors
 ///
-/// This is the single home for the logic; `sabrage-cli/src/main.rs` and
-/// `src-tauri/src/commands.rs` both call this function rather than carrying
-/// their own copies.
+/// Fatal when `current_exe()` fails, or no ancestor holds both markers and no override was given.
 pub fn resolve_repo_root(override_root: Option<&str>) -> Result<PathBuf, SabrageError> {
     if let Some(explicit) = override_root.filter(|s| !s.is_empty()) {
         return Ok(logical_absolute(PathBuf::from(explicit)));
@@ -186,26 +158,12 @@ pub fn resolve_repo_root(override_root: Option<&str>) -> Result<PathBuf, Sabrage
     })
 }
 
-/// The repo-root spelling contract, shared with `demo.sh`: absolute, `.`/`..`
-/// folded away **lexically**, symlinks preserved.
+/// The working directory the way `pwd` prints it: `$PWD` when it really names
+/// this process's cwd, `getcwd()` otherwise, `None` when neither is available.
 ///
-/// zsh's `cd`/`pwd` (and therefore `ROOT="$(cd "$(dirname "$0")" && pwd)"`) are
-/// logical: `..` pops the previous component of the path *as written* and a
-/// symlinked checkout keeps its symlink spelling. `Path::canonicalize` does the
-/// opposite on both counts, which is why it is not used here — the manifest
-/// bytes both front-ends write are derived from this string and compared
-/// literally.
-///
-/// Never touches the filesystem, so a root that does not exist yet (a fixture
-/// tree about to be created) is normalized just the same.
-/// The working directory the way `pwd` prints it.
-///
-/// `$PWD` is the *logical* cwd a shell maintains (`pwd -L`, symlinks intact);
-/// `getcwd()` is the physical one. Prefer `$PWD` — that is what `demo.sh`'s
-/// `ROOT` is built from — but only when it really names this process's cwd,
-/// since a GUI-launched `.app` inherits whatever `PWD` the launching context
-/// had, and cargo hands a test binary a cwd its parent shell's `PWD` never
-/// pointed at.
+/// `$PWD` is the *logical* cwd (`pwd -L`, symlinks intact) that demo.sh's
+/// `ROOT` is built from; `getcwd()` is the physical one. A GUI-launched `.app`
+/// or cargo test binary can inherit a stale `PWD`, hence the dev/ino check.
 fn logical_cwd() -> Option<PathBuf> {
     use std::os::unix::fs::MetadataExt;
 
@@ -260,9 +218,6 @@ fn logical_absolute(p: PathBuf) -> PathBuf {
 
 /// First ancestor of `start` (excluding `start` itself, which is an executable
 /// path, not a directory) that contains both [`REPO_ROOT_MARKERS`].
-///
-/// Public because it is testable without an installed binary, and because the
-/// CLI/Tauri layers may want to probe a candidate path before persisting it.
 pub fn find_repo_root_from(start: &Path) -> Option<PathBuf> {
     let mut dir = start.parent();
     while let Some(d) = dir {
@@ -352,7 +307,6 @@ impl Paths {
         let root: PathBuf = repo_root.into();
         let home = home_dir();
 
-        // lib.sh: for _cx in "$HOME/Applications/CrossOver.app" "/Applications/CrossOver.app"
         let cx_app = [
             home.join("Applications/CrossOver.app"),
             PathBuf::from("/Applications/CrossOver.app"),
@@ -372,7 +326,6 @@ impl Paths {
         let oxr_build = oxrsys.join("build-x64");
         let oxr_helper_build = oxrsys.join("build-helper-arm64");
 
-        // lib.sh: SDK path first, then `command -v adb`, else empty.
         let sdk_adb = home.join("Library/Android/sdk/platform-tools/adb");
         let adb = if is_executable(&sdk_adb) {
             Some(sdk_adb)
@@ -447,11 +400,8 @@ impl Paths {
 
     /// `<root>/logs` — where `run` writes `beatsaber-<ts>.log`.
     ///
-    /// run.sh: `mkdir -p "$ROOT/logs"` then
-    /// `LOG="$ROOT/logs/beatsaber-$(date +%Y%m%d-%H%M%S).log"`. The directory
-    /// is gitignored on purpose (CLAUDE.md, "Conventions") — it holds demo
-    /// runs' logs and both front-ends write into the same one, so the Logs
-    /// screen lists the shell's past runs too.
+    /// Reference: `scripts/demo/run.sh`. Both front-ends write here, so the Logs
+    /// screen lists the shell's past runs too. Gitignored on purpose.
     pub fn logs_dir(&self) -> PathBuf {
         self.root.join("logs")
     }
@@ -582,11 +532,10 @@ impl Bottle {
 /// Resolve the Beat Saber directory the way lib.sh/doctor.sh do:
 /// `${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/<bs_dir_leaf>}`.
 ///
-/// Note the deliberate reproduction of a shell quirk: when no bottle is resolved,
-/// `$PREFIX` is empty and the fallback becomes the absolute-looking
-/// `/drive_c/Program Files (x86)/…`. doctor never *uses* that value (sections 8
-/// and 3-z are skipped when there is no bottle and no override), but the string
-/// still appears in remedy text, so it must match.
+/// With no bottle and no override the shell's empty-`$PREFIX` quirk is
+/// reproduced on purpose: the absolute-looking `/drive_c/Program Files
+/// (x86)/...` string appears in remedy text and must match
+/// (tests::bs_dir_override_wins_and_default_uses_the_contract_leaf).
 pub fn resolve_bs_dir(bottle: Option<&Bottle>, bs_dir_override: Option<&Path>) -> PathBuf {
     if let Some(dir) = bs_dir_override {
         return dir.to_path_buf();
