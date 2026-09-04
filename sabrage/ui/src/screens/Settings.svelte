@@ -1,19 +1,16 @@
 <script lang="ts">
-  // Phase 4 — mockup: docs/design/mockup/Sabrage.dc.html (SETTINGS, lines 391–460;
-  // mock state 850–915). Design source: docs/design/design-app.md §4 screen table +
-  // "Settings write policy" paragraph, design-core.md §4.
-  //
   // Two independent persistence stores back this screen:
-  //  - `configStore` (oxrsys-runtime.toml, via config/runtime_toml.rs) — the
-  //    Streaming card only. Edited as a local `draft` diffed against the loaded
-  //    view so Save writes only changed keys (a `null`/untouched field is never
-  //    sent — see `buildPatch`); explicit Save/Revert, gated behind a one-time
-  //    inline acknowledgement panel (never `window.confirm` — it freezes the
-  //    webview).
-  //  - `settingsStore` (settings.json) — Audio & launch, Paths, and the adb-probe
-  //    toggle. Every field here autosaves on change/blur (mirrors Session.svelte's
-  //    local-`$state`-then-store convention), with a small transient "Saved" flash
+  //  - `configStore` (oxrsys-runtime.toml, via config/runtime_toml.rs) — Streaming
+  //    card only. A local `draft` is diffed against the loaded view so Save writes
+  //    only changed keys (`null` = untouched, never sent — see `buildPatch`);
+  //    explicit Save/Revert, gated behind a one-time inline acknowledgement panel
+  //    (never `window.confirm` — it freezes the webview).
+  //  - `settingsStore` (settings.json) — Audio & launch, Paths, adb-probe toggle.
+  //    Every field autosaves on change/blur (Session.svelte's
+  //    local-`$state`-then-store convention) with a transient "Saved" flash
   //    instead of a form-wide save button.
+  // Reference: sabrage/docs/design/design-app.md, "Settings write policy for
+  // `oxrsys-runtime.toml`".
   import { onMount } from "svelte";
   import { errMsg } from "../lib/text";
   import {
@@ -40,20 +37,16 @@
   import { settingsStore } from "../stores/settings.svelte";
   import { stageStore } from "../stores/stage.svelte";
 
-  // The runtime re-reads oxrsys-runtime.toml every 250 ms and rebuilds the
-  // encoder when `encoderProcess`/`videoCodec` move — `write_runtime_config`
-  // fails closed while a session is live rather than deferring to "next
-  // launch" (see that IPC fn's doc comment). Disable Save proactively with an
-  // honest reason instead of only surfacing the backend's refusal after a
-  // click.
+  // `write_runtime_config` fails closed while a session is live rather than
+  // deferring to "next launch" (see that IPC fn's doc comment), so Save is
+  // disabled proactively with an honest reason instead of surfacing the
+  // backend's refusal only after a click.
   const sessionBlocksSave = $derived(blocksMutation(sessionStore.status.phase));
 
-  // ── bottles (Paths card's default-bottle select) ───────────────────────────
 
   const bottles = $derived(bottlesStore.bottles);
   const bottlesLoaded = $derived(bottlesStore.bottlesLoaded);
 
-  // ── settings.json — local mirrors, seeded once settings load, then autosaved ─
 
   let defaultBottleSel = $state("");
   /** The path demo.sh derives for the selected bottle — shown as the empty
@@ -95,14 +88,10 @@
     allowAdbChk = s.allowAdbProbes;
   }
 
-  // A newer autosave can settle *after* an older one already rejected and
-  // reseeded the controls from a reverted store — see settingsStore.update's
-  // doc comment. `writeSeq` (bumped synchronously when a write is queued)
-  // lets us tell whether another write was queued behind this one: only the
-  // *last* settled write for a given click is allowed to reseed the
-  // controls, on success as well as on failure, so a later successful save
-  // is never left un-reflected on screen and an earlier failure never
-  // clobbers a later save's result.
+    // Only the last write queued for a burst reseeds the controls, on success
+    // as well as on failure: an earlier write settling while a newer one is
+    // still queued would reseed from a store that does not yet reflect it (see
+    // settingsStore.update). `writeSeq` is bumped synchronously at queue time.
   async function persistSettings(patch: Partial<Settings> | ((current: Settings) => Partial<Settings>)) {
     settingsSaveError = null;
     const seqBefore = settingsStore.writeSeq;
@@ -118,10 +107,9 @@
 
   async function persistLaunch(patch: Partial<LaunchDefaults>) {
     if (!settingsStore.settings) return;
-    // Resolved inside settingsStore.update's queued step against whatever
-    // `settings.launch` is when this write actually runs — not a snapshot
-    // captured here, which could already carry an earlier queued write's
-    // now-rolled-back optimistic value (see update's doc comment).
+    // A function, not a snapshot: it resolves inside settingsStore.update's
+    // queued step, so it composes with whatever `settings.launch` is then
+    // instead of carrying an earlier queued write's rolled-back value.
     await persistSettings((current) => ({ launch: { ...current.launch, ...patch } }));
   }
 
@@ -167,7 +155,6 @@
     await persistSettings({ allowAdbProbes: allowAdbChk });
   }
 
-  // ── oxrsys-runtime.toml — draft diffed against the loaded view ─────────────
 
   const EMPTY_VALUES: RuntimeConfigValues = {
     protocol: null,
@@ -270,7 +257,6 @@
     });
   }
 
-  // ── save flow (write-once acknowledgement + confirm) ────────────────────────
 
   let showAckPanel = $state(false);
   let saving = $state(false);
@@ -318,7 +304,6 @@
     lastWriteReport = null;
   }
 
-  // ── repository card ──────────────────────────────────────────────────────
 
   let repoInfo = $state<RepoInfo | null>(null);
   let repoInfoLoading = $state(false);
@@ -384,7 +369,6 @@
     }
   }
 
-  // ── footer: equivalent demo.sh command ──────────────────────────────────────
 
   const footerLaunchOpts = $derived.by(
     (): LaunchOpts => ({
