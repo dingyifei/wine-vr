@@ -1,42 +1,19 @@
 //! The check engine: one contract-ordered registry, bound to evaluator functions.
 //!
-//! # Contract
+//! `contract/pipeline.toml` owns the slug list, its order, and the per-side gates;
+//! nothing here may add, remove, or reorder checks. This crate owns check logic and
+//! message/remedy prose — every string must match `scripts/demo/doctor.sh` verbatim
+//! because docs/troubleshooting.md quotes those lines (the parity harness joins on
+//! slug plus status, never prose).
 //!
-//! * `contract/pipeline.toml` owns the **slug list, its order, and the per-side
-//!   gates**. Nothing here may add, remove, or reorder checks.
-//! * This crate owns **check logic and message/remedy prose**. The parity harness
-//!   joins the two front-ends on `slug` + status and never compares prose — but
-//!   every message and remedy string an evaluator prints must still match
-//!   `scripts/demo/doctor.sh` **verbatim**, because docs/troubleshooting.md
-//!   quotes those lines.
-//! * Evaluators are **read-only probes**. No filesystem mutation may appear
-//!   anywhere in check code — auto-fixes live in the (future) fix registry and
-//!   run from the preflight, never from doctor.
+//! Evaluators are read-only probes: no filesystem mutation in check code. Auto-fixes
+//! live in the fix registry and run from the preflight, never from doctor.
 //!
-//! # Group → module mapping
-//!
-//! Contract `group` values do not map 1:1 to module names; three are folded or
-//! renamed. The registry does not care (binding is by slug), but keep new
-//! evaluators in the module their group points at:
-//!
-//! | contract `group` | module |
-//! |---|---|
-//! | `meta` | [`meta`] |
-//! | `system`, `crossover` | [`system`] |
-//! | `bottle` | [`bottle`] |
-//! | `toolchain` | [`toolchain`] |
-//! | `sources` | [`sources`] |
-//! | `pinned` | [`pinned`] |
-//! | `game` | [`game`] |
-//! | `build` | [`build`] |
-//! | `overlay` | [`overlay`] |
-//! | `bottle-bridge` | [`bridge`] |
-//! | `host` | [`host`] |
-//! | `config` | [`config`] |
-//! | `headset` | [`headset`] |
-//! | `audio` | [`audio`] |
-//! | `network` | [`network`] |
-//! | `run-only` | [`run_only`] |
+//! Contract `group` values name their module except where folded or renamed:
+//! `crossover` lives in [`system`], `bottle-bridge` in [`bridge`], `run-only` in
+//! [`run_only`]; keep new evaluators in the module their group points at. The registry
+//! binds by slug in contract order
+//! (tests::registry_binds_in_contract_order_and_covers_every_slug).
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -63,15 +40,12 @@ pub mod sources;
 pub mod system;
 pub mod toolchain;
 
-// ── outcome types ─────────────────────────────────────────────────────────────
-
 /// Result of one check.
 ///
 /// `Pass`/`Warn`/`Fail`/`Info`/`Skipped` are the five statuses the zsh tap
 /// channel emits (`chk ok|warn|fail|info`, plus explicit `tap <slug> skipped`).
-/// `NotImplemented` has no zsh counterpart — it exists only while Phase 1 is
-/// filling in evaluators and is reported to the tap as `skipped`
-/// (see [`crate::tap`]).
+/// `NotImplemented` has no zsh counterpart and is reported to the tap as
+/// `skipped` (see [`crate::tap`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckStatus {
@@ -173,7 +147,8 @@ impl CheckOutcome {
         CheckOutcome::new(slug, CheckStatus::Skipped, reason.0)
     }
 
-    /// No evaluator is bound to this slug yet (Phase 1 scaffolding only).
+    /// A `NotImplemented` outcome for a slug with no bound evaluator — produced
+    /// only by a lenient registry build ([`build_registry`] with `strict = false`).
     pub fn not_implemented(slug: &str) -> CheckOutcome {
         CheckOutcome::new(
             slug,
@@ -206,8 +181,6 @@ impl From<&str> for SkipReason {
         SkipReason(s.to_string())
     }
 }
-
-// ── context ───────────────────────────────────────────────────────────────────
 
 /// The `WINEVR_*` mirror, as far as the check layer needs it.
 ///
@@ -329,15 +302,11 @@ impl CheckCtx {
     }
 }
 
-// ── registry ──────────────────────────────────────────────────────────────────
-
 /// A check evaluator: a synchronous, read-only probe.
 ///
-/// Sync is deliberate for v1. Every doctor probe is a `stat`, a small read, a
-/// digest, or a short subprocess; the async machinery in design-core §3 belongs
-/// to the *stage* layer, where long-running children and cancellation actually
-/// exist. Making these `async` now would buy nothing and force `BoxFuture` into
-/// every signature the Phase 1 evaluator agent writes.
+/// Sync is deliberate: every doctor probe is a `stat`, a small read, a digest, or a
+/// short subprocess. The async machinery of design-core §3 belongs to the stage
+/// layer, where long-running children and cancellation exist.
 pub type Evaluator = fn(&CheckCtx) -> CheckOutcome;
 
 /// One contract check joined to its evaluator.
@@ -345,7 +314,7 @@ pub type Evaluator = fn(&CheckCtx) -> CheckOutcome;
 pub struct BoundCheck {
     /// The contract entry — slug, group, both gates, `volatile`, `fix`.
     pub spec: &'static CheckSpec,
-    /// `None` while Phase 1 is still filling the group modules.
+    /// `None` only in a lenient registry build; [`registry`] binds every slug.
     pub eval: Option<Evaluator>,
 }
 
@@ -392,7 +361,7 @@ impl Registry {
 
     /// The doctor-visible subset: contract order minus [`NO_DOCTOR_ROW_GROUP`].
     /// doctor.sh never emits these slugs, so neither may the native doctor
-    /// (console, tap, or fail count) — tier-2 parity depends on it.
+    /// (console, tap, or fail count) — tests::doctor_walks_only_doctor_visible_checks.
     pub fn doctor_checks(&self) -> impl Iterator<Item = &BoundCheck> {
         self.checks
             .iter()
@@ -469,15 +438,14 @@ fn all_defs() -> Vec<(&'static str, Evaluator)> {
 
 /// Join the contract's ordered check list with the evaluator map.
 ///
-/// `strict = true` (the release contract) rejects any mismatch: a contract slug
-/// with no evaluator, an evaluator for a slug the contract does not declare, or
-/// two evaluators claiming the same slug. That is the mechanical enforcement of
-/// "adding a check to only one place must fail" — the parity design's tier-1
-/// coverage test in both directions.
+/// `strict = true` is the release contract; `strict = false` tolerates missing
+/// bindings, whose checks then report [`CheckStatus::NotImplemented`].
 ///
-/// `strict = false` is the Phase 1 escape hatch: unknown and duplicate
-/// registrations are still errors (those are always bugs), but missing bindings
-/// are tolerated and their checks report [`CheckStatus::NotImplemented`].
+/// # Errors
+///
+/// Missing evaluator (strict only), unknown slug, or duplicate binding. This enforces
+/// "adding a check to only one place must fail"
+/// (sabrage-parity::tests::strict_registry_builds_and_covers_the_contract_in_order).
 pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
     let defs = all_defs();
 
@@ -515,12 +483,9 @@ pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
         .collect();
 
     if strict {
-        // Every contract slug is bound, run-only preflights included: they have
-        // no doctor *row* ([`NO_DOCTOR_ROW_GROUP`] keeps them out of
-        // [`Registry::doctor_checks`]), but they do have evaluators, which the
-        // launch preflight resolves through this same registry. There is no
-        // group-shaped exemption left — a slug added to the contract without an
-        // evaluator is an immediate hard error wherever it lives.
+        // Run-only preflights are bound too: they have no doctor row
+        // (NO_DOCTOR_ROW_GROUP keeps them out of Registry::doctor_checks), but the
+        // launch preflight resolves their evaluators through this same registry.
         let missing: Vec<String> = checks
             .iter()
             .filter(|c| c.eval.is_none())
@@ -534,16 +499,16 @@ pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
     Ok(Registry { checks })
 }
 
-/// The registry, built strictly: **every** contract slug must have a bound
-/// evaluator, run-only preflights included ([`run_only`] binds those; they are
-/// hidden from doctor by [`Registry::doctor_checks`], not by being unbound).
-/// "Added a slug to the contract, forgot the evaluator" is an immediate hard
-/// error here, which is the point.
+/// The registry, built strictly: every contract slug has a bound evaluator,
+/// run-only preflights included ([`run_only`] binds those; [`Registry::doctor_checks`]
+/// hides them from doctor, not an absent binding).
+///
+/// # Panics
+///
+/// A contract slug with no evaluator is a hard error by design.
 pub fn registry() -> Registry {
     build_registry(true).expect("evaluator registrations are consistent with the contract")
 }
-
-// ── doctor ────────────────────────────────────────────────────────────────────
 
 /// The result of a full doctor pass.
 ///
