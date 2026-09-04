@@ -7,7 +7,7 @@
 
   let { onNavigate }: Props = $props();
 
-  // Chip labels match the approved mockup (Sabrage.dc.html pipeChips) verbatim.
+  // Chip labels copied verbatim from pipeChips in sabrage/docs/design/mockup/Sabrage.dc.html.
   const pipeChips: { n: string; arrow: boolean }[] = [
     { n: "Game (D3D11)", arrow: true },
     { n: "CrossOver / Wine", arrow: true },
@@ -26,9 +26,9 @@
     src: string;
   }
 
-  // Upstream authorship and licenses follow the approved mockup — this panel credits
-  // the UPSTREAM projects; the dingyifei forks are noted in the descriptions.
-  // (oxrsys's MPL-2.0 comes from the repo's own CLAUDE.md rules for ext/oxrsys.)
+  // Credits upstream projects; dingyifei forks appear only in descriptions. Authorship
+  // and licenses follow sabrage/docs/design/mockup/Sabrage.dc.html, except oxrsys's
+  // MPL-2.0, which comes from CLAUDE.md's ext/oxrsys rules.
   const upstream: UpstreamCard[] = [
     {
       k: "Windows layer",
