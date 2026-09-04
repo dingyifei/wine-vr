@@ -2462,4 +2462,208 @@ mod tests {
             std::fs::remove_dir_all(&base).ok();
         }
     }
+
+    // ── (11) PARITY.md section citations ─────────────────────────────────────
+
+    /// A section citation (`PARITY.md`, a section sign, a heading) names a real
+    /// `## ` heading of sabrage/PARITY.md, and the words it quotes appear
+    /// verbatim in that section.
+    mod parity_md_citations {
+        use super::repo_root;
+        use std::path::{Path, PathBuf};
+
+        /// Markdown emphasis dropped and whitespace collapsed, so a citation may
+        /// quote `the wired forwards row` for a row that renders `the **wired**
+        /// forwards row` across two wrapped lines.
+        fn normalize(text: &str) -> String {
+            text.replace('*', " ")
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        /// PARITY.md as `(heading title, section body)` pairs, split on `## `.
+        fn sections(markdown: &str) -> Vec<(String, String)> {
+            let mut out: Vec<(String, String)> = Vec::new();
+            for line in markdown.lines() {
+                match line.strip_prefix("## ") {
+                    Some(title) => out.push((title.trim().to_string(), String::new())),
+                    None => {
+                        if let Some(last) = out.last_mut() {
+                            last.1.push_str(line);
+                            last.1.push('\n');
+                        }
+                    }
+                }
+            }
+            out
+        }
+
+        /// One error string per citation in `flat_text` that names a heading
+        /// PARITY.md does not have, or quotes words its section does not
+        /// contain.
+        fn check_citations(flat_text: &str, headings: &[(String, String)]) -> Vec<String> {
+            const MARKER: &str = "PARITY.md \u{a7} ";
+            let mut errors = Vec::new();
+            let mut rest = flat_text;
+            while let Some(at) = rest.find(MARKER) {
+                let tail = &rest[at + MARKER.len()..];
+                rest = tail;
+                let line: String = tail
+                    .lines()
+                    .next()
+                    .unwrap_or("")
+                    .chars()
+                    .take(120)
+                    .collect();
+                // Longest title first, so `Run (launch)` wins over `Run` when both exist.
+                let mut candidates: Vec<&(String, String)> = headings.iter().collect();
+                candidates.sort_by_key(|(title, _)| std::cmp::Reverse(title.len()));
+                let matched = candidates.into_iter().find(|(title, _)| {
+                    line.strip_prefix(title.as_str())
+                        .is_some_and(|after| !after.starts_with(|c: char| c.is_alphanumeric()))
+                });
+                let Some((title, body)) = matched else {
+                    errors.push(format!("no such PARITY.md heading in citation: {line:?}"));
+                    continue;
+                };
+                let after = &line[title.len()..];
+                let Some(quoted) = after
+                    .strip_prefix(", \"")
+                    .and_then(|q| q.split_once('"').map(|(words, _)| words))
+                else {
+                    continue;
+                };
+                if !normalize(body).contains(&normalize(quoted)) {
+                    errors.push(format!(
+                        "PARITY.md \u{a7} {title} does not contain the quoted words {quoted:?}"
+                    ));
+                }
+            }
+            errors
+        }
+
+        /// Every line stripped of its leading comment marker and joined with a
+        /// single space, so a citation that wraps across comment lines is still
+        /// one run of text.
+        fn flatten(source: &str) -> String {
+            source
+                .lines()
+                .map(|line| {
+                    let line = line.trim_start();
+                    for marker in ["///", "//!", "//", "#", "*"] {
+                        if let Some(body) = line.strip_prefix(marker) {
+                            return body.trim();
+                        }
+                    }
+                    line.trim()
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+        }
+
+        fn collect(dir: &Path, extensions: &[&str], out: &mut Vec<PathBuf>) {
+            let Ok(entries) = std::fs::read_dir(dir) else {
+                return;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = entry.file_name();
+                if path.is_dir() {
+                    // Build output and the shell fixtures under tests/ are not
+                    // sources that cite PARITY.md.
+                    if name != "target" && name != "fixtures" {
+                        collect(&path, extensions, out);
+                    }
+                } else if path
+                    .extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| extensions.contains(&e))
+                {
+                    out.push(path);
+                }
+            }
+        }
+
+        fn cited_files(root: &Path) -> Vec<PathBuf> {
+            let mut files = Vec::new();
+            collect(&root.join("sabrage/crates"), &["rs"], &mut files);
+            collect(&root.join("sabrage/src-tauri"), &["rs"], &mut files);
+            collect(&root.join("sabrage/ui/src"), &["ts", "svelte"], &mut files);
+            collect(&root.join("scripts/demo"), &["sh"], &mut files);
+            files.push(root.join("demo.sh"));
+            files.sort();
+            files
+        }
+
+        #[test]
+        fn parity_md_section_citations_name_real_headings() {
+            let root = repo_root();
+            let markdown =
+                std::fs::read_to_string(root.join("sabrage/PARITY.md")).expect("PARITY.md reads");
+            let headings = sections(&markdown);
+            let mut errors: Vec<String> = Vec::new();
+            for file in cited_files(&root) {
+                let Ok(source) = std::fs::read_to_string(&file) else {
+                    continue;
+                };
+                for error in check_citations(&flatten(&source), &headings) {
+                    errors.push(format!("{}: {error}", file.display()));
+                }
+            }
+            assert!(
+                errors.is_empty(),
+                "PARITY.md citations that no longer resolve:\n{}",
+                errors.join("\n")
+            );
+        }
+
+        #[test]
+        fn citation_checker_rejects_a_mistyped_heading_and_a_paraphrased_quote() {
+            let headings = vec![
+                (
+                    "Doctor / checks".to_string(),
+                    "| Console colors gated on isatty | zsh bakes ANSI constants into every row |"
+                        .to_string(),
+                ),
+                (
+                    "Run preflight".to_string(),
+                    "| The **wired** forwards row | removed in preflight |".to_string(),
+                ),
+            ];
+            // The section sign is spelled `\u{a7}` in every literal below so
+            // that the tree scan above does not read these fixtures as real
+            // citations in this file.
+            let cases: &[(&str, &str, bool)] = &[
+                (
+                    "mistyped heading",
+                    "PARITY.md \u{a7} Doctor / cheks, \"Console colors gated on isatty\"",
+                    false,
+                ),
+                (
+                    "paraphrased quote",
+                    "PARITY.md \u{a7} Doctor / checks, \"ANSI colors are gated on a tty\"",
+                    false,
+                ),
+                (
+                    "exact heading with an exact quote",
+                    "PARITY.md \u{a7} Doctor / checks, \"Console colors gated on isatty\"",
+                    true,
+                ),
+                (
+                    "quote omitting the row's bold asterisks",
+                    "PARITY.md \u{a7} Run preflight, \"The wired forwards row\"",
+                    true,
+                ),
+            ];
+            for (label, citation, accepted) in cases {
+                let errors = check_citations(citation, &headings);
+                assert_eq!(
+                    errors.is_empty(),
+                    *accepted,
+                    "{label}: {citation} -> {errors:?}"
+                );
+            }
+        }
+    }
 }
