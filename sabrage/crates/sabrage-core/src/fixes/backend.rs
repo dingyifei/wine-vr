@@ -1,19 +1,12 @@
 //! `fix.set-graphics-backend` — force `CX_GRAPHICS_BACKEND` to `dxmt` in the
 //! bottle's `cxbottle.conf`.
 //!
-//! CrossOver's default `"auto"` silently fails to load DXMT, which presents as a
-//! black window with no VR (see CLAUDE.md's closed-investigation notes). `run.sh`
-//! rewrites the line unconditionally in preflight — a **permanent** mutation
-//! that is never unwound, matching the "permanent vs guarded" boundary in
-//! design-core §3.2.
+//! The CrossOver GUI writes `""` (= auto), which does not select DXMT: the game
+//! spins forever before D3D11 device creation, with no DXMT banner and no
+//! streamer (`docs/troubleshooting.md`). The edit is a permanent mutation that
+//! is never unwound (design-core §3.2).
 //!
-//! Implementation notes for the fixes agent (design-core §10.25):
-//! * the target line is exactly `"CX_GRAPHICS_BACKEND" = "dxmt"` — doctor greps
-//!   it anchored, so spacing is a byte contract;
-//! * three-branch edit logic (key absent / key present with another value / key
-//!   already correct), preserving the rest of the file;
-//! * refuse while the bottle's wineserver is live — the shell races the
-//!   CrossOver GUI, which rewrites the file from memory on exit.
+//! Reference: `scripts/demo/run.sh`.
 
 use std::path::Path;
 
@@ -42,12 +35,10 @@ const ENV_SECTION_HEADER: &str = "[EnvironmentVariables]";
 const FORCED_DESCRIPTION: &str =
     "bottle graphics backend forced to dxmt (was auto/other — the CrossOver GUI can reset this)";
 
-/// Which of `run.sh` lines 39–50's three branches [`rewrite_graphics_backend`]
-/// took.
+/// Which of [`rewrite_graphics_backend`]'s three branches it took.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Branch {
-    /// An existing `"CX_GRAPHICS_BACKEND" = "..."` line was rewritten in place
-    /// (`sed -i '' 's/^"CX_GRAPHICS_BACKEND" = ".*"$/.../''`).
+    /// An existing `"CX_GRAPHICS_BACKEND" = "..."` line was rewritten in place.
     Rewrote,
     /// No line started with the key at all, but `[EnvironmentVariables]` did
     /// exist; the target line was inserted immediately after that header.
@@ -56,39 +47,22 @@ pub enum Branch {
     AppendedSection,
 }
 
-/// Pure port of `run.sh` lines 39–50. Callers are expected to have already
-/// established (as `run.sh`'s own outer `if` does) that `TARGET_LINE` is
-/// **not** already present verbatim — this function does not re-check that,
-/// it only decides *how* to introduce it.
+/// Introduce `TARGET_LINE` into a `cxbottle.conf` body; returns the new bytes
+/// and which branch produced them. Callers have established the line is not
+/// present verbatim — this only decides how to introduce it.
 ///
-/// Line-oriented reconstruction preserves every untouched line byte-for-byte,
-/// including whether the file ends with a trailing newline; the append branch
-/// instead does a raw string concatenation, matching `printf … >> "$CXCONF"`
-/// exactly (it does not care whether `conf` already ended in a newline).
+/// Rewrite and insert branches are line-oriented: every untouched line and the
+/// trailing-newline state survive. Append is a raw concatenation.
 ///
-/// Caveat, faithfully reproduced: like `sed`, the rewrite branch only touches
-/// a matching `CX_GRAPHICS_BACKEND` line that is *itself* shaped
-/// `"CX_GRAPHICS_BACKEND" = "..."` (quoted value, one line). A line that starts
-/// with the key but is not shaped that way (e.g. an unquoted value) is left
-/// untouched, exactly as `sed`'s anchored substitution would skip it — the
-/// caller does not re-verify after the edit, matching `run.sh`.
+/// Like `sed`, the rewrite branch only touches a `CX_GRAPHICS_BACKEND` line
+/// shaped `"CX_GRAPHICS_BACKEND" = "..."`; any other shape is left untouched
+/// and the caller does not re-verify, so the result can lack the target line
+/// (tests::branch_rewrite_cases).
 ///
-/// Sed fidelity is not absolute, though — measured, not assumed. BSD
-/// `sed -i '' '/^\[EnvironmentVariables\]$/a\…'` mangles the header in exactly
-/// one cell: when `[EnvironmentVariables]` is the **last line of the file and
-/// that line has no trailing newline**, `a\` has nothing to append *after*, so
-/// it concatenates the appended text directly onto the header —
-/// `[EnvironmentVariables]"CX_GRAPHICS_BACKEND" = "dxmt"` — and still adds a
-/// trailing newline to the file sed never had. This implementation always
-/// inserts a real line break between the header and the new line and
-/// preserves the absence of a trailing newline exactly (pinned by the
-/// `header and inserted line must be joined by a real newline …` row of
-/// `branch_rewrite_cases` below): strictly
-/// better than `sed` in that one cell, not byte-parity with it. Every other
-/// cell measured — the header mid-file with no trailing newline, the rewrite
-/// branch with no trailing newline, and the append branch — is sed-identical.
-/// Real `cxbottle.conf` files always end in a newline, so the mangled cell
-/// does not arise in practice.
+/// Not byte-parity with BSD `sed` in one cell: with `[EnvironmentVariables]`
+/// as the last line and no trailing newline, sed's `a\` concatenates onto the
+/// header; this joins them with a real line break and keeps the newline absent
+/// (tests::branch_rewrite_cases).
 pub fn rewrite_graphics_backend(conf: &str) -> (String, Branch) {
     if conf.lines().any(|l| l.starts_with(KEY_PREFIX)) {
         let (mut lines, trailing_newline) = split_lines(conf);
@@ -118,8 +92,7 @@ pub fn rewrite_graphics_backend(conf: &str) -> (String, Branch) {
         );
     }
 
-    // `printf '\n[EnvironmentVariables]\n"CX_GRAPHICS_BACKEND" = "dxmt"\n' >> "$CXCONF"`:
-    // a raw append, indifferent to whether `conf` already ended in a newline.
+    // A raw append, indifferent to whether `conf` already ended in a newline.
     let appended = format!("{conf}\n{ENV_SECTION_HEADER}\n{TARGET_LINE}\n");
     (appended, Branch::AppendedSection)
 }
@@ -137,8 +110,6 @@ fn rejoin(lines: &[String], trailing_newline: bool) -> String {
     out
 }
 
-// ── wineserver liveness (shared with `fixes::session_json`) ───────────────────
-
 /// One running process whose resolved executable is a CrossOver `wineserver`.
 struct WineserverProc {
     /// The `WINEPREFIX` value from its environment. `None` covers both "the
@@ -148,11 +119,10 @@ struct WineserverProc {
     wineprefix: Option<String>,
 }
 
-/// Every live process whose resolved executable equals `wineserver_exe`
-/// (canonicalized on both sides, same convention as
-/// [`crate::process::find_processes_by_exe`], which this deliberately does not
-/// call — that helper does not read `environ`, and adding a second full
-/// process scan just to get pids back would cost the same syscalls twice).
+/// Every live process whose resolved executable equals `wineserver_exe`,
+/// canonicalized on both sides like [`crate::process::find_processes_by_exe`]
+/// (not reused: it skips `environ`, and a second full scan would repeat the
+/// same syscalls).
 fn scan_wineservers(wineserver_exe: &Path) -> Vec<WineserverProc> {
     let want = wineserver_exe
         .canonicalize()
@@ -160,9 +130,8 @@ fn scan_wineservers(wineserver_exe: &Path) -> Vec<WineserverProc> {
     let refresh = ProcessRefreshKind::nothing()
         .with_exe(UpdateKind::Always)
         .with_environ(UpdateKind::Always);
-    // `System::new()` loads nothing: `new_with_specifics` would perform its own
-    // `ProcessesToUpdate::All` scan before the explicit one below runs, walking
-    // the whole process table twice for one scan's worth of work.
+    // `System::new()` loads nothing; `new_with_specifics` would walk the whole
+    // process table once more before the explicit scan below.
     let mut sys = System::new();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh);
 
@@ -184,18 +153,13 @@ fn scan_wineservers(wineserver_exe: &Path) -> Vec<WineserverProc> {
         .collect()
 }
 
-/// The decision `bottle_wineserver_is_live` makes, factored out as a pure
-/// function of the `WINEPREFIX` values *observed* on every live wineserver
-/// process (one entry per process; `None` means its environment could not be
-/// read at all, or lacked the variable — both "cannot rule this one out").
+/// The `bottle_wineserver_is_live` decision as a pure function of the
+/// `WINEPREFIX` values observed on live wineserver processes; `None` (absent or
+/// unreadable environment) cannot be ruled out and counts as live.
 ///
-/// Kept separate from [`scan_wineservers`] so the actual decision — including
-/// the "when in doubt, refuse" rule — has a test that does not depend on
-/// spawning or observing real OS processes (system-wide process state is
-/// exactly the kind of thing a parallel test run cannot pin down: some other
-/// test in this same binary may have its own child alive at the same instant,
-/// and sandboxed CI runners have been observed to `SIGKILL` a copied-to-`/tmp`
-/// executable before it can even be scanned).
+/// Separate from `scan_wineservers` so the "when in doubt, refuse" rule has a
+/// test independent of system-wide process state
+/// (tests::wineservers_indicate_live_decides_by_wineprefix).
 fn wineservers_indicate_live(observed_wineprefixes: &[Option<String>], want_prefix: &str) -> bool {
     observed_wineprefixes.iter().any(|wp| match wp.as_deref() {
         Some(p) => p == want_prefix,
@@ -203,19 +167,14 @@ fn wineservers_indicate_live(observed_wineprefixes: &[Option<String>], want_pref
     })
 }
 
-/// Whether the CrossOver wineserver appears to be alive **for `bottle_prefix`
-/// specifically**.
+/// Whether a CrossOver wineserver appears to be alive **for `bottle_prefix`
+/// specifically**, read from process state because `wineserver -w` would block
+/// indefinitely against a live server: every process whose resolved executable
+/// is `wineserver_exe`, matched on its `WINEPREFIX` environment variable.
 ///
-/// `wineserver -w` would block indefinitely if a live server were probed
-/// directly, so this reads process state instead: every running process whose
-/// resolved executable is `wineserver_exe`, checked against its `WINEPREFIX`
-/// environment variable (set verbatim to the bottle prefix by both `run.sh`
-/// and this crate's own launch code). When a matching process's environment
-/// cannot be read at all, or simply lacks `WINEPREFIX`, this refuses to guess
-/// which bottle it belongs to and treats it as live for `bottle_prefix` — the
-/// shell races the CrossOver GUI here, and a false "clear" would let this fix
-/// corrupt a file CrossOver still has open. See [`wineservers_indicate_live`]
-/// for the actual (unit-tested) decision.
+/// A matching process whose `WINEPREFIX` cannot be read, or that lacks it, is
+/// treated as live: a false "clear" would let this fix edit a file the CrossOver
+/// GUI still has open (tests::wineservers_indicate_live_decides_by_wineprefix).
 pub(crate) fn bottle_wineserver_is_live(wineserver_exe: &Path, bottle_prefix: &Path) -> bool {
     let observed: Vec<Option<String>> = scan_wineservers(wineserver_exe)
         .into_iter()
@@ -230,8 +189,6 @@ pub(crate) fn bottle_wineserver_is_live(wineserver_exe: &Path, bottle_prefix: &P
 pub(crate) fn any_wineserver_alive(wineserver_exe: &Path) -> bool {
     !scan_wineservers(wineserver_exe).is_empty()
 }
-
-// ── the fix ─────────────────────────────────────────────────────────────────
 
 /// What the shared body does when the bottle's own wineserver is alive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -255,23 +212,14 @@ pub async fn set_graphics_backend(ctx: &StageCtx, sink: &EventSink) -> Result<Fi
 }
 
 /// [`set_graphics_backend`] **without** the live-wineserver refusal — the
-/// launch preflight's variant.
+/// launch preflight's variant. Same three-branch rewrite, same `FixReport`,
+/// same console text; only the liveness gate differs.
 ///
-/// `run.sh` does not care about a live wineserver here, and it is right not to:
-/// it rewrites `cxbottle.conf` in preflight (lines 38–52) and then, two blocks
-/// later, the `wineserver-reset` launch action kills that very wineserver
-/// (`WINEPREFIX="$PREFIX" "$WINESERVER" -k`, line 129) before anything reads
-/// the file again. The refusal exists to protect an edit that has to *survive*
-/// alongside a running CrossOver; a launch's edit does not have to survive
-/// anything — the next thing it does is tear that session down. Refusing here
-/// would instead make a launch impossible in exactly the situation
-/// (`./demo.sh run` twice in a row, a stale wineserver from a crashed session)
-/// where run.sh launches fine, which is the failure mode the wineserver reset
-/// was written for.
-///
-/// The doctor Fix button keeps the refusing variant. Same three-branch rewrite,
-/// same `FixReport`, same verbatim console text — only the liveness gate
-/// differs.
+/// The refusal protects an edit that must survive alongside a running CrossOver.
+/// A launch's edit does not: run.sh's `wineserver-reset` kills that wineserver
+/// before anything reads the file again, so refusing here would block
+/// `./demo.sh run` after a crashed session
+/// (tests::for_launch_edits_even_while_the_bottles_wineserver_is_live).
 pub async fn set_graphics_backend_for_launch(
     ctx: &StageCtx,
     sink: &EventSink,
@@ -312,15 +260,9 @@ async fn rewrite(ctx: &StageCtx, sink: &EventSink, policy: WineserverPolicy) -> 
 
     let (rewritten, _branch) = rewrite_graphics_backend(&conf);
 
-    // The rewrite branch is sed-faithful, which means it can leave the file
-    // without the target line: a `"CX_GRAPHICS_BACKEND"` line whose value is
-    // unquoted (or spaced differently) starts with the key but does not match
-    // the anchored substitution, so nothing is replaced
-    // (the `an unquoted value must not be touched …` row of `branch_rewrite_cases`).
-    // Writing those bytes back and reporting "forced to dxmt" would be a fix
-    // claiming a success doctor still fails on. Verify the postcondition the
-    // caller cares about — the line doctor greps for — before writing anything,
-    // and die with the same text run.sh's own post-fix check produces.
+    // The sed-faithful rewrite branch can return bytes without the target line, so
+    // verify it before writing — else the fix claims a success doctor still fails
+    // (tests::a_line_the_rewrite_cannot_canonicalize_is_a_failure_not_a_success).
     if !rewritten.lines().any(|l| l == TARGET_LINE) {
         return Err(ctx.fatal(
             format!(
@@ -359,22 +301,14 @@ mod tests {
         s.lines().any(|l| l == TARGET_LINE)
     }
 
-    // ── rewrite_graphics_backend: the three branches, byte-exact ────────────
-
     /// Every branch of `rewrite_graphics_backend` over literal `cxbottle.conf`
     /// bodies: (label, input, expected branch, expected bytes out, whether the
     /// result contains the line doctor greps for).
     ///
-    /// Two rows carry measured shell behaviour. The unquoted-value row is
-    /// sed-faithful: a line that starts with the key but is not shaped
-    /// `"CX_GRAPHICS_BACKEND" = "..."` is left alone, so the file can come out
-    /// without the target line (anchor `false`). The header-with-no-trailing-
-    /// newline row is a deliberate improvement over BSD sed
-    /// (review finding #10; measured table in the review), which in that one
-    /// cell concatenates the appended text straight onto the header and adds
-    /// a trailing newline
-    /// the file never had; this implementation joins them with a real `\n` and
-    /// preserves the missing trailing newline.
+    /// Two rows pin measured shell behaviour: a key line not shaped
+    /// `"CX_GRAPHICS_BACKEND" = "..."` is left alone as sed would, so the anchor
+    /// column is `false`; and the header-with-no-trailing-newline row is a
+    /// deliberate improvement over BSD sed's `a\` (review finding #10).
     #[test]
     fn branch_rewrite_cases() {
         let cases: &[(&str, &str, Branch, &str, bool)] = &[
@@ -446,18 +380,10 @@ mod tests {
         }
     }
 
-    // ── wineserver liveness: the pure decision, unit-tested directly ────────
-    //
-    // `scan_wineservers`'s actual OS-process scan is deliberately NOT
-    // exercised by spawning a stand-in child here: this crate's sandboxed test
-    // runner has been observed to SIGKILL a copied-to-`/tmp` executable before
-    // it can even be scanned (a code-signing/exec restriction on temp-dir
-    // binaries, unrelated to this logic), and `cargo test`'s own parallelism
-    // means unrelated tests elsewhere in this binary may have their own real
-    // child processes alive at the same instant — system-wide process state is
-    // not a fixture this suite can pin down deterministically. The decision
-    // logic itself (the part actually worth testing) is the pure function
-    // below, which takes the same shape `scan_wineservers` produces.
+    // `scan_wineservers`'s OS-process scan is deliberately not exercised by
+    // spawning a stand-in child: system-wide process state is not a fixture this
+    // suite can pin down (cargo test runs in parallel; a sandboxed runner has
+    // SIGKILLed a copied-to-`/tmp` executable before it could be scanned).
 
     #[test]
     fn wineservers_indicate_live_decides_by_wineprefix() {
@@ -517,8 +443,6 @@ mod tests {
         assert!(!any_wineserver_alive(nowhere));
         assert!(!bottle_wineserver_is_live(nowhere, Path::new("/anything")));
     }
-
-    // ── set_graphics_backend (the async fix) ────────────────────────────────
 
     fn scratch(tag: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("sabrage-backend-fix-{tag}-{}", std::process::id()))
@@ -601,10 +525,9 @@ mod tests {
     }
 
     /// A `CX_GRAPHICS_BACKEND` line the anchored rewrite cannot touch (an
-    /// unquoted value, unusual spacing) used to produce `changed: true` and
-    /// "forced to dxmt" over bytes that still did not contain the target line —
-    /// a fix reporting success on a file doctor keeps failing. Both doors now
-    /// verify the postcondition and die with run.sh's own post-fix text.
+    /// unquoted value, unusual spacing) is a failure through both doors: the
+    /// fix dies with run.sh's post-fix text instead of reporting "forced to
+    /// dxmt" over bytes that still lack the target line.
     #[tokio::test]
     async fn a_line_the_rewrite_cannot_canonicalize_is_a_failure_not_a_success() {
         for (tag, original) in [
@@ -695,14 +618,11 @@ mod tests {
         let (mut ctx, conf) = fixture_ctx(&root, false);
         std::fs::write(&conf, "\"CX_GRAPHICS_BACKEND\" = \"auto\"\n").unwrap();
 
-        // Stand in for a live wineserver with THIS test binary's own running
-        // process — guaranteed alive with no spawning needed (same trick
-        // `process::tests::finds_this_test_binary_by_its_exe_path` uses).
-        // Whatever `WINEPREFIX` this process does or does not have, the
-        // refusal must still hold: either it happens to match, or (the
-        // overwhelmingly likely case — nothing sets WINEPREFIX for `cargo
-        // test`) it is absent entirely, which is exactly the "cannot rule
-        // this one out" branch `wineservers_indicate_live` refuses on.
+        // Stand in for a live wineserver with this test binary's own process —
+        // guaranteed alive, nothing to spawn (the trick
+        // `process::tests::finds_this_test_binary_by_its_exe_path` uses). A
+        // `cargo test` process normally lacks `WINEPREFIX`, hitting
+        // `wineservers_indicate_live`'s "cannot rule this one out" branch.
         ctx.paths.wineserver = Some(std::env::current_exe().expect("current_exe resolves"));
 
         let sink: EventSink = Arc::new(|_| {});
@@ -716,8 +636,6 @@ mod tests {
 
         std::fs::remove_dir_all(&root).ok();
     }
-
-    // ── set_graphics_backend_for_launch (the preflight variant) ─────────────
 
     /// The whole point of the second entry point: run.sh rewrites
     /// `cxbottle.conf` in preflight and kills that wineserver two blocks
