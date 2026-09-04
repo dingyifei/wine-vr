@@ -1,31 +1,15 @@
-//! Generator for `scripts/demo/contract.gen.sh` — the zsh mirror of
-//! `contract/pipeline.toml`.
+//! Generator for `scripts/demo/contract.gen.sh`, the zsh mirror of
+//! `contract/pipeline.toml` that lib.sh sources so the shell needs no TOML parser.
 //!
-//! # Why a generator at all
+//! Two tripwires cover it: the `# contract-sha256:` header lets doctor's
+//! `meta.contract-sync` catch a contract edited without regenerating, and
+//! [`check`] catches a hand-edited generated file. The committed bytes are
+//! pinned by sabrage-parity's
+//! `tests::contract_gen_parity::generate_matches_the_committed_contract_gen_sh`.
 //!
-//! lib.sh must keep its runtime surface as dumb as it is today: no jq, no
-//! hand-rolled TOML awk, no `set -u` ordering hazards. So the scalars the shell
-//! needs are emitted into a whole generated file, committed, and `source`d. A
-//! whole file (rather than BEGIN/END markers inside lib.sh) leaves no ambiguity
-//! about what is hand-editable, and hand edits are caught by `--check`.
-//!
-//! # The two tripwires
-//!
-//! * **zsh side, no Rust required**: the `# contract-sha256:` header records the
-//!   digest of the three `contract/` files. doctor's `meta.contract-sync` check
-//!   recomputes it with `shasum` and FAILs on a mismatch, catching "edited the
-//!   contract, forgot to regenerate".
-//! * **Rust side**: [`check`] diffs a fresh generation against the committed
-//!   file, catching the inverse — a hand-edited generated file.
-//!
-//! # Deliberately not depending on `sabrage-core`
-//!
-//! The generator re-declares the small subset of contract fields the shell
-//! actually consumes. That keeps it honest: if a field is added to
-//! `pipeline.toml` and to `sabrage-core` but not here, the shell simply does not
-//! get it, which is a visible, intended outcome — not a silent coupling through
-//! a shared struct. serde ignores unknown fields, so extra contract sections
-//! cost nothing.
+//! The contract subset below is re-declared rather than imported from
+//! `sabrage-core`: a field added to `pipeline.toml` but not here is visibly
+//! absent from the shell instead of silently coupled through a shared struct.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -36,9 +20,9 @@ use sha2::{Digest, Sha256};
 /// Repo-relative path of the generated file.
 pub const OUTPUT_REL_PATH: &str = "scripts/demo/contract.gen.sh";
 
-/// Repo-relative paths of the three contract inputs, in the order the
-/// `contract-sha256` recipe concatenates them (doctor.sh section 0:
-/// `cat pipeline.toml oxrsys-runtime.toml.template active_runtime.x86_64.json.template`).
+/// Repo-relative paths of the three contract inputs, in the order their bytes
+/// are concatenated for the `contract-sha256` header.
+/// Reference: scripts/demo/doctor.sh section 0, same order and recipe.
 pub const CONTRACT_FILES: [&str; 3] = [
     "contract/pipeline.toml",
     "contract/oxrsys-runtime.toml.template",
@@ -56,8 +40,6 @@ pub const RUNTIME_TOML_TEMPLATE: &str =
 /// `contract/active_runtime.x86_64.json.template`, compiled in (hash input only).
 pub const HOST_MANIFEST_TEMPLATE: &str =
     include_str!("../../../../contract/active_runtime.x86_64.json.template");
-
-// ── contract subset ───────────────────────────────────────────────────────────
 
 #[derive(Debug, Deserialize)]
 struct Contract {
@@ -101,8 +83,6 @@ struct Dxmt {
     files: Vec<String>,
 }
 
-// ── errors ────────────────────────────────────────────────────────────────────
-
 /// Everything that can go wrong generating or checking the file.
 #[derive(Debug)]
 pub enum GenError {
@@ -139,8 +119,6 @@ fn read(path: &Path) -> Result<String, GenError> {
         source,
     })
 }
-
-// ── generation ────────────────────────────────────────────────────────────────
 
 /// The `contract-sha256` header value: sha256 over the three contract files'
 /// bytes, concatenated in [`CONTRACT_FILES`] order.
@@ -227,18 +205,11 @@ LEGACY_REVERSE_PORTS=({legacy_ports})   # 9947 deliberately absent
     ))
 }
 
-// ── zsh literal encoding ──────────────────────────────────────────────────────
-//
-// Every value below comes out of `contract/pipeline.toml`, and the generated
-// file is `source`d by lib.sh — so a value is *shell code* unless it is quoted.
-// A TOML string containing `$(…)`, a backtick, `$VAR`, whitespace or a glob
-// character would otherwise be executed, expanded, or word-split at source time
-// (and sabrage-core, which parses the TOML directly, would keep the literal —
-// a silent cross-front-end divergence that regeneration would happily bless).
-//
-// Encoding is *minimal*: a value that is already literal in the historical
-// quoting renders exactly as it did before this encoder existed, so the
-// committed `contract.gen.sh` is byte-identical and no golden moves.
+// A value here is shell code unless quoted, and sabrage-core reads the same TOML
+// literally — an unquoted `$(...)`/backtick/`$VAR`/space/glob silently diverges the
+// two front-ends (tests::hostile_contract_values_are_emitted_as_zsh_literals).
+// Encoding stays minimal so the committed contract.gen.sh is byte-identical
+// (tests::zsh_encoders_are_minimal_for_ordinary_contract_values).
 
 /// Wrap `s` in single quotes, which zsh treats as fully literal, closing and
 /// re-opening around each embedded `'` (`'\''`).
@@ -382,11 +353,9 @@ mod tests {
 
     /// Every contract scalar the zsh side consumes must be *emitted*, not
     /// hard-coded in lib.sh/setup.sh: mutate it in `pipeline.toml` and a body
-    /// line has to change. A field that only moves the header hash is a field
-    /// the shell never receives — `--regen` + `--check` + `meta.contract-sync`
-    /// would all report "in sync" while the two front-ends used different
-    /// values (that is exactly how `gbe_dll_asset`, `dxmt_tgz_asset` and
-    /// `bs_dir_leaf` were silently shell-hard-coded before Phase 1's review).
+    /// line has to change. A field that only moves the header hash never
+    /// reaches the shell, yet `--regen`, `--check` and `meta.contract-sync`
+    /// all report "in sync" while the two front-ends use different values.
     #[test]
     fn every_shell_consumed_contract_field_changes_a_body_line() {
         let base = generate();
@@ -464,8 +433,6 @@ mod tests {
             );
         }
     }
-
-    // ── zsh literal encoding ─────────────────────────────────────────────────
 
     #[test]
     fn zsh_encoders_are_minimal_for_ordinary_contract_values() {
