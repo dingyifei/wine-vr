@@ -1,84 +1,34 @@
 //! The privilege boundary — the pipeline's one privileged write.
 //!
-//! **Exactly one privileged write exists in the whole pipeline**: install layer
-//! 4, creating `/usr/local/share/openxr/1/` and writing
-//! `active_runtime.x86_64.json` as `root:wheel 0644`. Everything else in setup /
-//! build / install / run / stop is a plain user write, including install layers
-//! 1–2 inside `CrossOver.app` — those need macOS **App Management (TCC)**, which
-//! `sudo` cannot grant. Conflating the two is the classic mistake here; see
-//! [`classify_write_error`].
+//! Install layer 4 (`/usr/local/share/openxr/1/active_runtime.x86_64.json`,
+//! `root:wheel 0644`) is the only privileged write in the pipeline. Everything
+//! else, including install layers 1-2 inside `CrossOver.app`, is a plain user
+//! write; those need macOS App Management (TCC), which `sudo` cannot grant —
+//! conflating the two is the classic mistake here, see [`classify_write_error`].
 //!
-//! # The mechanism
+//! The content written is [`crate::util::host_manifest_file_bytes`] verbatim,
+//! and the write is skipped entirely when
+//! [`crate::util::host_manifest_is_current`] already holds, which is what keeps
+//! `./demo.sh install` and Sabrage from re-prompting after each other
+//! (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+//! "host-manifest bytes + skip-when-current").
+//! The JSON never rides on a command line: it is staged to a private temp file
+//! that the elevated `install -m 0644 -o root -g wheel` copies into place.
+//! The mechanism and the alternatives weighed against it: design-core
+//! § 5. Privilege boundary.
 //!
-//! `osascript -e 'do shell script "…" with administrator privileges'`, one
-//! prompt total (install.sh can prompt twice — once for `mkdir`, once for
-//! `tee`). Alternatives were considered and rejected in design-core §5: an
-//! `SMAppService` helper needs a stable Developer ID signature; an embedded
-//! `sudo` over a pty is terrible GUI UX and needs a tty the `.app` does not have.
-//! Rendering the exact `./demo.sh install` command for the user to paste stays
-//! the fallback when authorization is declined.
+//! The staging file is the soft spot of that scheme, so it lives under
+//! `~/Library/Application Support/Sabrage/tmp/` (mode `0700`) and never `/tmp`,
+//! is created `O_CREAT|O_EXCL` mode `0600` under a random name, and is removed
+//! on every exit path except a cancellation, which leaves it for
+//! `sweep_stale_staging` (`StagedTemp`).
 //!
-//! # The byte contract
-//!
-//! The content written is [`crate::util::host_manifest_file_bytes`] verbatim
-//! (`print -- "$WANT"`'s trailing newline included), and the write must be
-//! **skipped entirely** when
-//! [`crate::util::host_manifest_is_current`] already holds — that is what keeps
-//! `./demo.sh install` from re-prompting after Sabrage installed, and vice
-//! versa. The JSON never rides on the command line: write it to a temp file
-//! under Sabrage's own support directory and have the privileged command
-//! `install -m 0644 -o root -g wheel <tmp> <dest>`.
-//!
-//! [`write_host_manifest_privileged`] takes the **dylib path**, not pre-rendered
-//! content, and derives the bytes itself through [`host_manifest_bytes`]. That is
-//! deliberate: the comparison form ([`crate::util::render_host_manifest`], no
-//! trailing newline) and the file form differ by exactly one byte, and a
-//! signature that accepts either is a seam a caller can — and once did — get
-//! wrong, writing a host manifest that differs from `./demo.sh install`'s.
-//!
-//! # Hardening
-//!
-//! The staging file is the soft spot of any "write it as root from a temp file"
-//! scheme, so:
-//!
-//! * it lives under `~/Library/Application Support/Sabrage/tmp/` (mode `0700`),
-//!   **never** `/tmp` — a world-writable staging path for a root-installed file
-//!   is a swap race;
-//! * its name is randomized (`host-manifest-<uuid>.json`) and it is created
-//!   `O_CREAT|O_EXCL` with mode `0600`, so an attacker cannot pre-create it;
-//! * it is removed on every exit path ([`StagedTemp`]'s `Drop`) — with one
-//!   deliberate exception: a **cancellation** defuses that `Drop`
-//!   ([`StagedTemp::defuse`]) and leaves the file, because the elevated
-//!   descendant runs as root and cannot be reliably killed or even observed by
-//!   us; unlinking the source out from under a privileged `install` still in
-//!   flight would turn a cancelled run into a corrupt one. The next privileged
-//!   write sweeps anything older than [`STAGING_SWEEP_AGE`]
-//!   ([`sweep_stale_staging`]);
-//! * every argv element of the elevated command is single-quoted for `/bin/sh`
-//!   ([`shell_quote`]) and the whole command is then escaped for the AppleScript
-//!   string literal ([`applescript_escape`]) — two independent layers, both
-//!   round-trip tested, because a repo path containing a quote would otherwise
-//!   be arbitrary code execution *as root*;
-//! * after the elevated command returns, the destination is re-read and
-//!   byte-compared against the intended content. A mismatch is fatal: we would
-//!   rather fail the stage than tell the user the host registration is in place
-//!   when something else wrote it.
-//!
-//! # Which method fires where
-//!
-//! [`AdminMethod::detect`] picks `sudo` whenever a **controlling terminal** is
-//! reachable — stdin is a tty, or `/dev/tty` opens — and never consults stdout.
-//! `sudo` reads its password from `/dev/tty`, not from stdout, so
-//! `sabrage install | tee log` still prompts in the terminal exactly like
-//! `./demo.sh install | tee` does; keying off stdout would have popped a GUI
-//! dialog for a piped terminal run. The two `die` strings on that path
-//! (`sudo mkdir failed`, `sudo write failed`) are install.sh's, verbatim.
-//!
-//! A GUI-launched `.app` has no controlling terminal at all, so it takes the
-//! osascript path, which has no shell counterpart and therefore no verbatim text
-//! to match. (`cargo tauri dev` inherits the launching terminal, so the dev
-//! build of the GUI gets the `sudo` prompt in that terminal — correct, and the
-//! only way the two probes can disagree with "is this a GUI".)
+//! [`AdminMethod::detect`] picks `sudo` whenever a controlling terminal is
+//! reachable and never consults stdout, so `sabrage install | tee log` prompts
+//! in the terminal exactly like `./demo.sh install | tee`; a GUI-launched `.app`
+//! has no controlling terminal and takes the osascript path. The two `die`
+//! strings on the `sudo` path are install.sh's, verbatim.
+//! Reference: scripts/demo/install.sh.
 
 use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
@@ -93,8 +43,6 @@ use crate::error::{Result, SabrageError};
 use crate::events::{step, StageEvent, Stream};
 use crate::stages::StageCtx;
 
-// ── the commands we elevate ───────────────────────────────────────────────────
-
 /// Absolute paths only: a GUI-launched `.app` inherits a bare `PATH`, and a
 /// privileged command is the last place to let `PATH` decide what runs.
 const OSASCRIPT: &str = "/usr/bin/osascript";
@@ -106,21 +54,18 @@ const INSTALL: &str = "/usr/bin/install";
 pub const APP_MANAGEMENT_SETTINGS_URL: &str =
     "x-apple.systempreferences:com.apple.preference.security?Privacy_AppBundles";
 
-/// What [`StageEvent::NeedsAdmin`] says before the **osascript** prompt appears
-/// (design-core §5.4). The point is that the user can predict the dialog *and*
-/// knows it will not come back on every install.
+/// What [`StageEvent::NeedsAdmin`] says before the osascript dialog appears, so
+/// the user can predict the dialog and knows it will not return on every install
+/// (design-core § 5. Privilege boundary, implementation step 4).
 pub const NEEDS_ADMIN_REASON: &str =
     "this writes the host OpenXR registration — one password, only when the repo path changes";
 
 /// The same announcement for the [`AdminMethod::Sudo`] path, which prompts on
-/// the **controlling terminal**, not in a macOS dialog.
+/// the controlling terminal, not in a macOS dialog.
 ///
-/// A GUI started from a shell (`npm run tauri dev`, the documented dev
-/// workflow) inherits that terminal, so `detect()` picks `sudo` and the
-/// password prompt appears in a window that is very likely *behind* the one the
-/// user is looking at — the stage then looks hung. Saying where the prompt is
-/// is the whole point of announcing it, so the announcement names the mechanism
-/// [`AdminMethod::detect`] actually picked rather than one of the two.
+/// It says where the prompt is because a GUI started from a shell inherits that
+/// terminal and the password prompt can sit behind the window the user is
+/// looking at (tests::the_announcement_names_the_method_detect_actually_picked).
 pub const NEEDS_ADMIN_REASON_SUDO: &str = "sudo is waiting for your password in the terminal that launched Sabrage — this writes the host OpenXR registration, only when the repo path changes";
 
 /// The announcement for `method`: [`NEEDS_ADMIN_REASON`] for the dialog,
@@ -132,11 +77,9 @@ pub fn needs_admin_reason(method: AdminMethod) -> &'static str {
     }
 }
 
-/// The `--dry-run` stand-in for the prompt. A dry run must never emit
-/// [`StageEvent::NeedsAdmin`]: the GUI renders that as "macOS will ask for your
-/// password", which would be a lie about a run that touches nothing. Native-only
-/// row (demo.sh has no `--dry-run`), in the same "would …" voice as the
-/// executor's other planned-write rows.
+/// The `--dry-run` stand-in for the prompt: a dry run must never emit
+/// [`StageEvent::NeedsAdmin`], which the GUI renders as "macOS will ask for your
+/// password" (PARITY.md § CLI / GUI, "A dry run's layer 4 prints").
 pub const WOULD_PROMPT_DRY_RUN: &str = "would prompt for administrator authorization";
 
 /// osascript reports a dismissed authorization dialog as
@@ -150,11 +93,9 @@ const SUDO_DIE: [&str; 2] = ["sudo mkdir failed", "sudo write failed"];
 /// How long a cancellation waits for the elevated child to actually exit before
 /// giving up on it.
 ///
-/// Bounded on purpose: once `sudo` (or osascript's authorization) has exec'd,
-/// the child's real uid is 0 and an unprivileged parent's `kill(2)` comes back
-/// `EPERM`, so "wait for the child we just signalled" can be an unbounded wait
-/// on a process that will never notice. Waiting *some* bounded time still reaps
-/// the ordinary case (authorization not yet granted — the child is still ours).
+/// Bounded on purpose: past `sudo`'s exec the child's real uid is 0 and an
+/// unprivileged `kill(2)` comes back `EPERM`, so an unbounded wait would never
+/// finish (tests::a_cancelled_child_is_reaped_before_the_call_returns).
 const CANCEL_REAP_GRACE: Duration = Duration::from_millis(500);
 
 /// How old a leftover `host-manifest-*.json` must be before
@@ -169,8 +110,6 @@ const CANCELLED_MID_ELEVATION_WARN: &str =
     "cancelled while the elevated write may still be running — leaving the staging file in \
      place (removing it could corrupt a privileged write already in flight); the next install \
      sweeps it";
-
-// ── types ─────────────────────────────────────────────────────────────────────
 
 /// Outcome of the one privileged write.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -210,12 +149,10 @@ impl AdminMethod {
 
     /// The decision, as a pure function of the two probes.
     ///
-    /// Deliberately **not** a function of stdout: `sabrage install | tee log`
-    /// has a non-tty stdout and a perfectly good terminal to prompt on, and
-    /// `./demo.sh install | tee` prompts there too. Either probe alone is
-    /// sufficient — stdin redirected from a file (`sabrage install < /dev/null`)
-    /// still leaves `/dev/tty` open, and a process whose stdin is a tty always
-    /// has one.
+    /// Deliberately not a function of stdout: `sabrage install | tee log` has a
+    /// non-tty stdout and a perfectly good terminal to prompt on, and either probe
+    /// alone is sufficient
+    /// (tests::admin_method_is_decided_by_the_controlling_terminal_never_by_stdout).
     pub fn choose(stdin_is_tty: bool, controlling_tty: bool) -> AdminMethod {
         if stdin_is_tty || controlling_tty {
             AdminMethod::Sudo
@@ -229,8 +166,6 @@ impl AdminMethod {
 /// on. Opening `/dev/tty` is the portable test: it is the controlling terminal
 /// by definition, and the open fails with `ENXIO` when there is none (a
 /// GUI-launched `.app`, a daemon, a session-leaderless child).
-///
-/// The handle is dropped immediately; this only ever probes.
 fn controlling_tty_available() -> bool {
     std::fs::OpenOptions::new()
         .read(true)
@@ -252,19 +187,16 @@ pub enum WriteErrorKind {
     Other,
 }
 
-// ── quoting ───────────────────────────────────────────────────────────────────
-
 /// Escape a string for embedding inside an AppleScript string literal.
 ///
-/// `do shell script "…"` nests two levels of quoting: AppleScript's own literal
-/// (backslash and double quote are the specials) wrapping a `/bin/sh` command
-/// line. Paths here contain spaces routinely and could contain quotes; getting
-/// this wrong is a command-injection bug, not a cosmetic one.
+/// `do shell script "…"` nests two levels of quoting — AppleScript's own literal
+/// wrapping a `/bin/sh` command line — and getting either wrong is command
+/// injection as root, not a cosmetic bug
+/// (tests::nasty_paths_round_trip_through_both_quoting_layers).
 ///
 /// Newline, carriage return and tab are emitted as their AppleScript escapes
-/// (`\n`, `\r`, `\t`) rather than raw: a raw newline inside an AppleScript
-/// string literal is a *syntax error*, so a path containing one would otherwise
-/// turn a hard failure into an unpredictable one.
+/// because a raw newline inside an AppleScript literal is a syntax error
+/// (tests::applescript_escape_covers_every_special).
 pub fn applescript_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 8);
     for ch in s.chars() {
@@ -299,12 +231,10 @@ pub fn shell_quote(s: &str) -> String {
     out
 }
 
-/// The `/bin/sh` command the authorization dialog runs, both halves in one
-/// invocation so there is exactly one prompt:
-///
-/// ```text
-/// /bin/mkdir -p '<dir>' && /usr/bin/install -m 0644 -o root -g wheel '<tmp>' '<dest>'
-/// ```
+/// The `/bin/sh` command the authorization dialog runs: `mkdir -p` of the
+/// destination's directory and `install -m 0644 -o root -g wheel` of the staging
+/// file, joined with `&&` so there is exactly one prompt
+/// (tests::the_command_creates_the_directory_and_installs_root_wheel_0644).
 pub fn privileged_install_command(tmp: &Path, dest: &Path) -> String {
     let dir = dest.parent().unwrap_or_else(|| Path::new("/"));
     format!(
@@ -329,11 +259,11 @@ pub fn do_shell_script(command: &str) -> String {
 
 /// The exact argv of every child the elevation runs, in order.
 ///
-/// One vector for [`AdminMethod::Osascript`] (a single `osascript -e …`), two
-/// for [`AdminMethod::Sudo`] (`sudo mkdir -p …`, then `sudo install …`, mirroring
-/// install.sh's two sudo calls and its two `die` strings). Keeping this pure is
-/// what lets the argv be unit-tested and lets `--dry-run` print exactly what a
-/// real run would execute.
+/// One vector for [`AdminMethod::Osascript`], two for [`AdminMethod::Sudo`]
+/// (`sudo mkdir -p …`, then `sudo install …`), mirroring install.sh's two sudo
+/// calls and its two `die` strings
+/// (tests::elevation_argv_is_one_osascript_or_install_shs_two_sudo_calls).
+/// Reference: scripts/demo/install.sh.
 pub fn elevation_argv(method: AdminMethod, tmp: &Path, dest: &Path) -> Vec<Vec<OsString>> {
     let dir = dest.parent().unwrap_or_else(|| Path::new("/"));
     match method {
@@ -365,16 +295,13 @@ pub fn elevation_argv(method: AdminMethod, tmp: &Path, dest: &Path) -> Vec<Vec<O
     }
 }
 
-// ── the privileged write ──────────────────────────────────────────────────────
-
 /// The exact bytes install layer 4 stages and installs: the rendered manifest
 /// plus the single trailing newline `print -- "$WANT"` appends
 /// ([`crate::util::host_manifest_file_bytes`]).
 ///
-/// It exists as a named function so the byte source of the privileged write —
-/// the pipeline's most drift-sensitive artifact — is something tests and
-/// `sabrage-parity`'s golden can pin directly, instead of pinning the util
-/// helper and *hoping* the write path calls it.
+/// Named so tests and `sabrage-parity`'s golden pin the byte source of the
+/// privileged write directly, rather than the util helper the write path might
+/// not call.
 pub fn host_manifest_bytes(oxr_dylib: &Path) -> String {
     crate::util::host_manifest_file_bytes(oxr_dylib)
 }
@@ -382,31 +309,31 @@ pub fn host_manifest_bytes(oxr_dylib: &Path) -> String {
 /// Write the host OpenXR manifest for `oxr_dylib`, prompting for authorization
 /// only if needed.
 ///
-/// 1. returns [`PrivilegedWrite::Skipped`] without prompting when `dest` is
-///    already current ([`crate::util::host_manifest_is_current`] — install.sh's
-///    own currency test, so neither front-end re-prompts after the other ran);
-/// 2. emits [`StageEvent::NeedsAdmin`] *before* the prompt, so the UI can
-///    explain it (a `--dry-run` prompts for nothing and says so instead);
-/// 3. one prompt: `mkdir -p <dirname>` and `install -m 0644 -o root -g wheel`
-///    in a single `do shell script` (the `sudo` path keeps install.sh's two
-///    invocations and its two `die` strings);
-/// 4. a declined prompt is [`SabrageError::AdminDeclined`], not a generic
-///    failure — the UI offers the paste-this-in-Terminal fallback;
-/// 5. re-reads `dest` and byte-compares it to the intended bytes; a mismatch is
-///    fatal.
+/// Returns [`PrivilegedWrite::Skipped`] without prompting when `dest` is already
+/// current ([`crate::util::host_manifest_is_current`], install.sh's own currency
+/// test, so neither front-end re-prompts after the other ran),
+/// [`PrivilegedWrite::Planned`] under `--dry-run`, and
+/// [`PrivilegedWrite::Written`] only after `dest` has been re-read and
+/// byte-compared. Reference: scripts/demo/install.sh.
 ///
-/// The bytes are derived here, from [`host_manifest_bytes`] — the parameter is
-/// the **dylib path**, never pre-rendered content, so a caller cannot hand this
-/// the newline-less comparison form ([`crate::util::render_host_manifest`]) and
-/// silently write a file that differs from `./demo.sh install`'s by one byte.
+/// The parameter is the dylib path, never pre-rendered content: the comparison
+/// form ([`crate::util::render_host_manifest`]) and the file form differ by
+/// exactly one byte, and a signature accepting either lets a caller write a
+/// manifest that differs from `./demo.sh install`'s
+/// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+/// "the host manifest's bytes end in install.sh's trailing newline").
 ///
-/// The elevated child is the one mutation in the codebase that does **not** go
-/// through [`crate::executor::Executor`]: the osascript branch needs its stderr
-/// captured to tell "declined" from "failed", and the sudo branch needs the
-/// process's own tty for the password prompt — `spawn_streamed` gives neither
-/// (it pipes both streams and nulls stdin). A dry run therefore never reaches
-/// this code: it records the same staging write and the same argv through the
-/// executor and returns.
+/// The elevated child is the one mutation that does not go through
+/// [`crate::executor::Executor`]: the osascript branch needs its stderr captured
+/// to tell "declined" from "failed" and the sudo branch needs the process's own
+/// tty, neither of which `spawn_streamed` gives. A dry run never reaches it
+/// (tests::a_dry_run_plans_the_staging_write_and_the_elevated_argv).
+///
+/// # Errors
+///
+/// [`SabrageError::AdminDeclined`] for a declined prompt (the UI offers the
+/// paste-this-in-Terminal fallback), [`SabrageError::Cancelled`], and a fatal
+/// error when the destination does not match the intended bytes.
 pub async fn write_host_manifest_privileged(
     ctx: &StageCtx,
     oxr_dylib: &Path,
@@ -430,18 +357,14 @@ pub async fn write_host_manifest_privileged(
         return plan_privileged_write(ctx, method, &content, dest).await;
     }
 
-    // Nothing below this line is undoable from our side: `osascript`'s elevated
-    // `/bin/sh` is not even in our process tree, and past `sudo`'s exec we
-    // cannot signal it at all. So the token is checked *here*, before the
-    // announcement, before the staging file, and before any child — a run
-    // cancelled during layer 3 must not surface an authorization prompt.
+    // Nothing below this line is undoable from our side: past `osascript`'s or
+    // `sudo`'s exec we cannot signal the elevated child at all, so a run
+    // cancelled during layer 3 must not surface an authorization prompt
+    // (tests::a_cancelled_run_neither_announces_nor_stages_the_privileged_write).
     if ctx.cancel.is_cancelled() {
         return Err(SabrageError::Cancelled);
     }
 
-    // The announcement names the mechanism `detect()` actually picked: the
-    // dialog and the terminal prompt are in completely different places, and a
-    // GUI launched from a shell takes the terminal one.
     ctx.emit(StageEvent::NeedsAdmin {
         run_id: ctx.run_id,
         step: step::INSTALL_HOST_MANIFEST.into(),
@@ -460,11 +383,9 @@ pub async fn write_host_manifest_privileged(
         AdminMethod::Sudo => elevate_sudo(ctx, &argv).await,
     };
     if let Err(e) = elevated {
-        // A cancelled elevation is the one case where we do **not** know the
-        // privileged command is over: it runs as root, so our kill can come
-        // back EPERM, and osascript's elevated `/bin/sh` is not even in our
-        // process tree. Deleting the staging file here could hand a still-live
-        // `install` an ENOENT half-way through the pipeline's only root write.
+        // A cancelled elevation is the one case where the privileged command
+        // may still be reading this file, so it is kept rather than unlinked
+        // (tests::a_defused_staging_file_outlives_its_drop).
         if matches!(e, SabrageError::Cancelled) {
             staged.defuse();
             ctx.step(step::INSTALL_HOST_MANIFEST)
@@ -479,10 +400,9 @@ pub async fn write_host_manifest_privileged(
 /// The `--dry-run` half of [`write_host_manifest_privileged`]: record the
 /// staging write and the elevated argv through the executor, mutate nothing.
 ///
-/// Reported as [`PrivilegedWrite::Planned`], never `Written`: the caller turns
-/// the outcome into a row in the run log, and a preview that prints the same
-/// `ok "host registration written"` a real install prints is indistinguishable
-/// from completed work in the event log.
+/// Reported as [`PrivilegedWrite::Planned`], never `Written`: a preview that
+/// prints the row a real install prints is indistinguishable from completed work
+/// in the event log.
 async fn plan_privileged_write(
     ctx: &StageCtx,
     method: AdminMethod,
@@ -507,9 +427,10 @@ async fn plan_privileged_write(
 ///
 /// Exit status alone cannot tell a declined dialog from a failed command — both
 /// are non-zero — so the `(-128)` marker in stderr is what separates
-/// [`SabrageError::AdminDeclined`] from a real failure. Everything else on
+/// [`SabrageError::AdminDeclined`] from a real failure; everything else on
 /// stderr is surfaced as [`StageEvent::Output`] rather than swallowed
-/// (design-core §6.5).
+/// (tests::declined_and_failed_authorization_are_told_apart_by_stderr;
+/// design-core § 6, "No swallowed diagnostics").
 async fn elevate_osascript(ctx: &StageCtx, argv: &[OsString]) -> Result<()> {
     let out = run_capturing(argv, &ctx.cancel).await?;
     if out.status.success() {
@@ -543,15 +464,12 @@ async fn elevate_osascript(ctx: &StageCtx, argv: &[OsString]) -> Result<()> {
     ))
 }
 
-/// install.sh's sudo path, structurally unchanged:
+/// install.sh's sudo path, structurally unchanged, with
+/// `install -m 0644 -o root -g wheel` in place of `sudo tee` — same bytes, mode
+/// and ownership, without the JSON ever crossing a pipe or a command line
+/// (PARITY.md § Install (the one privileged write), "The elevated write is").
+/// Reference: scripts/demo/install.sh.
 ///
-/// ```zsh
-/// sudo mkdir -p "$(dirname "$HOST_XR_JSON")" || die "sudo mkdir failed"
-/// print -- "$WANT" | sudo tee "$HOST_XR_JSON" >/dev/null || die "sudo write failed"
-/// ```
-///
-/// `install -m 0644 -o root -g wheel` replaces `tee` — same resulting bytes,
-/// mode and ownership, without the JSON ever crossing a pipe or a command line.
 /// Both children inherit this process's stdio so `sudo`'s own password prompt
 /// works, which is why they cannot go through `spawn_streamed`.
 async fn elevate_sudo(ctx: &StageCtx, argv: &[Vec<OsString>]) -> Result<()> {
@@ -594,21 +512,18 @@ fn is_user_cancelled(stderr: &str) -> bool {
 
 /// Refuse a dylib path the host manifest cannot represent.
 ///
-/// install.sh's two `${//}` substitutions escape `\` and `"` and **nothing
-/// else**, so a checkout under a path with a tab or a newline in it renders a
-/// manifest that is not JSON — and this is the one write that installs its
-/// output as `root:wheel` over the file the OpenXR loader reads. Failing
-/// closed beats breaking runtime discovery for every app on the machine.
+/// install.sh's two `${//}` substitutions (mirrored exactly by
+/// [`crate::util::json_escape_string`]) escape `\` and `"` and nothing else, so
+/// a path holding a control character renders a manifest that is not JSON —
+/// installed `root:wheel` over the file the OpenXR loader reads
+/// (tests::a_control_character_in_the_path_is_refused_before_any_prompt).
 ///
-/// This runs *before* [`crate::util::render_host_manifest`].
-/// [`crate::util::json_escape_string`] is deliberately exactly install.sh's two
-/// substitutions (`\` and `"`), so a control character would reach the
-/// manifest raw on both sides — as invalid JSON. Refusing here is what keeps
-/// the native side from writing that file at all.
+/// Native-only divergence: install.sh writes the invalid bytes; every path
+/// without a control character passes through unchanged.
 ///
-/// Native-only, and a deliberate divergence: install.sh writes the invalid
-/// bytes. It cannot change any existing artifact — every path without a
-/// control character is accepted unchanged.
+/// # Errors
+///
+/// Fatal when the path contains a control character.
 pub fn reject_unrepresentable_manifest_path(ctx: &StageCtx, dylib: &Path) -> Result<()> {
     // The JSON minimum, exactly: U+0000..U+001F are the only characters a JSON
     // string literal may not carry raw. DEL and the C1 block are legal there,
@@ -626,8 +541,6 @@ pub fn reject_unrepresentable_manifest_path(ctx: &StageCtx, dylib: &Path) -> Res
         ),
     ))
 }
-
-// ── children ──────────────────────────────────────────────────────────────────
 
 /// Spawn `argv` with both output streams captured and stdin closed.
 async fn run_capturing(
@@ -655,12 +568,10 @@ async fn run_capturing(
             out.map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))
         }
         _ = cancel.cancelled() => {
-            // Give the child a bounded moment to finish before the future (and
-            // with it the child, `kill_on_drop`) is dropped: returning the
-            // instant Stop is pressed would let the caller tear the staging
-            // file down under a privileged `install` that is already running.
-            // Bounded because the elevated half is root-owned and may outlive
-            // us regardless — see CANCEL_REAP_GRACE.
+            // Bounded moment for the child to finish: returning the instant
+            // Stop is pressed would tear the staging file down under a live
+            // privileged `install` (CANCEL_REAP_GRACE; run_inheriting's twin
+            // arm is pinned by tests::a_cancelled_child_is_reaped_before_the_call_returns).
             let _ = tokio::time::timeout(CANCEL_REAP_GRACE, &mut wait).await;
             Err(SabrageError::Cancelled)
         }
@@ -687,20 +598,16 @@ async fn run_inheriting(argv: &[OsString], cancel: &CancellationToken) -> Result
             status.map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))
         }
         _ = cancel.cancelled() => {
-            // Signal, then *reap* — bounded. Without the wait this returned
-            // while the child (and, past the password prompt, its root-owned
-            // `mkdir`/`install`) was still running, and the caller's staging
-            // file was unlinked underneath it. The kill itself is best-effort
-            // for the same reason: after `sudo` execs, its real uid is 0 and
-            // this process cannot signal it at all.
+                // Signal, then reap — bounded, and the kill is best effort:
+                // after `sudo` execs, its real uid is 0 and this process cannot
+                // signal it at all
+                // (tests::a_cancelled_child_is_reaped_before_the_call_returns).
             let _ = child.start_kill();
             let _ = tokio::time::timeout(CANCEL_REAP_GRACE, child.wait()).await;
             Err(SabrageError::Cancelled)
         }
     }
 }
-
-// ── staging ───────────────────────────────────────────────────────────────────
 
 /// A `0600` file that deletes itself when dropped — unless it has been
 /// [`defuse`](StagedTemp::defuse)d.
@@ -716,9 +623,11 @@ impl StagedTemp {
     /// Create `dir` (mode `0700`) and a fresh randomly-named `0600` file in it
     /// holding `content`.
     ///
-    /// `create_new` is the load-bearing flag: it fails rather than reusing a
-    /// path something else pre-created, and combined with the random name it
-    /// means the bytes root installs can only have come from us.
+    /// `create_new` is the load-bearing flag: it fails rather than opening a
+    /// path something else pre-created, so with the random name the bytes root
+    /// installs can only have come from us
+    /// (tests::staging_creates_the_directory_0700_and_never_reuses_a_name,
+    /// tests::staged_temp_is_0600_and_deletes_itself).
     fn create(dir: &Path, content: &str) -> Result<StagedTemp> {
         std::fs::create_dir_all(dir).map_err(|e| SabrageError::io(dir, e))?;
         // Best effort: an existing directory keeps whatever mode it has, and a
@@ -756,13 +665,12 @@ impl Drop for StagedTemp {
     }
 }
 
-/// Remove staging files a previous run left behind (see
-/// [`StagedTemp::defuse`]), oldest-first safe: only files older than
-/// [`STAGING_SWEEP_AGE`] go, so a *concurrent* sabrage's live staging file is
-/// never taken out from under its own elevated write.
+/// Remove staging files a previous run left behind (see [`StagedTemp::defuse`]).
 ///
-/// Best effort throughout — a staging file we cannot remove is a stale `0600`
-/// file in our own `0700` directory, not a reason to fail an install.
+/// Only files older than `STAGING_SWEEP_AGE` go, so a concurrent sabrage's
+/// live staging file is never taken out from under its own elevated write.
+/// Best effort throughout: a file we cannot remove is a stale `0600` file in our
+/// own `0700` directory, not a reason to fail an install.
 fn sweep_stale_staging(dir: &Path) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -796,18 +704,17 @@ fn temp_file_name() -> String {
     format!("host-manifest-{}.json", uuid::Uuid::new_v4().as_simple())
 }
 
-// ── failure classification ────────────────────────────────────────────────────
-
 /// Classify an `io::Error` from a write to `path`.
 ///
-/// The `.app` test is on the path, not the error: a `PermissionDenied` under
-/// `…/CrossOver.app/…` is App Management, and telling the user to try `sudo`
-/// there would send them down a road with no end.
+/// The `.app` test is on the path, not the error: telling the user to try `sudo`
+/// under `…/CrossOver.app/…` sends them down a road with no end
+/// (tests::write_errors_classify_by_errno_and_path).
 ///
-/// [`WriteErrorKind::TccAppManagementLikely`] is a **hypothesis**, never a
-/// diagnosis — macOS reports a TCC refusal as a plain `EPERM`, indistinguishable
-/// from a genuine mode problem — which is why every string built from it says
-/// "likely" and offers the Terminal fallback alongside the grant flow.
+/// [`WriteErrorKind::TccAppManagementLikely`] is a hypothesis, never a diagnosis
+/// — macOS reports a TCC refusal as a plain `EPERM`, indistinguishable from a
+/// genuine mode problem — so every string built from it says "likely" and offers
+/// the Terminal fallback
+/// (tests::the_app_management_strings_stay_a_hypothesis_with_a_way_out).
 pub fn classify_write_error(err: &std::io::Error, path: &Path) -> WriteErrorKind {
     match err.kind() {
         std::io::ErrorKind::PermissionDenied if is_inside_app_bundle(path) => {
@@ -818,12 +725,11 @@ pub fn classify_write_error(err: &std::io::Error, path: &Path) -> WriteErrorKind
     }
 }
 
-/// Turn a plain [`SabrageError::Io`] from install layers 1–2 into the App
+/// Turn a plain [`SabrageError::Io`] from install layers 1-2 into the App
 /// Management error when the path and errno say that is the likely cause,
-/// emitting the explanation as a [`StageEvent::Fatal`] on the way out.
-///
-/// Everything else passes through untouched. Use it at the call site of a write
-/// inside `CrossOver.app`:
+/// emitting the explanation as a [`StageEvent::Fatal`] on the way out; anything
+/// else passes through untouched. Use it at the call site of a write inside
+/// `CrossOver.app`:
 ///
 /// ```ignore
 /// exec.copy_if_changed(src, dst)
@@ -832,10 +738,10 @@ pub fn classify_write_error(err: &std::io::Error, path: &Path) -> WriteErrorKind
 /// ```
 ///
 /// The returned error keeps its own `Display` (`kind() == "tcc_denied"`, which
-/// is what the GUI's permission panel branches on); the prose the *user* reads
-/// travels in the emitted event, exactly like [`StageCtx::fatal`]. A caller that
-/// gets `TccDenied` back must therefore propagate it rather than emitting a
-/// second `Fatal`.
+/// the GUI's permission panel branches on) and the prose the user reads travels
+/// in the emitted event, so a caller that gets `TccDenied` back must propagate
+/// it rather than emit a second `Fatal`
+/// (tests::only_a_tcc_shaped_io_error_is_upgraded).
 pub fn upgrade_write_error(ctx: &StageCtx, err: SabrageError) -> SabrageError {
     let SabrageError::Io { path, source } = &err else {
         return err;
@@ -853,17 +759,15 @@ pub fn upgrade_write_error(ctx: &StageCtx, err: SabrageError) -> SabrageError {
     SabrageError::TccDenied { path }
 }
 
-/// [`upgrade_write_error`] for a failure that arrives as a **child's** exit
-/// status rather than an `io::Error` — install layer 1's `cp -R` of the stock
-/// DXMT tree, the first write the pipeline makes into `CrossOver.app` and so
-/// the most likely place to meet App Management.
+/// [`upgrade_write_error`] for a failure that arrives as a child's exit status
+/// rather than an `io::Error` — install layer 1's `cp -R` of the stock DXMT
+/// tree, the first write the pipeline makes into `CrossOver.app`.
 ///
 /// There is no errno to classify, only the child's output tail, so the test is
-/// "destination inside a `.app` **and** the tail says permission denied". Same
-/// contract as [`upgrade_write_error`] in every other respect: the prose is
-/// emitted here, once, as a [`StageEvent::Fatal`], and the caller propagates
-/// the returned [`SabrageError::TccDenied`] instead of re-emitting. Anything
-/// else passes through untouched — a `ChildFailed` already explains itself.
+/// "destination inside a `.app` and the tail says permission denied". Same
+/// contract as [`upgrade_write_error`] otherwise: the prose is emitted here,
+/// once, and the caller propagates the returned [`SabrageError::TccDenied`]
+/// (tests::a_refused_cp_into_a_bundle_is_upgraded_like_a_refused_write).
 pub fn upgrade_child_write_error(ctx: &StageCtx, err: SabrageError, dest: &Path) -> SabrageError {
     let SabrageError::ChildFailed { tail, .. } = &err else {
         return err;
@@ -904,9 +808,10 @@ pub fn app_management_message(path: &Path) -> String {
 /// The grant flow (deep link + the relaunch requirement) and the Terminal
 /// fallback, on one `remedy:` line.
 ///
-/// The relaunch note is not optional trivia: macOS only re-evaluates a TCC grant
-/// for a process started after it was given, so "granted, still broken" is the
-/// default experience without it.
+/// The relaunch note is load-bearing: macOS only applies a TCC grant to a
+/// process started after it was given, so without it the user's experience is
+/// "granted, still broken"
+/// (tests::the_app_management_strings_stay_a_hypothesis_with_a_way_out).
 pub fn app_management_remedy(bottle: Option<&str>) -> String {
     format!(
         "grant App Management to Sabrage in System Settings ({APP_MANAGEMENT_SETTINGS_URL}), relaunch Sabrage, then retry — or run {} in Terminal",
@@ -943,9 +848,8 @@ pub fn is_inside_app_bundle(path: &Path) -> bool {
 /// where the temp file for the privileged write is staged (never `/tmp`: a
 /// world-writable staging path for a root-installed file is a swap race).
 ///
-/// One implementation, in [`crate::paths::sabrage_support_dir`]: Phase 3's
-/// session-state file lands in the same directory, and two spellings of one
-/// path is how the two front-ends of one store drift apart.
+/// One implementation, in [`crate::paths::sabrage_support_dir`]: two spellings
+/// of one path is how the two front-ends of one store drift apart.
 pub fn sabrage_support_dir() -> PathBuf {
     crate::paths::sabrage_support_dir()
 }
@@ -958,10 +862,9 @@ mod tests {
     use crate::stages::{EventSink, StageOptions};
     use std::sync::{Arc, Mutex as StdMutex};
 
-    // NOTE: nothing in this module may execute `osascript` or `sudo`. Every
-    // test either exercises a pure function, stages a file in a fixture
-    // directory, or drives the dry-run path — which records argv through the
-    // executor and spawns nothing.
+    // No test here may execute `osascript` or `sudo`: every test exercises a
+    // pure function, stages a file in a fixture directory, or drives the
+    // dry-run path, which records argv through the executor and spawns nothing.
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -985,8 +888,6 @@ mod tests {
         );
         (ctx, seen)
     }
-
-    // ── test-only inverses, so the round-trip is proven and not asserted ──────
 
     /// Reverse [`applescript_escape`]: the AppleScript string-literal rules.
     fn applescript_unescape(s: &str) -> String {
@@ -1059,8 +960,6 @@ mod tests {
             .expect("do shell script wrapper");
         applescript_unescape(inner)
     }
-
-    // ── quoting ──────────────────────────────────────────────────────────────
 
     #[test]
     fn applescript_escape_covers_every_special() {
@@ -1193,8 +1092,6 @@ mod tests {
         );
     }
 
-    // ── staging ──────────────────────────────────────────────────────────────
-
     #[test]
     fn staged_temp_is_0600_and_deletes_itself() {
         let dir = scratch("staging");
@@ -1239,8 +1136,6 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(dir.parent().unwrap().parent().unwrap());
     }
-
-    // ── the write itself ─────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_current_destination_is_skipped_without_prompting() {
@@ -1297,7 +1192,6 @@ mod tests {
             PrivilegedWrite::Planned
         );
 
-        // Nothing happened on disk.
         assert!(!dest.exists());
         // A dry run prompts for nothing, so NeedsAdmin — which the GUI renders
         // as "macOS will ask for your password" — must not be emitted; the
@@ -1351,14 +1245,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── cancellation: reap the child, keep the staging file ──────────────────
-
     /// The cancel arm must not return while the child it just signalled is
     /// still running: the caller's next act is to drop the staging file, and a
     /// privileged `install` reading it would get an ENOENT half-way through the
-    /// pipeline's only root write. `sleep` + `touch` is the observable form —
-    /// if the wait were missing, the marker could appear after the call
-    /// returned.
+    /// pipeline's only root write.
     #[tokio::test]
     async fn a_cancelled_child_is_reaped_before_the_call_returns() {
         let dir = scratch("cancel-reap");
@@ -1371,9 +1261,9 @@ mod tests {
                 shell_quote(&marker.to_string_lossy())
             )),
         ];
-        // Cancelled *after* the child is up: an already-cancelled token never
-        // reaches the spawn at all (see the test below), so pre-cancelling here
-        // would prove nothing about the reap.
+        // Cancelled *after* the child is up: an already-cancelled token never reaches
+        // the spawn (see tests::an_already_cancelled_token_never_spawns_the_elevated_child),
+        // so pre-cancelling here would prove nothing about the reap.
         let cancel = CancellationToken::new();
         let stopper = cancel.clone();
         tokio::spawn(async move {
@@ -1466,8 +1356,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// How many `host-manifest-*.json` are staged right now. Read-only: the
-    /// point of the assertion above is that this number does not move.
+    /// How many `host-manifest-*.json` are staged right now. Read-only.
     fn staging_file_count() -> usize {
         std::fs::read_dir(sabrage_temp_dir())
             .map(|entries| {
@@ -1483,13 +1372,11 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// install.sh's escaping is two substitutions and nothing else, so a path
-    /// carrying a raw control character renders a manifest that is not JSON —
-    /// and this is the one write that lands as `root:wheel` over the file the
-    /// OpenXR loader reads. It fails closed, before the currency test and
-    /// before any prompt; `json_escape_string` itself stays exactly the shell's
-    /// two substitutions, so every accepted path renders byte-identically on
-    /// both front-ends.
+    /// install.sh's escaping is two substitutions, so a path with a raw control
+    /// character renders non-JSON over the root:wheel file the OpenXR loader
+    /// reads. The guard fails closed, before the currency test and before any
+    /// prompt; `json_escape_string` stays those same two substitutions, so every
+    /// accepted path renders byte-identically on both front-ends.
     #[tokio::test]
     async fn a_control_character_in_the_path_is_refused_before_any_prompt() {
         let dir = scratch("control-char");
@@ -1508,8 +1395,7 @@ mod tests {
             assert!(matches!(err, SabrageError::Fatal { .. }), "{err:?}");
             assert!(err.to_string().contains("control character"), "{err}");
         }
-        // …and an ordinary path is untouched by the guard: every artifact on
-        // every existing machine renders exactly as before.
+        // …and an ordinary path is untouched by the guard.
         assert!(reject_unrepresentable_manifest_path(
             &ctx,
             Path::new("/Users/me/wine vr/it's/liboxrsys-runtime.dylib")
@@ -1563,8 +1449,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── the announced mechanism ──────────────────────────────────────────────
-
     #[test]
     fn the_announcement_names_the_method_detect_actually_picked() {
         assert_eq!(
@@ -1595,8 +1479,6 @@ mod tests {
             );
         }
     }
-
-    // ── cp -R refusals (install layer 1) ─────────────────────────────────────
 
     #[test]
     fn a_refused_cp_into_a_bundle_is_upgraded_like_a_refused_write() {
@@ -1675,8 +1557,6 @@ mod tests {
         ));
         assert!(!is_user_cancelled(""));
     }
-
-    // ── classification ───────────────────────────────────────────────────────
 
     #[test]
     fn write_errors_classify_by_errno_and_path() {
@@ -1794,8 +1674,6 @@ mod tests {
             "./demo.sh install --bottle BeatSaber (sudo writes it)"
         );
     }
-
-    // ── frame-era invariants ─────────────────────────────────────────────────
 
     #[test]
     fn app_bundle_detection_is_component_wise() {
