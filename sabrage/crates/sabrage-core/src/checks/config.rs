@@ -1,50 +1,20 @@
-//! Group `config` — doctor.sh section 13, 13b: the oxrsys runtime config and ALVR session state.
+//! Group `config` — the oxrsys runtime config and ALVR session state.
 //!
-//! Slugs owned here, in contract order:
+//! Binds `cfg.protocol.supported`, `cfg.protocol.legacy-oxrsys` and
+//! `cfg.session-pins`, in contract order, to read-only
+//! `fn(&CheckCtx) -> CheckOutcome` probes whose message and remedy strings
+//! match the shell verbatim except where noted below.
+//! Reference: scripts/demo/doctor.sh sections 13 and 13b.
 //!
-//! * `cfg.protocol.supported` — `oxrsys-runtime.toml` exists and its
-//!   `protocol` is a value the demo supports
-//! * `cfg.protocol.legacy-oxrsys` — `protocol = "oxrsys"` (the legacy
-//!   USB/adb-reverse path) — doctor FAILs, run WARNs, and the native run
-//!   preflight BLOCKS (recorded divergence)
-//! * `cfg.session-pins` — `<oxr_appsup>/alvr/session.json` has no
-//!   `manual_ips` entries; pins are fine while the Quest keeps that IP but
-//!   break streaming after a DHCP change. Volatile
+//! Multi-pin WARN entries keep session.json file order because this crate
+//! enables `serde_json/preserve_order`; see PARITY.md § Doctor / checks,
+//! "`host.manifest` / `cfg.session-pins` parse JSON natively (serde)".
 //!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim,
-//! with one recorded exception (below).
-//!
-//! ## `cfg.session-pins` unreadable/malformed divergence (A3b-3)
-//!
-//! doctor.sh's python inspector does `try: json.load(...) except Exception:
-//! sys.exit(0)`, so a read failure or malformed JSON exits 0 and doctor
-//! reports the same "no stale pins" Pass as a genuinely clean file. This
-//! module does not mirror that: [`inspect_session_pins`] distinguishes
-//! `Unreadable`/`Malformed` from `Clean` and [`cfg_session_pins`] Warns on
-//! the former, because collapsing "could not tell" into "clean" hides the
-//! exact degraded state this check exists to surface. `Corrupt` (a shape
-//! failure *after* a successful parse) genuinely mirrors doctor.sh — that
-//! shape check runs *outside* the shell probe's try/except, so real
-//! doctor.sh hits an uncaught Python exception there too, and "broken
-//! python3?" is an accurate diagnosis on that arm. `Unreadable`/`Malformed`
-//! are different: they are native-only Warns with no shell counterpart at
-//! all (round 2 / A3b-3: their message no longer borrows the "broken
-//! python3?" wording, since this evaluator's own std::fs/serde_json code hit
-//! the failure and there is no python3 to blame). Needs either a matching
-//! `scripts/demo/doctor.sh` change or a `sabrage/PARITY.md` row declaring
-//! the divergence (cross-area — this module cannot make either edit).
-//!
-//! ## `cfg.session-pins` ordering caveat
-//!
-//! doctor.sh's python inspector iterates `client_connections` in JSON
-//! insertion order (CPython dict order). `serde_json::Value` here is backed
-//! by a plain `BTreeMap` (this crate does not enable the `preserve_order`
-//! feature — that is a dependency change and out of this module's remit), so
-//! when *more than one* client has a stale IP pin simultaneously, the pinned
-//! entries in the WARN message are sorted by client name instead of insertion
-//! order. Single-pin sessions — overwhelmingly the common case — are
-//! unaffected.
+//! TODO(A3b-3): an unreadable or malformed `session.json` Warns here where
+//! doctor.sh's `try/except: sys.exit(0)` reports the clean Pass; the
+//! divergence still owes a `scripts/demo/doctor.sh` change or a
+//! `sabrage/PARITY.md` row. Pinned by tests::malformed_json_warns and
+//! tests::unreadable_session_json_warns.
 
 use std::path::Path;
 
@@ -52,11 +22,9 @@ use super::Evaluator;
 #[allow(unused_imports)]
 use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
 
-// ── section 13: protocol ─────────────────────────────────────────────────────
-
 /// One `protocol = "…"` line as doctor.sh's parser would resolve it.
 enum ProtocolState {
-    /// `[ -f "$TOML" ]` was false.
+    /// No regular file at the configured `oxrsys-runtime.toml` path.
     Missing,
     Alvr,
     Oxrsys,
@@ -64,21 +32,13 @@ enum ProtocolState {
     Other(String),
 }
 
-/// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{v=$2} END{print v}' "$TOML"`.
+/// The `protocol` value doctor.sh's last-match `awk` recipe would resolve,
+/// or the empty string when no line assigns a quoted one.
 ///
-/// * The regex requires the line to start (after leading whitespace) with the
-///   literal `protocol`, then optional whitespace, then `=` — a key like
-///   `protocol_foo` or a `#`-commented line does not match. It does not care
-///   which (or whether a) `[table]` the line sits under: this is table-blind,
-///   matching `ext/oxrsys/runtime/src/Config.cpp`'s own line-oriented reader.
-/// * `-F'"'` splits on double quotes; `$2` is the text between the first and
-///   second quote on a matching line, or empty if that line has no quote at
-///   all (an unquoted assignment).
-/// * Every matching line overwrites `v`, so the **last** matching line in the
-///   file wins — not `exit`-after-first-match. This mirrors both the runtime
-///   (a later assignment overwrites an earlier one, regardless of table) and
-///   doctor.sh's own `awk` recipe (`scripts/demo/doctor.sh`,
-///   `scripts/demo/run.sh`), which use this exact `{v=$2} END{print v}` form.
+/// Table-blind and last-assignment-wins, matching the runtime's line-oriented
+/// reader and the `awk` form doctor.sh and run.sh share; `#`-commented lines
+/// and keys like `protocol_foo` never match; an unquoted assignment resolves
+/// to the empty string. Pinned by tests::parse_protocol_matches_the_awk_recipe.
 fn parse_protocol(toml_text: &str) -> String {
     let mut value = String::new();
     for line in toml_text.lines() {
@@ -96,10 +56,11 @@ fn parse_protocol(toml_text: &str) -> String {
     value
 }
 
-/// `[ -f "$TOML" ]`, then [`parse_protocol`] on its contents. A read error
-/// after the existence check (e.g. a permission race) degrades to an empty
-/// `PROTO`, exactly like the shell's unredirected `awk` failing silently into
-/// an empty capture.
+/// The [`ProtocolState`] of the configured `oxrsys-runtime.toml`.
+///
+/// A read error after the existence check (a permission race, say)
+/// degrades to an empty `protocol`, like the shell's unredirected `awk`
+/// failing silently into an empty capture.
 fn read_protocol_state(ctx: &CheckCtx) -> ProtocolState {
     let toml_path = &ctx.paths.toml_path;
     if !toml_path.is_file() {
@@ -125,15 +86,10 @@ fn protocol_mismatch_remedy(toml_path: &Path) -> String {
     format!("set protocol = \"alvr\" in {}", toml_path.display())
 }
 
-/// doctor.sh section 13, the `cfg.protocol.supported` half:
-/// ```sh
-/// if [ -f "$TOML" ]; then
-///   PROTO="$(awk … "$TOML")"
-///   if [ "$PROTO" = "alvr" ]; then chk ok cfg.protocol.supported …
-///   elif [ "$PROTO" = "oxrsys" ]; then tap cfg.protocol.supported ok
-///   else chk fail cfg.protocol.supported … ; fi
-/// else chk fail cfg.protocol.supported "$TOML missing" "./demo.sh setup"; fi
-/// ```
+/// `cfg.protocol.supported`: Pass for `protocol = "alvr"`, silent Pass for
+/// `oxrsys` (the shell prints that row from `cfg.protocol.legacy-oxrsys`
+/// instead), Fail when the toml is missing or names any other value.
+/// Reference: scripts/demo/doctor.sh section 13.
 fn cfg_protocol_supported(ctx: &CheckCtx) -> CheckOutcome {
     match read_protocol_state(ctx) {
         ProtocolState::Missing => CheckOutcome::fail(
@@ -145,9 +101,7 @@ fn cfg_protocol_supported(ctx: &CheckCtx) -> CheckOutcome {
             "cfg.protocol.supported",
             "oxrsys-runtime.toml: protocol=alvr",
         ),
-        // Silent `tap … ok` in the shell (the row is printed by
-        // cfg.protocol.legacy-oxrsys instead) — still Pass, but the CLI
-        // console suppresses it.
+        // The shell prints this row from cfg.protocol.legacy-oxrsys instead (PARITY.md § Doctor / checks).
         ProtocolState::Oxrsys => CheckOutcome::silent_pass(
             "cfg.protocol.supported",
             "oxrsys-runtime.toml: protocol=oxrsys (supported; see cfg.protocol.legacy-oxrsys)",
@@ -160,20 +114,16 @@ fn cfg_protocol_supported(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-/// doctor.sh section 13, the `cfg.protocol.legacy-oxrsys` half:
-/// ```sh
-/// if [ "$PROTO" = "alvr" ]; then tap cfg.protocol.legacy-oxrsys ok
-/// elif [ "$PROTO" = "oxrsys" ]; then chk fail cfg.protocol.legacy-oxrsys …
-/// else tap cfg.protocol.legacy-oxrsys skipped; fi
-/// # ($TOML missing) -> tap cfg.protocol.legacy-oxrsys skipped
-/// ```
+/// `cfg.protocol.legacy-oxrsys`: Fail on `protocol = "oxrsys"` (the legacy
+/// USB/adb-reverse path), silent Pass on `alvr`, Skipped when the toml is
+/// missing or names any other value.
+/// Reference: scripts/demo/doctor.sh section 13.
 fn cfg_protocol_legacy_oxrsys(ctx: &CheckCtx) -> CheckOutcome {
     match read_protocol_state(ctx) {
         ProtocolState::Missing => CheckOutcome::skipped(
             "cfg.protocol.legacy-oxrsys",
             SkipReason::new(format!("{} missing", ctx.paths.toml_path.display())),
         ),
-        // Silent `tap … ok` in the shell — the CLI console suppresses it.
         ProtocolState::Alvr => CheckOutcome::silent_pass(
             "cfg.protocol.legacy-oxrsys",
             "oxrsys-runtime.toml: protocol=alvr (not the legacy oxrsys path)",
@@ -190,36 +140,29 @@ fn cfg_protocol_legacy_oxrsys(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-// ── section 13b: stale client IP pins ────────────────────────────────────────
-
 /// What [`inspect_session_pins`] found.
 enum SessionPinState {
     /// `fs::read_to_string` failed (missing between the `is_file()` gate and
-    /// the read, permissions, …). doctor.sh's inspector script's
-    /// `try/except: sys.exit(0)` swallows the equivalent Python failure
-    /// (`open()` raising) and reports the *clean* state, not an error —
-    /// intentionally NOT mirrored here (A3b-3): collapsing a read failure
-    /// into "no stale pins" hides exactly the degraded state this check
-    /// exists to expose. See the module doc for the resulting divergence.
+    /// the read, permissions, …). Warned rather than collapsed into `Clean`
+    /// the way doctor.sh's `try/except: sys.exit(0)` would (A3b-3): "could
+    /// not tell" is the degraded state this check exists to surface.
     Unreadable(std::io::Error),
-    /// `serde_json::from_str` failed (malformed JSON). Same doctor.sh
-    /// swallow-and-report-clean behavior as `Unreadable`, and the same
-    /// intentional divergence here.
+    /// `serde_json::from_str` failed (malformed JSON). Warned for the same
+    /// reason, and with the same deliberate doctor.sh divergence, as
+    /// `Unreadable` (A3b-3).
     Malformed(serde_json::Error),
-    /// The JSON parsed, but its shape breaks an assumption the *un-tried*
-    /// walk over `client_connections` makes (top level not an object,
-    /// `client_connections` present as a non-empty non-object, an entry
-    /// under it not an object, or `manual_ips` present as a non-empty
-    /// non-array/non-string-element value). In real Python this walk is
-    /// outside the `try/except`, so it is an uncaught exception -> non-zero
-    /// exit -> doctor's "broken python3?" WARN branch.
+    /// The JSON parsed, but its shape breaks the walk over
+    /// `client_connections` (the top level, `client_connections` itself, an
+    /// entry under it, or a non-empty `manual_ips` with the wrong type).
+    /// doctor.sh's Python raises outside its `try/except` here too, so its
+    /// "broken python3?" WARN is mirrored.
     Corrupt,
     /// Parsed and well-shaped; no client has a non-empty `manual_ips`.
     Clean,
-    /// Parsed and well-shaped; the space-joined, trailing-space
-    /// `"name=ip,ip "` entries doctor.sh's `tr '\n' ' '` step produces —
-    /// concatenating this directly before `"— fine while …"` reproduces the
-    /// exact single space the shell gets from that trailing space.
+    /// Space-joined `"name=ip,ip "` entries carrying doctor.sh's trailing
+    /// space, so concatenating directly before `"— fine while …"` reproduces
+    /// the single space the shell gets. Pinned by
+    /// tests::one_pinned_client_warns_with_the_trailing_space_quirk.
     Pinned(String),
 }
 
@@ -236,14 +179,10 @@ fn json_falsy(v: &serde_json::Value) -> bool {
     }
 }
 
-/// ```py
-/// import json,sys
-/// try: s = json.load(open(sys.argv[1]))
-/// except Exception: sys.exit(0)
-/// for n, c in (s.get("client_connections") or {}).items():
-///     ips = c.get("manual_ips") or []
-///     if ips: print(n + "=" + ",".join(ips))
-/// ```
+/// The [`SessionPinState`] of an ALVR `session.json`, mirroring doctor.sh's
+/// inline python inspector: every `client_connections` entry with a
+/// non-empty `manual_ips` contributes one `name=ip,ip` entry.
+/// Reference: scripts/demo/doctor.sh section 13b.
 fn inspect_session_pins(path: &Path) -> SessionPinState {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -298,8 +237,10 @@ fn inspect_session_pins(path: &Path) -> SessionPinState {
     }
 }
 
-/// doctor.sh section 13b: `[ -f "$SESSJSON" ]` gates the whole check —
-/// `tap cfg.session-pins skipped` when it is absent.
+/// `cfg.session-pins`: Skipped when `session.json` is absent, Pass when no
+/// client carries a manual IP pin, Warn otherwise — including the A3b-3
+/// read/parse failures doctor.sh reports as clean.
+/// Reference: scripts/demo/doctor.sh section 13b.
 fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
     let sessjson = ctx.paths.alvr_session_json();
     if !sessjson.is_file() {
@@ -313,12 +254,9 @@ fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
             "cfg.session-pins",
             "ALVR session state has no stale manual-IP pins",
         ),
-        // A3b-3 (round 2): a read or parse failure is a degraded state, not
-        // a clean one — Warn instead of collapsing into the same Pass as
-        // `Clean`. Unlike `Corrupt` below, this evaluator's own std::fs /
-        // serde_json code hit the failure — there is no python3 here to
-        // blame, so the message says so accurately; `.detail` carries the
-        // underlying error for anything that renders it.
+        // A3b-3: a read or parse failure is a degraded state, not a clean one,
+        // and no python3 is in this process to blame for it.
+        // Pinned by tests::malformed_json_warns, tests::unreadable_session_json_warns.
         SessionPinState::Unreadable(e) => CheckOutcome::warn(
             "cfg.session-pins",
             format!("could not inspect {}: {e}", sessjson.display()),
@@ -332,11 +270,8 @@ fn cfg_session_pins(ctx: &CheckCtx) -> CheckOutcome {
             ),
         )
         .with_detail(format!("JSON parse error: {e}")),
-        // Unlike the two arms above, `Corrupt` genuinely mirrors doctor.sh:
-        // the shape violations it covers happen *outside* the shell probe's
-        // try/except (see the enum doc), so real doctor.sh hits an
-        // uncaught Python exception here too — "broken python3?" is an
-        // accurate diagnosis on this arm, not a borrowed one.
+        // `Corrupt` mirrors doctor.sh: these shape violations raise outside the
+        // shell probe's try/except, so "broken python3?" is accurate here.
         SessionPinState::Corrupt => CheckOutcome::warn(
             "cfg.session-pins",
             format!("could not inspect {} (broken python3?)", sessjson.display()),
@@ -386,8 +321,6 @@ mod tests {
         CheckCtx::new(paths, CheckOptions::new())
     }
 
-    // ── parse_protocol ──────────────────────────────────────────────────────
-
     #[test]
     fn parse_protocol_matches_the_awk_recipe() {
         assert_eq!(parse_protocol("protocol = \"alvr\"\n"), "alvr");
@@ -413,8 +346,6 @@ mod tests {
         );
         assert_eq!(parse_protocol(""), "");
     }
-
-    // ── cfg.protocol.* ───────────────────────────────────────────────────────
 
     #[test]
     fn missing_toml_fails_supported_and_skips_legacy() {
@@ -468,10 +399,8 @@ mod tests {
     /// The `cfg.protocol.supported` / `cfg.protocol.legacy-oxrsys` pair for the
     /// `oxrsys-runtime.toml` bodies that differ only in the protocol value
     /// doctor.sh's last-match `awk` resolves to. `{toml}` in an expected remedy
-    /// is the row's own scratch toml path. Two cases keep their own functions:
-    /// the absent file (`missing_toml_fails_supported_and_skips_legacy`, which
-    /// writes no toml at all) and the A3b-1 regression
-    /// (`shadowed_protocol_alvr_then_oxrsys_resolves_to_the_last_assignment`).
+    /// is the row's own scratch toml path. The absent file and the A3b-1
+    /// shadowing regression keep their own functions.
     #[test]
     fn config_protocol_state_matrix() {
         // (status, message, remedy) expected from one evaluator.
@@ -555,8 +484,6 @@ mod tests {
             fs::remove_dir_all(&tmp).ok();
         }
     }
-
-    // ── cfg.session-pins ─────────────────────────────────────────────────────
 
     fn ctx_with_session(tmp: &Path, sessjson: PathBuf) -> CheckCtx {
         let mut paths = Paths::new(tmp);
@@ -703,9 +630,7 @@ mod tests {
 
     /// `cfg.session-pins` for the session.json bodies whose shape alone decides
     /// the verdict. `{session}` in an expected message is the row's own scratch
-    /// session.json path. The missing, unreadable and malformed files, the
-    /// bodies that do carry pins keep their own functions: their setup, their
-    /// assertions or the mutants they alone kill differ.
+    /// session.json path.
     #[test]
     fn session_json_shape_matrix() {
         let cases: &[(&str, &str, CheckStatus, &str)] = &[
