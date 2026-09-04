@@ -1,4 +1,9 @@
 <script lang="ts">
+  /** Owns the Logs screen: selected tab, live tail buffer (`lines` and its
+   * lowercased twin `lowerLines`), filter, and past-runs listing. Holds the
+   * tail id and talks to the backend over log-tail IPC directly, so every
+   * navigation and unmount must stop the current tail before starting
+   * another. */
   import { onDestroy, onMount } from "svelte";
   import { errMsg } from "../lib/text";
   import {
@@ -21,23 +26,19 @@
   ];
 
   const MAX_LINES = 5000;
-  /** How far past `MAX_LINES` the buffer is allowed to grow before it gets
-   * trimmed back down, so the trim (a full array re-slice, done to both
-   * `lines` and `lowerLines`) fires roughly once every 1000 lines instead of
-   * reallocating on every batch once the buffer is at cap. */
+  /** Hysteresis over `MAX_LINES`: a trim re-slices both `lines` and
+   * `lowerLines`, so it runs about once per 1000 lines instead of on every
+   * batch once the buffer sits at cap. */
   const TRIM_BLOCK = 1000;
-  /** How long to hold a keystroke before it actually re-runs the filter —
-   * `filteredLines` rescans the whole buffer, and without this every
-   * keystroke (and, while a filter is set, every incoming batch too) paid
-   * that cost immediately. */
+  /** Debounce before `filterQuery` — and so `filteredLines` — follows a
+   * keystroke: a non-empty query rescans the whole buffer, a cost every
+   * incoming batch already pays again while a filter is set. */
   const FILTER_DEBOUNCE_MS = 150;
 
   let tab = $state<Tab>("wineConsole");
-  /** Tracks the last tab a switch/back navigation was actually requested for
-   * — read instead of `tab` itself by the "already there, no-op" checks below,
-   * since `tab` only updates once the in-flight `stopTail()` resolves. Using
-   * the stale `tab` there let a rapid A -> B -> A get treated as a no-op on
-   * the second click and land on B instead of the user's actual last choice. */
+  /** The last tab a navigation was *requested* for. `switchTab`'s
+   * "already there, no-op" guard reads this and not `tab`, which updates only
+   * once the in-flight `stopTail()` resolves; a rapid A -> B -> A would land on B. */
   let pendingTab = $state<Tab>("wineConsole");
   let follow = $state(true);
   /** Bound to the filter `<input>` directly — updates every keystroke. */
@@ -54,23 +55,13 @@
   let resolvedPath = $state<string | null>(null);
   let pathError = $state<string | null>(null);
   let tailId: number | null = null;
-  /** Guards against a switchTab/openPastRun/backToPastRuns call whose
-   * `stopTail()` await settles after a later navigation call already
-   * superseded it — without this, an out-of-order resolution could still
-   * assign `tab`/`openedPastRun` and start a tail for the navigation the user
-   * had already moved past. */
+  /** Guards `switchTab`/`openPastRun`/`backToPastRuns`: a `stopTail()` await
+   * that settles after a later navigation superseded it must not assign
+   * `tab`/`openedPastRun` or start a tail for the navigation already left. */
   let navGeneration = 0;
-  /**
-   * Guards against a leaked tail from two interleaved `startTail`/`stopTail`
-   * calls (rapid tab switching): `startTail` captures the generation current
-   * at its own start, and every mutation it makes to shared state — including
-   * the eventual `tailId = id` assignment — is skipped once a later
-   * `startTail`/`stopTail` call has bumped the counter past it. Without this,
-   * an out-of-order `startLogTail` resolution (tab A's IPC call outlives tab
-   * B's) clobbers `tailId` with A's id while B's tail is the one actually
-   * feeding `lines` — B's tail then never gets stopped, since only the id in
-   * `tailId` is ever passed to `stopLogTail`.
-   */
+  /** Guards a leaked tail: `startTail` captures this at its start and skips
+   * every shared-state write it would make, `tailId` included, once a later
+   * `startTail`/`stopTail` bumped it. Only the id in `tailId` is ever stopped. */
   let tailGeneration = 0;
   let pastRuns = $state<PastRun[]>([]);
   let pastRunsLoaded = $state(false);
@@ -120,10 +111,9 @@
     truncatedNotice = false;
     resolvedPath = null;
     pathError = null;
-    // Route this call's batches through a generation check too — otherwise a
-    // batch that lands between `startLogTail` resolving and the immediate
-    // `stopLogTail` below (stale case) would still reach `onBatch` and mix
-    // into whatever tab is current by then.
+    // Generation-check this call's batches too: one landing between
+    // `startLogTail` resolving and the stale-case `stopLogTail` below would
+    // otherwise mix into whatever tab is current by then.
     const handleBatch = (b: LogBatch) => {
       if (myGeneration === tailGeneration) onBatch(b);
     };
@@ -152,10 +142,9 @@
   }
 
   async function stopTail() {
-    // Bump first, unconditionally: this invalidates any `startTail` still in
-    // flight even when it hasn't reached `startLogTail` yet (e.g. still
-    // awaiting `getLogSourcePath`), and even when no replacement `startTail`
-    // follows (switching to the tail-less "Past runs" tab).
+    // Bump first, unconditionally: this invalidates a `startTail` still in
+    // flight even before it reaches `startLogTail`, and even when no
+    // replacement `startTail` follows (the tail-less "Past runs" tab).
     tailGeneration++;
     if (tailId != null) {
       const id = tailId;
@@ -179,19 +168,13 @@
 
   async function switchTab(next: Tab) {
     // Past runs is the one tab worth re-clicking: it refreshes the listing.
-    // Everything else is already live-tailing, so re-selecting it is a no-op.
-    // Compares against `pendingTab` (the last *requested* tab), not `tab`
-    // itself — `tab` only updates once `stopTail()` below resolves, so a
-    // rapid A -> B -> A would otherwise see the second click's `next` (A)
-    // still equal to the still-stale `tab` (A) and treat it as a no-op,
-    // leaving the switch to land on B instead of the user's actual last pick.
+    // Compares `pendingTab`, not `tab`, which lags (see `pendingTab`'s doc).
     if (next === pendingTab && next !== "pastRuns") return;
     pendingTab = next;
     const myNav = ++navGeneration;
     await stopTail();
-    // A newer switchTab/openPastRun/backToPastRuns call superseded this one
-    // while `stopTail()` was in flight — let that call's own continuation own
-    // `tab`/`openedPastRun` and the resulting tail instead of overwriting it.
+    // A later navigation superseded this one while `stopTail()` was in
+    // flight; let its own continuation own `tab`/`openedPastRun` and the tail.
     if (myNav !== navGeneration) return;
     tab = next;
     openedPastRun = null;
