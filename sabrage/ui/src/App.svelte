@@ -1,4 +1,14 @@
 <script lang="ts">
+  /**
+   * Application shell: owns the active `screen`, the Library entry EditGame is
+   * open for, and the two menu-request counters. Owns no store — reads
+   * `doctorStore` for the sidebar badge, calls `sessionStore.stop()` for Stop,
+   * and passes `stageStore` to the stages panel and gate modal.
+   *
+   * Invariant: a menu-triggered Launch or Run Doctor only navigates and bumps
+   * a counter here; the owning screen performs the action, giving one launch
+   * path and one doctor path.
+   */
   import { onMount } from "svelte";
   import Sidebar from "./components/Sidebar.svelte";
   import GateModal from "./components/GateModal.svelte";
@@ -18,23 +28,18 @@
   import type { Screen } from "./types";
 
   let screen = $state<Screen>("about");
-  /** The Library entry `"edit"` is currently open for — `null` means "Add
-   * game" (EditGame starts from `newGameTemplate()` instead of a saved
+  /** The Library entry `"edit"` is open for; `null` means "Add game" (a new
    * entry). Only meaningful while `screen === "edit"`; stale otherwise. */
   let editGameId = $state<string | null>(null);
 
-  /** Bumped every time the Pipeline ▸ Launch menu item (⌘R) fires — Session
-   * watches this prop and calls its own `doLaunch(false)` once its bottle/
-   * options have loaded, so a menu-triggered launch runs through the exact
-   * same path as the Session screen's own Launch button rather than a second
-   * copy of the launch logic living here. */
+  /** Bumped every time the Pipeline ▸ Launch menu item (⌘R) fires; Session
+   * watches the prop and calls its own `doLaunch(false)` once its bottle and
+   * options have loaded, so the menu and the Launch button share one path. */
   let launchRequest = $state(0);
 
-  /** Bumped every time the Pipeline ▸ Run Doctor menu item (⌘D) fires —
-   * Doctor watches this prop and always forces a fresh pass, whether it was
-   * already the open screen (plain navigation is then a no-op) or the cache
-   * from a recent run was still fresh. See Doctor.svelte's own doc comment
-   * on `doctorRequest`/`doctorAutorunDecided`. */
+  /** Bumped every time the Pipeline ▸ Run Doctor menu item (⌘D) fires; Doctor
+   * watches the prop and forces a fresh pass even when it is already the open
+   * screen (plain navigation is then a no-op) or its cached result is fresh. */
   let doctorRequest = $state(0);
 
   function navigate(next: Screen) {
@@ -53,16 +58,15 @@
     screen = "edit";
   }
 
-  /** EditGame's Save/Cancel — always returns to Library (Save has already
-   * persisted through `libraryStore.save`, or the user backed out). */
+  /** EditGame's Save/Cancel — both return to Library; on Save the entry has
+   * already been persisted before this runs. */
   function doneEditing() {
     screen = "library";
   }
 
-  // Pipeline menu items that map onto navigation/actions this shell already
-  // owns (Run Doctor, Launch, Stop); anything else (Setup…/Build/Install…,
-  // Open Logs/Config Folder) is another screen's or the opener plugin's job
-  // and is deliberately a no-op here rather than guessed at.
+  // Menu ids this shell does not handle (Setup/Build/Install, Open Logs or
+  // Config Folder) are deliberate no-ops — they belong to another screen or
+  // the opener plugin.
   onMount(() => {
     let unlisten: (() => void) | undefined;
     void onMenu((id: string) => {
