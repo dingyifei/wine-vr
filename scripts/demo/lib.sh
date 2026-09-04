@@ -60,7 +60,7 @@ die()  { print -r -- "${_R}FATAL${_N} $*" >&2; exit 1; }
 # tap: append "<slug> <status>" to $WINEVR_DOCTOR_TAP when set (opt-in parity channel).
 # chk: print like ok/warn/fail/info AND tap. Both must return 0: lib.sh is sourced by
 # set -e stages and a bare `[ -n ... ] && ...` tail returns 1 with the tap off
-# (sabrage-parity::tests::lib_sh_tap_and_chk_return_zero_when_tap_disabled).
+# (sabrage-parity tests::lib_sh_contract::lib_sh_tap_and_chk_return_zero_when_tap_disabled).
 tap() { # slug status
   [ -n "${WINEVR_DOCTOR_TAP:-}" ] && print -r -- "$1 $2" >> "$WINEVR_DOCTOR_TAP"
   :
