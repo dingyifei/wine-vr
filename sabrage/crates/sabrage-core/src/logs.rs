@@ -1,44 +1,25 @@
 //! Log files: naming the wine console log, tailing the three live sources, and
 //! listing past runs.
 //!
-//! # The wine console log
+//! Reference: scripts/demo/run.sh, which names the log with `date
+//! +%Y%m%d-%H%M%S` and pipes the child through `tee`.
 //!
-//! run.sh:
+//! The name is local civil time, which is why this crate depends on `chrono`
+//! at all: `std::time` has no calendar. Sabrage diverges twice — a same-second
+//! name collision gets a `-2`, `-3`, ... suffix (detected by opening the file
+//! `create_new` in [`crate::executor::Executor::spawn_detached`], never
+//! assumed) and the child writes into the file descriptor directly instead of
+//! through `tee`, which can lose its last buffer when the pipeline is torn
+//! down (PARITY.md § Run (launch), "The wine console log is a plain file the
+//! child's stdout/stderr are redirected into").
 //!
-//! ```zsh
-//! mkdir -p "$ROOT/logs"
-//! LOG="$ROOT/logs/beatsaber-$(date +%Y%m%d-%H%M%S).log"
-//! "$WINE" … > >(tee "$LOG") 2>&1 &
-//! ```
-//!
-//! Two things follow. The name is **local** civil time (`date` with no `-u`),
-//! which is why this crate depends on `chrono` at all — `std::time` has no
-//! calendar. And the shell can collide: two launches in the same second write
-//! the same path, and `tee` truncates, so the first run's log is simply gone.
-//! [`wine_log_candidate`] adds a `-2`, `-3`, … suffix instead — a declared
-//! divergence (PARITY.md, "Planned for later phases"; design-core §10.9),
-//! enforced by opening the file `create_new` in
-//! [`crate::executor::Executor::spawn_detached`] so the collision is detected
-//! rather than assumed.
-//!
-//! Sabrage also replaces `tee` itself: the child writes into the file
-//! descriptor directly, and the tail below reads the same file. `tee` can lose
-//! the last buffer when the pipeline is torn down; a file fd cannot.
-//!
-//! # Tailing
-//!
-//! [`Tailer`] is rotation-aware — an inode change, a size that shrank, or a
-//! prefix that no longer matches the bytes last read from it (an in-place
+//! [`Tailer`] is rotation-aware: a new inode, a size below the cursor, or a
+//! prefix that mismatches the bytes last read from it (in-place
 //! `truncate(true)` that grew back past the cursor between two polls, which is
-//! how ALVR rewrites `session_log.txt`) all mean the file was replaced, and the
-//! tailer reopens from the start and says so ([`LogBatch::rotated`]). One poll
-//! reads a bounded number of bytes ([`POLL_BYTE_BUDGET`]), so a large existing
-//! log is drained across polls rather than materialised in one. A partial
-//! final line is buffered until its newline arrives, so a half-written line
-//! never reaches the UI as a complete one. Splitting reuses [`crate::process::ChunkSplitter`] — the same
-//! `\n`/`\r`/`\r\n`-tolerant state machine `spawn_streamed` already uses for
-//! wine/build-tool output — rather than a second hand-rolled copy of the same
-//! rule.
+//! how ALVR rewrites `session_log.txt`) each mean the file was replaced, and
+//! the tailer reopens from the start and says so ([`LogBatch::rotated`]).
+//! Splitting reuses [`crate::process::ChunkSplitter`] rather than a second
+//! copy of the same `\n`/`\r`/`\r\n` rule.
 
 use std::collections::VecDeque;
 use std::io::{Read, Seek, SeekFrom};
@@ -50,24 +31,20 @@ use crate::error::{Result, SabrageError};
 use crate::paths::Paths;
 use crate::process::ChunkSplitter;
 
-// ── naming ────────────────────────────────────────────────────────────────────
-
-/// The filename stem run.sh builds with `date +%Y%m%d-%H%M%S`.
+/// Filename prefix shared with run.sh: every wine console log is
+/// `beatsaber-<stamp>.log`.
 pub const WINE_LOG_PREFIX: &str = "beatsaber-";
 
 /// The candidate path for attempt `attempt` of this launch's console log,
 /// given an already-formatted `YYYYmmdd-HHMMSS` stamp.
 ///
-/// * `attempt == 0` → `beatsaber-YYYYmmdd-HHMMSS.log`, byte-identical to the
+/// * `attempt == 0` -> `beatsaber-YYYYmmdd-HHMMSS.log`, byte-identical to the
 ///   shell's name for the same instant;
-/// * `attempt == n >= 1` → the same name with `-{n+1}` before `.log`, i.e.
+/// * `attempt == n >= 1` -> the same name with `-{n+1}` before `.log`, i.e.
 ///   `beatsaber-20260829-101112-2.log` for the first collision.
 ///
-/// Takes `stamp` as a plain string rather than a `chrono` type so nothing
-/// calling this — including test code in other crates — needs a date/time
-/// library dependency just to name a log file candidate: `chrono` is an
-/// implementation detail of [`wine_log_candidate`]'s stamp computation, not a
-/// fact this API should force on its callers.
+/// `stamp` is a plain string so no caller needs a date/time dependency just to
+/// name a candidate (F16, tests::wine_log_candidate_delegates_to_the_stamped_form_byte_for_byte).
 pub fn wine_log_candidate_stamped(logs_dir: &Path, stamp: &str, attempt: u32) -> PathBuf {
     let name = if attempt == 0 {
         format!("{WINE_LOG_PREFIX}{stamp}.log")
@@ -90,8 +67,6 @@ pub fn wine_log_candidate(
     let stamp = local_now.format("%Y%m%d-%H%M%S").to_string();
     wine_log_candidate_stamped(logs_dir, &stamp, attempt)
 }
-
-// ── sources ───────────────────────────────────────────────────────────────────
 
 /// One tailable log.
 ///
@@ -149,8 +124,6 @@ pub fn resolve_source(paths: &Paths, source: &LogSource) -> Option<PathBuf> {
     }
 }
 
-// ── tailing ───────────────────────────────────────────────────────────────────
-
 /// One poll's worth of new lines.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -161,11 +134,10 @@ pub struct LogBatch {
     /// was replaced (new inode), truncated, or rewritten in place. The UI
     /// clears its buffer on this and then appends `lines`.
     ///
-    /// Read it as a property of the batch, not of the poll: a rotation
-    /// detected while earlier lines were still queued is announced on the
-    /// first batch that actually carries bytes from the reopened file, and the
-    /// batches before it (the previous incarnation's backlog, which
-    /// [`LogBatch::truncated`] promises is never dropped) leave this `false`.
+    /// It is a property of the batch, not of the poll: a rotation detected
+    /// while earlier lines are still queued is announced on the first batch
+    /// that carries bytes from the reopened file (A8-4,
+    /// tests::a_backlog_queued_before_a_vanish_survives_reappearance_uncut).
     pub rotated: bool,
     /// This batch hit [`MAX_LINES_PER_POLL`] or [`POLL_BYTE_BUDGET`]: the rest
     /// is still queued internally (never dropped) or still unread in the file,
@@ -189,17 +161,16 @@ const TAIL_PRELOAD_CAP_BYTES: u64 = 256 * 1024;
 /// Bound on the bytes ONE [`Tailer::poll`] reads, whatever has accumulated in
 /// the file since the last one.
 ///
-/// [`MAX_LINES_PER_POLL`] caps what a poll *delivers*, not what it reads: the
-/// old loop did one `read_to_end` from the cursor and split every byte of it
-/// into `pending` before that cap was ever applied, so opening a large
-/// `--verbose` wine console log (or an `oxrsys-runtime.log` at its 5 MiB
-/// rotation size) from offset 0 materialised the whole file as `String`s in a
-/// single call. The cursor and the splitter both survive to the next poll, and
-/// the poller runs every 250 ms, so a backlog is drained across polls instead.
+/// `MAX_LINES_PER_POLL` caps what a poll *delivers*, not what it reads:
+/// without this bound, opening a large `--verbose` wine console log (or an
+/// `oxrsys-runtime.log` at its 5 MiB rotation size) from offset 0 would
+/// materialise the whole file as `String`s in one call. The cursor and
+/// splitter survive to the next poll, so a backlog drains across polls
+/// (tests::one_poll_reads_at_most_the_byte_budget_and_still_delivers_every_line).
 const POLL_BYTE_BUDGET: usize = 1024 * 1024;
 
-/// One `read` of the loop above. Small enough that the line cap is noticed
-/// promptly, large enough that a 1 MiB budget is 16 syscalls.
+/// One `read` inside [`Tailer::poll`]'s read loop. Small enough that the line
+/// cap is noticed promptly, large enough that a 1 MiB budget is 16 syscalls.
 const READ_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Bound on the splitter's unterminated-line buffer.
@@ -233,7 +204,7 @@ pub struct Tailer {
     /// `.truncate(true)`, keeping the inode).
     signature: Vec<u8>,
     /// `\n`/`\r`/`\r\n`-tolerant splitter; its internal buffer *is* the
-    /// "partial final line" the doc below promises never shows up early.
+    /// partial final line that must never reach a caller as a complete one.
     splitter: ChunkSplitter,
     /// Bytes fed to `splitter` since it last emitted a line — the counter
     /// behind [`MAX_UNTERMINATED_LINE_BYTES`].
@@ -245,12 +216,10 @@ pub struct Tailer {
     /// How many of the leading entries in `pending` were read out of a
     /// **previous** incarnation of the path (A8-4).
     ///
-    /// A rotation that finds `pending` non-empty cannot deliver those lines as
-    /// the new file's beginning — the consumer clears its buffer on
-    /// [`LogBatch::rotated`] and would then label the old session's last lines
-    /// as the new one's first. So the backlog goes out under `rotated: false`,
-    /// this counter marks how much of it is old, and `drain_capped` never lets
-    /// one batch straddle the boundary.
+    /// The backlog goes out under `rotated: false` and `drain_capped` never
+    /// lets one batch straddle the boundary, so a consumer that clears on
+    /// `rotated` cannot label the old file's last lines as the new one's first
+    /// (tests::a_backlog_queued_before_a_vanish_survives_reappearance_uncut).
     carry: usize,
     /// A rotation has been *detected* but not yet *announced*: set with
     /// `carry`, consumed by the first batch that actually carries bytes from
@@ -338,11 +307,9 @@ impl Tailer {
                         lines.drain(0..lines.len() - tail_lines);
                     }
                     pending = lines.into();
-                    // `splitter` still holds any genuine trailing partial line
-                    // (the file's tail had no terminator yet at the moment we
-                    // read it) — left in place so the very next `poll()`
-                    // completes it, exactly like an ordinary mid-stream
-                    // partial.
+                    // `splitter` still holds any genuine trailing partial
+                    // line — left in place so the very next `poll()` completes
+                    // it, exactly like an ordinary mid-stream partial.
                 }
                 signature = read_signature(f, offset).map_err(|e| SabrageError::io(path, e))?;
             }
@@ -364,19 +331,20 @@ impl Tailer {
 
     /// Read whatever has arrived since the last poll.
     ///
-    /// Detects rotation first — a new inode, a size below the cursor, or a
-    /// rewritten prefix (the bytes before the cursor no longer match the
-    /// [`Tailer::signature`] read from them, which is what an in-place
-    /// `truncate(true)` that grew back past the cursor between two polls looks
-    /// like) — and any of the three reopens from the start with
-    /// [`LogBatch::rotated`] set. A file that has vanished yields an empty
-    /// batch rather than an error — the next poll picks it up when it comes
-    /// back.
+    /// Only complete lines are delivered; a trailing partial line stays
+    /// buffered until its newline arrives or it outgrows
+    /// `MAX_UNTERMINATED_LINE_BYTES`. A file that was replaced, truncated,
+    /// or rewritten in place is reopened from the start and the batch says so
+    /// ([`LogBatch::rotated`]); a vanished file yields whatever was already
+    /// queued and is picked up on the next poll.
     ///
-    /// One call reads at most [`POLL_BYTE_BUDGET`] bytes and stops early once
-    /// [`MAX_LINES_PER_POLL`] lines are queued: the cursor and the splitter
-    /// survive to the next call, so a large backlog is drained across polls
-    /// instead of materialised in one.
+    /// One call reads at most `POLL_BYTE_BUDGET` bytes and stops early once
+    /// `MAX_LINES_PER_POLL` lines are queued; the remainder arrives on later
+    /// calls.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures other than the file being absent, which is not an error.
     pub fn poll(&mut self) -> Result<LogBatch> {
         let path_str = self.path.display().to_string();
 
@@ -424,21 +392,11 @@ impl Tailer {
             let file =
                 std::fs::File::open(&self.path).map_err(|e| SabrageError::io(&self.path, e))?;
 
-            // Anything still queued in `pending` was already read out of the
-            // *previous* incarnation of this path — real content, just not yet
-            // handed to a caller because an earlier poll hit
-            // `MAX_LINES_PER_POLL` (possibly while the path had vanished; see
-            // the `NotFound` arm above, which drains but never clears
-            // `pending` on its own). `LogBatch::truncated` promises those
-            // lines are "never dropped" — a rotation must not silently break
-            // that promise by wiping `pending` out from under them. Drain and
-            // deliver them now — but as what they are: the tail of the
-            // **previous** incarnation. Handing them out under `rotated: true`
-            // told the consumer to clear its buffer and then showed it the old
-            // session's last lines as the new file's first, which is how a
-            // startup failure gets attributed to the wrong session (A8-4). The
-            // marker waits in `pending_rotation` for the first batch that
-            // really does come out of the reopened file.
+            // Backlog from the previous incarnation goes out under `rotated:
+            // false`; under `true` the consumer clears and then reads it as
+            // the new file's first lines, misattributing a startup failure
+            // (A8-4,
+            // tests::a_backlog_queued_before_a_vanish_survives_reappearance_uncut).
             let backlog = !self.pending.is_empty();
             self.open = Some((file, current_id));
             self.offset = 0;
@@ -513,15 +471,10 @@ impl Tailer {
             }
         }
 
-        // ── the continuity witness, read AGAIN (A8-7) ────────────────────────
-        // The precheck above compared the bytes before the cursor *before*
-        // this read; a truncate-and-regrow-past-the-cursor landing in the
-        // window between the two would be read as a continuation, and the new
-        // file's whole prefix below `offset` silently skipped — the next poll
-        // then sees the signature this read installed and stays "continuous"
-        // forever. Bracketing the read with the same witness closes it: what
-        // sits before `offset_before` must still be what sat there when the
-        // precheck looked.
+        // Bracket the read with the same witness: a truncate-and-regrow
+        // landing between the precheck and here would read as a continuation
+        // and skip the new file's whole prefix for good (A8-7,
+        // tests::a_rewrite_landing_inside_the_read_window_is_not_read_as_a_continuation).
         #[cfg(test)]
         tests::after_read_hook();
         let straddled = consumed > 0
@@ -533,11 +486,10 @@ impl Tailer {
                     .unwrap_or(true));
 
         if straddled {
-            // Undo the read whole: those bytes belong to an incarnation this
-            // tailer can no longer place. Dropping `open` makes the next poll
-            // a fresh open from byte 0, and the deferred marker (A8-4) makes
-            // that batch the one that announces the rotation — this one still
-            // carries only what was already queued.
+            // Undo the read: those bytes belong to an incarnation this
+            // tailer cannot place. Dropping `open` makes the next poll a fresh
+            // open from byte 0, and the deferred marker (A8-4) makes that
+            // batch the one that announces the rotation.
             self.pending.truncate(pending_before);
             self.splitter = ChunkSplitter::new();
             self.unterminated = 0;
@@ -558,9 +510,8 @@ impl Tailer {
         let budget_hit = consumed >= POLL_BYTE_BUDGET;
 
         // A rotation detected on an earlier poll is announced HERE: with
-        // `carry` down to zero, this batch is the first one whose lines really
-        // do begin the new incarnation. Until then the marker stays pending —
-        // it is never dropped, only deferred.
+        // `carry` down to zero, this batch is the first whose lines really do
+        // begin the new incarnation. The marker is deferred, never dropped.
         let rotated = rotated || (self.carry == 0 && std::mem::take(&mut self.pending_rotation));
         let (lines, truncated) = self.drain_capped();
         Ok(LogBatch {
@@ -614,8 +565,6 @@ fn read_signature(f: &mut std::fs::File, offset: u64) -> std::io::Result<Vec<u8>
         Err(e) => Err(e),
     }
 }
-
-// ── past runs ─────────────────────────────────────────────────────────────────
 
 /// One `logs/beatsaber-*.log` on disk.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -682,8 +631,6 @@ mod tests {
         dir
     }
 
-    // ── the truncate/read-race seam (A8-7) ───────────────────────────────────
-
     thread_local! {
         /// Per-thread, so one test's hook cannot reach another's `poll` —
         /// `cargo test` gives each `#[test]` its own thread.
@@ -693,7 +640,7 @@ mod tests {
 
     /// Called by [`Tailer::poll`] between its read loop and its post-read
     /// continuity check — the exact window a truncate-and-regrow has to land
-    /// in to be read as a continuation. Nothing outside `cfg(test)` can
+    /// in to be read as a continuation (A8-7). Nothing outside `cfg(test)` can
     /// register anything, and the default is a no-op.
     pub(super) fn after_read_hook() {
         let f = AFTER_READ.with(|h| h.borrow_mut().take());
@@ -738,15 +685,12 @@ mod tests {
         f.set_modified(t).unwrap();
     }
 
-    // ── wine_log_candidate ───────────────────────────────────────────────────
-
     #[test]
     fn wine_log_candidate_delegates_to_the_stamped_form_byte_for_byte() {
-        // Two facts about the same names: `wine_log_candidate_stamped` emits
-        // these exact paths for a hand-built stamp with no chrono in sight —
-        // the whole point of the split (F16) — and the chrono-typed
-        // convenience wrapper delegates to it byte for byte, so neither entry
-        // point can drift alone.
+        // Both entry points, one expectation: the stamped form emits these
+        // paths for a hand-built stamp with no chrono in sight (F16), and the
+        // chrono wrapper delegates to it byte for byte, so neither can drift
+        // alone.
         let now = chrono::Local
             .with_ymd_and_hms(2026, 8, 29, 10, 11, 12)
             .unwrap();
@@ -779,8 +723,6 @@ mod tests {
         }
     }
 
-    // ── LogSource wire shape ─────────────────────────────────────────────────
-
     #[test]
     fn log_source_file_is_a_struct_variant_on_the_wire() {
         let s = LogSource::File {
@@ -806,8 +748,6 @@ mod tests {
             serde_json::json!({"kind": "alvrSession"})
         );
     }
-
-    // ── resolve_source ───────────────────────────────────────────────────────
 
     #[test]
     fn resolve_source_maps_the_two_fixed_oxrsys_paths_and_the_file_variant() {
@@ -943,8 +883,6 @@ mod tests {
         assert_eq!(resolved, Some(live_log));
     }
 
-    // ── list_past_runs ───────────────────────────────────────────────────────
-
     #[test]
     fn list_past_runs_lists_newest_first_and_ignores_non_matching_entries() {
         let dir = scratch("past-runs");
@@ -967,8 +905,6 @@ mod tests {
     fn list_past_runs_is_empty_for_a_missing_directory() {
         assert!(list_past_runs(Path::new("/does/not/exist/at/all/sabrage-test")).is_empty());
     }
-
-    // ── Tailer ───────────────────────────────────────────────────────────────
 
     #[test]
     fn poll_returns_newly_appended_lines() {
@@ -1431,8 +1367,8 @@ mod tests {
         );
         assert!(!b2.rotated, "nothing from the new incarnation is out yet");
 
-        // The next poll reopens from byte 0 and delivers the new file entire —
-        // prefix included, which is what used to be lost.
+        // The next poll reopens from byte 0 and delivers the new file
+        // entire, prefix included.
         let b3 = t.poll().unwrap();
         assert!(b3.rotated, "and THIS batch begins the new incarnation");
         assert_eq!(b3.lines.len(), 300);
