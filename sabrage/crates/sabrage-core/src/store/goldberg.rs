@@ -1,19 +1,14 @@
 //! The revert-original-`steam_api64.dll` action.
 //!
-//! // DIVERGENCE: `run.sh` has no counterpart — it only ever *installs*
-//! Goldberg (`stages::run::actions::goldberg_stage`), never puts the backed-up
-//! dll back. This is Sabrage-only, declared in `PARITY.md` ("Revert-
-//! original-`steam_api64.dll` action (no shell counterpart either …) — Phase
-//! 4+, if ever)"). It exists so a user who wants to launch through real Steam
-//! once (screenshots, a Steam-only mod, sanity-checking a purchase) does not
-//! have to go hunt down `.orig-steam` by hand.
+//! Sabrage-only, so a user can launch through real Steam once without hunting
+//! down `.orig-steam` by hand: run.sh installs Goldberg and never restores the
+//! backup (PARITY.md § Planned for later phases (declared now),
+//! "Revert-original-`steam_api64.dll` action").
 //!
-//! Reverting is deliberately narrow: it swaps the dll back and leaves every
-//! other Goldberg artifact in place (`.orig-steam` itself, `steam_appid.txt`,
-//! `steam_settings/`), because the very next `./demo.sh run` /
+//! The revert swaps the dll back and leaves `.orig-steam`, `steam_appid.txt`
+//! and `steam_settings/` in place, because the next launch through
 //! [`crate::stages::run::actions::goldberg_stage`] reinstalls Goldberg
-//! unconditionally — there is nothing to clean up that the next launch
-//! wouldn't just redo.
+//! unconditionally.
 
 use std::path::{Path, PathBuf};
 
@@ -27,22 +22,19 @@ use crate::session;
 use crate::stages::run::actions::steam_api_path;
 use crate::util::{cmp_files, file_sha256_matches};
 
-/// The substring `pgrep -f 'Beat Saber.exe'` matches on argv — the needle
-/// [`crate::stages::stop`] scans survivors with (its own `const` is private to
-/// that module; this is the same string, deliberately, so the two doors agree
-/// on what "the game is running" looks like).
+/// The argv substring that means "Beat Saber is running", kept byte-identical
+/// to [`crate::stages::stop`]'s private const of the same string so the two
+/// doors agree on what a live game looks like.
 const BEAT_SABER_EXE_NEEDLE: &str = "Beat Saber.exe";
 
 /// What [`revert_original_steam_dll`] did.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RevertReport {
-    /// `true` iff a `.orig-steam` backup existed, was **not** itself a
-    /// Goldberg dll (neither the contract pin nor the payload this checkout
-    /// installs), and was copied back over the live dll. `false` means there
-    /// was nothing to revert: no backup at all, or a backup whose bytes are
-    /// Goldberg's (see [`revert_original_steam_dll`]'s last refusal) —
-    /// `message` says which.
+    /// `true` iff a `.orig-steam` backup existed, was not itself a Goldberg
+    /// dll (see [`revert_original_steam_dll`] for what that is tested
+    /// against), and was copied back over the live dll; `false` means nothing
+    /// was reverted and `message` says which case applied.
     pub restored: bool,
     /// Human-readable summary, safe to show verbatim in the UI.
     pub message: String,
@@ -50,71 +42,57 @@ pub struct RevertReport {
     pub dll_path: String,
 }
 
-/// `"$API.orig-steam"` — the exact suffix
-/// [`crate::stages::run::actions::goldberg_stage`] uses, reproduced here
-/// rather than imported from that module (its copy is a private fn, and this
-/// one-line `OsString` push is not worth a `pub(crate)` seam there for).
+/// `"$API.orig-steam"` — the backup path
+/// [`crate::stages::run::actions::goldberg_stage`] writes.
+///
 /// `pub(crate)` so [`super::library::validate`] can compute the same path for
-/// its `origSteamPresent` probe without a third copy.
+/// its `origSteamPresent` probe.
 pub(crate) fn orig_steam_path(api: &Path) -> PathBuf {
     let mut s = api.as_os_str().to_os_string();
     s.push(".orig-steam");
     PathBuf::from(s)
 }
 
-/// Restore the Steam `steam_api64.dll` this machine had before Goldberg, from
-/// its `.orig-steam` backup.
+/// Restore the Steam `steam_api64.dll` from its `.orig-steam` backup.
 ///
-/// Three refusals, all of them about not lying to the user:
+/// Refuses while a session is live ([`session::live_session_reason`], with the
+/// operation lock held across the check and the copy), while any Beat Saber
+/// process is on argv, and when the backup is itself a Goldberg dll — tested
+/// against the contract pin, this checkout's `Paths::gbe_dll` payload, and the
+/// provenance a launch records
+/// ([`crate::stages::run::actions::goldberg_backup_is_goldberg`]), because the
+/// launch tolerates an unpinned payload (PARITY.md § Invariants that must NOT
+/// change (byte/behavior parity), "Goldberg hash-tolerance at run").
 ///
-/// * **while a session is live** ([`session::live_session_reason`]) — the dll is
-///   memory-mapped by a running Beat Saber process, and swapping it out from
-///   under a live game is exactly the kind of "mutate the machine
-///   mid-session" the operation lock and this check both exist to prevent.
-///   The lock is taken *first* and held through the copy, because the
-///   interesting window is the one inside a run that has already installed
-///   Goldberg but not yet published its live-session handle: only the lock
-///   covers that.
-/// * **while Beat Saber is running** — the pre-telemetry window the predicate
-///   above cannot see: `run.sh` installs Goldberg (`run.sh:150`) long before
-///   the runtime publishes a `runtime_status.json`, and a `./demo.sh run`
-///   writes no session record at all, so between the wine spawn and the first
-///   streamed frame `live_session_reason` still says "idle" while the game has
-///   this very dll mapped. An argv scan for `Beat Saber.exe`
-///   ([`crate::process::find_processes_by_cmdline`], the probe `stop` already
-///   uses) closes that window without either front-end learning a new
-///   protocol. It is deliberately *not* scoped to `bs_dir`: wine puts a
-///   `Z:\…` Windows path on the command line, which no unix prefix test can
-///   match, so any running Beat Saber refuses this one dll swap.
-/// * **when the backup is itself the Goldberg dll** — `run.sh:147` and
-///   [`crate::stages::run::actions::goldberg_stage`] snapshot whatever dll was
-///   in place at the first launch, with no way to tell a real Steam library
-///   from an install that arrived already Goldberg'd. Copying those bytes back
-///   and reporting success would leave the user on Goldberg under an explicit
-///   "restored" claim, so this refuses instead. "Is Goldberg" is tested
-///   against the contract pin, against the payload this checkout installs
-///   (`Paths::gbe_dll`) **and** against the provenance a Sabrage launch
-///   records when it mints a backup it already saw was Goldberg
-///   ([`crate::stages::run::actions::goldberg_backup_is_goldberg`]): the
-///   launch tolerates a payload that does not match the pin (PARITY.md,
-///   "Goldberg hash-tolerance at run") and backs it up anyway, so a pin-only
-///   test let exactly those bytes be "restored", and a bytes-only test stops
-///   recognising them the moment `gbe_dll` changes underneath.
+/// The argv scan is not scoped to `bs_dir`: wine puts a `Z:\` Windows path on
+/// the command line, which no unix prefix test can match, so any running Beat
+/// Saber refuses this dll swap (A13a-2).
 ///
-/// Nothing here can prove a backup *is* the real Steam dll — only that it is
-/// not a Goldberg one this pipeline knows. The success message says "the
-/// .orig-steam backup" for that reason, never "the original".
+/// Nothing here proves a backup is the real Steam dll, only that it is not a
+/// Goldberg one this pipeline knows; the success message says "the .orig-steam
+/// backup", never "the original". See
+/// tests::{refuses_when_the_backup_is_itself_the_pinned_goldberg_dll,
+/// refuses_when_the_backup_is_an_unpinned_goldberg_build,
+/// refuses_when_a_launch_recorded_the_backup_as_goldberg,
+/// refuses_while_a_matching_game_process_is_running,
+/// the_success_message_never_claims_the_original_was_restored}.
+///
+/// # Errors
+///
+/// Fatal when a session is live or a matching game process is running, and
+/// whatever the copy returns; the no-backup and backup-is-Goldberg cases are
+/// `Ok` with `restored: false`.
 pub async fn revert_original_steam_dll(
     executor: &dyn Executor,
     bs_dir: &Path,
 ) -> Result<RevertReport> {
-    // Built here rather than taken as a parameter, so the one call site (the
-    // Tauri command layer) stays a two-argument one — the same pair
-    // `SettingsPathsCache::snapshot` builds: the persisted `settings.repo_root`
-    // through `resolve_repo_root`, degrading to the empty root exactly as that
-    // cache does when either step fails. The root matters now that the backup
-    // test reads `paths.gbe_dll`; `sabrage_appsup`/`oxr_appsup` (the liveness
-    // predicate's inputs) are `$HOME`-derived either way.
+    // Built here rather than taken as a parameter so the one call site (the
+    // Tauri command layer) stays two-argument: the persisted
+    // `settings.repo_root` through `resolve_repo_root`, degrading to the empty
+    // root exactly as `SettingsPathsCache::snapshot` does when either step
+    // fails. Degrading is harmless for the liveness predicate
+    // (`sabrage_appsup`/`oxr_appsup` are `$HOME`-derived either way) but not
+    // free: the is-Goldberg check reads `paths.gbe_dll`.
     let appsup = Paths::new(PathBuf::new()).sabrage_appsup;
     let repo_root = super::settings::load(&super::settings::settings_path(&appsup))
         .ok()
@@ -125,8 +103,8 @@ pub async fn revert_original_steam_dll(
 }
 
 /// [`revert_original_steam_dll`] with the Goldberg pin passed in — the
-/// testability seam ([`super::library`]'s `validate_pinned` has the same one,
-/// for the same reason: no test can fabricate bytes hashing to the real pin).
+/// testability seam, because no test can fabricate bytes hashing to the real
+/// contract pin.
 pub(crate) async fn revert_with_pin(
     executor: &dyn Executor,
     paths: &Paths,
@@ -143,11 +121,9 @@ pub(crate) async fn revert_with_pin(
     .await
 }
 
-/// [`revert_with_pin`] with the running-game argv needle passed in — the third
-/// testability seam, for the same reason as the other two: a test cannot start
-/// Beat Saber, so it hands in a needle that matches nothing (or, for the
-/// refusal case, one that matches the test binary's own command line, the
-/// trick `stages::stop`'s process tests use).
+/// [`revert_with_pin`] with the running-game argv needle passed in, so a test
+/// can hand in a needle that matches nothing or one that matches its own
+/// command line (tests::refuses_while_a_matching_game_process_is_running).
 async fn revert_probed(
     executor: &dyn Executor,
     paths: &Paths,
@@ -156,17 +132,16 @@ async fn revert_probed(
     game_needle: &str,
 ) -> Result<RevertReport> {
     // Held through the liveness re-check and the copy: a run holds this lock
-    // from before its Goldberg step until well after it publishes the live
-    // session, so acquiring it here is what closes the check-then-copy window
-    // that `live_session()` alone leaves open.
+    // from before its Goldberg step until after it publishes the live session,
+    // so it closes the check-then-copy window `live_session_reason` alone
+    // leaves open (tests::waits_for_the_operation_lock_then_proceeds).
     let _op = crate::stages::acquire_operation_lock().await;
 
-    // The machine-wide predicate, not a local copy: this door used to consult
-    // only the in-process handle and `session-state.json`'s wine pid, so a
-    // `./demo.sh run` session — which writes neither — could have the
-    // `steam_api64.dll` it has mapped replaced underneath it. `live_session_reason`
-    // sees that session through its fresh `runtime_status.json`, and an
-    // unreadable record still counts as live exactly as the local copy had it.
+    // The machine-wide predicate, not a local copy: a `./demo.sh run` session
+    // writes neither an in-process handle nor `session-state.json`, and only
+    // `live_session_reason` sees it, through its fresh `runtime_status.json`
+    // (tests::refuses_while_only_the_runtime_reports_a_live_session). Its
+    // rule that an unverifiable record counts as live applies here too.
     if let Some(reason) = session::live_session_reason(paths) {
         return Err(SabrageError::fatal(
             format!("cannot revert steam_api64.dll while a session is live — {reason}"),
@@ -175,11 +150,11 @@ async fn revert_probed(
     }
 
     // The window `live_session_reason` structurally cannot see: a `./demo.sh
-    // run` publishes no handle, no `run_phase`, no `session-state.json`, and
-    // its `runtime_status.json` does not exist until the runtime starts
-    // streaming (~30 s after the wine spawn, and the Goldberg install happens
-    // before the spawn). A running game with this dll mapped is the one thing
-    // that is observable throughout, so it is probed directly.
+    // run` publishes no handle, no run phase and no `session-state.json`, and
+    // its `runtime_status.json` appears only once the runtime streams, long
+    // after the Goldberg install. A running game with this dll mapped is the
+    // one thing observable throughout, so it is probed directly
+    // (tests::refuses_while_a_matching_game_process_is_running).
     let games = crate::process::find_processes_by_cmdline(game_needle);
     if let Some(p) = games.first() {
         return Err(SabrageError::fatal(
@@ -208,14 +183,12 @@ async fn revert_probed(
         });
     }
 
-    // Any kind of Goldberg: the contract pin, the payload this checkout would
-    // install (which `run` copies over the dll whatever it hashes to, and
-    // whose bytes therefore end up in `.orig-steam` on an install that arrived
-    // already Goldberg'd with a non-pinned build), or a launch's own recorded
-    // provenance — the third is the only one that still recognises a backup
-    // minted from a Goldberg build the *current* `gbe_dll` no longer matches
-    // (the payload was replaced, or the repo root moved), which is exactly the
-    // backup a bytes-only test would copy back and call a restore.
+    // Any kind of Goldberg: the contract pin, the payload this checkout installs,
+    // or a launch's recorded provenance — only the third recognises a backup from
+    // a Goldberg build `gbe_dll` does not match (PARITY.md § Invariants that must
+    // NOT change (byte/behavior parity), "Goldberg hash-tolerance at run"), the
+    // exact backup a bytes-only test would restore
+    // (tests::refuses_when_a_launch_recorded_the_backup_as_goldberg).
     if file_sha256_matches(&backup, gbe_dll_sha256)
         || cmp_files(&paths.gbe_dll, &backup)
         || crate::stages::run::actions::goldberg_backup_is_goldberg(paths, &backup)
@@ -330,7 +303,6 @@ mod tests {
         assert!(!report.restored);
         assert!(report.message.contains("nothing to revert"));
         assert!(report.dll_path.ends_with("steam_api64.dll"));
-        // The dll is untouched.
         assert_eq!(
             std::fs::read(dir.join("steam_api64.dll")).unwrap(),
             b"GOLDBERG"
@@ -364,7 +336,6 @@ mod tests {
             b"REAL-STEAM-BYTES",
             "the live dll now holds the backup's bytes"
         );
-        // The backup, appid marker, and steam_settings/ are all still there.
         assert_eq!(
             std::fs::read(dir.join("steam_api64.dll.orig-steam")).unwrap(),
             b"REAL-STEAM-BYTES"
@@ -403,7 +374,7 @@ mod tests {
         let dir = plugin_dir(&bs_dir);
         std::fs::create_dir_all(&dir).unwrap();
         // The install arrived already Goldberg'd: the first launch snapshotted
-        // Goldberg's own bytes into `.orig-steam` (run.sh:147 / actions.rs).
+        // Goldberg's own bytes into `.orig-steam`.
         std::fs::write(dir.join("steam_api64.dll"), b"GOLDBERG-EMULATOR-BYTES").unwrap();
         std::fs::write(
             dir.join("steam_api64.dll.orig-steam"),
@@ -636,10 +607,8 @@ mod tests {
         let now = crate::session::now_unix_ms();
         // Both halves of `watcher::runtime_status_live`: a fresh stamp *and* a
         // `process_id` that is still alive (this test process stands in for the
-        // runtime). Freshness alone stopped being evidence when the door and
-        // the Session screen's `External` phase were unified on that one
-        // predicate — a status naming no live process is a file neither reader
-        // will vouch for.
+        // runtime). A status naming no live process is a file neither this door
+        // nor the Session screen's `External` phase will vouch for.
         let pid = std::process::id();
         std::fs::write(
             paths.oxr_appsup.join("runtime_status.json"),
@@ -713,7 +682,7 @@ mod tests {
             tokio::spawn(async move { revert(&paths, &bs_dir, UNMATCHABLE_PIN).await })
         };
 
-        // While the lock is held the copy cannot have happened.
+        // Give the spawned revert a chance to reach the lock and block there.
         tokio::task::yield_now().await;
         assert_eq!(
             std::fs::read(dir.join("steam_api64.dll")).unwrap(),
@@ -732,17 +701,13 @@ mod tests {
         std::fs::remove_dir_all(&bs_dir).unwrap();
     }
 
-    // Every test above holds `session::lock_session_globals()`, because
-    // `revert_probed` reads the published run phase and the run-stage tests
-    // publish it: without the guard a `RunPhaseScope` alive on another harness
-    // thread makes this module's reverts fail with "a launch for bottle
-    // 'Steam' is in progress".
-    //
-    // The in-process half of the liveness rule — a `LiveSessionHandle`
-    // published through `session::set_live_session` — is still not faked here:
-    // that guard deliberately does not reset `LIVE_SESSION` (tests in other
-    // modules set it without holding the guard), so a fake published here would
-    // leak into them. The persisted half above covers the same branch of
-    // `live_session_reason`, and `waits_for_the_operation_lock_then_proceeds`
-    // covers the window that check alone could not close.
+    // Every test above holds `session::lock_session_globals()`: a
+    // `RunPhaseScope` alive on another harness thread otherwise makes these
+    // reverts fail with "a launch for bottle 'Steam' is in progress". The
+    // guard deliberately does not reset `LIVE_SESSION` (other modules set it
+    // without holding the guard), so no `LiveSessionHandle` is faked here;
+    // tests::refuses_while_a_persisted_session_records_a_live_wine_child
+    // exercises the same refusal branch of `live_session_reason`, and
+    // tests::waits_for_the_operation_lock_then_proceeds the window that check
+    // alone cannot close.
 }
