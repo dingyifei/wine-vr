@@ -1,67 +1,23 @@
-//! `sabrage-core` — the UI-agnostic native pipeline engine behind Sabrage.
+//! `sabrage-core`: the UI-agnostic native pipeline engine behind Sabrage.
 //!
-//! This crate is the Rust half of a two-implementation system. The zsh pipeline
-//! (`demo.sh` + `scripts/demo/*.sh`) stays the reference; sabrage-core is an
-//! independent implementation that meets it at exactly two places:
+//! An independent implementation of the zsh pipeline (`demo.sh` +
+//! `scripts/demo/*.sh`, which stays the reference). They meet at two places:
 //!
-//! 1. **`contract/pipeline.toml`** — pins, the depot triple, port lists, the DXMT
-//!    artifact set, and the ordered check/launch-action registries. The shell
-//!    consumes it through the GENERATED `scripts/demo/contract.gen.sh`; this
-//!    crate parses it directly ([`contract`]).
-//! 2. **Byte-shared on-disk artifacts** — the host OpenXR manifest and the
+//! 1. `contract/pipeline.toml` — pins, depot triple, port lists, DXMT artifact
+//!    set, and ordered check/launch-action registries. Parsed directly here
+//!    ([`contract`]); the shell reaches it via generated
+//!    `scripts/demo/contract.gen.sh`. Registry order and slug coverage pinned by
+//!    `checks::tests::registry_binds_in_contract_order_and_covers_every_slug`.
+//! 2. Byte-shared on-disk artifacts — the host OpenXR manifest and the
 //!    `oxrsys-runtime.toml` first-write template, rendered from
-//!    `contract/*.template` by both sides ([`util`]). install.sh does literal
-//!    string equality on the manifest, so a single differing byte makes the two
-//!    front-ends thrash each other with sudo prompts.
+//!    `contract/*.template` by both sides ([`util`]). Manifest bytes pinned by
+//!    `stages::install::tests::layer_four_stages_the_host_manifest_file_form_byte_for_byte`.
 //!
-//! Console text is *not* a shared contract — but check message and remedy
-//! strings still track `scripts/demo/doctor.sh` verbatim, because
-//! `docs/troubleshooting.md` quotes them.
+//! Deliberate divergences live in `sabrage/PARITY.md`.
 //!
-//! # Layers
-//!
-//! Phase 1 shipped the read-only half: the contract types, the typed lib.sh path
-//! port, the check registry, the shell-idiom primitives, and the parity tap.
-//! Phase 2 adds the mutating half — the stage layer — around a single rule:
-//! **every mutation goes through [`executor::Executor`]**, so `--dry-run` is the
-//! same code path with one implementation swapped rather than a second, drifting
-//! one.
-//!
-//! # Module map
-//!
-//! Read-only:
-//! * [`contract`] — the compiled-in `contract/` and its types
-//! * [`paths`] — [`paths::Paths`] / [`paths::Bottle`], the typed lib.sh port,
-//!   and [`paths::resolve_repo_root`]
-//! * [`checks`] — check registry, [`checks::CheckOutcome`], [`checks::run_doctor`]
-//! * [`util`] — `cmp -s`, sha256, `win_path`, `bs_version`, the DXMT artifact
-//!   predicates, template rendering, the `meta.contract-sync` hash recipe
-//! * [`tap`] — the `"<slug> <status>"` parity channel
-//!
-//! Mutating:
-//! * [`events`] — [`events::StageEvent`], [`events::Stage`], the step ids
-//! * [`stages`] — [`stages::StageCtx`], the operation lock, [`stages::run_stage`]
-//! * [`executor`] — every mutating primitive, real and dry-run
-//! * [`process`] — child spawn/stream/cancel and the exec-path reap primitive
-//! * [`fixes`] — the remedy actions doctor rows and the launch preflight offer
-//! * [`privilege`] — the pipeline's one privileged write
-//! * [`error`] — [`error::SabrageError`] and demo.sh exit-code mapping
-//!
-//! Phase 3 adds the launch half — [`stages::run`], the state machine behind
-//! `demo.sh run` — plus the two things a *session* needs that a stage does
-//! not:
-//! * [`session`] — the live handle, the broadcast [`session::SessionStatus`],
-//!   the crash-recovery [`session::state::SessionState`], and the file-only
-//!   telemetry watcher
-//! * [`logs`] — the wine console log's name, the rotation-aware tailer, and
-//!   the past-run list
-//!
-//! Phase 4 adds the two things the GUI persists that demo.sh never had:
-//! * [`config`] — the typed, format-preserving `oxrsys-runtime.toml` editor
-//!   (the deliberate write-once override: create-if-absent from the shared
-//!   template, then in-place `toml_edit` value edits with backups)
-//! * [`store`] — Sabrage's own `~/Library/Application Support/Sabrage/`
-//!   store: `settings.json` (defaults, repo root) and `library.json` (games)
+//! Checks are read-only. Every mutation goes through [`executor::Executor`], so
+//! `--dry-run` is the same code path with one implementation swapped rather than
+//! a second, drifting one.
 
 pub mod checks;
 pub mod config;
