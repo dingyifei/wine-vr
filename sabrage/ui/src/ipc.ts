@@ -1,6 +1,6 @@
 // Hand-mirrored IPC boundary between the Svelte frontend and sabrage-app's
-// Tauri commands (`src-tauri/src/commands.rs`). No codegen — when either side
-// changes a shape, update both by hand and keep this comment as the pointer.
+// Tauri commands (`src-tauri/src/commands.rs`). No codegen: a shape change on
+// either side has to be made by hand on both.
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
@@ -21,7 +21,7 @@ export interface DoctorEvent {
    * this check's remedy has none. Resolve to a `FixAction` with
    * `contractFixIdToAction` before offering a Fix button — `fix.create-z-drive`
    * is the one contract id deliberately left unmodelled and resolves to
-   * `null` (`fix.edit-protocol` gained a `FixAction` in Phase 4). */
+   * `null`. */
   fix: string | null;
 }
 
@@ -33,8 +33,8 @@ export interface DoctorSummary {
 }
 
 /** Sidebar footer snapshot — mirrors `commands::AppState`. `defaultBottle`/
- * `defaultBsDir` are Phase 4 additions (from `Settings`) so the Sidebar and
- * Session screen can prefill without a second `getSettings()` call. */
+ * `defaultBsDir` come from `Settings`, so the Sidebar and Session screen can
+ * prefill without a second `getSettings()` call. */
 export interface AppState {
   repoRoot: string | null;
   bottles: string[];
@@ -75,16 +75,11 @@ export async function getAppState(): Promise<AppState> {
   return invoke<AppState>("get_app_state");
 }
 
-// ── pipeline stages + fixes ─────────────────────────────────────────────────
-//
-// Mirrors `sabrage_core::events` / `sabrage_core::fixes` (via
-// `src-tauri/src/commands.rs`, which forwards `StageEvent` to the channel
-// verbatim — there is no separate wire type on the Rust side either).
 
 /** Mirrors `sabrage_core::Stage` (serde lowercase). `run_stage(stage: "run")`
- * works as of Phase 3, but its promise does not resolve until the session
- * ends — see `launch()`'s own doc comment; the Session screen calls `launch`,
- * not `runStage`, for that reason. */
+ * works, but its promise does not resolve until the session ends — see
+ * `launch()`'s own doc comment; the Session screen calls `launch`, not
+ * `runStage`, for that reason. */
 export type Stage = "setup" | "build" | "install" | "run" | "stop";
 
 /** Mirrors `sabrage_core::Severity` (serde camelCase — all four words are
@@ -147,7 +142,6 @@ export type StageEvent =
   | { kind: "autoFixed"; runId: string; step: string; fix: FixAction; description: string }
   | { kind: "needsAdmin"; runId: string; step: string; reason: string }
   | { kind: "fatal"; runId: string; message: string; remedy: string | null; fix: FixAction | null }
-  // ── Phase 3 (run) ──
   /** A raw `print -r --` line, reproduced verbatim — leading spaces and all,
    * possibly empty. `run.sh`'s launch banner and its audio/dashboard/exit
    * lines are the only source of these (see `events.rs`'s `StageEvent::Text`
@@ -220,12 +214,9 @@ export interface FixRunOpts {
  * path is `runStage` directly (see `contractFixIdToAction`'s doc comment)
  * rather than `applyFix`.
  *
- * Every fix is additionally `forbidden_while_session_live` on the Rust side,
- * refused by `fixes::apply` both before it takes the operation lock and again
- * with it held (a session can start during a long wait), so a Fix button
- * offered during — or just before — a live session fails with a remedy rather
- * than mutating; disable them with `blocksMutation(status.phase)` so the user
- * learns that before clicking. */
+ * `fixes::apply` refuses every fix while a session is live, so disable the
+ * buttons with `blocksMutation(status.phase)`
+ * (`sabrage_core::fixes::tests::apply_refuses_every_session_forbidden_fix_while_a_session_is_live`). */
 export const FIX_META: Record<
   FixAction,
   {
@@ -315,13 +306,9 @@ export const FIX_META: Record<
  *   at an 800x900 black screen, and editing the pinned IP on the Settings
  *   screen is the recovery that works.
  *
- * Keeping the metadata while withholding the button is exactly what this set
- * exists for — `bare in FIX_META` used to be the whole test, which is how
- * `cfg.session-pins` kept rendering a Fix button for a remedy Rust had already
- * stopped offering. `run_doctor` now also projects every row's fix id through
- * `FixAction::from_contract_id` before it goes on the wire and the `fix`
- * command refuses a withheld action outright, so this is the third of three
- * doors, not the only one. */
+ * This set is the third of three doors: `run_doctor` also projects every row's
+ * fix id through `FixAction::from_contract_id`, and the `fix` command refuses a
+ * withheld action outright. */
 const DEFERRED_FIX_IDS: ReadonlySet<string> = new Set([
   "fix.create-z-drive",
   "fix.delete-session-json",
@@ -330,8 +317,7 @@ const DEFERRED_FIX_IDS: ReadonlySet<string> = new Set([
 /** `"fix.set-graphics-backend"` -> `"set-graphics-backend"`; `null` for a
  * contract id this table does not model **and** for one it models but does not
  * offer (`DEFERRED_FIX_IDS`) — mirrors `FixAction::from_contract_id` exactly.
- * `fix.edit-protocol` resolves to `"edit-protocol"` as of Phase 4. A `null`
- * result means "render no Fix button", not an error. */
+ * A `null` result means "render no Fix button", not an error. */
 export function contractFixIdToAction(id: string): FixAction | null {
   const full = id.startsWith("fix.") ? id : `fix.${id}`;
   if (DEFERRED_FIX_IDS.has(full)) return null;
@@ -370,24 +356,21 @@ export async function cancelStage(runId: string): Promise<boolean> {
 }
 
 /**
- * Stop the session. As of Phase 3 this covers two cases (see
- * `commands::stop_session`'s doc comment):
+ * Stop the session — two cases (see `commands::stop_session`'s doc comment):
  *
- * - A session this Sabrage process is supervising (`launch()` is still
- *   pending) is stopped by firing its own cancel token — `bottle` is ignored,
- *   and `onEvent` receives nothing new: the still-pending `launch()` call's
- *   own `onEvent` carries every teardown row. The resolved `StageOutcome` is
- *   synthetic (`{ stage: "run", ok: true, exitCodeEquiv: 130 }`, INT parity).
- * - Otherwise, runs the `stop` stage for `bottle` as before.
+ * - a session this Sabrage process is supervising (`launch()` still pending)
+ *   is stopped by firing its own cancel token: `bottle` is ignored, `onEvent`
+ *   receives nothing new (the pending `launch()` call's own `onEvent` carries
+ *   every teardown row), and the resolved `StageOutcome` is synthetic
+ *   (`{ stage: "run", ok: true, exitCodeEquiv: 130 }`, INT parity);
+ * - otherwise the `stop` stage runs for `bottle`.
  *
  * `sessionStore.stop()` is the intended call site for both — it supplies
- * `bottle` from `sessionStore.status.bottle` so callers never need to track
- * one themselves.
+ * `bottle` from `sessionStore.status.bottle`.
  *
- * The live-session branch **rejects** when teardown did not actually finish:
- * it timed out (the session may still be running), or the run detached
- * instead of stopping. Show that message — it used to resolve `ok: true`
- * regardless, so "Stopped" could appear over a still-running game.
+ * The live-session branch **rejects** when teardown did not actually finish
+ * (it timed out, or the run detached instead of stopping); show that message,
+ * or "Stopped" appears over a still-running game.
  */
 export async function stopSession(
   bottle: string | null | undefined,
@@ -405,15 +388,12 @@ export async function stopSession(
  * `window.confirm` (it blocks the webview). An action `contractFixIdToAction`
  * withholds (`DEFERRED_FIX_IDS`) is refused outright, confirmed or not.
  *
- * **The first `onEvent` carries the run id.** `fixes::apply` emits an
- * `"applying fix '<action>'"` line *before* it waits for the operation lock
- * (and a "waiting for another Sabrage operation to finish" line when it has
- * to), so `ev.runId` from that first event is a live `cancelStage(runId)`
- * handle for the whole wait — a fix queued behind another Sabrage process's
- * build can run for minutes before it mutates anything, and the wait itself
- * ends immediately on cancel with nothing touched. Capture it and enable a
- * Cancel affordance; a call site that ignores it leaves the user with no way
- * out of a queued mutation.
+ * **The first `onEvent` carries the run id.** `fixes::apply` emits its
+ * `"applying fix '<action>'"` line before it waits for the operation lock, so
+ * `ev.runId` from that first event is a live `cancelStage(runId)` handle for
+ * the whole wait — which can last minutes behind another Sabrage operation and
+ * ends with nothing touched. Capture it and enable a Cancel affordance; a call
+ * site that ignores it leaves the user with no way out of a queued mutation.
  */
 export async function applyFix(
   action: FixAction,
@@ -434,9 +414,6 @@ export async function applyFix(
   });
 }
 
-// ── session / launch (Phase 3) ──────────────────────────────────────────────
-//
-// Mirrors `sabrage_core::session` (via `src-tauri/src/commands.rs`).
 
 /** Mirrors `sabrage_core::session::SessionPhase` (serde camelCase — every
  * word is already lowercase, so this looks like plain lowercase).
@@ -459,8 +436,8 @@ export type SessionPhase =
   | "external";
 
 /** Is something running (or about to be) that a mutating action must not
- * disturb? The one definition of "a session is live" for the whole UI —
- * screens used to re-derive their own phase sets, and drifted.
+ * disturb? The one definition of "a session is live" for the whole UI; no
+ * screen derives its own phase set.
  *
  * `"exited"` is not live (the wine child is gone, the row is just the last
  * session's epitaph) and neither is `"idle"`. Everything else is. */
@@ -557,10 +534,10 @@ export const IDLE_SESSION_STATUS: SessionStatus = {
 
 /** Mirrors `commands::LaunchOpts` (serde camelCase). Every field but the
  * bottle/bs-dir pair has no `demo.sh` counterpart at all outside `run.sh`
- * itself — see that struct's own doc comment. `gameId` (Phase 4) is the
- * library entry this launch belongs to, when it came from the Library
- * screen's Run button — the backend uses it to record a `LastSession` after
- * the run settles; omit it for the plain Session screen's own launches. */
+ * itself — see that struct's own doc comment. `gameId` is the library entry
+ * this launch belongs to, when it came from the Library screen's Run button —
+ * the backend uses it to record a `LastSession` after the run settles; omit it
+ * for the plain Session screen's own launches. */
 export interface LaunchOpts {
   bottle?: string | null;
   bsDir?: string | null;
@@ -611,13 +588,12 @@ export async function getSessionStatus(): Promise<SessionStatus> {
 }
 
 /** Detach from the live session — the app-quit "leave it running" answer
- * (critique.md, "app-quit semantics for a live session"). A no-op when
- * nothing is live. */
+ * (`sabrage/docs/design/critique.md`, "app-quit semantics for a live
+ * session"). A no-op when nothing is live. */
 export async function detachSession(): Promise<void> {
   return invoke("detach_session");
 }
 
-// ── reconcile ────────────────────────────────────────────────────────────────
 
 /** One `adb forward tcp:<port> tcp:<port>` a `--wired` launch created —
  * mirrors `sabrage_core::session::state::WiredForward`. */
@@ -688,14 +664,12 @@ export interface ReconcileReport {
 /**
  * Reconcile whatever `session-state.json` says on disk against what is
  * actually running. Call at startup and again before showing the Launch
- * button (design-app §6). Request/response, not a stream — there is no
- * `onEvent` here.
+ * button. Request/response, not a stream — there is no `onEvent` here.
  */
 export async function reconcileSession(bottle: string | null): Promise<ReconcileReport> {
   return invoke<ReconcileReport>("reconcile_session", { bottle });
 }
 
-// ── logs ─────────────────────────────────────────────────────────────────────
 
 /** Mirrors `sabrage_core::logs::LogSource` (serde `tag: "kind"`, camelCase).
  * `file`'s `path` is a specific past run from `listPastRuns()`. */
@@ -754,7 +728,6 @@ export async function getLogSourcePath(source: LogSource): Promise<string | null
   return invoke<string | null>("get_log_source_path", { source });
 }
 
-// ── quit ─────────────────────────────────────────────────────────────────────
 
 /** The three answers to "a session is still running — quit anyway?" — mirrors
  * `commands::QuitChoice` (serde camelCase; every variant is one already-lower
@@ -762,22 +735,18 @@ export async function getLogSourcePath(source: LogSource): Promise<string | null
 export type QuitChoice = "stop" | "keep" | "cancel";
 
 /** Resolve the pending quit-while-live dialog (`onQuitRequested`). `"stop"`/
- * `"keep"` end by exiting the app from the Rust side — do not expect this
- * promise's *settlement* to be observable from the webview either way, only
- * `"cancel"` reliably returns control to the caller.
+ * `"keep"` exit the app from the Rust side — only `"cancel"` reliably returns
+ * control to the caller.
  *
  * `"stop"` rejects (while still exiting) when teardown did not finish inside
- * its 30 s budget: Sabrage then detaches instead — guards disarmed, the
- * record marked detached, the game left running — rather than exiting with a
- * half-torn-down session. A quit dialog left unanswered for 20 s is also
- * given up on: the next quit request is no longer intercepted at all and the
- * app exits through the same keep-running path, so a webview that died before
- * subscribing to `onQuitRequested` can never make Sabrage unquittable. */
+ * its 30 s budget: Sabrage detaches instead — guards disarmed, the record
+ * marked detached, the game left running. An unanswered dialog is given up on
+ * after 20 s and the next quit request exits through the keep-running path, so
+ * a webview that died before subscribing cannot make Sabrage unquittable. */
 export async function resolveQuit(choice: QuitChoice): Promise<void> {
   return invoke("resolve_quit", { choice });
 }
 
-// ── global events ────────────────────────────────────────────────────────────
 
 /** Subscribe to the 1 Hz `session://status` broadcast. */
 export async function onSessionStatus(cb: (status: SessionStatus) => void): Promise<UnlistenFn> {
@@ -796,16 +765,14 @@ export interface QueuedStage {
  * `stopSession` call finds another operation already in flight and has to
  * wait for it.
  *
- * `run_stage` used to take the operation lock *before* emitting its first
- * `stageStarted`, so a queued run had no id the UI could offer Cancel for:
- * the button stayed disabled for the whole wait, and then the stage mutated
- * the machine when its turn came. Core now emits `stageStarted` first, so the
- * id exists either way; this event additionally names the wait *as* a wait
- * (the common case is queueing behind a `sabrage` CLI build in another
- * process, which nothing on the stage channel would mention). Cancelling on
- * this id works — the lock wait itself is cancellable, and the executor fails
- * every filesystem primitive once the token fires. Treat it exactly like
- * `stageStarted`'s `runId` (and expect `stageStarted` for the same run).
+ * Core emits `stageStarted` before it takes the operation lock, so a queued
+ * run already has an id Cancel can use; this event additionally names the wait
+ * *as* a wait (the common case is queueing behind a `sabrage` CLI build in
+ * another process, which nothing on the stage channel would mention).
+ * Cancelling on this id works — the lock wait itself is cancellable, and the
+ * executor fails every filesystem primitive once the token fires. Treat it
+ * exactly like `stageStarted`'s `runId` (and expect `stageStarted` for the
+ * same run).
  */
 export async function onStageQueued(cb: (queued: QueuedStage) => void): Promise<UnlistenFn> {
   return listen<QueuedStage>("stage://queued", (event) => cb(event.payload));
@@ -833,12 +800,9 @@ export async function onMenu(cb: (which: "doctor" | "launch" | "stop") => void):
   };
 }
 
-// ── runtime config (Phase 4) ────────────────────────────────────────────────
-//
-// Mirrors `sabrage_core::config::runtime_toml` (via `src-tauri/src/commands.rs`).
-// Edits `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` in place —
-// the deliberate divergence from demo.sh's write-once treatment of that file
-// (design-app.md §4, "Settings write policy").
+// Sabrage edits `~/Library/Application Support/OXRSys/oxrsys-runtime.toml` in
+// place — the deliberate divergence from demo.sh's write-once treatment of that
+// file (`sabrage/docs/design/design-app.md` §4, "Settings write policy").
 
 /** Mirrors `config::runtime_toml::Protocol` (serde lowercase). */
 export type Protocol = "alvr" | "oxrsys";
@@ -918,29 +882,24 @@ export async function readRuntimeConfig(): Promise<RuntimeConfigView> {
 
 /**
  * Apply `patch` to `oxrsys-runtime.toml` — creates the file byte-identical to
- * the shared template first if it doesn't exist yet, otherwise snapshots a
- * backup and edits values in place, preserving every other byte. Rejects
- * when the file has a `parseError` (edits are refused rather than risking an
- * unreadable rewrite — fix the file by hand first) or on a validation/IPC
- * failure. A patch that changes nothing writes no backup and no file.
+ * the shared template if it doesn't exist, otherwise snapshots a backup and
+ * edits in place, preserving every other byte. Rejects when the file has a
+ * `parseError` (fix by hand first), on a validation/IPC failure, and **while
+ * a session is live** (`./demo.sh stop --bottle <name>`). A patch that changes
+ * nothing writes no backup and no file.
  *
- * **Rejects while a session is live**, with `./demo.sh stop --bottle <name>`
- * as the remedy. The runtime re-reads this file every 250 ms and rebuilds the
- * encoder when `encoderProcess`/`videoCodec` move, so a save mid-stream is a
- * live reconfiguration, not a next-launch setting — disable Save while
- * `blocksMutation(sessionStore.status.phase)` rather than promising "values
- * take effect at the next launch". It also serializes against
+ * The runtime re-reads this file every 250 ms and rebuilds the encoder when
+ * `encoderProcess`/`videoCodec` move, so a save mid-stream is a live
+ * reconfiguration — disable Save while
+ * `blocksMutation(sessionStore.status.phase)`. Also serializes against
  * setup/build/install and the `edit-protocol` fix (the process-wide operation
- * lock), so a save can block briefly behind one of those.
+ * lock), so a save can block briefly.
  */
 export async function writeRuntimeConfig(patch: RuntimeConfigPatch): Promise<WriteReport> {
   return invoke<WriteReport>("write_runtime_config", { patch });
 }
 
-// ── settings (Phase 4) ──────────────────────────────────────────────────────
-//
-// Mirrors `sabrage_core::store::settings` (via `src-tauri/src/commands.rs`).
-// Persisted at `<Sabrage appsup>/settings.json`.
+// Settings are persisted at `<Sabrage appsup>/settings.json`.
 
 /** Mirrors `store::settings::LaunchDefaults` (serde camelCase) — the four
  * `run.sh`-only flags (see `LaunchOpts`'s doc comment), as app-wide defaults
@@ -948,11 +907,9 @@ export async function writeRuntimeConfig(patch: RuntimeConfigPatch): Promise<Wri
  *
  * The index signature is the wire half of `LaunchDefaults`'s own
  * `#[serde(flatten)] extra` map, for the same reason `Settings` has one a
- * level up: a key a *newer* Sabrage wrote inside `launch` was previously
- * dropped while deserializing and deleted by the next autosave. Spread the
- * loaded object (`{ ...settings.launch, wired: true }`) rather than rebuilding
- * it field by field, or the extras are stripped before they reach the
- * backend. */
+ * level up. Spread the loaded object (`{ ...settings.launch, wired: true }`)
+ * rather than rebuilding it field by field, or a newer Sabrage's keys are
+ * stripped before they reach the backend. */
 export interface LaunchDefaults {
   noAudio: boolean;
   noDashboard: boolean;
@@ -966,9 +923,8 @@ export interface LaunchDefaults {
 /** Mirrors `store::settings::Settings` (serde camelCase).
  *
  * The index signature is the wire half of the store's `#[serde(flatten)]
- * extra` map: a newer Sabrage's keys are read and written back verbatim, so
- * running an older build and toggling one control no longer strips them.
- * Keep spreading the loaded object (`{ ...settings, ...patch }`) rather than
+ * extra` map: a newer Sabrage's keys are read and written back verbatim. Keep
+ * spreading the loaded object (`{ ...settings, ...patch }`) rather than
  * rebuilding one field by field, or the extras are dropped before they reach
  * the backend. */
 export interface Settings {
@@ -996,8 +952,8 @@ export async function getSettings(): Promise<Settings> {
 }
 
 /** Persist `settings` and return it back as saved (same shape, including any
- * unknown top-level keys, which now round-trip). Rejects when `$HOME` is
- * missing/empty/non-absolute rather than writing the store somewhere else. */
+ * unknown top-level keys). Rejects when `$HOME` is missing/empty/non-absolute
+ * rather than writing the store somewhere else. */
 export async function saveSettings(settings: Settings): Promise<Settings> {
   return invoke<Settings>("save_settings", { settings });
 }
@@ -1031,10 +987,7 @@ export async function getRepoInfo(): Promise<RepoInfo> {
   return invoke<RepoInfo>("get_repo_info");
 }
 
-// ── library (Phase 4) ───────────────────────────────────────────────────────
-//
-// Mirrors `sabrage_core::store::library` (via `src-tauri/src/commands.rs`).
-// Persisted at `<Sabrage appsup>/library.json`.
+// The library is persisted at `<Sabrage appsup>/library.json`.
 
 /** Mirrors `store::library::LaunchOverrides` (serde camelCase) — per-game
  * overrides of `Settings.launch`; `null` on a field means "use the global
@@ -1158,17 +1111,17 @@ export interface RevertReport {
  * Restore `steam_api64.dll.orig-steam` back over `steam_api64.dll` for the
  * library entry named `gameId`. A no-op (`restored: false`, explanatory
  * `message`) when there is no `.orig-steam` to restore from, or when the
- * backup is itself the pinned Goldberg dll — nothing here can prove a backup
- * is the real Steam dll, so the message says "the .orig-steam backup", never
- * "the original". The next launch re-applies Goldberg regardless — `message`
- * says so (`// DIVERGENCE:` from run.sh, which never restores; see
- * `PARITY.md`). Rejects while a session is live.
+ * backup is itself the pinned Goldberg dll — the message says "the .orig-steam
+ * backup", never "the original", because nothing can prove it is. The next
+ * launch re-applies Goldberg regardless, and `message` says so. Restoring at
+ * all is a divergence — run.sh never does (PARITY.md § Planned for later
+ * phases (declared now), "Revert-original-`steam_api64.dll` action"). Rejects
+ * while a session is live.
  *
- * `expectedBsDir` is the Beat Saber directory the screen showed and
- * validated. This command mutates the entry's **saved** `bsDir`, so a form
- * with an unsaved path edit would otherwise overwrite a dll in a different
- * installation than the one on screen; pass it and the backend fails closed
- * on a mismatch. Optional only so a caller that renders no path can omit it.
+ * `expectedBsDir` is the Beat Saber directory the screen showed and validated.
+ * The command mutates the entry's **saved** `bsDir`, so an unsaved path edit
+ * would target a different installation; pass it and the backend fails closed
+ * on a mismatch. Optional for callers that render no path.
  */
 export async function revertOriginalSteamDll(
   gameId: string,
@@ -1180,14 +1133,11 @@ export async function revertOriginalSteamDll(
   });
 }
 
-// ── native dialogs ───────────────────────────────────────────────────────────
 
 /**
- * Open a native "choose a folder" dialog (`@tauri-apps/plugin-dialog`,
- * `dialog:allow-open` capability). Resolves `null` on cancel — the plugin's
- * own `open()` returns `string | string[] | null` depending on options; this
- * always asks for a single directory, so the union collapses to
- * `string | null` here.
+ * Open a native "choose a folder" dialog (`@tauri-apps/plugin-dialog`, the
+ * `dialog:allow-open` capability in `capabilities/main.json`). Resolves `null`
+ * on cancel.
  */
 /** `commands::BsDirSuggestion` — the bottle-derived Beat Saber dir (empty when
  * no bottle) and the nearest EXISTING directory a folder picker should start
