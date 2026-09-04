@@ -23,18 +23,17 @@
 mod tests {
     use std::path::PathBuf;
 
-    /// The repo root: this crate's manifest dir is `sabrage/crates/sabrage-parity`,
-    /// so three `..` hops land on `sabrage-parity` → `crates` → `sabrage` → repo
-    /// root — the same depth `sabrage-contract-gen::compiled_repo_root()` uses
-    /// (it lives at the same `crates/<name>` depth).
+    /// The repo root, resolved from this crate's manifest dir.
+    ///
+    /// `sabrage-contract-gen` sits at the same `crates/<name>` depth, so both
+    /// resolve the same directory — pinned by
+    /// `tests::contract_gen_parity::check_reports_in_sync_against_the_live_checkout`.
     pub(crate) fn repo_root() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
             .canonicalize()
             .expect("repo root resolves")
     }
-
-    // ── (1) contract-gen regen ──────────────────────────────────────────────
 
     /// `generate() == committed scripts/demo/contract.gen.sh`, as a compile-time
     /// byte comparison against this crate's own `include_str!` of the checked-in
@@ -46,10 +45,9 @@ mod tests {
         #[test]
         fn generate_matches_the_committed_contract_gen_sh() {
             let generated = sabrage_contract_gen::generate();
-            // Included at this crate's own include-path depth (src/lib.rs ->
-            // sabrage-parity -> crates -> sabrage -> repo root), so the
-            // comparison is against the bytes checked in on disk at build
-            // time, not against a value re-derived from contract/.
+            // include_str! resolves relative to this file, so the comparison is
+            // against the bytes checked in on disk, never a value re-derived
+            // from contract/.
             let committed = include_str!("../../../../scripts/demo/contract.gen.sh");
             assert_eq!(
                 generated, committed,
@@ -69,17 +67,12 @@ mod tests {
                 .join("\n")
         }
 
-        /// A contract scalar the shell hard-codes is a scalar the two
-        /// front-ends can silently disagree about: editing it in
-        /// `pipeline.toml` and regenerating moves only the generated file's
-        /// `# contract-sha256:` header, so `--check`, `--regen` and doctor's
-        /// `meta.contract-sync` all report "in sync" while native setup fetches
-        /// one asset and setup.sh fetches another (or the two resolve BS_DIR to
-        /// different directories).
-        ///
-        /// `sabrage-contract-gen` emits these three; the shell must source
-        /// them. `sabrage-core` already reads them from the contract
-        /// (`stages::setup`, `paths::resolve_bs_dir`).
+        /// The three contract scalars `sabrage-contract-gen` emits must be
+        /// sourced by the shell, never re-typed: editing one in `pipeline.toml`
+        /// and regenerating moves only the generated file's `# contract-sha256:`
+        /// header, so `--check`, `--regen` and doctor's `meta.contract-sync` all
+        /// report "in sync" while native setup fetches one asset and setup.sh
+        /// another (or the two resolve BS_DIR to different directories).
         #[test]
         fn the_shell_sources_the_emitted_asset_and_install_leaf_scalars() {
             let root = repo_root();
@@ -165,16 +158,12 @@ mod tests {
         }
     }
 
-    // ── (2) shell fingerprint tripwire ──────────────────────────────────────
-
     /// `sabrage/parity/shell.fingerprint` pins the sha256 of `demo.sh` plus
-    /// every `scripts/demo/*.sh` (excluding the GENERATED `contract.gen.sh`,
-    /// which is covered by `contract_gen_parity` instead). Any edit to a
-    /// tracked shell file — content OR the tracked file set itself — turns
-    /// this test red until `scripts/dev/parity.sh --bless` re-signs it, which
-    /// (per design-parity.md §4 tier 1.2) only re-blesses after the rest of
-    /// the suite passes. The coupling from "shell edited" to "cargo test red"
-    /// is mechanical, not honor-system.
+    /// every `scripts/demo/*.sh` (`contract.gen.sh` excluded — `contract_gen_parity`
+    /// covers it). Any edit to a tracked shell file — its content OR the tracked
+    /// file set itself — turns this test red until `scripts/dev/parity.sh --bless`
+    /// re-signs it, which per docs/design/design-parity.md §4 tier 1.2 only
+    /// happens after the rest of the suite passes.
     mod shell_fingerprint {
         use super::repo_root;
         use std::path::{Path, PathBuf};
@@ -266,8 +255,6 @@ mod tests {
         }
     }
 
-    // ── (3) slug coverage: doctor.sh chk/tap call sites <-> contract slugs ──
-
     /// Token-scans `doctor.sh` for every slug it emits via `chk <status>
     /// <slug> …` or `tap <slug> <status>` (literal calls), plus the four
     /// `for _x in slug:value …; do` loops whose body reuses the loop
@@ -323,12 +310,12 @@ mod tests {
 
         /// The executable part of a shell line: everything before the first
         /// **comment** `#` — one that starts a word (line start, or after
-        /// whitespace) and is not inside a single- or double-quoted string.
+        /// whitespace) and is not inside a single- or double-quoted string, so
+        /// `${_f#$ROOT/}`, `$#` and a quoted `#` all survive.
         ///
-        /// Without this the scanner credits a commented-out `chk` line as a
-        /// live emission, which is precisely how a deleted check keeps its
-        /// coverage. `${_f#$ROOT/}`, `$#` and a `#` inside a quoted message are
-        /// not comments and must survive.
+        /// Without this the scanner credits a commented-out `chk` line as a live
+        /// emission, so a deleted check keeps its coverage; see
+        /// `tests::slug_coverage::a_hash_starts_a_comment_only_when_it_begins_an_unquoted_word`.
         fn strip_comment(line: &str) -> &str {
             let mut in_single = false;
             let mut in_double = false;
@@ -382,14 +369,12 @@ mod tests {
 
         /// Does the loop body starting at `rest` actually emit for `var`?
         ///
-        /// The two halves must be *joined*, not merely both present: a
-        /// `chk`/`tap` call only counts when that call itself carries the
-        /// loop item's slug — either `${_x%%:*}` inline (sections 4/6/9) or a
-        /// variable the extraction was assigned to (`_slug="${_o%%:*}"`,
-        /// section 10). Counting "some line extracts" AND "some line calls"
-        /// independently credits every slug in the header as soon as the body
-        /// contains *any* unrelated emission, which is exactly the shape a
-        /// deleted per-item check leaves behind (round-1 finding A1-7).
+        /// The two halves must be *joined*, not merely both present: a `chk`/`tap`
+        /// call counts only when it carries the loop item's slug, inline
+        /// (`${_x%%:*}`) or through the assigned variable. Independent counting
+        /// credits every header slug once the body contains any unrelated emission
+        /// — the shape a deleted per-item check leaves behind (r1:A1-7). See
+        /// `tests::slug_coverage::a_loop_credits_its_header_slugs_only_when_the_body_emits_for_them`.
         fn loop_body_emits(rest: &[String], var: &str, call_re: &Regex) -> bool {
             let extraction = format!("${{{var}%%:*}}");
             // Shell text that provably carries this loop item's slug.
@@ -576,8 +561,6 @@ mod tests {
             );
         }
 
-        // ── the scanner's own behaviour, on inline fixtures ──────────────────
-
         fn slugs_of(fixture: &str) -> Vec<String> {
             scan_doctor_slugs(fixture).order
         }
@@ -708,8 +691,6 @@ mod tests {
         }
     }
 
-    // ── (4) run.sh preflight/launch-action tags <-> contract gates ──────────
-
     mod run_sh_tags {
         use super::repo_root;
         use regex::Regex;
@@ -738,10 +719,8 @@ mod tests {
             ("preflight-autofix:", Gate::Autofix),
         ];
 
-        /// All slugs on `# <tag> <slug> [<slug> …]` lines, in file order
-        /// (multiple slugs on one line, as `cfg.protocol.supported
-        /// cfg.protocol.legacy-oxrsys` did before the gates split them, expand
-        /// to multiple entries).
+        /// All slugs on `# <tag> <slug> [<slug> …]` lines, in file order; a line
+        /// naming several slugs expands to one entry per slug.
         fn extract_tagged(text: &str, tag: &str) -> Vec<String> {
             let re = Regex::new(&format!(r"(?m)^#\s*{}\s+(.+)$", regex::escape(tag))).unwrap();
             re.captures_iter(text)
@@ -756,10 +735,9 @@ mod tests {
         /// slug -> the gate its tag claims, for every tagged (or documented
         /// untagged) preflight in run.sh.
         ///
-        /// Merging the three tag kinds into one "is gating at all" bag — which
-        /// this test used to do — cannot tell `warn` from `block` in either
-        /// direction: turning `game.version`'s `warn` into a `die` left the tag
-        /// and the whole comparison unchanged. The map is the fix.
+        /// Per gate, not one "is gating at all" bag: a bag cannot tell `warn` from
+        /// `block` in either direction, so turning `game.version`'s `warn` into a
+        /// `die` would leave the comparison unchanged.
         fn tag_gate_map(text: &str) -> (BTreeMap<String, Gate>, Vec<String>) {
             let mut map: BTreeMap<String, Gate> = BTreeMap::new();
             let mut conflicts: Vec<String> = Vec::new();
@@ -943,8 +921,8 @@ mod tests {
         }
 
         /// Swapping the two verbs of the mixed protocol group in memory — the
-        /// exact change the old group-level verb bag could not see — must be
-        /// reported.
+        /// change a group-level verb bag cannot see — must be reported once per
+        /// half.
         #[test]
         fn swapping_the_verbs_of_a_mixed_tag_group_is_caught() {
             let root = repo_root();
@@ -1050,8 +1028,6 @@ mod tests {
             );
         }
 
-        // ── the tag scan's own behaviour, on inline fixtures ─────────────────
-
         #[test]
         fn the_scan_separates_block_warn_and_autofix() {
             let fixture = "# preflight: a.block\n[ -f x ] || die \"gone\"\n\
@@ -1099,19 +1075,13 @@ mod tests {
         }
     }
 
-    // ── (5) artifact goldens ─────────────────────────────────────────────────
-
-    /// Byte-exact rendering checks, each built from the template/contract
-    /// file read fresh off disk rather than sabrage-core's compiled-in copy
-    /// — plus the pure pins that live here per 3.5 (`win_path_table` and the write-signature shim),
-    /// which read nothing. sabrage-core pins the compiled-in templates' shape
-    /// (`contract::tests::templates_are_the_bytes_the_shell_writes`), the
-    /// host manifest's two forms against each other, and the compiled-in
-    /// bytes against the on-disk files by digest
-    /// (`contract::tests::compiled_contract_sha256_matches_the_checkout_it_was_built_from`);
-    /// this module is where a *rendered* artifact is compared against those
-    /// on-disk bytes, so a stale `include_str!` (edited the on-disk template,
-    /// forgot to rebuild) shows up here as a byte diff on the artifact itself.
+    /// Byte-exact rendering checks, each built from the template/contract file
+    /// read fresh off disk rather than sabrage-core's compiled-in copy — plus
+    /// the pure pins that live here per 3.5 (`win_path_table` and the
+    /// write-signature shim), which read nothing. sabrage-core pins the
+    /// compiled-in templates and their digests; this module is where a
+    /// *rendered* artifact is compared against the on-disk bytes, so a stale
+    /// `include_str!` shows up here as a byte diff on the artifact itself.
     mod artifact_goldens {
         use super::repo_root;
         use std::path::{Path, PathBuf};
@@ -1137,14 +1107,9 @@ mod tests {
         /// r1:A1-8 regression: the dylib path is JSON-escaped, so a path
         /// containing `"` or `\` decodes back to itself.
         ///
-        /// The dylib path lands inside a JSON string literal, so both
-        /// front-ends escape it (`util::json_escape_string` here,
-        /// `${OXR_DYLIB//\\/\\\\}` + `${.../\"/\\\"}` in install.sh) before the
-        /// `@OXR_DYLIB@` substitution. The golden above proves an ordinary
-        /// path is unchanged by that; this one proves a path containing `"` or
-        /// `\` still produces JSON whose decoded `library_path` is the path we
-        /// asked for, rather than the invalid/misdirected manifest a raw
-        /// replace writes into a root-owned file.
+        /// Both front-ends escape before the `@OXR_DYLIB@` substitution
+        /// (`util::json_escape_string` here, parameter expansion in install.sh); a
+        /// raw replace writes an invalid or misdirected root-owned manifest.
         #[test]
         fn render_host_manifest_json_escapes_the_dylib_path() {
             for raw in [
@@ -1169,27 +1134,15 @@ mod tests {
             }
         }
 
-        /// The bytes install layer 4 actually **writes** — not merely the ones
-        /// `util` can render.
-        ///
-        /// install.sh writes the manifest with `print -- "$WANT"`, so the live
-        /// `/usr/local/share/openxr/1/active_runtime.x86_64.json` ends
-        /// `7d 0a 7d 0a` (`}\n}\n`). The comparison form
-        /// (`render_host_manifest`, what `$(<file)` yields) is that minus the
-        /// final newline, and the two are one byte apart: writing the wrong one
-        /// ships a host manifest that differs from `./demo.sh install`'s on the
-        /// single most drift-sensitive artifact in the pipeline. The Phase-2
-        /// review found exactly that — the util helpers were right and the
-        /// install call site passed the other one.
-        ///
-        /// So this golden pins the **write path's own** byte source, read off
-        /// the on-disk template, and the shape that makes the mistake
-        /// unexpressible: `write_host_manifest_privileged` takes the dylib
-        /// path, never pre-rendered content (see the compile-time tripwire
-        /// below). Driving layer 4 end to end needs an async runtime this crate
-        /// deliberately does not depend on; that half lives in sabrage-core's
-        /// `layer_four_stages_the_host_manifest_file_form_byte_for_byte`, which
-        /// runs `install::run` under a recording dry-run executor.
+        /// The bytes install layer 4 actually **writes**: the file form, which is
+        /// `render_host_manifest` plus one trailing newline (install.sh's
+        /// `print -- "$WANT"`), never the newline-less comparison form. The two
+        /// are one byte apart on the most drift-sensitive artifact in the
+        /// pipeline, and `write_host_manifest_privileged` takes the dylib path
+        /// rather than pre-rendered content so the mistake is unexpressible (the
+        /// compile-time tripwire below). Driving layer 4 end to end needs an async
+        /// runtime this crate does not depend on; that half is sabrage-core's
+        /// `stages::install::tests::layer_four_stages_the_host_manifest_file_form_byte_for_byte`.
         #[test]
         fn the_privileged_write_stages_the_file_form_of_the_host_manifest() {
             let root = repo_root();
@@ -1310,24 +1263,16 @@ mod tests {
 
         #[test]
         fn steam_appid_txt_content_has_no_trailing_newline() {
-            // run.sh: `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"` —
-            // `stages::run::actions::goldberg_stage` writes this file for
-            // real now, from the exact expression this test pins:
-            // `contract().game.appid.to_string()`, rendered with no trailing
-            // newline (`printf '%s'`, never `print`/`println`). This golden
-            // does not re-exercise the write itself — sabrage-core's own
-            // `goldberg_stage` tests already do that against a fixture
-            // executor — it only pins the *value and shape* the contract
-            // must keep producing, so a contract change (a different appid
-            // type, or the game section growing a formatted-string field)
-            // that would silently change the on-disk bytes fails here first.
+            // run.sh writes this file with `printf '%s' "$BS_APPID"`, so the
+            // contract value must render with no trailing newline. The write
+            // itself is covered by sabrage-core's `goldberg_stage` tests; this
+            // pins the value and its shape, so a contract change that would alter
+            // the on-disk bytes fails here first.
             let appid = sabrage_core::contract().game.appid.to_string();
             assert_eq!(appid, "620980");
             assert!(!appid.ends_with('\n'));
         }
     }
-
-    // ── (6) contract sanity ──────────────────────────────────────────────────
 
     mod contract_sanity {
         #[test]
@@ -1393,20 +1338,13 @@ mod tests {
             assert!(!c.ports.legacy_reverse.contains(&9947));
         }
 
-        /// Hermetic mirror of sabrage-core's registry invariants so CI (which
-        /// runs only this crate + contract-gen on ubuntu) gates them: the
-        /// strict registry must build, cover the contract in order, and leave
-        /// **no** slug unbound — run-only preflights included. A mis-registered
-        /// evaluator would otherwise ship CI-green and panic at runtime in the
-        /// CLI and app.
-        ///
-        /// Phase 3 removed the `NO_DOCTOR_ROW_GROUP` exemption `build_registry`
-        /// used to grant the three `run-only` slugs (they have no doctor
-        /// *row*, but `checks::run_only` binds a real evaluator for each, which
-        /// `stages::run::preflight` resolves through this same registry) — see
-        /// `checks::mod`'s own doc comment on `build_registry`. This test
-        /// pins that: `strict = true` now means every contract slug, with no
-        /// group-shaped carve-out left.
+        /// Hermetic mirror of sabrage-core's registry invariants so CI (which runs
+        /// only this crate + contract-gen on ubuntu) gates them: the strict
+        /// registry must build, cover the contract in order, and leave **no** slug
+        /// unbound — run-only preflights included, because `checks::run_only`
+        /// binds a real evaluator for each even though they have no doctor row. A
+        /// mis-registered evaluator would otherwise ship CI-green and panic at
+        /// runtime in the CLI and app.
         #[test]
         fn strict_registry_builds_and_covers_the_contract_in_order() {
             use sabrage_core::checks::build_registry;
@@ -1426,8 +1364,6 @@ mod tests {
             }
         }
     }
-
-    // ── (7) run launch preflight <-> contract, in both directions ────────────
 
     /// `run_sh_tags` (module 4) ties run.sh's `# preflight:`/`# launch-action:`
     /// tags to the contract. This module closes the other side of the same
@@ -1482,8 +1418,6 @@ mod tests {
         }
     }
 
-    // ── (8) launch artifact/behavior goldens ──────────────────────────────────
-
     mod launch_goldens {
         use sabrage_core::executor::PlannedKind;
         use sabrage_core::{contract, Bottle, Paths, StageCtx, StageOptions};
@@ -1492,16 +1426,12 @@ mod tests {
 
         /// A dependency-free `block_on`.
         ///
-        /// `sabrage-parity` carries no async runtime at all — every dependency
-        /// in `Cargo.toml` is a `dev-dependency`, and none of them is `tokio`
-        /// (adding one is a `Cargo.toml` edit outside this crate's ownership
-        /// this phase). Every `DryRunExecutor` method
-        /// [`sabrage_core::stages::run::actions::goldberg_stage`] drives
-        /// (`copy_if_changed`/`write_atomic`/`create_dir_all`) is
-        /// `Box::pin(async move { … Ok(…) })` with no real `.await` inside — it
-        /// resolves on the very first poll — so a hand-rolled poll loop over
-        /// [`std::task::Waker::noop`] (stable since 1.85) drives it to
-        /// completion with no dependency at all.
+        /// `sabrage-parity` carries no async runtime: every `Cargo.toml` entry is
+        /// a dev-dependency and none is tokio. Every `DryRunExecutor` method that
+        /// [`sabrage_core::stages::run::actions::goldberg_stage`] drives resolves
+        /// on the first poll — none of them actually awaits — so a hand-rolled
+        /// loop over [`std::task::Waker::noop`] drives it to completion with no
+        /// dependency.
         fn block_on<F: std::future::Future>(fut: F) -> F::Output {
             use std::task::{Context, Poll, Waker};
             let waker = Waker::noop();
@@ -1529,17 +1459,12 @@ mod tests {
             Arc::new(|_| {})
         }
 
-        // ── steam_appid.txt bytes ────────────────────────────────────────────
-
-        /// run.sh:150 — `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"`:
-        /// the appid digits, and nothing else — no trailing newline. Driven
-        /// through the real `actions::goldberg_stage` under `--dry-run` (never
-        /// a copy of its recipe), so a call-site regression — util's helper is
-        /// right and the call site passes something else, exactly the bug the
-        /// Phase-2 review found on the host manifest — would turn this red:
-        /// the plan's `Write` action for `steam_appid.txt` records `"<n>
-        /// bytes"`, and `n` must equal the appid string's own length with no
-        /// byte added or dropped.
+        /// run.sh's `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"`
+        /// (`# launch-action: goldberg-stage`): the appid digits, and nothing else
+        /// — no trailing newline. Driven through the real `actions::goldberg_stage`
+        /// under `--dry-run`, never a copy of its recipe, so a call-site regression
+        /// turns this red: the plan's `Write` action records `"<n> bytes"`, and `n`
+        /// must equal the appid string's own length.
         #[test]
         fn steam_appid_txt_is_written_as_exactly_the_appid_digits_with_no_trailing_newline() {
             let root = scratch("goldberg");
@@ -1587,22 +1512,15 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
         }
 
-        // ── steam_appid.txt bytes, as they land on disk ──────────────────────
-
         /// A synchronous [`Executor`] that really writes, into the test's own
         /// scratch tree.
         ///
-        /// The plan a dry run records carries no content — `write_atomic`
-        /// becomes `PlannedAction { reason: "<n> bytes" }` and the bytes are
-        /// dropped — so the golden above can only pin the payload's *length*:
-        /// `b"999999"` and `b"62098\n"` both record `"6 bytes"`. Reading the
-        /// file back is the only way to pin the bytes, and
-        /// [`sabrage_core::executor::RealExecutor`] cannot be driven from this
-        /// crate (its primitives are `tokio::fs`, and sabrage-parity has no
-        /// async runtime — adding one is a `Cargo.toml` edit outside this
-        /// crate's ownership). `std::fs` behind the same trait gives the real
-        /// on-disk bytes with no dependency at all; every primitive the run
-        /// stage does not use panics rather than pretending to succeed.
+        /// A dry-run plan carries no content — `write_atomic` records only
+        /// `"<n> bytes"` — so the golden above can pin the payload's length but not
+        /// its bytes. [`sabrage_core::executor::RealExecutor`] cannot be driven from
+        /// this crate (`tokio::fs` primitives, no async runtime), so `std::fs`
+        /// behind the same trait gives the real on-disk bytes; every primitive the
+        /// run stage does not use panics rather than pretending to succeed.
         #[derive(Debug)]
         struct SyncFsExecutor;
 
@@ -1728,12 +1646,10 @@ mod tests {
             }
         }
 
-        /// run.sh:150 — `printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt"`,
-        /// read back off disk: the appid digits and **nothing else**.
-        ///
-        /// The dry-run golden above can only see the payload's length; this one
-        /// goes red for any six-byte impostor (`999999`, `62098\n`) as well as
-        /// for a wrong length.
+        /// The same `printf '%s' "$BS_APPID"` write (run.sh, `# launch-action:
+        /// goldberg-stage`), read back off disk: the appid digits and **nothing
+        /// else**. The dry-run golden above sees only the payload's length; this
+        /// one goes red for a six-byte impostor (`999999`, `62098\n`) as well.
         #[test]
         fn steam_appid_txt_lands_on_disk_as_exactly_the_appid_digits() {
             let root = scratch("goldberg-bytes");
@@ -1778,12 +1694,11 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
         }
 
-        // ── wine_env ─────────────────────────────────────────────────────────
-
-        /// run.sh:245-251, table form. The load-bearing branch is `WINEDEBUG`:
-        /// the caller's preset wins in **both** the verbose and non-verbose
-        /// arms (`${WINEDEBUG:-…}`), and an inherited empty string is treated
-        /// like unset (zsh's `:-`, not `-`).
+        /// run.sh's five wine exports, table form (`# launch-action:
+        /// launch-wine`). The load-bearing branch is `WINEDEBUG`: the caller's
+        /// preset wins in **both** the verbose and non-verbose arms
+        /// (`${WINEDEBUG:-…}`), and an inherited empty string is treated like
+        /// unset (zsh's `:-`, not `-`).
         #[test]
         fn wine_env_table() {
             use sabrage_core::stages::run::actions::wine_env;
@@ -1845,8 +1760,6 @@ mod tests {
             );
         }
 
-        // ── wine_spec argv ───────────────────────────────────────────────────
-
         /// `"$WINE" --bottle "$WINEVR_BOTTLE" --no-update --cx-app "$BS_WIN"`.
         #[test]
         fn wine_spec_argv_matches_run_shs_command_line() {
@@ -1886,10 +1799,9 @@ mod tests {
             std::fs::remove_dir_all(&root).ok();
         }
 
-        // ── wine_log_candidate ───────────────────────────────────────────────
-
-        /// `date +%Y%m%d-%H%M%S` for attempt 0; Sabrage's own `-{n+1}` suffix
-        /// on a collision (declared divergence — PARITY.md).
+        /// `date +%Y%m%d-%H%M%S` for attempt 0; Sabrage's own `-{n+1}` suffix on a
+        /// collision — a declared divergence (PARITY.md § Run (launch), "The wine
+        /// console log is a plain file").
         #[test]
         fn wine_log_candidate_matches_run_shs_date_stamp_and_the_dash_two_collision_suffix() {
             use chrono::TimeZone;
@@ -1912,8 +1824,6 @@ mod tests {
             assert_eq!(p3, logs_dir.join("beatsaber-20260829-101112-4.log"));
         }
     }
-
-    // ── (9) run.sh die/warn/banner text pinned verbatim ───────────────────────
 
     /// `stages::run` reproduces a long list of run.sh's `die`/`warn`/`info`/
     /// banner strings verbatim, scattered as `&str` literals across
@@ -2292,8 +2202,8 @@ mod tests {
             );
         }
 
-        /// run.sh:255-263's nine-line banner block — every line, in order,
-        /// including the two blank lines that frame it.
+        /// run.sh's nine-line launch banner (`# launch-action: launch-wine`) —
+        /// every line, in order, including the two blank lines that frame it.
         #[test]
         fn the_launch_banner_lines_are_verbatim_in_run_sh() {
             use sabrage_core::events::StageEvent;
@@ -2374,7 +2284,6 @@ mod tests {
             assert_verbatim(&text, INT_TEARDOWN_LINE, "stages::run::INT_TEARDOWN_LINE");
         }
     }
-    // ── (10) repo-root spelling ──────────────────────────────────────────────
 
     /// `tap` and `chk` in scripts/demo/lib.sh return 0 with the tap disabled:
     /// lib.sh is sourced by `set -e` stages, and a bare `[ -n … ] && …` tail
@@ -2411,18 +2320,14 @@ mod tests {
     /// Both front-ends embed the repo root as an absolute string inside the
     /// root-owned host manifest and compare those bytes **literally**
     /// (`install.sh`'s `[ "$(cat "$HOST_XR_JSON")" = "$WANT" ]`,
-    /// `util::host_manifest_is_current` here). Two spellings of one checkout
-    /// therefore mean two different manifests: alternating between Sabrage and
-    /// `./demo.sh install` each sees the other's file as stale and prompts for
-    /// sudo again.
+    /// `util::host_manifest_is_current` here), so two spellings of one checkout
+    /// mean two manifests and a sudo prompt per alternation (r1:A2-6).
     ///
-    /// The shared spelling contract is zsh's **logical** `pwd`: absolute,
-    /// `.`/`..` folded textually, symlinks preserved as the user spelled them.
-    /// demo.sh gets it from `ROOT="$(cd "$(dirname "$0")" && pwd)"`;
-    /// `paths::resolve_repo_root` mirrors it (`logical_absolute`, deliberately
-    /// not `canonicalize`). This module pins both halves — the shell's `pwd`
-    /// staying logical, and the native resolver's two behaviours — so neither
-    /// side can drift to a physical spelling on its own.
+    /// The shared contract is zsh's **logical** `pwd`: absolute, `.`/`..` folded
+    /// textually, symlinks preserved as the user spelled them — demo.sh's
+    /// `ROOT="$(cd "$(dirname "$0")" && pwd)"` and `paths::resolve_repo_root`'s
+    /// `logical_absolute`, deliberately not `canonicalize`. This module pins both
+    /// halves.
     mod repo_root_spelling {
         use super::repo_root;
 
