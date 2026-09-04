@@ -1,74 +1,34 @@
 //! `session-state.json` — the crash-recovery record.
 //!
 //! `~/Library/Application Support/Sabrage/session-state.json`
-//! ([`crate::paths::Paths::session_state_path`]). Written by the launch path,
-//! read by [`super::reconcile`]. It exists for exactly one reason: `run.sh`'s
-//! guards are shell traps, and a `SIGKILL`, a panic, or a power loss skips
-//! traps entirely — leaving the Mac's default output device on `BlackHole 2ch`
-//! with nothing on the machine able to say what it was before, an ALVR
-//! dashboard nobody can attribute, and (after `--wired`) two adb forwards that
-//! silently break WiFi discovery on the next run. `stop.sh` can only *warn*
-//! about all three. This file is what lets Sabrage actually undo them
-//! (design-core §4.2; PARITY.md "Persisted audio-device restore").
+//! ([`crate::paths::Paths::session_state_path`]), written by the launch path
+//! and read by [`super::reconcile`]. `run.sh`'s guards are shell traps, so a
+//! `SIGKILL`, a panic or a power loss skips them and leaves the Mac's output
+//! device on `BlackHole 2ch`, an unattributable ALVR dashboard and (after
+//! `--wired`) two adb forwards that break WiFi discovery on the next run,
+//! with nothing on the machine describing them. This file lets Sabrage undo
+//! them (design-core §4.2; PARITY.md
+//! § Session (detach / reconcile), "A **Dead** or **IdentityMismatch**
+//! recorded session").
 //!
-//! # The invariant (write-before-mutate)
+//! The record is saved *before* each guarded mutation and again after each
+//! guard is released, so recovery is idempotent: a flag that is already `true`
+//! means that guard is done, and a crash at any instant leaves a file
+//! describing only work that still needs doing. Every optional field and flag
+//! carries `#[serde(default)]`, so an older file still loads;
+//! [`SESSION_STATE_VERSION`] covers what defaults cannot.
 //!
-//! **The file is saved BEFORE each guarded mutation, and each guard flag is
-//! flipped by its own `save()` after that guard is released.** Concretely:
-//!
-//! | order | what happens |
-//! |---|---|
-//! | 1 | `prev_audio_output` recorded and [`save`]d — *then* `SwitchAudioSource -t output -s "BlackHole 2ch"` runs |
-//! | 2 | `alvr_dashboard` spawned — its [`crate::process::ProcInfo`] recorded and [`save`]d immediately |
-//! | 3 | `--wired` forwards created — recorded and [`save`]d as they are made |
-//! | 4 | wine spawned — its identity recorded and [`save`]d |
-//! | 5 | on teardown, each guard released → its [`GuardFlags`] bit set → [`save`] |
-//! | 6 | all guards released and the child reaped → [`clear`] |
-//!
-//! Saving *after* the mutation would leave the exact window this file exists to
-//! close: crash between "audio switched" and "audio recorded" and the device is
-//! unrecoverable. The cost is a redundant save when nothing crashes, which is
-//! one small atomic write per guard.
-//!
-//! Recovery is therefore **idempotent by construction**: a flag that is already
-//! `true` means that guard was released, so reconcile skips it; a crash at any
-//! instant leaves a file describing only work that still needs doing.
-//!
-//! # Forward compatibility
-//!
-//! Every optional field and every flag carries `#[serde(default)]`, so a file
-//! written by an older Sabrage still loads (the phase that adds a field must
-//! not strand a user mid-session). [`SESSION_STATE_VERSION`] is for the case
-//! defaults cannot cover, and it is enforced in one direction only:
-//! [`SessionState::is_supported_version`] is false for a record written by a
-//! *newer* Sabrage, and every mutating path
-//! ([`super::reconcile`]) must then report it and leave it alone. Rewriting a
-//! v2 record through a v1 struct would silently drop the guard that version
-//! added, and clearing it afterwards would throw away the only description of
-//! a mutation this binary cannot undo.
-//!
-//! # One file, more than one front-end
-//!
-//! There is exactly one record path per machine
-//! ([`crate::paths::Paths::session_state_path`]) and two front-ends that write
-//! it — the Sabrage app and the `sabrage` CLI. An atomic rename stops a torn
-//! read; it does **not** stop a lost update. [`save`] and [`clear`] therefore
-//! refuse to touch a record that names a *live foreign* `owner_pid`
-//! ([`has_live_foreign_owner`]), which is the contract `owner_pid`'s own
-//! documentation already states. The compare against what is on disk happens
-//! under the advisory lock at
-//! [`crate::paths::Paths::session_state_lock_path`], so the other front-end
-//! cannot write between the read and the rename. The lock is best-effort (a
-//! machine that cannot lock must still be able to stop a session) — the
-//! compare is what makes the remaining race *safe*, and the lock is what makes
-//! it rare. [`clear_run`] adds the half neither gives: a *late* teardown
-//! deleting a record that already belongs to a newer run is not a lost update
-//! at all — both writers are legitimate — so that removal compares the run id
-//! on disk and leaves a stranger's record where it is. Both mutating paths also
-//! refuse a record from a newer schema, the rule the section above states.
-//! What neither covers is a whole `reconcile` pass, which reads,
-//! restores and rewrites across several of these calls; serializing that is
-//! the operation lock's job.
+//! One record path is shared by both front-ends (the app and the `sabrage`
+//! CLI), and an atomic rename stops a torn read but not a lost update. [`save`],
+//! [`clear`], [`clear_run`] and [`mark_detached`] therefore compare what is on
+//! disk under `lock_record`: a record a live foreign process owns and a
+//! record from a newer schema are refused, and [`clear_run`] and
+//! [`mark_detached`] additionally leave another run's record exactly as it is
+//! (`Ok`), the newer owner being responsible for it. Serializing a whole
+//! [`super::reconcile`] pass across several such calls is the operation lock's
+//! job. See tests::{a_save_for_a_different_run_does_not_clobber_a_live_owners_record,
+//! a_newer_schema_record_is_never_overwritten_or_deleted,
+//! clear_run_only_removes_the_record_it_names}.
 
 use std::path::{Path, PathBuf};
 
@@ -85,9 +45,10 @@ pub const SESSION_STATE_VERSION: u32 = 1;
 
 /// One `adb forward tcp:<port> tcp:<port>` created by a `--wired` launch.
 ///
-/// Per-serial, because the removal must be too: `adb forward --remove` is
-/// applied to exactly these ports on exactly this device, never
-/// `--remove-all` (PARITY.md; CLAUDE.md's `--wired` note).
+/// Per-serial, because the removal must be too: `adb forward --remove` names
+/// exactly these ports on exactly this device, never `--remove-all`
+/// (PARITY.md § Invariants that must NOT change (byte/behavior parity), "adb `forward --remove`
+/// per-serial for exactly tcp:9943+9944"; CLAUDE.md's `--wired` note).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WiredForward {
@@ -131,14 +92,13 @@ pub struct SessionState {
     /// The owner's start time (seconds since the epoch), when it could be
     /// observed at write time.
     ///
-    /// `owner_pid` alone is a number, and pids are recycled: without this, a
-    /// record written in the pre-spawn window whose owner then died stayed
-    /// "foreign-owned" forever as soon as anything else reused that pid — and
-    /// a foreign-owned record can be neither overwritten nor cleared, so the
-    /// next launch died mid-run with a remedy (`./demo.sh stop`) that could not
-    /// clear it either. Paired with `owner_pid` this is the same recycled-pid
-    /// guard [`ProcInfo::is_same_process`] gives `wine`. `None` in records
-    /// written before this field existed, where the pid alone is all there is.
+    /// Pids are recycled, so `owner_pid` alone keeps a record whose owner died
+    /// in the pre-spawn window foreign-owned — neither overwritable nor
+    /// clearable, wedging the next launch — as soon as anything else reuses
+    /// that pid; paired with the pid this is the same guard
+    /// [`ProcInfo::is_same_process`] gives `wine`. `None` in records written
+    /// before this field existed, where the pid alone is all there is.
+    /// See tests::a_live_foreign_owner_is_recognised_only_while_its_session_can_still_be_running.
     #[serde(default)]
     pub owner_started_at: Option<u64>,
     /// The wine child's identity. `None` between guard acquisition and the
@@ -214,11 +174,10 @@ impl SessionState {
 
     /// Was this record written by a Sabrage this one understands?
     ///
-    /// `false` means the file comes from a **newer** schema: it may describe a
-    /// guard this binary has never heard of, so rewriting it through this
-    /// struct would drop that guard's description and clearing it would throw
-    /// away the only record of a mutation nothing here can undo. The mutating
-    /// paths report such a record and leave it exactly as it is.
+    /// `false` means a **newer** schema: the file may describe a guard this
+    /// binary has never heard of, so the mutating paths report such a record
+    /// and leave it exactly as it is
+    /// (tests::a_newer_schema_record_is_never_overwritten_or_deleted).
     pub fn is_supported_version(&self) -> bool {
         self.version <= SESSION_STATE_VERSION
     }
@@ -240,11 +199,10 @@ impl SessionState {
 /// * absent → `Ok(None)` — the normal case, meaning "no session to reconcile";
 /// * present but unreadable or malformed → `Err` ([`SabrageError::Io`]).
 ///
-/// The second case is deliberately **not** folded into `None`: a corrupt file
-/// may still be describing a live session with a rerouted audio device, and
-/// silently reporting "nothing to recover" is how a user ends up with no sound
-/// and no explanation. The caller surfaces it and can then remove the file
-/// itself.
+/// The second case is deliberately not folded into `None`: a corrupt file may
+/// still describe a live session with a rerouted audio device, and reporting
+/// "nothing to recover" for it leaves the user with no sound and no
+/// explanation (tests::a_corrupt_file_is_an_error_never_a_silent_none).
 pub fn load(path: &Path) -> Result<Option<SessionState>> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -262,26 +220,20 @@ pub fn load(path: &Path) -> Result<Option<SessionState>> {
 /// Does `state` describe a session **another live process** is responsible
 /// for?
 ///
-/// The three conditions together, because each one alone is wrong:
+/// True only when all three hold: `owner_pid` is neither 0 (an older record
+/// that never wrote one) nor this process; that pid is alive **and** still the
+/// process that recorded it (a record written before
+/// [`SessionState::owner_started_at`] existed can only trust the bare pid);
+/// and the session has not visibly ended — the recorded wine child is still
+/// that same process, or there is no wine child yet (the pre-spawn window,
+/// where the record is the only description of guards already taken).
 ///
-/// * `owner_pid` is neither 0 (an older record that never wrote one) nor this
-///   process — our own records are ours to rewrite;
-/// * that pid is still alive **and is still the process that wrote the
-///   record** — a crashed owner's record is exactly what recovery exists for,
-///   and refusing to touch it would strand the audio device forever. The
-///   recorded [`SessionState::owner_started_at`] is what makes the second half
-///   decidable; a record from before that field existed still has to trust the
-///   bare pid;
-/// * the session itself has not visibly ended: either the recorded wine child
-///   is still that same process, or there is no wine child *yet* — the
-///   pre-spawn window where the guards are already taken and the record is the
-///   only description of them.
-///
-/// A record whose wine pid is gone is therefore never protected by this, no
-/// matter who wrote it: it is a leftover, and undoing its guards is the whole
-/// job. The residual false positive is a recycled `owner_pid` in a record
-/// written before `owner_started_at` existed, which costs one kept record and
-/// one row, never a mutation.
+/// A record whose wine pid is gone is therefore never protected, whoever
+/// wrote it: it is a leftover, and undoing its guards is the job. The one
+/// residual false positive — a recycled `owner_pid` in a record written
+/// before `owner_started_at` existed — costs a kept record and a reported
+/// row, never a mutation. See
+/// tests::a_live_foreign_owner_is_recognised_only_while_its_session_can_still_be_running.
 pub fn has_live_foreign_owner(state: &SessionState) -> bool {
     if state.owner_pid == 0 || state.owner_pid == std::process::id() {
         return false;
@@ -355,12 +307,11 @@ async fn lock_record(record_path: &Path) -> Option<std::fs::File> {
 /// The refusal both [`save`] and [`clear`] raise for a record written by a
 /// **newer** Sabrage.
 ///
-/// The module header states the rule ("every mutating path must then report it
-/// and leave it alone") and [`super::reconcile::untouchable`] renders the
-/// friendly row for it — but the rule has to be enforced *here* too, or a path
-/// that never went through reconcile (a launch that carried on past a
-/// `Reconciled::Busy`, a teardown, a guard flag flip) still rewrites a v2
-/// record through the v1 struct and drops the guard that version described.
+/// Enforced here and not only in [`super::reconcile::untouchable`], because a
+/// path that never went through reconcile (a launch that carried on past a
+/// `Reconciled::Busy`, a teardown, a guard flag flip) would otherwise rewrite
+/// a v2 record through this v1 struct
+/// (tests::a_newer_schema_record_is_never_overwritten_or_deleted).
 fn newer_schema(verb: &str, path: &Path, existing: &SessionState) -> SabrageError {
     SabrageError::fatal(
         format!(
@@ -394,14 +345,15 @@ fn owned_elsewhere(verb: &str, path: &Path, existing: &SessionState) -> SabrageE
 /// plans the write instead of performing it. Pretty-printed because a human
 /// reading this file is exactly the situation it exists for.
 ///
-/// Refuses when what is already on disk describes a **different** run that
-/// another live process owns ([`has_live_foreign_owner`]): the single record
-/// path is shared by both front-ends, and an atomic rename prevents a torn
-/// read, not a lost update. Saving over one's own run — the ordinary
-/// guard-by-guard flag flip — is unaffected, and so is saving over a record
-/// whose owner is gone. The check and the write happen under
-/// [`lock_record`], so the other front-end cannot slip its own write between
-/// them; a dry run takes no lock, having nothing to serialize.
+/// # Errors
+///
+/// Refuses a record on disk that describes a **different** run another live
+/// process owns ([`has_live_foreign_owner`]) — the ordinary guard-by-guard
+/// flag flip over one's own run is unaffected — and any record written by a
+/// newer Sabrage, one's own run included. The check and the write happen
+/// under `lock_record`, which a dry run skips, having nothing to
+/// serialize. See
+/// tests::a_save_for_a_different_run_does_not_clobber_a_live_owners_record.
 pub async fn save(executor: &dyn Executor, path: &Path, state: &SessionState) -> Result<()> {
     let _lock = if executor.is_dry_run() {
         None
@@ -434,14 +386,11 @@ async fn write_record(executor: &dyn Executor, path: &Path, state: &SessionState
 /// Set `detached: true` on the record for `run_id` — and **only** if that is
 /// still the record on disk. `true` when the flag was written.
 ///
-/// [`super::reconcile::detach`]'s safety net, and the one write that must not
-/// be a read-modify-write across two calls: it runs *after* the supervisor was
-/// asked to let go, so between a [`load`] and a [`save`] the supervisor can
-/// finish its teardown and [`clear`] the record — and `save` would then
-/// **recreate** it, resurrecting a cleared session as a detached one. The load,
-/// the compare and the write all happen under one [`lock_record`], and a record
-/// that is absent (or belongs to another run, or is already detached) is left
-/// exactly as it is: this never creates a file.
+/// [`super::reconcile::detach`]'s safety net. The load, the compare and the
+/// write happen under one `lock_record`, and an absent record is left
+/// absent: re-creating it would resurrect a session the supervisor cleared
+/// while this call was in flight
+/// (tests::mark_detached_never_recreates_a_cleared_record).
 pub async fn mark_detached(executor: &dyn Executor, path: &Path, run_id: RunId) -> Result<bool> {
     let _lock = if executor.is_dry_run() {
         None
@@ -481,13 +430,13 @@ pub async fn clear(executor: &dyn Executor, path: &Path) -> Result<()> {
 
 /// [`clear`], but only if the record on disk is still `expected`'s.
 ///
-/// The compare-and-swap the single shared record path needs: an atomic rename
-/// stops a torn read, and [`lock_record`] makes a lost update rare, but neither
-/// stops a *late* teardown (or a reconcile that started before a launch did)
-/// from deleting a **newer** run's record — audio device, dashboard and
-/// forwards description and all. A different run on disk is not an error and
-/// not this caller's business: the file is left exactly as it is and `Ok(())`
-/// is returned, because the newer owner is the one responsible for it now.
+/// The compare-and-swap the single shared record path needs: neither the
+/// atomic rename nor `lock_record` stops a *late* teardown (or a reconcile
+/// that started before a launch did) from deleting a **newer** run's record —
+/// its audio device, dashboard and forwards description and all. A different
+/// run on disk is not an error: the file is left exactly as it is and `Ok(())`
+/// is returned, because the newer owner is responsible for it now. See
+/// tests::clear_run_only_removes_the_record_it_names.
 pub async fn clear_run(executor: &dyn Executor, path: &Path, expected: RunId) -> Result<()> {
     clear_inner(executor, path, Some(expected)).await
 }
@@ -696,8 +645,8 @@ mod tests {
         );
 
         // Same pid, a different process: a recycled `owner_pid` is not an
-        // owner. Without the recorded start time this record could never be
-        // overwritten *or* cleared, and the next launch died on it.
+        // owner. Without the recorded start time such a record can be neither
+        // overwritten nor cleared, and it wedges the next launch.
         let real_start = s.owner_started_at;
         s.owner_started_at = Some(real_start.unwrap_or(0).wrapping_add(1_000));
         assert!(
@@ -749,8 +698,7 @@ mod tests {
             "the other front-end's record is byte-identical afterwards"
         );
 
-        // The owner's own writes still go through, and so does anyone's once
-        // that process is gone.
+        // The owner's own writes still go through.
         theirs.guards.audio_restored = true;
         save(&real(), &path, &theirs).await.unwrap();
 
