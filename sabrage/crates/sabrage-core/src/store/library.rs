@@ -33,8 +33,6 @@ use crate::util::{bs_version, cmp_files, file_sha256_matches};
 use super::goldberg::orig_steam_path;
 use super::settings::Settings;
 
-// ── per-game launch overrides + history ─────────────────────────────────────
-
 /// A per-game partial override of [`super::settings::LaunchDefaults`].
 /// `None` on any field means "use the global setting" — see
 /// [`effective_options`].
@@ -47,9 +45,8 @@ pub struct LaunchOverrides {
     pub verbose: Option<bool>,
 }
 
-/// The most recent launch of one game, as recorded by the Tauri launch
-/// command after a `run` stage returns (brief's "Existing command changes
-/// (C)" — this struct is what it writes via [`Library::record_last_session`]).
+/// The most recent launch of one game, written by the Tauri launch command
+/// after a `run` stage returns (via [`Library::record_last_session`]).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct LastSession {
@@ -123,21 +120,14 @@ impl Library {
         self.games.iter().find(|g| g.id == id)
     }
 
-    /// [`Library::upsert`] for the **Edit-game form**: everything the user can
-    /// actually edit comes from `incoming`, every server-owned field is taken
-    /// from the entry already stored.
+    /// [`Library::upsert`] for the **Edit-game form**: every editable field comes
+    /// from `incoming`, while `last_session`, `added_at_unix_ms` and `appid` are
+    /// kept from the stored entry. An unknown id is a plain insert (Add-game
+    /// wizard's first save).
     ///
-    /// The editor loads a whole [`GameEntry`], including fields no control on
-    /// that screen touches, and submits it back minutes later. Meanwhile the
-    /// launch path writes `last_session` behind its back
-    /// ([`Library::record_last_session`]), so a plain whole-entry `upsert`
-    /// would delete a session that ended while the form was open. The
-    /// server-owned set is `last_session`, `added_at_unix_ms` and `appid` —
-    /// the first is written only by the launch path, the other two only by
-    /// [`new_entry_template`]; no editor control writes any of them.
-    ///
-    /// An `incoming` id the library does not know is a plain insert (the
-    /// Add-game wizard's first save).
+    /// The form submits a whole [`GameEntry`] cloned minutes earlier, so a plain
+    /// `upsert` would delete a session recorded while it was open
+    /// (tests::an_edit_racing_a_recorded_session_keeps_both).
     pub fn upsert_editable(&mut self, incoming: GameEntry) -> &GameEntry {
         let mut merged = incoming;
         if let Some(existing) = self.get(merged.id) {
@@ -164,18 +154,14 @@ impl Library {
     /// `settings ⊕ this game's overrides`, or `None` when the library has no
     /// entry with `game_id`.
     ///
-    /// The one entry point for "what flags does *this* game launch with":
-    /// [`effective_options`] is the merge rule itself, this is the lookup in
-    /// front of it, and the Tauri launch command resolves both here rather
-    /// than letting the front-end re-implement the merge (a second copy of a
-    /// precedence rule is one copy too many — the same reasoning
-    /// `crate::util`'s re-exports document).
+    /// The one entry point for "what flags does *this* game launch with": the
+    /// Tauri launch command resolves the merge here rather than letting the
+    /// front-end keep a second copy of the precedence rule
+    /// (tests::launch_options_for_resolves_the_merge_by_id_and_is_none_for_a_stranger).
     pub fn launch_options_for(&self, game_id: Uuid, settings: &Settings) -> Option<StageOptions> {
         self.get(game_id).map(|e| effective_options(settings, e))
     }
 }
-
-// ── file I/O ──────────────────────────────────────────────────────────────
 
 /// `<sabrage_appsup>/library.json`.
 pub fn library_path(sabrage_appsup: &Path) -> PathBuf {
@@ -184,19 +170,17 @@ pub fn library_path(sabrage_appsup: &Path) -> PathBuf {
 
 /// Load `library.json`.
 ///
-/// * absent → `Ok(Library::default())` (version 1, no games) — first run;
-/// * present but unparseable → `Err`, never a silent reset (same rule as
-///   [`super::settings::load`] and [`crate::session::state::load`]);
-/// * `version` newer than [`LIBRARY_VERSION`] → `Err`, **before** any caller
-///   can mutate and re-save it.
+/// An absent file is `Ok(Library::default())` (version 1, no games): first run.
 ///
-/// That last rule is what stops an older Sabrage from quietly destroying a
-/// newer one's data: [`GameEntry`]/[`Library`] are closed serde structs, so a
-/// field this binary does not know is dropped on the next
-/// [`save`] — and since the file keeps its `version`, nothing downstream would
-/// ever notice. Refusing is the only honest answer this binary can give.
-/// (The flip side of the rule: **any** schema addition here must bump
-/// [`LIBRARY_VERSION`], or an older build will still silently eat it.)
+/// # Errors
+///
+/// A present but unparseable file — an `Err`, never a silent reset
+/// (tests::a_corrupt_file_is_an_error_never_a_silent_reset) — and a `version`
+/// newer than [`LIBRARY_VERSION`], refused **before** a caller can mutate and
+/// re-save it, because [`Library`] is a closed serde struct and the re-save
+/// would drop the newer build's fields while keeping its `version`. Any schema
+/// addition here must bump [`LIBRARY_VERSION`]
+/// (tests::a_newer_schema_version_is_refused_not_silently_rewritten).
 pub fn load(path: &Path) -> Result<Library> {
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
@@ -226,31 +210,28 @@ pub fn load(path: &Path) -> Result<Library> {
 
 /// Serializes every [`transact`] against every other one in this process.
 ///
-/// [`save`] is atomic per *write* ([`Executor::write_atomic`] renames a
-/// uuid-named temp file over the target), but a library edit is a
-/// load → mutate → save *transaction*, and two of those interleaving means the
-/// second one's `save` writes a snapshot taken before the first one's — the
-/// classic lost update. Removing a game while the launch path records its
-/// last session is not hypothetical: `record_last_session` runs on a
-/// background task after every run.
+/// [`save`] is atomic per *write*, but a library edit is a
+/// load → mutate → save *transaction*: two interleaving means the second
+/// one's `save` writes a snapshot taken before the first one's
+/// (tests::interleaved_transactions_do_not_resurrect_a_removed_game).
 ///
 /// A lock of its own rather than [`crate::stages::OPERATION_LOCK`]: the
-/// library is written from inside a run (the post-launch record) as well as
-/// from the Library screen, so borrowing the operation lock here would either
-/// deadlock the run that already holds it or block edits for a whole session.
+/// library is written from inside a run (the post-launch
+/// `record_last_session`) as well as from the Library screen, so borrowing
+/// the operation lock would deadlock the run that already holds it, or block
+/// every library edit for the length of a session.
 static LIBRARY_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 /// Run one complete `library.json` read-modify-write transaction under
-/// [`LIBRARY_LOCK`].
+/// [`LIBRARY_LOCK`], returning whatever `f` returns.
 ///
 /// `f` sees the freshly loaded library and mutates it in place; the file is
-/// rewritten only if `f` actually changed something (so a no-op removal never
-/// mints a `library.json` that did not exist). Whatever `f` returns is handed
-/// back to the caller — typically the row it just saved, or whether it found
-/// anything to remove.
+/// rewritten only if `f` actually changed something, so a no-op removal
+/// never mints a `library.json` that did not exist
+/// (tests::transact_writes_only_when_the_library_actually_changed).
 ///
-/// **Every** writer must go through this: a bare [`load`]/[`save`] pair around
-/// the same file re-opens exactly the window this closes.
+/// **Every** writer must go through this: a bare [`load`]/[`save`] pair
+/// around the same file re-opens exactly the window this closes.
 pub async fn transact<T>(
     executor: &dyn Executor,
     path: &Path,
@@ -279,8 +260,6 @@ pub async fn save(executor: &dyn Executor, path: &Path, lib: &Library) -> Result
     bytes.push(b'\n');
     executor.write_atomic(path, &bytes).await
 }
-
-// ── templates + effective options ────────────────────────────────────────
 
 /// A fresh [`GameEntry`] for the Add-game wizard, seeded from `settings` and
 /// the machine's current bottle list.
@@ -345,20 +324,18 @@ pub fn effective_options(settings: &Settings, entry: &GameEntry) -> StageOptions
     }
 }
 
-// ── validity ──────────────────────────────────────────────────────────────
-
 /// Where the installed `steam_api64.dll` stands relative to the Goldberg
-/// dll and its `.orig-steam` backup. See [`validate`]'s rule for how each
-/// variant is derived.
+/// dll and its `.orig-steam` backup.
 ///
-/// "Is Goldberg" means **either** the contract-pinned build (`gbe_dll_sha256`)
-/// **or** the payload this checkout would actually install
-/// (`Paths::gbe_dll`, `third_party/gbe/steam_api64.dll`) byte for byte. The
-/// pin alone was not enough: `run`/`run.sh` install whatever is at that path
-/// and only *warn* when it does not match the pin (PARITY.md, "Goldberg
-/// hash-tolerance at run"), and a contract pin bump retroactively makes an
-/// installed dll unrecognized — in both cases a pin-only test called Goldberg
-/// bytes `Original`, and the revert door then offered to "restore" them.
+/// "Is Goldberg" means **either** the contract-pinned build
+/// (`gbe_dll_sha256`) **or** the payload this checkout would install
+/// (`Paths::gbe_dll`) byte for byte: `run` installs whatever is at that
+/// path and only warns on a pin mismatch
+/// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+/// "Goldberg hash-tolerance at run"), and a pin bump orphans a dll
+/// installed before it. A pin-only test calls both `Original`, and the
+/// revert door offers to "restore" Goldberg's own bytes
+/// (tests::goldberg_state_covers_all_five_variants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GoldbergState {
@@ -389,10 +366,11 @@ pub enum GoldbergState {
 /// Where a [`GameEntry`] stands, for the Library screen's status tag.
 ///
 /// Invariant: **`Ready` means every hard gate the launch itself enforces is
-/// already satisfied** — exe, 1.29.4, bottle, `z:` when outside `drive_c`, and
-/// `steam_api64.dll`. Anything `run.sh`/[`crate::stages::run`] would `die` on
-/// must show as something other than `Ready`, or the badge contradicts the
-/// button next to it.
+/// already satisfied** — exe, 1.29.4, bottle, `z:` when outside `drive_c`,
+/// and `steam_api64.dll`. Anything `run.sh`/[`crate::stages::run`] would
+/// `die` on must show as something other than `Ready`, or the badge
+/// contradicts the button next to it
+/// (tests::healthy_game_without_steam_dll_is_not_ready).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum GameStatus {
@@ -440,13 +418,11 @@ fn bottle_template_value(conf: &str) -> Option<String> {
 /// machine beyond `stat`/`read` — same contract as every `checks::*`
 /// evaluator.
 ///
-/// `paths` is accepted (rather than only `bs_dir`/`bottle_name`) for the same
-/// reason `CheckCtx` carries the whole `Paths` set: callers already have one
-/// in hand. Its `gbe_dll` — the Goldberg payload *this checkout* installs — is
-/// read by the Goldberg classification below, alongside the contract pin.
+/// `paths` is accepted whole (like `CheckCtx`'s) because callers already
+/// have one; its `gbe_dll` is the Goldberg payload *this checkout* installs,
+/// read by the classification alongside the contract pin.
 ///
-/// Thin wrapper around [`validate_with_bottle`] — see that function for the
-/// actual rules and for why the split exists.
+/// Thin wrapper around [`validate_with_bottle`].
 pub fn validate(paths: &Paths, bs_dir: &Path, bottle_name: &str) -> GameValidity {
     let bottle = Bottle::unvalidated(bottle_name);
     validate_with_bottle(&paths.gbe_dll, bs_dir, bottle_name, &bottle)
@@ -456,15 +432,11 @@ pub fn validate(paths: &Paths, bs_dir: &Path, bottle_name: &str) -> GameValidity
 /// than building one from `bottle_name` itself.
 ///
 /// The split exists **entirely for testability**: [`Bottle::unvalidated`]
-/// resolves against the real, unfixture-able
-/// `~/Library/Application Support/CrossOver/Bottles/<name>` (`paths::bottles_root`
-/// is `$HOME`-derived, not `Paths`-derived — see that module's doc comment),
-/// so a test cannot make `bottle_exists` true by writing a fixture bottle
-/// under a scratch temp dir the way [`crate::checks::bottle`]'s tests fake a
-/// bottle and hand it to `CheckCtx` directly. This function accepts the same kind of
-/// pre-built `Bottle` (whose `prefix` may point anywhere) so tests can do the
-/// same; [`validate`] is the only caller that actually derives one from
-/// `$HOME`.
+/// resolves against the real `$HOME`-derived bottles root
+/// (`paths::bottles_root` is not `Paths`-derived), so only a caller-supplied
+/// `Bottle` — whose `prefix` may point anywhere — lets a test make
+/// `bottle_exists` true from a fixture. [`validate`] is the only caller that
+/// derives one from `$HOME`.
 fn validate_with_bottle(
     gbe_dll: &Path,
     bs_dir: &Path,
@@ -482,11 +454,10 @@ fn validate_with_bottle(
 
 /// [`validate_with_bottle`] with the Goldberg pin passed in.
 ///
-/// Second testability seam, same shape as the [`Bottle`] one above: the pin is
-/// the sha256 of a dll no test can fabricate bytes for, so a test that wants to
-/// exercise the *pin-matched* branches hands in the digest of its own fixture
-/// instead. [`validate_with_bottle`] is the only caller that reads the real
-/// contract pin.
+/// Second testability seam: no test can fabricate bytes hashing to the real
+/// contract pin, so a test exercising the pin-matched branches hands in the
+/// digest of its own fixture. [`validate_with_bottle`] is the only caller
+/// that reads the contract pin.
 fn validate_pinned(
     gbe_dll: &Path,
     bs_dir: &Path,
@@ -513,32 +484,22 @@ fn validate_pinned(
         .lines()
         .any(|l| l == "\"CX_GRAPHICS_BACKEND\" = \"dxmt\"");
 
-    // `[[ "$BS_DIR" != "$PREFIX/drive_c/"* ]]` — same prefix test
-    // `checks::bottle::bs_dir_outside_drive_c` uses, computed unconditionally
-    // here (this module has no "bottle resolved" gate the way that check
-    // does; an unresolved bottle's unvalidated prefix is still meaningful for
-    // this string test).
+    // The same prefix test `checks::bottle::bs_dir_outside_drive_c` makes,
+    // computed unconditionally: this module has no "bottle resolved" gate,
+    // and an unresolved bottle's prefix is still a meaningful string.
     let outside_drive_c = {
         let glob = format!("{}/drive_c/", bottle.prefix.display());
         !bs_dir.to_string_lossy().starts_with(&glob)
     };
     let z_drive_ok = outside_drive_c.then(|| bottle.z_drive().exists());
 
-    // The dll's own bytes are consulted *first*, on every branch: they are the
-    // only positive evidence available here. Deriving "original" from the mere
-    // absence of a backup is how an already-Goldberg'd install gets labelled
-    // untouched — and then backed up, and then "restored" — see
-    // `super::goldberg`'s refusal for the other half of that story.
+    // The dll's own bytes are the only positive evidence available here:
+    // deriving "original" from a missing backup labels an already-Goldberg'd
+    // install untouched, then backs it up and "restores" it — see
+    // `super::goldberg`'s refusal.
     let api = steam_api_path(bs_dir);
     let dll_present = api.is_file();
     let orig_steam_present = orig_steam_path(&api).is_file();
-    // Two ways to be Goldberg, because the pin is not the only Goldberg this
-    // pipeline installs: `run`/`run.sh` copy `third_party/gbe/steam_api64.dll`
-    // whatever it hashes to (a pin mismatch is a warn, never a block — see
-    // PARITY.md), and a contract pin bump orphans a dll that was pinned when
-    // it was installed. A pin-only test labelled both of those `Original` —
-    // "the untouched Steam dll" — and the Edit-game screen then offered to
-    // restore them.
     let dll_is_goldberg =
         dll_present && (file_sha256_matches(&api, gbe_dll_sha256) || cmp_files(gbe_dll, &api));
     let goldberg = match (dll_present, dll_is_goldberg, orig_steam_present) {
@@ -575,18 +536,17 @@ fn validate_pinned(
         problems.push("Beat Saber is outside drive_c but the bottle has no z: drive".to_string());
     }
     if goldberg == GoldbergState::NoDll {
-        // run.sh:143-145 / `stages::run::actions::goldberg_stage`: the launch
-        // dies right here, in the same words. A game that cannot launch is
-        // never `Ready`.
+        // run.sh's `# launch-action: goldberg-stage` dies here in these same
+        // words (`stages::run::actions::goldberg_stage`); a game that cannot
+        // launch is never `Ready`.
         problems.push(format!(
             "steam_api64.dll not found under {} — is this a complete Beat Saber install?",
             bs_dir.display()
         ));
     }
 
-    // The ladder is ordered most-specific first, and `Ready` means "the
-    // shell-equivalent launch has nothing left to refuse": a missing exe,
-    // bottle, version, z: drive **or `steam_api64.dll`** all keep it away.
+    // Most-specific first; `Ready` is the invariant documented on
+    // `GameStatus`.
     let status = if !exe_present {
         GameStatus::NotFound
     } else if !bottle_exists {
@@ -647,8 +607,6 @@ mod tests {
             last_session: None,
         }
     }
-
-    // ── file I/O ──────────────────────────────────────────────────────────
 
     #[test]
     fn library_path_is_the_json_file_under_appsup() {
@@ -773,10 +731,10 @@ mod tests {
 
     #[tokio::test]
     async fn interleaved_transactions_do_not_resurrect_a_removed_game() {
-        // The shape that bit: the Library screen removes a game while the
-        // post-launch task records that same game's last session. Both used
-        // to load their own snapshot and save the whole file back, so
-        // whichever renamed last won outright.
+        // The shape this pins: the Library screen removes a game while the
+        // post-launch task records that same game's last session. Without
+        // `transact`, each loads its own snapshot and saves the whole file
+        // back, and whichever renames last wins outright.
         let dir = scratch("transact-race");
         let path = dir.join("library.json");
         let a = entry("A");
@@ -860,8 +818,6 @@ mod tests {
 
         fs::remove_dir_all(&dir).unwrap();
     }
-
-    // ── Library mutators ─────────────────────────────────────────────────
 
     #[test]
     fn upsert_inserts_then_replaces_by_id() {
@@ -965,8 +921,6 @@ mod tests {
         assert!(!lib.record_last_session(Uuid::new_v4(), session));
     }
 
-    // ── new_entry_template precedence ───────────────────────────────────
-
     #[test]
     fn template_prefers_settings_default_bottle_over_the_bottle_list() {
         let settings = Settings {
@@ -1020,8 +974,6 @@ mod tests {
             e.bs_dir
         );
     }
-
-    // ── effective_options merge ──────────────────────────────────────────
 
     #[test]
     fn effective_options_merges_overrides_over_settings_and_takes_identity_from_the_entry() {
@@ -1079,8 +1031,6 @@ mod tests {
         );
         assert!(lib.launch_options_for(Uuid::new_v4(), &settings).is_none());
     }
-
-    // ── validate ──────────────────────────────────────────────────────────
 
     fn fake_bottle(label: &str) -> Bottle {
         let dir = std::env::temp_dir().join(format!(
@@ -1191,8 +1141,9 @@ mod tests {
         fs::create_dir_all(&bs_dir).unwrap();
         fs::write(bs_dir.join("Beat Saber.exe"), b"stub").unwrap();
         fs::write(bs_dir.join("BeatSaberVersion.txt"), "1.29.4_4575554838\n").unwrap();
-        // Ready requires the dll the launch would otherwise die on
-        // (run.sh:143-145) — see `healthy_game_without_steam_dll_is_not_ready`.
+        // Ready requires the dll run.sh's `# launch-action: goldberg-stage`
+        // would otherwise die on — see
+        // `healthy_game_without_steam_dll_is_not_ready`.
         fs::write(bs_dir.join("steam_api64.dll"), b"REAL-STEAM").unwrap();
 
         let v = validate_with_bottle(&paths().gbe_dll, &bs_dir, &b.name, &b);
@@ -1215,10 +1166,9 @@ mod tests {
     #[test]
     fn bottle_template_and_backend_mismatches_surface_as_problems_without_forcing_needs_attention()
     {
-        // A wrong template/backend does not, on its own, flip status away
-        // from Ready — only version and z: drive gate `status` per the
-        // brief's rule; template/backend still show up as problems for the
-        // detail row.
+        // Template and backend are detail-row facts, not launch gates: a
+        // wrong value surfaces as a problem but never moves `status` off
+        // Ready.
         let b = fake_bottle("mismatch");
         fs::create_dir_all(b.prefix.join("drive_c")).unwrap();
         fs::write(
@@ -1241,8 +1191,6 @@ mod tests {
 
         fs::remove_dir_all(&b.prefix).unwrap();
     }
-
-    // ── Goldberg state ────────────────────────────────────────────────────
 
     fn plugin_dir(bs_dir: &Path) -> PathBuf {
         bs_dir.join("Beat Saber_Data/Plugins/x86_64")
@@ -1320,7 +1268,8 @@ mod tests {
 
     #[test]
     fn healthy_game_without_steam_dll_is_not_ready() {
-        // Everything run.sh checks except the dll it dies on at line 145.
+        // Everything run.sh checks except the dll its
+        // `# launch-action: goldberg-stage` block dies on.
         let b = fake_bottle("nodll");
         fs::create_dir_all(b.prefix.join("drive_c")).unwrap();
         fs::write(
