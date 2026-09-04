@@ -1,20 +1,13 @@
 //! The parity tap channel: `"<slug> <status>"`, one line per check.
 //!
-//! lib.sh:
-//!
-//! ```zsh
-//! tap() { # slug status
-//!   [ -n "${WINEVR_DOCTOR_TAP:-}" ] && print -r -- "$1 $2" >> "$WINEVR_DOCTOR_TAP"
-//!   :
-//! }
-//! ```
-//!
-//! This is what the tier-2 live differ (`scripts/dev/parity.sh`) compares between
-//! a zsh doctor run and a native one. It carries **slug + status only** — never
-//! prose — which is exactly why check message text can stay impl-owned.
+//! The channel carries slug and status only (see scripts/demo/lib.sh, `tap()`),
+//! never prose, which is why check message text can stay implementation-owned;
+//! the tier-2 live differ (`scripts/dev/parity.sh`) compares it between a zsh
+//! doctor run and a native one.
 //!
 //! Status vocabulary is fixed by the zsh side: `ok`, `warn`, `fail`, `info`,
-//! `skipped`. Nothing else may appear on this channel.
+//! `skipped`. Nothing else may appear on this channel
+//! (tests::words_match_the_zsh_vocabulary).
 
 use std::io::Write;
 use std::path::Path;
@@ -23,12 +16,9 @@ use crate::checks::{CheckOutcome, CheckStatus};
 
 /// The tap word for a status.
 ///
-/// [`CheckStatus::NotImplemented`] maps to `skipped` because the differ's
-/// vocabulary is the zsh one and has no fourth state. That is deliberately the
-/// *honest* mapping while Phase 1 is in flight: an unbound slug behaves like a
-/// row that did not run, so the differ reports a real mismatch against a zsh
-/// `ok`/`fail` instead of silently agreeing. When every evaluator is bound this
-/// arm becomes unreachable.
+/// [`CheckStatus::NotImplemented`] maps to `skipped` so an unbound slug reads as
+/// a row that did not run and the differ reports a real mismatch against a zsh
+/// `ok`/`fail` instead of silently agreeing (tests::words_match_the_zsh_vocabulary).
 pub fn tap_word(status: CheckStatus) -> &'static str {
     match status {
         CheckStatus::Pass => "ok",
