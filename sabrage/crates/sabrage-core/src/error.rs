@@ -1,14 +1,9 @@
 //! Error taxonomy (design-core §8).
 //!
-//! Phase 1 shipped the three variants the check and path layers can produce;
-//! Phase 2's frame adds the ones the stage/process/privilege layers raise.
-//!
-//! Two of the new variants exist to keep `die()` text verbatim **and** carry
-//! structure: `Download`'s and `HashMismatch`'s `Display` strings are
-//! byte-identical to `lib.sh`'s `fetch_pinned` failures
-//! (`download failed: $url`, `sha256 mismatch for $label (got $hash)`), so the
-//! GUI can branch on `kind()` while the console text still matches the shell
-//! and the docs that quote it.
+//! `Download` and `HashMismatch` keep `Display` byte-identical to `lib.sh`'s
+//! `fetch_pinned` die text, so a front-end can branch on `kind()` while the
+//! console text still matches the shell and the docs that quote it
+//! (tests::display_matches_lib_sh_die_text).
 
 use std::path::PathBuf;
 
@@ -126,26 +121,15 @@ impl SabrageError {
 
     /// Has this error's prose already reached the user as a `Fatal` row?
     ///
-    /// The rule a front-end needs when an operation fails: print (or show) the
-    /// error, *unless* the layer that raised it already said the same thing in
-    /// the event stream. Three variants are contracts to exactly that effect —
-    /// [`crate::stages::StageCtx::fatal`] emits the row and returns
-    /// [`SabrageError::Fatal`]; `privilege::upgrade_write_error` emits the App
-    /// Management explanation and returns [`SabrageError::TccDenied`];
-    /// `privilege::elevate_osascript` emits the declined-authorization row and
-    /// returns [`SabrageError::AdminDeclined`] — and all three document that
-    /// the caller must propagate rather than re-emit.
-    ///
-    /// [`SabrageError::Cancelled`] is included for a different reason: it is
-    /// the user's own Stop or Ctrl-C. `run` already printed run.sh's
-    /// `-- interrupted: stopping wine` section, a build stage's child simply
-    /// stops, and `demo.sh` prints nothing after its INT trap re-raises the
-    /// signal — a trailing `error: cancelled` would be the one line the shell
-    /// never shows. The exit code (130) still carries the fact.
-    ///
-    /// Lives here rather than in either front-end because both need it: the
-    /// CLI decides whether to print a final `error:` line, the GUI whether to
-    /// surface a second banner over the `Fatal` row already in the run log.
+    /// True for the variants whose raiser emits the row and then returns the
+    /// error, its callers propagating rather than re-emitting
+    /// ([`crate::stages::StageCtx::fatal`], `privilege::upgrade_write_error`,
+    /// `privilege::upgrade_child_write_error`, `privilege::elevate_osascript`),
+    /// and for [`SabrageError::Cancelled`], where the user's own Stop or Ctrl-C
+    /// is the report and the exit code (130) carries the fact. A front-end
+    /// reports the error only when this is false — the CLI's final `error:`
+    /// line — and the rule lives in core so the GUI can share it
+    /// (tests::already_reported_covers_the_variants_that_emit_their_own_row).
     pub fn already_reported(&self) -> bool {
         matches!(
             self,
