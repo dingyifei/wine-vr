@@ -3,68 +3,22 @@
 //!
 //! Reference: `scripts/demo/setup.sh`. Four steps, in order:
 //!
-//! 1. [`step::SETUP_SUBMODULES`] — `git submodule update --init` for
-//!    `ext/{oxrsys,wineopenxr,ALVR}`, then wineopenxr's nested submodules with
-//!    `--filter=blob:none` and ALVR's `openvr`; die if `openvr_driver.h` did not
-//!    materialize; grep `ext/ALVR/alvr/server_core/src/connection.rs` for
-//!    `is_streaming_nonblocking` to prove the oxrsys patch set is checked out.
-//! 2. [`step::SETUP_PINNED`] — Goldberg dll (a present-but-unpinned dll is kept
-//!    with a warn, never re-fetched) and the DXMT tarball: fetch, `rm -rf` the
-//!    artifact dir, extract into `ext/`, re-check completeness, then write the
-//!    `.sha256` provenance marker ([`crate::util::contract_marker_bytes`]).
-//! 3. [`step::SETUP_CONFIG`] — **write-once** `oxrsys-runtime.toml` from
-//!    [`crate::util::toml_template`]; an existing file is never overwritten,
-//!    only reported (and warned about when `protocol` is not `alvr`). The
-//!    creation goes through [`crate::executor::Executor::create_new`] (`O_EXCL`)
-//!    rather than an `exists()` probe plus
-//!    [`crate::executor::Executor::write_atomic`]: the probe and the write are
-//!    separated by an `await`, and the Sabrage operation lock covers neither an
-//!    editor nor a concurrently running `demo.sh setup`, so the racy shape
-//!    could rename a template over a hand-maintained config that was never
-//!    backed up. When the kernel says somebody else created it first, the file
-//!    is reported exactly as the already-present branch reports it.
-//! 4. [`step::SETUP_GAME`] — Beat Saber presence probe; skipped entirely when
-//!    neither `--bottle` nor `--bs-dir` was given.
+//! 1. [`step::SETUP_SUBMODULES`] — the `ext/` submodules.
+//! 2. [`step::SETUP_PINNED`] — the pinned Goldberg dll and DXMT artifacts.
+//! 3. [`step::SETUP_CONFIG`] — the runtime `oxrsys-runtime.toml`.
+//! 4. [`step::SETUP_GAME`] — the Beat Saber presence probe.
 //!
-//! Byte contracts: the toml template is [`crate::util::toml_template`] verbatim,
-//! and the marker file is the pin plus one newline — nothing else.
+//! The config is write-once via [`crate::executor::Executor::create_new`]
+//! (`O_EXCL`, not `exists()` then rename): a config this run did not write
+//! is reported, never replaced —
+//! tests::a_config_created_by_another_writer_is_reported_not_replaced.
 //!
-//! # Every mutation through the executor, and what that means for `--dry-run`
-//!
-//! `git submodule update`, the two pinned fetches, the DXMT `rm -rf` +
-//! extraction, and the config write all go through `ctx.executor` (narrowed to
-//! their step with [`crate::stages::StageCtx::executor_for`]) so a dry run
-//! plans instead of acting — [`crate::executor::DryRunExecutor`] never actually
-//! spawns `git`, `curl`, or `tar`, and never writes a byte.
-//!
-//! That means the shell's *postcondition* assertions — `openvr_driver.h`
-//! materialized, the patch-set grep, the extracted DXMT set being complete —
-//! would always read false after a planned-but-not-executed mutation. Rather
-//! than report those as failures a dry run could not itself have caused, each
-//! such check is skipped (never `die`s) when
-//! [`crate::executor::Executor::is_dry_run`] is true. The check still runs for
-//! real when the postcondition already happens to hold — a dry run over an
-//! already-set-up checkout reports the same `ok` rows a real run would — and
-//! only then. When the postcondition is currently **false**, the row swaps to
-//! a future-tense `info` ("would initialize submodules …", "would extract
-//! ext/dxmt-artifacts …") instead of the `ok`: a preview may say what it
-//! plans to do, but it may not claim a checkout state that does not exist
-//! (`sabrage setup --dry-run` over a fresh clone used to print three green
-//! completed-state rows). This is the same verb swap `build.rs` applies to its
-//! own staged-copy outcome, and PARITY.md's "would …" dry-run language row.
-//!
-//! The rule is the **whole** claimed postcondition, not the part of it that
-//! happens to be observable. Two rows named a byte a dry run had not written:
-//!
-//! * the extraction row's parenthetical claims the provenance marker, but
-//!   [`setup_pinned`] returns early ("already present") whenever the marker is
-//!   current — so *reaching* that row at all means the marker is absent or
-//!   stale, and under `--dry-run` nothing wrote it. There is therefore no
-//!   dry-run shape in which the `ok` is truthful, and the row is always the
-//!   future-tense one there;
-//! * the config row said "wrote …" for a file [`crate::executor::DryRunExecutor`]
-//!   only planned. It now says "would write …", and `sabrage setup --dry-run`
-//!   over a fresh checkout leaves — and claims — nothing on disk.
+//! Every mutation goes through `ctx.executor`, so a dry run plans instead of
+//! acting. Postcondition checks are skipped (never fatal) when the run only
+//! planned the mutation; a false one swaps the `ok` row for a future-tense
+//! `info` — a preview may not claim a state that does not exist. See
+//! tests::a_dry_run_over_a_fresh_checkout_never_claims_completed_state and
+//! PARITY.md § CLI / GUI, "Dry-run rows swap the verb to".
 
 use std::path::Path;
 
@@ -74,8 +28,6 @@ use crate::events::step;
 use crate::process::{self, ChildSpec};
 use crate::stages::{require_bottle, StageCtx};
 use crate::util;
-
-// ── dry-run "would …" rows (no shell counterpart; see the module doc) ────────
 
 /// Replaces `ok "submodules ready"` under `--dry-run` when the submodules are
 /// not in fact checked out yet.
@@ -101,8 +53,6 @@ pub async fn run(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-// ── 1. submodules ────────────────────────────────────────────────────────────
-
 /// A `git -C <dir> submodule update <rest...>` spec, attributed to
 /// [`step::SETUP_SUBMODULES`].
 fn git_submodule_spec(ctx: &StageCtx, dir: &Path, rest: &[&str]) -> ChildSpec {
@@ -116,7 +66,6 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
     let st = ctx.step(step::SETUP_SUBMODULES);
     st.info("initializing submodules (first fetch is large: ALVR + the wine source tree)...");
 
-    // git -C "$ROOT" submodule update --init ext/oxrsys ext/wineopenxr ext/ALVR
     run_child_ok(
         ctx,
         git_submodule_spec(
@@ -134,7 +83,7 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
     )
     .await?;
     // blob:none keeps the wine-mirror clone to tens of MB instead of full
-    // history: git -C "$WOXR" submodule update --init --filter=blob:none
+    // history.
     run_child_ok(
         ctx,
         git_submodule_spec(
@@ -144,7 +93,7 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
         ),
     )
     .await?;
-    // openvr (alvr_session build dep): git -C "$ALVR" submodule update --init
+    // openvr is an alvr_session build dependency.
     run_child_ok(
         ctx,
         git_submodule_spec(ctx, &ctx.paths.alvr, &["submodule", "update", "--init"]),
@@ -165,7 +114,6 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
         ));
     }
 
-    // grep -q is_streaming_nonblocking "$ALVR/alvr/server_core/src/connection.rs"
     let connection_rs = ctx.paths.alvr.join("alvr/server_core/src/connection.rs");
     let patchset_present = std::fs::read(&connection_rs)
         .map(|bytes| String::from_utf8_lossy(&bytes).contains("is_streaming_nonblocking"))
@@ -186,8 +134,6 @@ async fn setup_submodules(ctx: &StageCtx) -> Result<()> {
         ))
     }
 }
-
-// ── 2. pinned binaries ───────────────────────────────────────────────────────
 
 async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
     let exec = ctx.executor_for(step::SETUP_PINNED);
@@ -212,7 +158,6 @@ async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
         .await?;
     }
 
-    // DXMT fork artifacts.
     if util::dxmt_ok(&ctx.paths) {
         ctx.step(step::SETUP_PINNED)
             .info("already present: dxmt-artifacts (sha256 marker matches)");
@@ -254,11 +199,9 @@ async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
         exec.write_atomic(&marker_path, marker_bytes.as_bytes())
             .await?;
         let st = ctx.step(step::SETUP_PINNED);
-        // The `ok` row claims *both* halves of the postcondition — the files
-        // and the marker. `util::dxmt_ok` (files **and** a current marker)
-        // already returned early above, so reaching this line under a dry run
-        // means the marker is missing or stale and nothing wrote it: a complete
-        // file set alone may not buy the green row. See the module docs.
+        // The `ok` row claims the files *and* the marker; reaching this line
+        // under a dry run means the marker is missing or stale and nothing
+        // wrote it — tests::a_dry_run_over_an_already_set_up_checkout_still_reports_the_ok_rows.
         if extracted_ok && !exec.is_dry_run() {
             st.ok("extracted ext/dxmt-artifacts (provenance marker written)");
         } else {
@@ -276,8 +219,6 @@ async fn setup_pinned(ctx: &StageCtx) -> Result<()> {
     }
 }
 
-// ── 3. runtime config ────────────────────────────────────────────────────────
-
 async fn setup_config(ctx: &StageCtx) -> Result<()> {
     let st = ctx.step(step::SETUP_CONFIG);
     let exec = ctx.executor_for(step::SETUP_CONFIG);
@@ -287,15 +228,14 @@ async fn setup_config(ctx: &StageCtx) -> Result<()> {
         report_existing_config(st, &ctx.paths.toml_path);
     } else {
         // `O_EXCL`, not `exists()`-then-rename: whoever created the file
-        // between the probe above and this line keeps it (see the module docs).
+        // between the probe above and this line keeps it —
+        // tests::a_config_created_by_another_writer_is_reported_not_replaced.
         let created = exec
             .create_new(&ctx.paths.toml_path, util::toml_template().as_bytes())
             .await?;
         if !created {
-            // Someone else won the race. The file is now in exactly the shape
-            // the branch above exists to describe, so describe it — the one
-            // thing setup may never do to a config it did not write is
-            // replace it.
+            // Someone else won the race; setup may never replace a config it
+            // did not write, so report it exactly as the branch above does.
             report_existing_config(st, &ctx.paths.toml_path);
         } else if exec.is_dry_run() {
             // Planned, not performed: no bytes are on disk to have written.
@@ -318,13 +258,12 @@ async fn setup_config(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-/// setup.sh's two rows for a config this run did not write: the `info` when its
-/// `protocol` is already `alvr`, the `warn` (verbatim, "not overwriting"
-/// included) when it is anything else.
+/// Emits the row for a config this run did not write: `info` when its
+/// `protocol` is already `alvr`, otherwise the `warn` that reproduces
+/// setup.sh's "not overwriting" text verbatim —
+/// tests::config_warns_verbatim_when_protocol_is_not_alvr.
 ///
-/// Two callers, one text: the ordinary already-present case, and the one where
-/// [`crate::executor::Executor::create_new`] reports that another writer got
-/// there first.
+/// Reference: `scripts/demo/setup.sh`.
 fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) {
     let text = std::fs::read_to_string(toml_path).unwrap_or_default();
     let proto = parse_protocol_awk(&text);
@@ -341,12 +280,13 @@ fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) 
     }
 }
 
-/// `awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}'`.
+/// The `protocol` value from an `oxrsys-runtime.toml`: the first matching
+/// line wins, and an absent or unquoted value yields the empty string —
+/// tests::parse_protocol_awk_matches_the_shell_recipe.
 ///
-/// Mirrors `scripts/demo/setup.sh`'s first-match `{print $2; exit}`; the
-/// `parse_protocol` helper in [`crate::checks::config`] instead mirrors
-/// `scripts/demo/doctor.sh`'s last-match `{v=$2} END{print v}` — opposite
-/// match semantics, so they are not one helper.
+/// Reference: `scripts/demo/setup.sh`. [`crate::checks::config`]'s
+/// `parse_protocol` mirrors doctor.sh's last-match semantics instead, so the
+/// two are not one helper.
 fn parse_protocol_awk(toml_text: &str) -> String {
     for line in toml_text.lines() {
         let after_leading_ws = line.trim_start();
@@ -363,8 +303,6 @@ fn parse_protocol_awk(toml_text: &str) -> String {
     String::new()
 }
 
-// ── 4. Beat Saber presence ───────────────────────────────────────────────────
-
 async fn setup_game(ctx: &StageCtx) -> Result<()> {
     let st = ctx.step(step::SETUP_GAME);
     if ctx.opts.bottle_name.is_none() && ctx.opts.bs_dir_override.is_none() {
@@ -373,11 +311,9 @@ async fn setup_game(ctx: &StageCtx) -> Result<()> {
         );
         return Ok(());
     }
-    // `[ -n "${WINEVR_BOTTLE:-}" ] && require_bottle || { BS_DIR=...; DEPOT_CMD=... }`:
-    // when a bottle name was given, require_bottle both dies (verbatim text)
-    // on a missing bottle and pins BS_DIR the same way `StageCtx` already did;
-    // when only --bs-dir was given, ctx.bs_dir already equals it. Either way
-    // the DepotDownloader command is the same formula.
+    // A given bottle name must still die the require_bottle way on a missing
+    // bottle; with only --bs-dir, ctx.bs_dir already holds it —
+    // tests::game_check_dies_the_require_bottle_way_for_a_missing_bottle.
     if ctx.opts.bottle_name.is_some() {
         require_bottle(ctx)?;
     }
@@ -394,19 +330,13 @@ async fn setup_game(ctx: &StageCtx) -> Result<()> {
     Ok(())
 }
 
-// ── shared child-spawn helper ────────────────────────────────────────────────
-
-/// Run `spec` through the stage's executor, mapping a non-zero real exit to
-/// [`SabrageError::ChildFailed`].
+/// Runs `spec` through the stage's executor.
 ///
-/// The shell aborts on these commands via a bare `set -e` — there is no
-/// bespoke `die()` text to reproduce, so this is [`process::run_ok`]'s
-/// mapping, minus the output tail: [`crate::executor::Executor::run_child`]
-/// returns a plain [`std::process::ExitStatus`], not the tail
-/// `spawn_streamed` captures internally, but every line the child printed
-/// already reached the event stream (and the log) as it ran. In `--dry-run`,
-/// [`crate::executor::DryRunExecutor::run_child`] never spawns and always
-/// reports success, so this always returns `Ok` there.
+/// # Errors
+///
+/// [`SabrageError::ChildFailed`] with an empty tail on a non-zero exit: every
+/// line the child printed already reached the event stream as it ran. A dry
+/// run never spawns and always reports success, so this returns `Ok` there.
 async fn run_child_ok(ctx: &StageCtx, spec: ChildSpec) -> Result<()> {
     let status = ctx.executor.run_child(&spec).await?;
     if status.success() {
@@ -474,8 +404,6 @@ mod tests {
             .collect()
     }
 
-    // ── parse_protocol_awk ───────────────────────────────────────────────────
-
     #[test]
     fn parse_protocol_awk_matches_the_shell_recipe() {
         assert_eq!(parse_protocol_awk("protocol = \"alvr\"\n"), "alvr");
@@ -494,8 +422,6 @@ mod tests {
             "first"
         );
     }
-
-    // ── setup_game / skip-advice text ────────────────────────────────────────
 
     #[tokio::test]
     async fn game_check_is_skipped_without_bottle_or_bs_dir() {
@@ -589,8 +515,6 @@ mod tests {
         std::fs::remove_dir_all(&fixture).ok();
     }
 
-    // ── setup_config ─────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn config_write_once_never_overwrites_an_existing_file() {
         let fixture = scratch("config-existing-alvr");
@@ -655,13 +579,10 @@ mod tests {
         std::fs::remove_dir_all(&fixture).ok();
     }
 
-    /// The concurrent-writer race A5-3 named, made deterministic: an
-    /// [`crate::executor::Executor`] that stands in for the other process —
-    /// it creates the file itself (as an editor or a concurrent `demo.sh setup`
-    /// would, between `setup_config`'s existence probe and its write) and then
-    /// reports what the kernel reports to the loser of an `O_EXCL` open:
-    /// `Ok(false)`, caller's bytes not written. Everything else forwards to the
-    /// real executor underneath.
+    /// A [`crate::executor::Executor`] that loses the `O_EXCL` create race
+    /// A5-3 names: `create_new` writes the other writer's bytes itself and
+    /// then returns `Ok(false)`, the caller's bytes unwritten. Every other
+    /// method forwards to the inner executor.
     #[derive(Debug)]
     struct LosesTheCreateRace {
         inner: Arc<dyn crate::executor::Executor>,
@@ -783,8 +704,7 @@ mod tests {
         ctx.executor = LosesTheCreateRace::around(ctx.executor.clone(), hand_edited);
 
         // Nothing on disk when the stage probes: the other writer's file
-        // appears only inside the create call, which is the window the old
-        // `is_file()`-then-`write_atomic` shape renamed straight over.
+        // appears only inside the create call.
         assert!(!paths.toml_path.exists());
         setup_config(&ctx).await.unwrap();
 
@@ -812,8 +732,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&fixture).ok();
     }
-
-    // ── setup_pinned ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn goldberg_present_with_wrong_hash_is_kept_and_not_redownloaded() {
@@ -892,8 +810,6 @@ mod tests {
         assert!(!plan.iter().any(|a| a.kind == PlannedKind::RemoveDir));
         std::fs::remove_dir_all(&fixture).ok();
     }
-
-    // ── dry-run honesty: no green completed-state rows for planned work ──────
 
     /// Make `fixture` look like a checkout whose submodules are initialized and
     /// whose ALVR branch carries the oxrsys patch set.
@@ -984,10 +900,9 @@ mod tests {
                 "a truthful postcondition lost its ok row {claim:?}: {rows:?}"
             );
         }
-        // A5-1: the extraction row claims the *marker* too, and the marker is
-        // exactly what this fixture lacks (a current one would have short-
-        // circuited the whole step). A dry run wrote none, so the row must stay
-        // future-tense — and the file must still be absent afterwards.
+        // A5-1: the extraction row claims the marker too, and the marker is
+        // exactly what this fixture lacks — so the row must stay future-tense
+        // and the file must still be absent afterwards.
         assert!(
             rows.iter()
                 .any(|(sev, t)| *sev == Severity::Info && t == DXMT_WOULD_EXTRACT_INFO),
@@ -1043,8 +958,6 @@ mod tests {
         }));
         std::fs::remove_dir_all(&fixture).ok();
     }
-
-    // ── full-stage dry run ───────────────────────────────────────────────────
 
     #[tokio::test]
     async fn dry_run_over_a_fresh_checkout_plans_every_mutation_without_touching_disk() {
