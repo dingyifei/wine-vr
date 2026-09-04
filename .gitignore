@@ -18,6 +18,8 @@ build/
 *.dxvk-cache
 *.log
 logs/
+# …but not sabrage-core/src/logs/, the sibling-module directory of logs.rs's extracted tests
+!sabrage/crates/sabrage-core/src/logs/
 
 # Local investigation evidence (kept out of git history)
 evidence/
