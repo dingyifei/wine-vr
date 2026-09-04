@@ -1,125 +1,29 @@
-//! Reconciling a session Sabrage did not (or no longer) supervises.
+//! Reconcile a session Sabrage does not supervise.
 //!
-//! Run at startup and whenever the Session screen opens: read
-//! [`state::SessionState`], work out what is actually true on the machine, and
-//! either adopt the session, finish its cleanup, or refuse to touch it.
+//! Run at app start, when the Session screen opens, and — as
+//! `finish_stopped_session` — from [`crate::stages::stop`].
 //!
-//! # The three classifications, and why the third exists
+//! `Live` is adopted untouched; `Dead` gets the full restore (audio device,
+//! ALVR dashboard, `--wired` forwards); a recycled pid (`IdentityMismatch`)
+//! gets the pid-free restore and signals nothing. The record is cleared only
+//! once every guard it recorded is released, and kept otherwise.
+//! `Unverifiable`, newer-schema, live-foreign and in-flight records are
+//! reported and left as they are. [`detach`] marks the record and leaves every
+//! guard in place. The row texts live on this file's consts; the shell has no
+//! counterpart — PARITY.md § Session (detach / reconcile), "A recorded
+//! **Live** session".
 //!
-//! [`classify`] is pure — [`crate::process::ProcInfo::is_same_process`] and
-//! [`crate::process::is_alive`], nothing else:
+//! Every mutation goes through [`crate::executor::Executor`], so `--dry-run`
+//! plans the recovery instead of performing it; the audio probe is read-only
+//! and goes through [`crate::process::capture`].
 //!
-//! * [`Classification::Live`] — the recorded pid is alive *and* reports the
-//!   recorded start time. It really is our wine process; adopt it.
-//! * [`Classification::Dead`] — the pid is gone. Whatever the guards say still
-//!   needs undoing, and the wine child cannot be signalled because it does not
-//!   exist. Safe to do everything ([`RestoreMode::Full`]).
-//! * [`Classification::IdentityMismatch`] — a process with that pid exists, but
-//!   its start time differs: the pid was **recycled** and now belongs to
-//!   something else entirely. This is the case that must never be handled like
-//!   `Dead`, because `Dead`'s cleanup includes reaping by identity — and here
-//!   the identity is a stranger's, quite possibly the user's editor.
-//!   [`RestoreMode::SafeOnly`] restores what is not attached to a pid (audio,
-//!   adb forwards) and signals nothing.
+//! # Failure policy
 //!
-//! * [`Classification::Unverifiable`] — the recorded `start_time` is the 0 the
-//!   spawn fallback writes when the pid could not be observed
-//!   ([`crate::executor::Executor::spawn_detached`]), and that pid is *alive*.
-//!   It can never match a real start time, so it is not `Live`; but calling it
-//!   a recycled pid is a guess in the other direction, and acting on that guess
-//!   means restoring the audio device and pulling the `--wired` forwards out
-//!   from under what may well be the running session. Nothing is touched and
-//!   the record is kept.
-//!
-//! # Records that are not ours to touch
-//!
-//! Three more shapes are reported and left exactly as they are
-//! ([`Reconciled::Busy`]), because in each one the guards belong to somebody
-//! who is still using them:
-//!
-//! * the record of a launch **this process is running right now** — before the
-//!   wine spawn it has `wine: None`, which classifies as `Dead`, and its
-//!   [`crate::session::LIVE_SESSION`] handle does not exist yet either. The
-//!   run stage's published phase ([`crate::session::run_phase`]) is what names
-//!   it, which is why reconciliation takes that as an ambient input;
-//! * a record whose `owner_pid` is a live *foreign* process
-//!   ([`state::has_live_foreign_owner`]) — the other front-end's session;
-//! * a record written by a **newer** Sabrage
-//!   ([`state::SessionState::is_supported_version`]) — it may describe a guard
-//!   this build cannot undo, and rewriting it through this struct would erase
-//!   that description.
-//!
-//! # Detach
-//!
-//! [`detach`] is the app-quit "leave it running" answer (critique.md's
-//! app-quit issue): mark the on-disk state `detached`, fire the handle's
-//! `detach` token so the supervisor stops without running teardown, and
-//! **leave every guard in place**. A detached session's guards are pending on
-//! purpose; a later reconcile that finds `detached: true` must not silently
-//! undo the user's choice while the game is still running.
-//!
-//! # What the user sees
-//!
-//! Everything this module does is a Sabrage-only capability — `run.sh`'s guards
-//! are shell traps, and `stop.sh` can only *warn* that the audio device is
-//! still on BlackHole. So the rows have no shell counterpart to match; they are
-//! listed here (and in `sabrage/PARITY.md`) as the contract instead:
-//!
-//! | | text |
-//! |---|---|
-//! | section | `reconciling the previous session` ([`RECONCILE_SECTION`]) |
-//! | ok | `audio: restored output -> <dev> (previous session did not shut down cleanly)` |
-//! | warn | `recorded output device '<dev>' is not connected — restored output -> <alt> instead (previous session did not shut down cleanly)` |
-//! | warn | `could not restore the audio output (recorded device '<dev>' is not connected) — restore with: …` |
-//! | ok | `ALVR dashboard closed (left over from the previous session)` |
-//! | info | `cleared adb forward tcp:<port> on <serial>` |
-//! | info | `previous session record kept for a later restore` |
-//! | warn | `previous session record kept: Sabrage process <pid> is running this session` |
-//! | warn | `previous session record kept: written by a newer Sabrage (schema v<n>, this build understands v<m>)` |
-//! | warn | `previous session state kept: wine pid <pid> still alive` (stop only) |
-//! | warn | `previous session state kept: wine pid <pid> is alive but could not be identified` (stop only) |
-//! | warn | `previous session not fully restored: <error>` (stop only) |
-//! | info | `the record is kept; stop again to retry` (stop only) |
-//!
-//! The section banner is emitted **lazily**, immediately before the first
-//! *restoration* row, so a stale record with nothing left to undo reconciles in
-//! silence. The two audio rows in the middle are the
-//! recorded-device-is-gone path (the disconnected AirPods of the 2026-08-29
-//! finding): the fallback switch counts as a restoration and takes the banner,
-//! the "could not restore" row does not. The two stop-only rows above are emitted by
-//! [`finish_stopped_session`] itself rather than by [`restore_with`], and — like
-//! the "still alive" warn that predates them — carry no banner: they report why
-//! there was no recovery, not a recovery that happened. Under `--dry-run` each
-//! verb is swapped ("would restore", "would be closed", "would clear"), the
-//! convention PARITY.md already records for the other stages' preview rows.
-//!
-//! # Failure policy: `stop` must not abort here
-//!
-//! [`finish_stopped_session`] reports its own failures ([`RECONCILE_FAILED`] +
-//! [`RECONCILE_RETRY_HINT`]) and returns `Ok(())`. `stop.sh` has no step that
-//! can end the script early — every one of its blocks is `|| true`-shaped or a
-//! plain report — and this whole pass is *additive* to that stage, so a
-//! reconcile that cannot finish (a recorded `SwitchAudioSource` or `adb` that
-//! no longer exists, an unwritable store) must never cost the user the ports
-//! and audio rows that follow it. The record is left on disk in that case,
-//! un-cleared, with only the guards that really were released flagged: the next
-//! `stop` picks up exactly where this one stopped.
-//!
-//! [`SabrageError::Cancelled`] is the one error that still reaches the caller —
-//! a Cancel during `stop` must surface as exit 130, not as a warn row and a
-//! green stage (`stages::stop`'s own Cancellation section).
-//!
-//! # Every mutation goes through the executor
-//!
-//! The device switch, the dashboard `SIGTERM` (as `/bin/kill -TERM <pid>`, the
-//! same primitive [`crate::stages::stop`] uses — the [`crate::executor::Executor`]
-//! trait has no "signal a pid" method), each `adb forward --remove`, every
-//! [`state::save`] and the final [`state::clear`] are all
-//! [`crate::executor::Executor`] calls, so `--dry-run` plans the whole recovery
-//! instead of performing it. The one thing that is *not* — the audio probe:
-//! the current default output device and the list of output devices to fall
-//! back to — is read-only and goes through [`crate::process::capture`], which
-//! is what that function exists for.
+//! Landmine: `finish_stopped_session` propagates only
+//! [`SabrageError::Cancelled`]; every other failure becomes rows plus `Ok(())`
+//! with the record kept, so `stop` still reaches its ports and audio reports.
+//! See tests::{a_cancelled_reconcile_still_reaches_the_caller,
+//! a_failed_restore_is_reported_and_the_record_is_kept_for_the_next_stop}.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -179,11 +83,10 @@ impl Classification {
     /// Is the recorded process alive as far as anything here can tell?
     ///
     /// [`Classification::Unverifiable`] counts: it is the alive-pid case whose
-    /// identity simply cannot be checked, and every door in this codebase
-    /// treats it as running (the module doc's fourth bullet,
-    /// [`crate::session::session_block_at`]'s third signal). Rendering it as
-    /// exited is how the Session screen offers Launch for a session the launch
-    /// path then refuses.
+    /// identity cannot be checked, and every door treats it as running
+    /// ([`crate::session::session_block_at`]'s third signal,
+    /// [`crate::session::watcher`]'s phase). Rendering it as exited is how the
+    /// Session screen offers Launch for a session the launch path then refuses.
     pub fn is_live(self) -> bool {
         matches!(self, Classification::Live | Classification::Unverifiable)
     }
@@ -246,13 +149,11 @@ impl Reconciled {
     /// The reason a caller about to mutate the machine must **stop**, or
     /// `None` when this outcome licenses carrying on.
     ///
-    /// A9-1: `Busy` used to be indistinguishable from "nothing to carry
-    /// forward" at the launch site, so a record protected *because* another
-    /// front-end's session is live let the launch continue into preflight's
-    /// auto-fixes, `adb forward --remove` and the bottle's `wineserver -k` —
-    /// taking down the very session the classification had just refused to
-    /// touch. Only this process's own in-flight record (`silent`) is safe to
-    /// carry on over: it is this launch's own.
+    /// A9-1: every `Busy` but this process's own in-flight record (`silent`)
+    /// is a refusal. Carrying on would take preflight's auto-fixes, `adb
+    /// forward --remove` and the bottle's `wineserver -k` into the very
+    /// session the classification had just refused to touch. See
+    /// tests::every_busy_but_our_own_in_flight_record_is_a_refusal.
     pub fn busy_refusal(&self) -> Option<&str> {
         match self {
             Reconciled::Busy {
@@ -295,10 +196,9 @@ pub fn classify(state: &SessionState) -> Classification {
 /// branch, whose `ProcInfo` is the same spawn-time identity `wine` holds.
 ///
 /// One predicate, so the phase the Session screen shows and the classification
-/// the launch path refuses on cannot disagree — an alive pid with the spawn
-/// fallback's `start_time == 0` was `Unverifiable` (and therefore live) to
-/// reconciliation while the monitor rendered it `Exited`, offering Launch for a
-/// session `run` would then refuse.
+/// the launch path refuses on cannot disagree over an alive pid carrying the
+/// spawn fallback's `start_time == 0`. See
+/// tests::the_spawn_fallback_start_time_can_never_match.
 pub fn classify_identity(wine: Option<&ProcInfo>) -> Classification {
     let Some(wine) = wine else {
         return Classification::Dead;
@@ -329,8 +229,6 @@ fn restore_mode(class: Classification) -> Option<RestoreMode> {
         Classification::IdentityMismatch => Some(RestoreMode::SafeOnly),
     }
 }
-
-// ── reconcile ─────────────────────────────────────────────────────────────────
 
 /// Read the state file and act on it, emitting nothing on the happy path.
 ///
@@ -369,7 +267,6 @@ where
         return Ok(Reconciled::NoSession);
     };
 
-    // ── records that are not ours to touch (module doc) ──────────────────────
     if let Some(reason) = untouchable(&state, run_phase.as_ref()) {
         // Silent for our own in-flight launch — there is nothing wrong and
         // nothing for the user to do — and a row for the two that a person may
@@ -458,12 +355,10 @@ fn untouchable(
     state: &SessionState,
     run_phase: Option<&crate::session::RunPhaseInfo>,
 ) -> Option<Untouchable> {
-    // A launch this process is running *right now*. Before the wine spawn its
-    // record has `wine: None` — which classifies as `Dead` — and there is no
-    // live handle yet, so the published phase is the only thing that knows.
-    // Without this, remounting the Session screen mid-launch restores the audio
-    // device, kills the dashboard this launch just spawned, pulls its forwards
-    // and deletes its record, all under a launch that keeps going.
+    // Before the wine spawn the record has `wine: None` (which classifies as
+    // `Dead`) and no live handle exists, so only the published phase can keep
+    // a mid-launch reconcile from tearing down the launch's own guards.
+    // See tests::a_record_belonging_to_the_launch_in_progress_is_never_touched.
     if let Some(info) = run_phase {
         let in_flight = matches!(
             info.phase,
@@ -493,31 +388,22 @@ fn untouchable(
     None
 }
 
-// ── stop's tail end ───────────────────────────────────────────────────────────
-
 /// The reconcile pass [`crate::stages::stop`] runs after `wineserver -k` and
-/// before its audio report.
+/// before its audio report, on records this process does not supervise.
 ///
-/// `stop` must work on sessions Sabrage did not start — that is its whole
-/// point — so it cannot rely on an in-process handle. It reads the same record
-/// [`reconcile`] does, but *after* the kill, when the recorded wine pid should
-/// already be gone:
+/// A dead wine pid gets [`RestoreMode::Full`], a recycled pid
+/// [`RestoreMode::SafeOnly`]; the record is then cleared, or kept when a guard
+/// could not be released. A still-alive one gets one warn and the record is
+/// kept for the next `stop`. No record, another bottle's record, and a session
+/// this process supervises are skipped.
 ///
-/// * **dead** (the normal case) → [`RestoreMode::Full`] then [`state::clear`],
-///   which is why the `stop.4.audio` row that follows can report the restored
-///   device instead of stop.sh's "still BlackHole 2ch" warning;
-/// * **identity mismatch** → [`RestoreMode::SafeOnly`] then clear;
-/// * **still alive** (`wineserver -k` did not take) → one warn, and the record
-///   is kept so the next `stop` can try again.
+/// # Errors
 ///
-/// Three cases are skipped outright: no record at all, a record for a *different
-/// bottle* (this `stop` never touched it — the stage is bottle-scoped), and a
-/// record for a session **this process is supervising**, whose own teardown
-/// will release the guards.
-///
-/// **Only ever fails with [`SabrageError::Cancelled`]** — see the module doc's
-/// "Failure policy". Every other failure becomes two rows and `Ok(())`, so the
-/// `stop` stage always reaches its ports and audio reports.
+/// Only [`SabrageError::Cancelled`]. Every other failure becomes two rows and
+/// `Ok(())` so the stage still reaches its ports and audio reports. See
+/// tests::{stop_restores_and_clears_a_session_it_did_not_start,
+/// stop_ignores_a_record_belonging_to_another_bottle,
+/// a_failed_restore_is_reported_and_the_record_is_kept_for_the_next_stop}.
 pub(crate) async fn finish_stopped_session(ctx: &StageCtx) -> Result<()> {
     let live = crate::session::live_session_run_id();
     finish_stopped_session_with(ctx, live, crate::session::run_phase(), || {
@@ -550,13 +436,11 @@ const RECONCILE_FAILED: &str = "previous session not fully restored";
 const RECONCILE_RETRY_HINT: &str = "the record is kept; stop again to retry";
 
 /// Turn a reconcile failure into two rows and `Ok(())`, so the stage that
-/// invoked it keeps going (module doc, "Failure policy").
+/// invoked it keeps going.
 ///
 /// [`SabrageError::Cancelled`] passes straight through: a Cancel must fail the
-/// stage with exit 130 rather than be reported as a partial restore and then
-/// forgotten. `stop`'s own between-step checkpoint would catch it a moment
-/// later anyway, but a function that swallowed cancellation would be one more
-/// place for that guarantee to rot.
+/// stage with exit 130 rather than be reported as a partial restore. See
+/// tests::a_cancelled_reconcile_still_reaches_the_caller.
 fn tolerate_reconcile_failure(ctx: &StageCtx, result: Result<()>) -> Result<()> {
     match result {
         Ok(()) => Ok(()),
@@ -622,8 +506,6 @@ where
     Ok(())
 }
 
-// ── restoration ───────────────────────────────────────────────────────────────
-
 /// What the audio probe came back with: the `SwitchAudioSource` binary that
 /// answered, the device it named, and every output device present right now.
 ///
@@ -641,26 +523,18 @@ struct AudioProbe {
 }
 
 /// `SwitchAudioSource -c -t output` and `-a -t output`, `$(…)`-trimmed — both
-/// read-only, hence [`crate::process::capture`] rather than the executor.
+/// read-only, hence [`crate::process::capture`] rather than the executor. The
+/// two are independent, so they run concurrently ([`tokio::join!`]), and only
+/// for a record that still has an unreleased audio guard.
 ///
-/// `None` when the binary is absent, `-c` is unrunnable, or `-c` exits
-/// non-zero: the audio guard is then left **pending** rather than flagged,
-/// because "we could not look" is not "there was nothing to do". The device
-/// *list* is the softer of the two — a failed `-a` yields an empty pool, which
-/// only costs the fallback, not the ordinary restore.
+/// `Ok(None)` is "we could not look" (no binary, a failed or wedged `-c`) and
+/// leaves the audio guard **pending** rather than flagged; a failed `-a` only
+/// costs the fallback pool.
 ///
-/// Both captures happen up front rather than lazily so the whole probe stays
-/// one injection point (see [`reconcile_with`]); they run only when a record
-/// actually has an unreleased audio guard. They are two independent read-only
-/// probes, so they run **concurrently** ([`tokio::join!`]) rather than one
-/// after the other — `-a`'s answer is read only by
-/// [`crate::session::fallback_output_device`]'s not-connected branch, so most
-/// restores pay for it without using it either way; concurrency at least
-/// keeps that from costing two probes' latency in series.
+/// # Errors
 ///
-/// `Ok(None)` is "we could not look" (no binary, a failed or wedged probe);
-/// `Err(Cancelled)` is the one answer that is **not** that — see
-/// [`probe_capture`].
+/// [`SabrageError::Cancelled`] only — see `probe_capture` and
+/// tests::a_missing_switchaudiosource_leaves_the_audio_guard_pending.
 async fn current_output_device(ctx: &StageCtx) -> Result<Option<AudioProbe>> {
     let Some(bin) = which("SwitchAudioSource") else {
         return Ok(None);
@@ -699,16 +573,16 @@ async fn current_output_device(ctx: &StageCtx) -> Result<Option<AudioProbe>> {
 const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// [`crate::process::capture_with`] under the *operation's* token and
-/// [`PROBE_TIMEOUT`]. `None` for a spawn failure, for a probe that ran out of
+/// `PROBE_TIMEOUT`. `None` for a spawn failure, for a probe that ran out of
 /// time, and for a cancelled one — indistinguishable to every caller, because
 /// all three mean "we could not look".
 ///
-/// The token matters twice over: Cancel can interrupt a wedged CoreAudio probe
-/// instead of waiting out the deadline with the operation lock held, and
-/// `capture_with` kills the probe's whole **process group** on the way out, so
-/// a `SwitchAudioSource` that forked cannot outlive its dropped leader. (A
-/// `tokio::time::timeout` around `capture` did neither: it fired before
-/// `capture`'s own deadline, so even the group kill never ran.)
+/// The token lets Cancel interrupt a wedged CoreAudio probe instead of waiting
+/// out the deadline with the operation lock held, and `capture_with` kills the
+/// probe's whole **process group**, so a `SwitchAudioSource` that forked cannot
+/// outlive its dropped leader. Not a `tokio::time::timeout` around `capture`:
+/// it fires before `capture`'s own deadline, so the group kill never runs — a
+/// timing property, and the test for it was decided against.
 async fn probe_capture(
     spec: &crate::process::ChildSpec,
     cancel: &tokio_util::sync::CancellationToken,
@@ -782,11 +656,11 @@ async fn switch_output(ctx: &StageCtx, bin: &Path, device: &str) -> Result<bool>
 ///
 /// Three outcomes, in order of preference: the recorded device; the fallback
 /// [`crate::session::fallback_output_device`] picks when the recorded one is no
-/// longer connected (the AirPods of the 2026-08-29 finding, whose switch exits
-/// non-zero with "Could not find an audio device named … Nothing was changed."
-/// and would otherwise leave the Mac silent on BlackHole); or a warn naming the
-/// device and the commands to fix it by hand, with the guard left **pending**
-/// so the record survives for the next try.
+/// longer connected (its switch exits non-zero with "Could not find an audio
+/// device named … Nothing was changed." and would otherwise leave the Mac
+/// silent on BlackHole); or a warn naming the device and the commands to fix it
+/// by hand, with the guard left **pending** so the record survives for the next
+/// try. See tests::a_recorded_device_that_is_gone_falls_back_to_the_built_in_output.
 async fn restore_audio<F, Fut>(
     ctx: &StageCtx,
     path: &Path,
@@ -883,15 +757,16 @@ async fn restore_dashboard(
 }
 
 /// Remove exactly the recorded `--wired` forwards, on exactly the recorded
-/// serials. Never `--remove-all` (CLAUDE.md; PARITY.md).
+/// serials; never `--remove-all`
+/// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
+/// "adb `forward --remove` per-serial for exactly tcp:9943+9944").
 ///
 /// Each removal that succeeds drops its port from the record; the guard is only
-/// flagged once none are left. A removal that fails is *indeterminate* — the
-/// device is usually simply gone, and with it the forward, but it may equally
-/// be a transient adb failure over a still-installed `tcp:9943`, which silently
-/// breaks the next WiFi discovery. Flagging the guard released on that would
-/// clear the record and leave nothing that knows the port is still there; the
-/// kept record is what the next launch or `stop` retries from.
+/// flagged once none are left. A failed removal is *indeterminate* — usually a
+/// vanished device, but equally a transient adb failure over a still-installed
+/// `tcp:9943`, which silently breaks the next WiFi discovery — so the record is
+/// kept for the next launch or `stop`. See
+/// tests::a_forward_that_could_not_be_removed_keeps_the_record.
 async fn restore_forwards(
     ctx: &StageCtx,
     path: &Path,
@@ -922,13 +797,10 @@ async fn restore_forwards(
             still_installed.push(fwd);
             continue;
         }
-        // Progress is written the moment it happens (the write-before-mutate
-        // rule's other half, `session::state`'s header): a crash after the
-        // `tcp:9943` removal but before the end of this loop must not leave a
-        // record still claiming 9943 is installed. A retry of an
-        // already-absent forward exits non-zero, and this function reads any
-        // non-zero as "still installed" — so that phantom row would be kept
-        // forever and `forwards_cleared` would never flip.
+        // Progress is written the moment it happens: a retry of an
+        // already-absent forward exits non-zero, which this loop reads as
+        // "still installed", so a crash mid-loop would strand a phantom port.
+        // See tests::a_removal_that_took_is_on_disk_before_the_next_one_is_tried.
         state.wired_forwards.retain(|f| f != &fwd);
         state::save(&*ctx.executor, path, state).await?;
         let line = forward_row(dry, fwd.port, &fwd.serial);
@@ -995,11 +867,11 @@ where
 /// Clear the record — or keep it, when a guard is still pending. `true` when
 /// it was kept.
 ///
-/// The live failure this exists for: a `stop` whose recorded output device had
-/// disconnected switched nothing, cleared the record anyway, and left the user
-/// on `BlackHole 2ch` with no machine-readable trace of what to restore. A
-/// record whose guards are not all released is worth more on disk than off it —
-/// the next launch or `stop` retries from it.
+/// A record whose guards are not all released is worth more on disk than off
+/// it: clearing it strands the user on `BlackHole 2ch` with no machine-readable
+/// trace of what to restore, and the next launch or `stop` retries from the
+/// kept record. See
+/// tests::with_nothing_to_fall_back_to_the_record_is_kept_with_the_remedy.
 async fn finish_record(
     ctx: &StageCtx,
     path: &Path,
@@ -1007,10 +879,9 @@ async fn finish_record(
     mode: RestoreMode,
 ) -> Result<bool> {
     if restore_complete(state, mode) {
-        // Run-id guarded: this pass may have taken seconds (an audio probe, a
-        // `SIGTERM`, two `adb forward --remove`s), and a launch that started
-        // meanwhile has already written its own record over this path. Only
-        // the record this pass actually reconciled is ours to delete.
+        // Run-id guarded: reconciliation can take seconds, and a launch that
+        // started meanwhile has written its own record at this path. Only the
+        // record carrying the run-id we read is ours to delete.
         state::clear_run(&*ctx.executor, path, state.run_id).await?;
         return Ok(false);
     }
@@ -1050,8 +921,6 @@ impl<'a> Banner<'a> {
         }
     }
 }
-
-// ── row texts ─────────────────────────────────────────────────────────────────
 
 /// `audio: restored output -> <dev> (previous session did not shut down cleanly)`
 ///
@@ -1107,34 +976,19 @@ fn newer_schema_row(version: u32) -> String {
     )
 }
 
-// ── detach ────────────────────────────────────────────────────────────────────
-
 /// Detach from a live session: mark the state file `detached`, fire the
-/// handle's `detach` token, and leave every guard alone.
+/// handle's `detach` token, and leave every guard in place. Takes [`Paths`]
+/// rather than a [`StageCtx`] because app-quit has no stage context.
 ///
-/// Takes [`Paths`] rather than a [`StageCtx`] because app-quit has no stage
-/// context to hand — it is unwinding the app, not running a stage.
-///
-/// The supervisor is the authority here: firing `handle.detach` is what makes
-/// it disarm both guards, mark the record `detached`, and drop out of
-/// [`crate::session::LIVE_SESSION`]. This function triggers that, waits up to
-/// [`DETACH_WAIT`] for the slot to be released (app-quit needs the bookkeeping
-/// finished before the process goes away), and then — only once the supervisor
-/// has **provably** let go through this detach — sets `detached` itself if the
-/// flag did not make it to disk. That last step is a safety net, and it is
-/// hedged three ways, because every one of these was a way to relabel a session
-/// that in fact stopped:
-///
-/// * it runs only when the wait ended in the slot *clearing*, never on the
-///   [`DETACH_WAIT`] timeout — a supervisor that is still holding the slot is
-///   still writing to that record;
-/// * it re-checks `handle.cancel` afterwards: a Stop that fired during the wait
-///   is terminal and owns the teardown, and its record (kept because a guard
-///   could not be released) must not come back as `detached: true` — the app
-///   then tells the user the game "is still running, unsupervised" about a
-///   session it stopped;
-/// * it goes through [`state::mark_detached`], which creates nothing: a record
-///   the supervisor already cleared stays cleared.
+/// The supervisor is the authority: firing `handle.detach` is what disarms both
+/// guards, marks the record, and drops out of
+/// [`crate::session::LIVE_SESSION`]. This waits up to `DETACH_WAIT` for that
+/// slot to clear and only then sets `detached` itself as a safety net — never
+/// on the timeout, never once `handle.cancel` has fired, and through
+/// [`state::mark_detached`], which creates nothing. See tests::{
+/// detach_does_not_relabel_a_session_stopped_during_the_wait,
+/// detach_that_times_out_leaves_the_record_alone,
+/// detach_creates_nothing_when_the_supervisor_already_cleared_the_record}.
 pub async fn detach(ctx_paths: &Paths, handle: &LiveSessionHandle) -> Result<()> {
     detach_with(ctx_paths, handle, DETACH_WAIT, |run_id| {
         crate::session::live_session_is(run_id)
@@ -1158,18 +1012,14 @@ async fn detach_with<F>(
 where
     F: Fn(RunId) -> bool,
 {
-    // Stop is terminal, and detach is subordinate to it. Both tokens feed one
-    // unbiased `select!` in the supervisor, so a detach fired *after* a Stop
-    // can still win that race — disarming the guards, marking the record
-    // `detached` and leaving wine running, while the Stop caller watches the
-    // live slot empty and reports success. A Stop that has fired can never be
-    // superseded here, and cancellation is monotonic, so this check cannot
-    // race back the other way.
+    // Stop is terminal and detach is subordinate to it: both tokens feed one
+    // unbiased `select!`, so a detach fired after a Stop could otherwise win
+    // that race and leave wine running under a caller reporting success.
+    // See tests::detach_does_nothing_once_stop_has_already_fired.
     //
-    // This is also the return that silently absorbs the Tauri quit dialog's
-    // stop-then-timeout arm (`commands::resolve_quit`, which fires `cancel`
-    // and only then calls detach): nothing is detached there, and the message
-    // that arm renders has to say so itself — this function cannot.
+    // This is also the return that absorbs `commands::resolve_quit`'s
+    // stop-then-timeout arm: nothing is detached there, so that arm's own
+    // message has to say so.
     if handle.cancel.is_cancelled() {
         return Ok(());
     }
@@ -1221,14 +1071,10 @@ mod tests {
     use uuid::Uuid;
 
     /// A pid no process can have on macOS (the default `kern.maxproc` ceiling
-    /// is five digits), chosen instead of spawning a throwaway child so the
-    /// "dead" case is deterministic and free of a pid-reuse race.
-    ///
-    /// Deliberately **not** `u32::MAX`: that is `-1` as an `i32`, and
-    /// `kill(-1, …)` addresses *every* process the user can signal.
+    /// is five digits), so the "dead" case is deterministic and free of a
+    /// pid-reuse race. Not `u32::MAX`: that is `-1` as an `i32`, and
+    /// `kill(-1, …)` addresses every process the user can signal.
     const DEAD_PID: u32 = 2_147_483_646;
-
-    // ── fixtures ─────────────────────────────────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!(
@@ -1243,10 +1089,9 @@ mod tests {
 
     /// A context whose Sabrage store and adb both point **inside the fixture**.
     ///
-    /// `sabrage_appsup` is the load-bearing override: without it
-    /// `Paths::new` derives it from the real `$HOME` and these tests would read
-    /// — and with a real executor, write — the developer's own
-    /// `session-state.json`.
+    /// `sabrage_appsup` is the load-bearing override: without it `Paths::new`
+    /// derives it from the real `$HOME`, and these tests read — and with a real
+    /// executor write — the developer's own `session-state.json`.
     fn test_ctx(dir: &Path, dry_run: bool) -> (StageCtx, Arc<StdMutex<Vec<StageEvent>>>) {
         let seen = Arc::new(StdMutex::new(Vec::new()));
         let s = seen.clone();
@@ -1362,8 +1207,8 @@ mod tests {
         }
     }
 
-    /// The device of the 2026-08-29 finding: recorded at launch, disconnected
-    /// by the time `stop` ran.
+    /// The recorded output device of the disconnected-device defect: connected
+    /// at launch, gone by the time `stop` ran.
     const AIRPODS: &str = "Yifei\u{2019}s AirPods Pro";
 
     /// `SwitchAudioSource -a -t output` on that machine, verbatim and in order.
@@ -1377,10 +1222,9 @@ mod tests {
     ];
 
     /// A [`crate::executor::DryRunExecutor`] whose children come back
-    /// **non-zero** whenever `device` is one of their arguments — the machine
-    /// failure this fallback exists for, where
-    /// `SwitchAudioSource -t output -s "…AirPods Pro"` printed `Could not find
-    /// an audio device named … Nothing was changed.` and exited 1.
+    /// **non-zero** whenever `device` is one of their arguments: the machine
+    /// failure the audio fallback exists for, a disconnected recorded output
+    /// device.
     ///
     /// Everything else delegates, and the inner executor still *sees* the
     /// child, so the plan records every attempt in order.
@@ -1528,8 +1372,6 @@ mod tests {
             .collect()
     }
 
-    // ── classify ─────────────────────────────────────────────────────────────
-
     #[test]
     fn classify_reads_pid_and_start_time_only() {
         assert_eq!(classify(&pending(None, None)), Classification::Dead);
@@ -1564,10 +1406,9 @@ mod tests {
     #[test]
     fn the_spawn_fallback_start_time_can_never_match() {
         // `spawn_detached` records start_time 0 when it cannot observe the pid;
-        // a live pid with that record is the conservative branch, not Live —
-        // and not `IdentityMismatch` either, which would claim to know the pid
-        // was recycled and go on to undo the guards of what may be the running
-        // session. Its own answer, which restores nothing (A9-5).
+        // that identity gets its own classification, which restores nothing.
+        // `IdentityMismatch` would undo the guards of a possibly-running
+        // session (A9-5).
         let unobserved = ProcInfo {
             start_time: 0,
             ..me()
@@ -1591,8 +1432,6 @@ mod tests {
             Classification::IdentityMismatch
         );
     }
-
-    // ── reconcile ────────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn no_state_file_is_no_session_and_says_nothing() {
@@ -1689,12 +1528,9 @@ mod tests {
             vec![Severity::Ok, Severity::Ok, Severity::Info, Severity::Info],
         );
 
-        // Mutations, in order: switch, save, kill, save, then each removal
-        // followed by its own save (A9-4: progress has to be crash-durable —
-        // a record that still claims a removed forward is installed can never
-        // be completed, because re-removing an absent listener exits
-        // non-zero), the final forwards save, and the clear. Every flag hits
-        // disk before the next guard is touched.
+        // Every flag hits disk before the next guard is touched: progress has
+        // to be crash-durable (A9-4). See
+        // tests::a_removal_that_took_is_on_disk_before_the_next_one_is_tried.
         let planned = ctx.executor.planned();
         let kinds: Vec<PlannedKind> = planned.iter().map(|p| p.kind).collect();
         assert_eq!(
@@ -1792,14 +1628,12 @@ mod tests {
         }
     }
 
-    /// A9-1. The window between the first guard and the wine spawn: the record
-    /// exists, `wine` is still `None` (so `classify` says `Dead`), and there is
-    /// no live handle yet — only the run stage's published phase knows this
-    /// launch is happening. Reconciling it (the Session screen remounts, and
-    /// its `onMount` reconcile takes no lock) would restore the audio device
-    /// mid-launch, `SIGTERM` the dashboard this launch just spawned, pull its
-    /// `--wired` forwards and delete its record, under a launch that keeps
-    /// going.
+    /// A9-1. Between the first guard and the wine spawn the record exists with
+    /// `wine` still `None`, so `classify` says `Dead` and only the run stage's
+    /// published phase knows the launch is happening. Reconciling it would
+    /// restore the audio device mid-launch, `SIGTERM` the dashboard this launch
+    /// just spawned, pull its `--wired` forwards and delete its record, under a
+    /// launch that keeps going.
     #[tokio::test]
     async fn a_record_belonging_to_the_launch_in_progress_is_never_touched() {
         for phase in [
@@ -1886,8 +1720,8 @@ mod tests {
     }
 
     /// A9-3. The other front-end's record: `sabrage run` in a terminal next to
-    /// an open Sabrage. `owner_pid` says who is running it, and the field's own
-    /// documentation has always said reconcile must not touch its guards.
+    /// an open Sabrage. `owner_pid` names the process running it, and reconcile
+    /// must not touch its guards.
     #[tokio::test]
     async fn a_record_a_live_foreign_process_owns_is_reported_and_left_alone() {
         let dir = scratch("owned-elsewhere");
@@ -1951,14 +1785,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A9-5. `start_time == 0` is the spawn fallback's "could not observe",
-    /// not evidence of a recycled pid. While that pid is alive, dismantling
-    /// the session's guards — switching the audio device back, pulling the
-    /// `--wired` forwards that carry the stream — may be disconnecting the
-    /// running session.
-    /// A9-1. Every `Busy` except this process's own in-flight record is a
-    /// record somebody is still using — and the launch path has to be able to
-    /// *tell*, or it carries on into preflight's auto-fixes, `adb forward
+    /// A9-1, A9-5. Every `Busy` except this process's own in-flight record is a
+    /// record somebody is still using, and the launch path has to be able to
+    /// *tell*: otherwise it carries on into preflight's auto-fixes, `adb forward
     /// --remove` and the bottle's `wineserver -k`, taking down the session the
     /// classification just refused to touch.
     #[tokio::test]
@@ -2086,11 +1915,10 @@ mod tests {
 
     /// A9-4. The removals are not atomic with the record that describes them:
     /// a crash (or a Cancel, or a power loss) between two `adb forward
-    /// --remove`s must leave a record naming only what is *still* installed.
-    /// Removing 9943 and then crashing used to leave both ports on disk, and
-    /// the retry's `--remove` of an already-absent listener exits non-zero —
-    /// which this module reads as "still installed", so the phantom row was
-    /// kept forever and the guard never released.
+    /// --remove`s must leave a record naming only what is *still* installed. A
+    /// record that keeps an already-removed port can never be completed,
+    /// because the retry's `--remove` of an absent listener exits non-zero and
+    /// this module reads that as "still installed".
     #[tokio::test]
     async fn a_removal_that_took_is_on_disk_before_the_next_one_is_tried() {
         let dir = scratch("forward-crash-resume");
@@ -2122,7 +1950,7 @@ mod tests {
         }
 
         let mut state = pending(Some(dead()), None);
-        state.prev_audio_output = None; // no audio probe in this test
+        state.prev_audio_output = None;
         write_state(&ctx, &state);
 
         let out = reconcile_with(&ctx, None, None, no_probe()).await.unwrap();
@@ -2210,9 +2038,10 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The 2026-08-29 finding: the recorded device (AirPods) had disconnected,
-    /// so the switch exited non-zero, the Mac stayed on BlackHole — silent —
-    /// and the record was cleared anyway. Now the built-in speakers take over.
+    /// The disconnected-device defect: the recorded output (AirPods) is gone,
+    /// so the switch to it fails. Without a fallback the Mac is left on
+    /// BlackHole — silent — with the record cleared as if it had been restored;
+    /// the built-in speakers take over instead.
     #[tokio::test]
     async fn a_recorded_device_that_is_gone_falls_back_to_the_built_in_output() {
         let dir = scratch("dead-audio-fallback");
@@ -2264,9 +2093,9 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// Nothing audible on the list: say what failed, name the recorded device
-    /// and the two commands, and **keep the record** so the next launch or stop
-    /// can try again.
+    /// Nothing audible to fall back to: warn with the unrestorable-device row,
+    /// keep the record so the next launch or stop can try again, and re-save it
+    /// with the audio guard still pending.
     #[tokio::test]
     async fn with_nothing_to_fall_back_to_the_record_is_kept_with_the_remedy() {
         let dir = scratch("dead-audio-stuck");
@@ -2340,9 +2169,8 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// The same failure through `stop` — the entry point the live incident came
-    /// in on (`sabrage stop --bottle Steam` after the owning Sabrage was
-    /// `kill -9`ed).
+    /// The same audio failure through `stop`, the other entry point into
+    /// `restore_with`.
     #[tokio::test]
     async fn stop_keeps_the_record_when_the_audio_could_not_be_restored() {
         let dir = scratch("stop-audio-stuck");
@@ -2408,8 +2236,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&dir).ok();
     }
-
-    // ── restore_with ─────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn a_missing_switchaudiosource_leaves_the_audio_guard_pending() {
@@ -2523,8 +2349,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── row texts ────────────────────────────────────────────────────────────
-
     #[test]
     fn the_row_texts_are_stable_in_both_verbs() {
         assert_eq!(
@@ -2580,7 +2404,7 @@ mod tests {
         assert_eq!(STEP, "session.reconcile");
     }
 
-    // ── the wire shapes the TS mirror pins ───────────────────────────────────
+    // These camelCase wire shapes are what sabrage/ui/src/ipc.ts mirrors.
 
     #[test]
     fn the_reconcile_types_serialize_camel_case() {
@@ -2606,8 +2430,6 @@ mod tests {
         assert_eq!(j["pending"], true);
         assert_eq!(j["state"]["prevAudioOutput"], "MacBook Pro Speakers");
     }
-
-    // ── finish_stopped_session (stop's tail) ─────────────────────────────────
 
     fn stop_ctx(dir: &Path, dry_run: bool) -> (StageCtx, Arc<StdMutex<Vec<StageEvent>>>) {
         let (mut ctx, seen) = test_ctx(dir, dry_run);
@@ -2816,8 +2638,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // ── detach ───────────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn detach_fires_only_the_detach_token_and_marks_the_record() {
         let dir = scratch("detach");
@@ -2896,8 +2716,8 @@ mod tests {
     /// A9-9. Stop can also win *during* detach's wait: it fires the terminal
     /// token and then releases the live slot, and its teardown legitimately
     /// **keeps** the record when a guard could not be released (a disconnected
-    /// output device). Writing `detached: true` over that record is how the app
-    /// came to tell the user a session it had just stopped "detached instead of
+    /// output device). Writing `detached: true` over that record makes the app
+    /// tell the user a session it had just stopped "detached instead of
     /// stopping — it is still running, unsupervised".
     #[tokio::test]
     async fn detach_does_not_relabel_a_session_stopped_during_the_wait() {
