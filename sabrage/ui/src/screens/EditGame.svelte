@@ -1,7 +1,8 @@
 <script lang="ts">
   // Add/edit one library entry: Identity & paths (editable, debounced
-  // `validateGame`), Patches and Streaming (read-only — global runtime values
-  // live in Settings), and per-flag launch overrides. Owns a deep-cloned draft
+  // `validateGame`), Patches (status plus the .orig-steam revert action),
+  // Streaming (read-only — the global runtime values live in Settings), and
+  // per-flag launch overrides. Owns a deep-cloned draft
   // and writes `libraryStore` only on Save; `gameId === null` is the "Add game"
   // path (from `newGameTemplate()`), otherwise edits a saved entry in place.
   // `isLivePhase` (shared with Session.svelte) gates Revert; Save is never
@@ -155,8 +156,8 @@
   let verboseChoice = $state<OverrideChoice>("global");
 
   // Seed the four selects once, the moment `entry` first resolves. The
-  // `seeded` latch also gates the write-back effect below, which would
-  // otherwise stamp four `"global"` defaults over `entry.launchOverrides`.
+  // write-back effect below shares the `seeded` latch so the seeding always
+  // wins the first flush, whatever order the two effects run in.
   let seeded = false;
   $effect(() => {
     if (entry && !seeded) {

@@ -436,8 +436,8 @@ export type SessionPhase =
   | "external";
 
 /** Is something running (or about to be) that a mutating action must not
- * disturb? The one definition of "a session is live" for the whole UI; no
- * screen derives its own phase set.
+ * disturb? The one definition of "a session is live" for the whole UI — call
+ * it rather than spelling out a phase set.
  *
  * `"exited"` is not live (the wine child is gone, the row is just the last
  * session's epitaph) and neither is `"idle"`. Everything else is. */
@@ -1134,11 +1134,6 @@ export async function revertOriginalSteamDll(
 }
 
 
-/**
- * Open a native "choose a folder" dialog (`@tauri-apps/plugin-dialog`, the
- * `dialog:allow-open` capability in `capabilities/main.json`). Resolves `null`
- * on cancel.
- */
 /** `commands::BsDirSuggestion` — the bottle-derived Beat Saber dir (empty when
  * no bottle) and the nearest EXISTING directory a folder picker should start
  * in (the field's own value, else the derived path, else $HOME). */
@@ -1155,6 +1150,11 @@ export async function suggestBsDir(
   return invoke<BsDirSuggestion>("suggest_bs_dir", { bottle, current });
 }
 
+/**
+ * Open a native "choose a folder" dialog (`@tauri-apps/plugin-dialog`, the
+ * `dialog:allow-open` capability in `capabilities/main.json`). Resolves `null`
+ * on cancel.
+ */
 export async function pickFolder(
   title: string,
   defaultPath?: string | null,

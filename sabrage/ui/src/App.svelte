@@ -64,9 +64,8 @@
     screen = "library";
   }
 
-  // Menu ids this shell does not handle (Setup/Build/Install, Open Logs or
-  // Config Folder) are deliberate no-ops — they belong to another screen or
-  // the opener plugin.
+  // `onMenu` delivers exactly the three Pipeline menu ids built in
+  // src-tauri's `build_menu` (Run Doctor, Launch, Stop).
   onMount(() => {
     let unlisten: (() => void) | undefined;
     void onMenu((id: string) => {

@@ -1,8 +1,8 @@
 <script lang="ts">
   // The Doctor screen — drives `doctorStore` (every check pass goes through
   // `runChecks()`) and owns bottle selection plus Fix-in-flight state.
-  // Whole-stage fixes share StagesPanel's single GateModal
-  // (`stageStore.openGate`); `sessionStore` blocks every mutation while live.
+  // Whole-stage fixes open the app-root GateModal via `stageStore.openGate`, the
+  // same singleton StagesPanel drives; `sessionStore` blocks mutation while live.
   import { onMount } from "svelte";
   import { cap, errMsg, titleCase } from "../lib/text";
   import BottleSelect from "../components/BottleSelect.svelte";

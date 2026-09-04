@@ -38,7 +38,8 @@
   let tab = $state<Tab>("wineConsole");
   /** The last tab a navigation was *requested* for. `switchTab`'s
    * "already there, no-op" guard reads this and not `tab`, which updates only
-   * once the in-flight `stopTail()` resolves; a rapid A -> B -> A would land on B. */
+   * once the in-flight `stopTail()` resolves; comparing `tab` would make a
+   * rapid A -> B -> A land on B. */
   let pendingTab = $state<Tab>("wineConsole");
   let follow = $state(true);
   /** Bound to the filter `<input>` directly — updates every keystroke. */
@@ -61,7 +62,8 @@
   let navGeneration = 0;
   /** Guards a leaked tail: `startTail` captures this at its start and skips
    * every shared-state write it would make, `tailId` included, once a later
-   * `startTail`/`stopTail` bumped it. Only the id in `tailId` is ever stopped. */
+   * `startTail`/`stopTail` bumped it. `stopTail` only stops the id in `tailId`,
+   * so a clobbered `tailId` leaks the live tail. */
   let tailGeneration = 0;
   let pastRuns = $state<PastRun[]>([]);
   let pastRunsLoaded = $state(false);

@@ -70,10 +70,6 @@
     expandedId = expandedId === id ? null : id;
   }
 
-  // `effectiveLaunchOpts` mirrors `store::library::effective_options` on the
-  // Rust side (per field, `override ?? global default`); the client, not the
-  // backend, is the source of truth for the `LaunchOpts` flags sent over IPC.
-
   // `isLivePhase` excludes `"exited"`: the backend leaves that phase published
   // until the next launch, so a bare `phase !== "idle"` would hold every Run
   // button disabled for the rest of the app's life after one session ended.
@@ -93,6 +89,9 @@
       !settingsStore.loadOk,
   );
 
+  // `effectiveLaunchOpts` mirrors `store::library::effective_options` on the
+  // Rust side (per field, `override ?? global default`); the client, not the
+  // backend, is the source of truth for the `LaunchOpts` flags sent over IPC.
   function effectiveLaunchOpts(entry: GameEntry): LaunchOpts {
     const global = settingsStore.settings?.launch;
     return {

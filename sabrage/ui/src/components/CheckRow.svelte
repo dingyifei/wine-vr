@@ -41,9 +41,9 @@
       <div class="text-muted remedy">{row.remedy}</div>
     {/if}
     {#if row.detail}
-      <!-- The check's own diagnostic (e.g. "read error"/"JSON parse error"): remedy is fixed per slug
-           and can misblame a cause the native evaluator never hit (A3b-3,
-           checks::config::tests::malformed_json_warns, checks::config::tests::unreadable_session_json_warns), so detail is truthful. -->
+      <!-- The check's own diagnostic (e.g. "read error"/"JSON parse error"): the doctor.sh-verbatim
+           message can blame a cause the native evaluator never hit (A3b-3, pinned by
+           checks::config::tests::malformed_json_warns and ::unreadable_session_json_warns), so detail is truthful. -->
       <div class="text-muted detail">{row.detail}</div>
     {/if}
   </div>

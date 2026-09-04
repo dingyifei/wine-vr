@@ -3,8 +3,10 @@
   // and quit, or cancel. Mounted once at the app root (App.svelte); shown
   // when sessionStore.quitRequested (Rust side intercepts ExitRequested/
   // CloseRequested to prevent a live session dying with the process). Buttons
-  // answer via sessionStore.resolveQuit; unanswered, ipc.ts gives up after
-  // 20 s. Exit policy: sabrage/docs/design/critique.md.
+  // answer via sessionStore.resolveQuit; if this dialog sits unanswered for
+  // 20 s, the *next* quit request is let through and takes the keep-running
+  // answer (src-tauri commands.rs, QUIT_DIALOG_TIMEOUT). Exit policy:
+  // sabrage/docs/design/critique.md.
   import { sessionStore } from "../stores/session.svelte";
 
   let stoppingAndQuitting = $state(false);
