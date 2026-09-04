@@ -26,7 +26,8 @@ use crate::fixes::{FixAction, FixReport};
 use crate::stages::{EventSink, StageCtx};
 
 /// Bound on `adb forward --list`: a cold run starts adb's background server and
-/// can block for seconds. A timeout is a query failure, never an empty table.
+/// can block for seconds. A timeout is a query failure, never an empty table;
+/// the spawn must stay `tokio::process` — `timeout` cannot bound a blocking one.
 const ADB_LIST_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// This fix's own step id, used when it runs as a fix (doctor's fix list or
@@ -572,9 +573,8 @@ mod tests {
     /// An `adb` that cannot be spawned at all is the other half of "adb could
     /// not tell us": exactly one `warn` naming the query failure and the two
     /// ports that may still be installed, plus an `unchanged` report carrying
-    /// the same text. Doctor records only `fatal` events and repaints the row
-    /// from a fresh check pass, so this warn does not reach the GUI (A4-5;
-    /// the UI half is `ui/src/screens/Doctor.svelte`).
+    /// the same text. Both are what Doctor renders as this row's fix notice
+    /// (A4-5; the UI half is `ui/src/screens/Doctor.svelte`'s `runFix`).
     #[tokio::test]
     async fn an_unspawnable_adb_warns_once_and_never_reports_a_clean_table() {
         let root = scratch("list-unspawnable");

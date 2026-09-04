@@ -1,15 +1,19 @@
 //! Reconcile a session Sabrage does not supervise.
 //!
-//! Run at app start, when the Session screen opens, and — as
-//! `finish_stopped_session` — from [`crate::stages::stop`].
+//! Run at app start, when the Session screen opens, at the head of
+//! [`crate::stages::run`] (a `Live` classification refuses the Launch there),
+//! and — as `finish_stopped_session` — from [`crate::stages::stop`].
 //!
 //! `Live` is adopted untouched; `Dead` gets the full restore (audio device,
 //! ALVR dashboard, `--wired` forwards); a recycled pid (`IdentityMismatch`)
 //! gets the pid-free restore and signals nothing. The record is cleared only
-//! once every guard it recorded is released, and kept otherwise.
+//! once every guard that mode may release is released, and kept otherwise —
+//! `SafeOnly` never asks about the dashboard (`restore_complete`).
 //! `Unverifiable`, newer-schema, live-foreign and in-flight records are
-//! reported and left as they are. [`detach`] marks the record and leaves every
-//! guard in place. The row texts live on this file's consts; the shell has no
+//! left as they are — the newer-schema and live-foreign ones with a warn row,
+//! this process's own in-flight record silently. [`detach`] marks the record and leaves every
+//! guard in place. The row texts live on this file's consts and `*_row` fns,
+//! plus [`crate::session::audio_unrestorable_line`]; the shell has no
 //! counterpart — PARITY.md § Session (detach / reconcile), "A recorded
 //! **Live** session".
 //!
@@ -1785,7 +1789,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// A9-1, A9-5. Every `Busy` except this process's own in-flight record is a
+    /// A9-1. Every `Busy` except this process's own in-flight record is a
     /// record somebody is still using, and the launch path has to be able to
     /// *tell*: otherwise it carries on into preflight's auto-fixes, `adb forward
     /// --remove` and the bottle's `wineserver -k`, taking down the session the

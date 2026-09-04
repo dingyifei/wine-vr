@@ -439,8 +439,9 @@ pub mod step {
 
     // run.sh
     /// The ordered preflight block: every `# preflight:` / `# preflight-warn:` /
-    /// `# preflight-autofix:` tagged check of `scripts/demo/run.sh`, in that
-    /// script's order.
+    /// `# preflight-autofix:` tagged check of `scripts/demo/run.sh`. The native
+    /// side evaluates the same set in contract order — see
+    /// [`crate::stages::run::preflight`].
     pub const RUN_PREFLIGHT: StepId = "run.1.preflight";
     /// `launch-action: adb-forward-hygiene` — `--wired` creates
     /// `tcp:9943`/`tcp:9944` per-serial; a normal run removes exactly those two.

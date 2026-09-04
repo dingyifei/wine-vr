@@ -117,13 +117,12 @@ fn narrate_built(ctx: &StageCtx, step_id: StepId, dry_run: bool, built: &str, wo
     }
 }
 
-/// `command -v <name>` searched over `search_path` (e.g.
-/// [`crate::process::default_child_path`]), not this process's inherited `PATH`.
+/// build.sh's `for tool in cmake ninja x86_64-w64-mingw32-gcc`, in that order.
 const REQUIRED_TOOLS: [&str; 3] = ["cmake", "ninja", "x86_64-w64-mingw32-gcc"];
 
 /// `command -v <name>` searched over `search_path` (a colon-joined list, e.g.
 /// [`crate::process::default_child_path`]) rather than this process's own
-/// inherited `PATH` — see the module doc's `PATH` section.
+/// inherited `PATH`.
 fn resolve_tool(name: &str, search_path: &str) -> Option<PathBuf> {
     std::env::split_paths(search_path).find_map(|dir| {
         let candidate = dir.join(name);

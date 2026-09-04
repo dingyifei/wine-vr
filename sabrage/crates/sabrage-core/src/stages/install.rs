@@ -546,12 +546,13 @@ mod tests {
     /// Every `write_atomic` the stage performs, with its bytes.
     type Writes = Arc<StdMutex<Vec<(std::path::PathBuf, Vec<u8>)>>>;
 
-    /// [`DryRunExecutor`] with two test affordances: every `write_atomic` is
-    /// kept **with its bytes** (the plan records only a byte count, and the
-    /// host manifest is defined by its bytes), and `copy_if_changed` can fail
-    /// with `PermissionDenied` under a path prefix — the shape a macOS App
-    /// Management refusal arrives in. Everything else delegates, so `run()`
-    /// behaves as under a plain dry run and still touches nothing.
+    /// [`DryRunExecutor`] with the test affordances it lacks: every
+    /// `write_atomic` is kept **with its bytes** (the plan records only a byte
+    /// count, and the host manifest is defined by its bytes), `copy_if_changed`
+    /// can fail with `PermissionDenied` under a path prefix — the shape a macOS
+    /// App Management refusal arrives in — and the per-field knobs below. Every
+    /// method no knob touches delegates, so `run()` behaves as under a plain dry
+    /// run and still touches nothing.
     struct TestExecutor {
         inner: Arc<dyn Executor>,
         writes: Writes,
@@ -829,9 +830,9 @@ mod tests {
     /// Builds a complete on-disk fixture (build outputs, DXMT artifacts, a
     /// fake CrossOver.app tree, a fake bottle, and a host manifest already
     /// current) so [`run`] can execute all four layers without touching the
-    /// real machine and without reaching the unimplemented
+    /// real machine and without reaching
     /// `privilege::write_host_manifest_privileged` (layer 4 takes the
-    /// "already current" branch).
+    /// "already current" branch, so no test can prompt for authorization).
     fn full_fixture() -> (StageCtx, Arc<StdMutex<Vec<StageEvent>>>) {
         let root = scratch("full");
         let mut paths = Paths::new(&root);
@@ -866,7 +867,7 @@ mod tests {
 
         // Layer 4's destination, overridden off the real
         // /usr/local/share/openxr path and pre-written as already current so
-        // `run()` never calls the unimplemented privilege stub.
+        // `run()` never reaches the privileged write.
         let host_xr_json = root.join("host/active_runtime.x86_64.json");
         std::fs::create_dir_all(host_xr_json.parent().unwrap()).unwrap();
         let want = crate::util::render_host_manifest(&paths.oxr_dylib);

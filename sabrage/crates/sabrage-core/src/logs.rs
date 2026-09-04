@@ -161,11 +161,12 @@ const TAIL_PRELOAD_CAP_BYTES: u64 = 256 * 1024;
 /// Bound on the bytes ONE [`Tailer::poll`] reads, whatever has accumulated in
 /// the file since the last one.
 ///
-/// `MAX_LINES_PER_POLL` caps what a poll *delivers*, not what it reads:
-/// without this bound, opening a large `--verbose` wine console log (or an
-/// `oxrsys-runtime.log` at its 5 MiB rotation size) from offset 0 would
-/// materialise the whole file as `String`s in one call. The cursor and
-/// splitter survive to the next poll, so a backlog drains across polls
+/// `MAX_LINES_PER_POLL` caps what a poll *delivers*, and it bounds the read
+/// only while lines keep arriving: a file with few or no newlines (a large
+/// `--verbose` wine console log's unterminated tail, an `oxrsys-runtime.log`
+/// at its 5 MiB rotation size) would otherwise be read whole into the
+/// splitter in one call. The cursor and splitter survive to the next poll, so
+/// a backlog drains across polls
 /// (tests::one_poll_reads_at_most_the_byte_budget_and_still_delivers_every_line).
 const POLL_BYTE_BUDGET: usize = 1024 * 1024;
 
@@ -203,8 +204,9 @@ pub struct Tailer {
     /// cursor before we looked (ALVR opens `session_log.txt` with
     /// `.truncate(true)`, keeping the inode).
     signature: Vec<u8>,
-    /// `\n`/`\r`/`\r\n`-tolerant splitter; its internal buffer *is* the
-    /// partial final line that must never reach a caller as a complete one.
+    /// `\n`/`\r`/`\r\n`-tolerant splitter; its internal buffer *is* the partial
+    /// final line, which reaches a caller only once it is terminated or
+    /// outgrows [`MAX_UNTERMINATED_LINE_BYTES`].
     splitter: ChunkSplitter,
     /// Bytes fed to `splitter` since it last emitted a line — the counter
     /// behind [`MAX_UNTERMINATED_LINE_BYTES`].
@@ -393,10 +395,8 @@ impl Tailer {
                 std::fs::File::open(&self.path).map_err(|e| SabrageError::io(&self.path, e))?;
 
             // Backlog from the previous incarnation goes out under `rotated:
-            // false`; under `true` the consumer clears and then reads it as
-            // the new file's first lines, misattributing a startup failure
-            // (A8-4,
-            // tests::a_backlog_queued_before_a_vanish_survives_reappearance_uncut).
+            // false`; under `true` the consumer clears and misattributes it to
+            // the new file (A8-4, tests::a_backlog_queued_before_a_vanish_survives_reappearance_uncut).
             let backlog = !self.pending.is_empty();
             self.open = Some((file, current_id));
             self.offset = 0;

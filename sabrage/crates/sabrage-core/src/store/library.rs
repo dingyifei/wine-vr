@@ -333,8 +333,8 @@ pub fn effective_options(settings: &Settings, entry: &GameEntry) -> StageOptions
 /// path and only warns on a pin mismatch
 /// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
 /// "Goldberg hash-tolerance at run"), and a pin bump orphans a dll
-/// installed before it. A pin-only test calls both `Original`, and the
-/// revert door offers to "restore" Goldberg's own bytes
+/// installed before it. A pin-only test would call both `Original`, and the
+/// revert door would offer to "restore" Goldberg's own bytes
 /// (tests::goldberg_state_covers_all_five_variants).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

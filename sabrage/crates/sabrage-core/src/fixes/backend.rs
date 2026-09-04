@@ -170,7 +170,7 @@ fn wineservers_indicate_live(observed_wineprefixes: &[Option<String>], want_pref
 /// Whether a CrossOver wineserver appears to be alive **for `bottle_prefix`
 /// specifically**, read from process state because `wineserver -w` would block
 /// indefinitely against a live server: every process whose resolved executable
-/// is `wineserver_exe`, matched on its `WINEPREFIX` environment variable.
+/// is `wineserver_exe`, matched on its `WINEPREFIX` environment variable, compared as an exact string — `run.sh` and this crate's launch code both set it verbatim to the bottle prefix, neither side canonicalizes.
 ///
 /// A matching process whose `WINEPREFIX` cannot be read, or that lacks it, is
 /// treated as live: a false "clear" would let this fix edit a file the CrossOver

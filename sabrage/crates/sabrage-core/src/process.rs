@@ -551,7 +551,7 @@ async fn pump<R>(
 /// cannot say whether the wine process running under that number is *the* one
 /// this Sabrage launched, and signalling a recycled pid is the one
 /// unrecoverable mistake the reconcile path can make
-/// (tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
+/// (identity_tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcInfo {
@@ -600,7 +600,7 @@ impl ProcInfo {
     /// A `start_time` of 0 is the "could not observe at spawn" fallback
     /// [`crate::executor::Executor::spawn_detached`] records; it never equals
     /// a real start time, so such an identity always reports `false`
-    /// (tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
+    /// (identity_tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
     pub fn is_same_process(&self) -> bool {
         if !is_alive(self.pid) {
             return false;
@@ -634,7 +634,7 @@ pub fn find_processes_by_exe(path: &Path) -> Vec<ProcInfo> {
 /// Windows-path argument (e.g. `Z:\repo\…\Beat Saber.exe`), so per-element and
 /// whole-line matching agree in the real case; both are checked so a
 /// hypothetical split across two argv elements still matches
-/// (tests::cmdline_matching_is_the_pgrep_f_shape).
+/// (identity_tests::cmdline_matching_is_the_pgrep_f_shape).
 pub fn cmdline_contains(cmd: &[String], needle: &str) -> bool {
     cmd.iter().any(|arg| arg.contains(needle)) || cmd.join(" ").contains(needle)
 }

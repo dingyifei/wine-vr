@@ -48,8 +48,9 @@ fn stale_listeners() -> String {
     out
 }
 
-/// `net.ports`: Warn naming the busy listeners, Pass when the streaming
-/// ports are free. Reference: scripts/demo/doctor.sh section 16.
+/// `net.ports`: Warn naming the busy listeners, Pass when [`stale_listeners`]
+/// reports none — including when `lsof` cannot be spawned, matching doctor.sh.
+/// Reference: scripts/demo/doctor.sh section 16.
 /// tests::net_ports_matches_a_direct_lsof_probe
 fn net_ports(_ctx: &CheckCtx) -> CheckOutcome {
     let stale = stale_listeners();
@@ -205,8 +206,7 @@ mod tests {
         }
     }
 
-    /// A4-4: failed adb probe must not read as "clean". tests::net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb
-
+    /// A4-4: a failed adb probe must not read as "clean".
     #[test]
     fn net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb() {
         let opts = CheckOptions::new();

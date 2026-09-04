@@ -554,10 +554,11 @@ const BUILT_IN_OUTPUT: &str = "Built-in Output";
 /// leaves the Mac on `BlackHole 2ch`, silent.
 ///
 /// `devices` is `SwitchAudioSource -a -t output`, in its own order. Returns
-/// the built-in output when the list has one, else the first device that is
-/// not one of `VIRTUAL_OUTPUT_MARKERS`, else `None` — and `None` obliges
-/// the caller to print the remedy rather than switch to something that stays
-/// silent. See tests::the_fallback_picks_the_built_in_output_then_any_real_one.
+/// the built-in output when the list has one — the one device that is always
+/// physically there, so always a safe landing — else the first device that is
+/// not one of `VIRTUAL_OUTPUT_MARKERS`, else `None`; `None` obliges the caller
+/// to print the remedy rather than switch to something that stays silent.
+/// See tests::the_fallback_picks_the_built_in_output_then_any_real_one.
 pub fn fallback_output_device(devices: &[String]) -> Option<String> {
     devices
         .iter()
@@ -611,8 +612,9 @@ pub fn audio_unrestorable_line(previous: &str) -> String {
 /// Poisoning is ignored: a panicking test has already failed.
 ///
 /// [`LIVE_SESSION`] is deliberately **not** reset here: tests in other modules
-/// set that slot without holding this guard, and blanking it on every
-/// acquisition would pull it out from under them.
+/// set that slot without holding this guard
+/// (logs::tests::resolve_source_wine_console_prefers_the_live_session_over_everything),
+/// and blanking it on every acquisition would pull it out from under them.
 #[cfg(test)]
 pub(crate) fn lock_session_globals() -> SessionGlobalsGuard {
     static LOCK: Mutex<()> = Mutex::new(());

@@ -431,7 +431,8 @@ fn gate(ctx: &StageCtx, spec: &CheckSpec, outcome: CheckOutcome, facts: &TomlFac
 }
 
 /// "Applicable but unverifiable" — the row is emitted, and then the launch
-/// stops (design-core §10's S11).
+/// stops: PARITY.md § Run preflight (encoded in the contract's per-side
+/// gates), "A `Skipped` outcome that reaches a gate is a Fatal".
 ///
 /// The reason the check gave is carried into the die text, with its remedy
 /// appended when it has one, so the user reads why it could not be checked

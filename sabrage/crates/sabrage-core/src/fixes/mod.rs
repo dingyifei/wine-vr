@@ -44,8 +44,9 @@ pub const CONTRACT_FIX_PREFIX: &str = "fix.";
 ///   screen ([`crate::fixes::session_json`]), and the working recovery is to
 ///   edit the pinned IP in place, which the Settings screen's config editor
 ///   does. Returning `None` here keeps the destructive button off the Doctor
-///   row; the action stays reachable from `sabrage fix delete-session-json`
-///   for a user who has read [`FixDef::consequence`].
+///   row; no front-end offers it today — the Tauri `fix` command refuses a
+///   deferred action outright ([`FixAction::is_deferred`]). The variant stays
+///   modelled so [`FixDef::consequence`] keeps the outcome on record.
 pub const DEFERRED_CONTRACT_FIX_IDS: [&str; 2] = ["fix.create-z-drive", "fix.delete-session-json"];
 
 /// A mutation the pipeline can apply on the user's behalf.

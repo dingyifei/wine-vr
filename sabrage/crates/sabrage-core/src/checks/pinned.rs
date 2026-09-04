@@ -58,11 +58,11 @@ fn dep_dxmt(ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-/// Hash this multi-megabyte dll once and reuse the digest for the warn detail.
-/// Re-hashing to build it is the obvious edit; no test catches the added cost.
 fn dep_goldberg(ctx: &CheckCtx) -> CheckOutcome {
     let gbe = &ctx.paths.gbe_dll;
     let expected = &contract().deps.gbe_dll_sha256;
+    // One hash pass: the warn detail reuses this digest rather than re-hashing a
+    // multi-megabyte dll on every doctor/preflight run; no test catches the added cost.
     match sha256_file(gbe) {
         Ok(got) if got.eq_ignore_ascii_case(expected) => {
             CheckOutcome::pass("dep.goldberg", "Goldberg steam_api64.dll (sha256 verified)")

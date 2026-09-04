@@ -191,7 +191,8 @@ pub struct Contract {
     pub dxmt: Dxmt,
     /// Ordered check registry; order is doctor.sh's and load-bearing (section 3
     /// resolves bottle context later checks consume; run-only preflights last).
-    /// Pinned by `sabrage-parity::tests::slug_coverage::doctor_slug_coverage_matches_the_contract`.
+    /// Doctor-row order (run-only slugs excluded) is pinned by
+    /// `sabrage-parity::tests::slug_coverage::doctor_slug_coverage_matches_the_contract`.
     #[serde(default, rename = "check")]
     pub checks: Vec<CheckSpec>,
     /// Ordered launch-action registry.
@@ -232,7 +233,9 @@ impl Contract {
     /// The `DepotDownloader …` remedy string doctor's `game.present` row prints.
     ///
     /// Byte-identical to lib.sh's `DEPOT_CMD` / doctor.sh's `$DEPOT_CMD`, including
-    /// the quoting of `-dir`; pinned by `tests::depot_command_matches_lib_sh`.
+    /// the quoting of `-dir`. `tests::depot_command_matches_lib_sh` pins this side's
+    /// literal only — nothing reads lib.sh, so a shell-side edit has to be mirrored
+    /// here by hand.
     pub fn depot_command(&self, bs_dir: &Path) -> String {
         format!(
             "DepotDownloader -app {} -depot {} -manifest {} -username <steam-user> -dir \"{}\"",

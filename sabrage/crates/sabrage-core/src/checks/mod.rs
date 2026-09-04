@@ -6,8 +6,9 @@
 //! because docs/troubleshooting.md quotes those lines (the parity harness joins on
 //! slug plus status, never prose).
 //!
-//! Evaluators are read-only probes: no filesystem mutation in check code. Auto-fixes
-//! live in the fix registry and run from the preflight, never from doctor.
+//! Evaluators are read-only probes: no filesystem mutation in check code. Mutating
+//! remedies live in [`crate::fixes`] — applied automatically by the launch preflight
+//! for `autofix` gates and on demand by doctor's fix button, never by a check itself.
 //!
 //! Contract `group` values name their module except where folded or renamed:
 //! `crossover` lives in [`system`], `bottle-bridge` in [`bridge`], `run-only` in
@@ -445,7 +446,7 @@ fn all_defs() -> Vec<(&'static str, Evaluator)> {
 ///
 /// Missing evaluator (strict only), unknown slug, or duplicate binding. This enforces
 /// "adding a check to only one place must fail"
-/// (sabrage-parity::tests::strict_registry_builds_and_covers_the_contract_in_order).
+/// (sabrage-parity::tests::contract_sanity::strict_registry_builds_and_covers_the_contract_in_order).
 pub fn build_registry(strict: bool) -> Result<Registry, RegistryError> {
     let defs = all_defs();
 

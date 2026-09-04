@@ -149,12 +149,12 @@ async fn revert_probed(
         ));
     }
 
-    // The window `live_session_reason` structurally cannot see: a `./demo.sh
-    // run` publishes no handle, no run phase and no `session-state.json`, and
-    // its `runtime_status.json` appears only once the runtime streams, long
-    // after the Goldberg install. A running game with this dll mapped is the
-    // one thing observable throughout, so it is probed directly
-    // (tests::refuses_while_a_matching_game_process_is_running).
+    // The same running-game signal `live_session_reason` ends on
+    // (`session::running_game_pid`), re-probed here with an injectable needle so a
+    // test can drive this refusal without starting Beat Saber
+    // (tests::refuses_while_a_matching_game_process_is_running). It is the one
+    // signal that needs nothing to have been written, which is what covers a
+    // `./demo.sh run` between its wine spawn and its first streaming status.
     let games = crate::process::find_processes_by_cmdline(game_needle);
     if let Some(p) = games.first() {
         return Err(SabrageError::fatal(

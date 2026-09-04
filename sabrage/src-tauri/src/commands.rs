@@ -9,12 +9,13 @@
 //! rather than a [`StageCtx`].
 //!
 //! [`launch`]'s promise does not resolve until the session ends, which can be
-//! hours — every command's promise is a secondary confirmation, never the
-//! liveness signal a screen renders off of.
+//! hours — a streaming command's promise is a secondary confirmation of what
+//! its channel already reported, never the liveness signal a screen renders
+//! off of.
 //!
 //! [`detach_session`]/[`resolve_quit`] are the app-quit-while-a-session-is-live
-//! answer: `lib.rs`'s `ExitRequested`/`CloseRequested` handlers open the dialog
-//! they resolve, and that comment cites this one for why they exist.
+//! answer: `lib.rs`'s `ExitRequested`/`CloseRequested` handlers open, via
+//! `app://quit-requested`, the dialog these two resolve.
 //!
 //! `ui/src/ipc.ts` hand-mirrors every serde shape here 1:1 — keep both sides in
 //! sync when either changes.
@@ -2571,6 +2572,10 @@ mod tests {
         assert!(!registry.cancel("run"));
         assert!(!fired.load(Ordering::SeqCst));
     }
+
+    // `sabrage-app` depends on no JSON crate, so these tests exercise the
+    // pure helpers; the serde wire-format round trips live in
+    // sabrage-core's store/config test modules.
 
     #[test]
     fn classify_repo_root_source_follows_resolve_repo_roots_own_precedence() {

@@ -1,6 +1,6 @@
 //! `demo.sh run` — launch Beat Saber through the bridge.
 //!
-//! Reference: `scripts/demo/run.sh` (270 lines). Unlike the other four stages
+//! Reference: `scripts/demo/run.sh`. Unlike the other four stages
 //! this one is a state machine: preflight and prepare, then the guarded region
 //! (`guarded`) that the shell's traps cover, then exactly one `teardown`.
 //!
@@ -226,7 +226,7 @@ fn checkpoint(ctx: &StageCtx) -> Result<()> {
 /// [`session::reconcile::finish_record`](crate::session::reconcile) keeps
 /// `session-state.json` when a guard could not be released, and carrying the
 /// name forward lets the retry that record was kept for actually happen
-/// (A9-2; tests::a_teardown_with_an_unrestorable_guard_keeps_the_record).
+/// (r1:A9-2; tests::a_kept_records_forwards_travel_into_the_next_launch).
 /// A record whose restore succeeded has `audio_restored` set and carries nothing.
 fn unfinished_audio_restore(state: &SessionState) -> Option<String> {
     // The kept-record condition, asked of the state rather than of the
@@ -321,7 +321,7 @@ fn refuse_launch(ctx: &StageCtx, headline: &str, reason: &str, bottle: &str) -> 
 /// and `Drop` clears the slot only while it belongs to this run, since `run`
 /// releases the lock at the launch boundary and a detached or cancelled run
 /// can still be unwinding while the next launch publishes its own `Preflight`.
-/// `finalize_exited`(Self::finalize_exited) is the one publication meant to
+/// [`finalize_exited`](Self::finalize_exited) is the one publication meant to
 /// outlive `run`, so the Session screen can say “Exited (code N)”.
 ///
 /// See tests::{the_scope_publishes_identity_and_drop_clears_only_its_own_run,
@@ -894,7 +894,7 @@ async fn finish_record(ctx: &StageCtx, path: &Path, sess: &SessionState) -> Resu
 /// real constant rather than copying a substring.
 pub const HELPER_REAPED_LINE: &str = "encoder helper: reaped (left over from the runtime)";
 
-/// run.sh's INT trap prints this first, before `stop_wine` runs.
+/// run.sh's INT trap prints this after its blank line and before `stop_wine`.
 ///
 /// `pub` (A1-3), same reason as [`HELPER_REAPED_LINE`].
 pub const INT_TEARDOWN_LINE: &str = "interrupted: stopping wine";

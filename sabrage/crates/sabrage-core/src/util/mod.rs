@@ -86,6 +86,9 @@ pub fn strip_trailing_newlines(s: &str) -> &str {
 ///
 /// See tests::bs_version_falls_back_to_question_mark and
 /// tests::version_stamp_scan_matches_grep.
+///
+/// Hand-rolled rather than `regex`-backed: sabrage-core carries no regex
+/// dependency, and the pattern is a fixed digit/separator shape.
 pub fn bs_version(bs_dir: &Path) -> String {
     if let Ok(bytes) = std::fs::read(bs_dir.join("BeatSaberVersion.txt")) {
         let text = String::from_utf8_lossy(&bytes).into_owned();

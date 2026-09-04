@@ -109,7 +109,8 @@ const ADB_PROBE_POLL: Duration = Duration::from_millis(20);
 
 /// `"$ADB" devices` stdout, or empty when the binary is missing, fails to run,
 /// or does not answer within `timeout`. Same probe `checks::headset` makes;
-/// duplicated because that module is private.
+/// duplicated rather than shared because that probe is private to a module
+/// this one does not own.
 ///
 /// The bound is load-bearing (A7-4): evaluators are synchronous, so a wedged
 /// `adb` would hold the launch's operation lock past every cancellation

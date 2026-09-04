@@ -172,17 +172,16 @@ fn checkpoint(ctx: &StageCtx) -> Result<()> {
 /// Emits nothing when `ctx.paths.wineserver` is `None`: lib.sh swallows the
 /// command-not-found failure, so neither side prints anything.
 ///
+/// The `-w` bound is a [`tokio::time::timeout`]; the child dies only through
+/// [`crate::process::spawn_streamed`]'s `kill_on_drop(true)` when the timed-out
+/// future drops. Untested (a timing property); breaking it leaks a `wineserver -w` per stop.
+///
 /// # Errors
 ///
 /// [`SabrageError::Cancelled`] if `ctx.cancel` fires during either child. A
 /// plain non-zero or failed child is swallowed, matching the shell's `|| true`.
 /// See tests::{dry_run_stop_wine_plans_the_wineserver_pair_only_when_crossover_is_present,
 /// stop_wine_propagates_a_pre_cancelled_token_instead_of_swallowing_it}.
-///
-/// The `-w` bound is a [`tokio::time::timeout`]: dropping the timed-out future
-/// ends the child via [`crate::process::spawn_streamed`]'s `kill_on_drop(true)`.
-/// Nothing tests it (a timing property); breaking it leaks a `wineserver -w`
-/// per stop.
 async fn stop_wine(ctx: &StageCtx, bottle: &Bottle) -> Result<()> {
     let Some(wineserver) = ctx.paths.wineserver.as_ref() else {
         return Ok(());
@@ -359,6 +358,8 @@ async fn report_ports_with(ctx: &StageCtx, lsof: &Path, deadline: Duration) {
 ///
 /// [`SabrageError::Cancelled`] the moment `ctx.cancel` fires after any one
 /// kill, skipping the remaining kills and the closing message.
+/// A kill child that fails — the pid vanished between the scan and the signal —
+/// is swallowed, exactly where the shell's `pkill -f … || true` swallows it.
 async fn reap(
     ctx: &StageCtx,
     procs: Vec<ProcInfo>,
@@ -816,8 +817,8 @@ mod tests {
         }
     }
 
-    /// Finding #8: survivors are matched by argv, not by exe path.
-
+    /// Finding #8: the survivor row agrees with a direct argv probe — same matches,
+    /// same text, for both the empty and the non-empty case.
     #[test]
     fn report_survivors_matches_a_direct_probe() {
         let (ctx, seen) = test_ctx(StageOptions::default());
@@ -1269,7 +1270,6 @@ mod tests {
 
     /// Finding #2: cancellation propagates out of the stop helpers instead of
     /// being swallowed.
-
     #[tokio::test]
     async fn stop_wine_propagates_a_pre_cancelled_token_instead_of_swallowing_it() {
         let (mut ctx, _seen) = test_ctx(StageOptions {

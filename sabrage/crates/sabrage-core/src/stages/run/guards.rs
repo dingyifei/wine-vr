@@ -3,8 +3,9 @@
 //! (`launch-action: audio-route`, `launch-action: dashboard`); everything the
 //! script does before them is permanent (parity decision 17).
 //!
-//! Each guard persists its record into [`SessionState`] before it mutates
-//! (see [`crate::session::state`]). `release` undoes the mutation, sets the
+//! Each guard persists its record into [`SessionState`] around its mutation —
+//! the previous audio device before the switch, the dashboard's identity
+//! immediately after its spawn (see [`crate::session::state`]). `release` undoes the mutation, sets the
 //! flag and saves; `disarm` forgets without undoing (detach — `session-state.json`
 //! still describes the device and dashboard for a later Sabrage); `Drop` is a
 //! synchronous best-effort fallback for panics and early returns, inert once

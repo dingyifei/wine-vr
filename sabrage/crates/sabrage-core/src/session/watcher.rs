@@ -40,6 +40,10 @@ pub struct RuntimeStatus {
 /// whose staleness means anything (tests::snapshot_tests::snapshot_phase_transitions).
 pub const RUNTIME_STATE_STREAMING: &str = "streaming";
 
+/// How stale `runtime_status.json` may be before it stops counting as evidence
+/// of a live runtime: comfortably above the observed write cadence, low enough
+/// that a killed runtime stops looking alive within one status poll
+/// (tests::the_watcher_duration_budgets).
 pub const RUNTIME_STATUS_MAX_AGE: Duration = Duration::from_secs(3);
 
 /// How long a fresh launch gets before [`SessionMonitor::snapshot`] will even
@@ -1393,8 +1397,8 @@ mod tests {
             std::fs::remove_dir_all(&dir).ok();
         }
 
-        /// #2/#100: the precedence table in [`SessionMonitor::snapshot`]'s doc
-        /// comment — every row where two sources disagree, plus the live-only and
+        /// #2/#100: the phase precedence [`SessionMonitor::snapshot`] implements
+        /// — every row where two sources disagree, plus the live-only and
         /// persisted-only baselines those conflicts are measured against.
         #[tokio::test]
         async fn snapshot_phase_precedence_table() {

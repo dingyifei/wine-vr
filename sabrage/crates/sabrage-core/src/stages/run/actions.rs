@@ -411,10 +411,12 @@ pub fn wineserver_still_alive_warn(survivors: &str) -> String {
     )
 }
 
-/// run.sh:136's die, verbatim. `pub` (A1-3).
+/// The die run.sh prints after the survivor warn, verbatim
+/// (scripts/demo/run.sh # launch-action: wineserver-reset). `pub` (A1-3).
 pub const WINESERVER_MANUAL_KILL_DIE: &str = "kill the listed wineserver(s) manually, then re-run";
 
-/// run.sh:145's die. `pub` (A1-3).
+/// The die run.sh prints when no `steam_api64.dll` exists under `$BS_DIR`
+/// (scripts/demo/run.sh # launch-action: goldberg-stage). `pub` (A1-3).
 pub fn steam_api_missing_die(bs_dir: &Path) -> String {
     format!(
         "steam_api64.dll not found under {} — is this a complete Beat Saber install?",
@@ -660,8 +662,8 @@ pub fn bs_win_path(ctx: &StageCtx, bottle: &Bottle) -> String {
 ///
 /// The load-bearing detail is `WINEDEBUG`: the caller's preset wins in both
 /// branches (`${WINEDEBUG:-…}`), so `WINEDEBUG=+d3d11` survives `--verbose`
-/// (PARITY.md § Invariants that must NOT change (byte/behavior parity),
-/// "`WINEDEBUG` caller-precedence"). `inherited_winedebug` is that preset; `None`
+/// (parity decision 21; PARITY.md § Invariants that must NOT change
+/// (byte/behavior parity), "`WINEDEBUG` caller-precedence"). `inherited_winedebug` is that preset; `None`
 /// and `Some("")` both take the branch default (zsh's `:-` treats unset and empty alike).
 pub fn wine_env(
     verbose: bool,

@@ -94,8 +94,10 @@ const SUDO_DIE: [&str; 2] = ["sudo mkdir failed", "sudo write failed"];
 /// giving up on it.
 ///
 /// Bounded on purpose: past `sudo`'s exec the child's real uid is 0 and an
-/// unprivileged `kill(2)` comes back `EPERM`, so an unbounded wait would never
-/// finish (tests::a_cancelled_child_is_reaped_before_the_call_returns).
+/// unprivileged `kill(2)` comes back `EPERM`, so a wait on a signalled child
+/// that never notices could run forever; a bounded one still reaps the ordinary
+/// case, where the child is still ours
+/// (tests::a_cancelled_child_is_reaped_before_the_call_returns).
 const CANCEL_REAP_GRACE: Duration = Duration::from_millis(500);
 
 /// How old a leftover `host-manifest-*.json` must be before
@@ -598,10 +600,10 @@ async fn run_inheriting(argv: &[OsString], cancel: &CancellationToken) -> Result
             status.map_err(|e| SabrageError::io(PathBuf::from(&argv[0]), e))
         }
         _ = cancel.cancelled() => {
-                // Signal, then reap — bounded, and the kill is best effort:
-                // after `sudo` execs, its real uid is 0 and this process cannot
-                // signal it at all
-                // (tests::a_cancelled_child_is_reaped_before_the_call_returns).
+            // Signal, then reap — bounded, and the kill is best effort:
+            // after `sudo` execs, its real uid is 0 and this process cannot
+            // signal it at all
+            // (tests::a_cancelled_child_is_reaped_before_the_call_returns).
             let _ = child.start_kill();
             let _ = tokio::time::timeout(CANCEL_REAP_GRACE, child.wait()).await;
             Err(SabrageError::Cancelled)
@@ -1469,7 +1471,7 @@ mod tests {
         );
         assert!(!needs_admin_reason(AdminMethod::Osascript).contains("terminal"));
         // Both still say what the password buys, which is the other half of
-        // design-core §5.4's promise.
+        // design-core § 5. Privilege boundary, implementation step 4.
         for method in [AdminMethod::Osascript, AdminMethod::Sudo] {
             assert!(
                 needs_admin_reason(method).contains("host OpenXR registration")
