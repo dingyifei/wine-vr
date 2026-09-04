@@ -1,4 +1,8 @@
 <script lang="ts">
+  // Owns selectedBottle and copiedStage; drives `stageStore` by opening a gate
+  // (dry run or real) and reads `bottlesStore` for the picker, `sessionStore`
+  // for liveness. Shares one GateModal and one disable rule with Doctor's
+  // whole-stage Fix: `blocksMutation(session phase)` or `stageStore.running`.
   import { onMount } from "svelte";
   import { blocksMutation, type Stage } from "../ipc";
   import BottleSelect from "./BottleSelect.svelte";
@@ -48,21 +52,12 @@
   let selectedBottle = $state("");
   let copiedStage = $state<Stage | null>(null);
 
-  /** Every whole-stage fix here (Setup/Build/Install) is refused by the
-   * backend while a session is live — `deny_stage_while_session_live` in
-   * `stages::run_stage` refuses even a dry run, since it exists to protect
-   * artifacts the live session has open, not to avoid a real mutation. Only
-   * disabling the real Run button (and leaving Dry-run offered) would just
-   * move the failure from "disabled, explained" to "clicked, then refused". */
+  /** `deny_stage_while_session_live` refuses Setup/Build/Install — dry runs
+   * included — while a session is live, so both buttons are disabled here. */
   const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
-  /** A stage started from elsewhere (this same panel, Doctor's whole-stage
-   * Fix, GateModal's own "Open <stage>" remedy) can still be running after
-   * its dialog was Hidden — `stageStore.gate` goes back to `null` on Hide,
-   * but the underlying `runStage` invocation and its lock hold keep going.
-   * Without this, Run/Dry-run here would silently queue a second `openGate`
-   * that the modal defers until the hidden one finishes, then displays with
-   * the wrong title over the wrong rows — see the GateModal fix this pairs
-   * with. */
+  /** A stage started elsewhere keeps running after its gate dialog is Hidden:
+   * `stageStore.gate` returns to `null` but the `runStage` invocation and its
+   * lock hold do not, so the buttons stay disabled on `running`, not on `gate`. */
   const stageRunning = $derived(stageStore.running);
 
   onMount(async () => {
@@ -72,12 +67,9 @@
   });
 
   function demoCommand(card: Card): string {
-    // `--bottle` is shown whenever a bottle is selected, not only for the
-    // card that *requires* one (`needsBottle` gates the Run button and the
-    // picker's visibility, not whether the flag applies — every demo.sh
-    // stage accepts `--bottle`; see `run()` below, which passes it the same
-    // way). A required-but-unselected bottle still shows the `<name>`
-    // placeholder so the command reads as a template.
+    // Every demo.sh stage accepts `--bottle`, so the flag is shown whenever a
+    // bottle is selected; `needsBottle` gates the Run button and the picker, not
+    // the flag. A required-but-unselected bottle shows `<name>` so the command reads as a template.
     if (card.needsBottle) {
       return `./demo.sh ${card.stage} --bottle ${shQuote(selectedBottle || "<name>")}`;
     }
@@ -100,11 +92,9 @@
   }
 
   function run(card: Card, dryRun: boolean) {
-    // Pass whatever bottle is selected regardless of `card.needsBottle` — the
-    // shared selector belongs to the whole panel, not just Install's card, so
-    // running `setup` here matches `./demo.sh setup --bottle <name>` (which
-    // uses the bottle, when given one, for its own-Beat-Saber-presence check)
-    // rather than always forcing the "no bottle" path.
+    // The bottle selector belongs to the whole panel, so the selection is passed
+    // for every card regardless of `card.needsBottle`: `setup` with a bottle runs
+    // its Beat Saber presence check against that bottle.
     stageStore.openGate({
       stage: card.stage,
       bottle: selectedBottle || null,
