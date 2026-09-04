@@ -1,8 +1,5 @@
 <script lang="ts">
-  // The bottle `<select>` (or its "none found" fallback) repeated, byte for
-  // byte, across Session/Settings/EditGame/Doctor/StagesPanel. Every caller
-  // still owns its own `bottles`/`bottlesLoaded` source (`bottlesStore` or
-  // `doctorStore`) and passes them in — this component only renders.
+  // Presentational only: callers own `bottles`/`bottlesLoaded` and pass them in; no owned state.
   interface Props {
     id: string;
     bottles: string[];
