@@ -1,49 +1,18 @@
-//! `fix.restage-helper` — copy the native-arm64 encoder helper from
+//! `fix.restage-helper` — stage the native-arm64 encoder helper from
 //! `build-helper-arm64` next to the runtime dylib in `build-x64`.
 //!
-//! The x86_64 runtime locates the helper beside its own dylib
-//! (`dladdr`/ModuleDirectory), so a `build-x64` re-configure that sweeps the
-//! staged copy silently downgrades a session to in-process H.264. `run.sh`
-//! self-heals by restaging; this is the same operation, offered as a fix.
+//! Returns unchanged when the staged copy is already arm64, changed once
+//! restaged, or fails when neither copy nor build output is arm64. The x86_64
+//! runtime finds the helper beside its own dylib, so a swept staged copy
+//! silently downgrades to in-process H.264.
 //!
-//! Implementation notes for the fixes agent:
-//! * source is [`crate::paths::Paths::oxr_helper_built`], destination is
-//!   [`crate::paths::Paths::oxr_helper_staged`];
-//! * an already-arm64 staged helper is a silent [`FixReport::unchanged`];
-//!   otherwise copy with the executor's `copy_if_changed`, which repairs a
-//!   mode-only difference as well as differing bytes — a staged copy with the
-//!   right bytes and no execute bit is not "unchanged", and nothing else can
-//!   repair it (a rebuild produces the same bytes);
-//! * verify the SOURCE is arm64 first ([`crate::util::helper_is_arm64`], where
-//!   `arm64e` alone must NOT satisfy) and refuse rather than stage a wrong-arch
-//!   binary that would shadow a good one.
+//! Only `build-helper-arm64` builds the helper; the staged copy is validated
+//! at its destination (arm64, executable):
+//! tests::a_byte_identical_but_non_executable_staged_helper_is_repaired.
 //!
-//! Ported verbatim from `run.sh`'s `ensure_helper_staged()` (lines 72–91):
-//!
-//! ```zsh
-//! ensure_helper_staged() {
-//!   helper_is_arm64 "$OXR_HELPER_BIN" && return 0
-//!   if helper_is_arm64 "$OXR_HELPER_BIN_BUILT"; then
-//!     warn "encoder helper missing/not arm64 at $OXR_HELPER_BIN — restaging from the helper build tree"
-//!     install_if_changed "$OXR_HELPER_BIN_BUILT" "$OXR_HELPER_BIN"
-//!     helper_is_arm64 "$OXR_HELPER_BIN" || \
-//!       die "encoder helper restage failed validation at $OXR_HELPER_BIN — ./demo.sh build"
-//!     ok "encoder helper restaged (arm64)"
-//!   else
-//!     die "encoder_process=$ENCODER_PROC needs the arm64 helper, but neither the staged copy
-//!        ($OXR_HELPER_BIN) nor the build output ($OXR_HELPER_BIN_BUILT) is an arm64 executable — ./demo.sh build"
-//!   fi
-//! }
-//! ```
-//!
-//! `$ENCODER_PROC` (default `"auto"` when the key is absent/empty, exactly like
-//! the shell's `${ENCODER_PROC:-auto}`) is read only to interpolate the final
-//! die text — it does not gate whether a restage is attempted, unlike `run.sh`'s
-//! outer `case`, which skips `ensure_helper_staged` entirely for
-//! `encoder_process=inproc`. That skip is a *launch preflight* shortcut (inproc
-//! never needs the helper); this fix is invoked independently of any launch —
-//! from `build`'s own arch gate, or a GUI button — so it always attempts the
-//! restage the shell function's body describes.
+//! Reference: `scripts/demo/run.sh`'s `ensure_helper_staged`. The shell skips
+//! that function for `encoder_process=inproc`; this fix always attempts the
+//! restage regardless of launch context.
 
 use crate::error::Result;
 use crate::events::{step, StageEvent, StepId};
@@ -52,27 +21,18 @@ use crate::fixes::{FixAction, FixReport};
 use crate::stages::{EventSink, StageCtx};
 use crate::util::helper_is_arm64;
 
-/// `fix.restage-helper`'s own step id for [`crate::events::StageEvent::Line`]
-/// rows that aren't naturally part of a `build` stage run (the arm64
-/// re-validation failure, the final "needs the arm64 helper" die). The copy
-/// itself is attributed to [`step::BUILD_HELPER`] — restaging the encoder
-/// helper is exactly what that step means, whether triggered by `build` or by
-/// this fix.
+/// Step id for this fix's [`crate::events::StageEvent::Line`] rows; the copy
+/// itself uses [`step::BUILD_HELPER`], since restaging is that step's purpose.
 const STEP: StepId = "fix.restage-helper";
 
-/// `$ENCODER_PROC`, read with **the runtime's own semantics** rather than the
-/// shell's `awk` recipe.
+/// `$ENCODER_PROC` as the *runtime* resolves it, not as the shell's `awk`
+/// recipe does.
 ///
-/// `ext/oxrsys/runtime/src/Config.cpp` is table-blind and last-assignment-wins
-/// (see [`crate::config::runtime_toml`]'s header), so a file with
-/// `encoder_process = "inproc"` early and `encoder_process = "native"` later
-/// runs the *helper* path — and this die text has to name the value the runtime
-/// will actually use, not the first one in the file. A value the runtime would
-/// ignore reads as absent here for the same reason: the runtime falls back to
-/// its default, so `${ENCODER_PROC:-auto}` is the honest answer.
-///
-/// Shared with the reader the Settings screen uses, rather than a third copy of
-/// the same rules.
+/// [`crate::config::runtime_toml`]'s reader is table-blind and last-assignment-wins,
+/// matching `ext/oxrsys/runtime/src/Config.cpp`, so the die text names the value
+/// the runtime will actually use. Returns empty when no usable assignment exists,
+/// including values the runtime would ignore
+/// (tests::parse_encoder_process_follows_the_runtime_semantics).
 fn parse_encoder_process(toml_text: &str) -> String {
     let (values, _invalid, _shadowed) =
         crate::config::runtime_toml::read_lines_like_the_runtime(toml_text);
@@ -82,15 +42,13 @@ fn parse_encoder_process(toml_text: &str) -> String {
         .unwrap_or_default()
 }
 
-/// `${ENCODER_PROC:-auto}` — empty falls back to `"auto"`, exactly like the
-/// shell parameter expansion.
+/// `${ENCODER_PROC:-auto}` — an empty read (no `encoder_process` key, no file,
+/// or a value the runtime would ignore) falls back to `"auto"`, like the shell
+/// parameter expansion (tests::encoder_process_or_default_falls_back_to_auto).
 ///
-/// Empty means: no `encoder_process` key, no file, or a value the *runtime*
-/// would ignore. Not "unquoted": [`crate::config::runtime_toml`]'s reader takes
-/// `encoder_process = native` the way `Config.cpp` does, where doctor.sh's
-/// `awk -F'"'` recipe (and, for tap parity, `checks::config`) reads it as
-/// absent. That divergence is the shell's, and it is recorded in
-/// `sabrage/PARITY.md`, not papered over here.
+/// This reader and the doctors' `awk` emulation disagree on unquoted values:
+/// PARITY.md § Declared by the 2026-08-30 adversarial review (round 1 fixes),
+/// "Config readers: doctor emulates `awk`, launch uses the runtime's semantics."
 fn encoder_process_or_default(toml_text: &str) -> String {
     let raw = parse_encoder_process(toml_text);
     if raw.is_empty() {
@@ -105,8 +63,6 @@ pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixRepor
     let staged = ctx.paths.oxr_helper_staged.clone();
     let built = ctx.paths.oxr_helper_built.clone();
 
-    // `helper_is_arm64 "$OXR_HELPER_BIN" && return 0` — completely silent,
-    // nothing to do.
     if helper_is_arm64(&staged) {
         return Ok(FixReport::unchanged(
             FixAction::RestageHelper,
@@ -145,13 +101,10 @@ pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixRepor
 
     let copied = executor.copy_if_changed(&built, &staged).await?;
     match copied {
-        // Bytes already match AND the mode already matches. Reaching this at
-        // all means the destination changed between the arm64 probe above and
-        // the copy — `copy_if_changed` repairs a mode-only difference itself
-        // and reports it as `Copied` (a staged helper that lost its execute bit
-        // is not "unchanged": nothing else can repair it, since a rebuild
-        // produces the same bytes). The row is `install_if_changed`'s,
-        // reproduced regardless.
+        // Unreachable unless the destination changed since the arm64 probe:
+        // `copy_if_changed` reports a mode-only repair as `Copied`, not as
+        // unchanged (tests::a_byte_identical_but_non_executable_staged_helper_is_repaired).
+        // The `unchanged:` row is `install_if_changed`'s, reproduced regardless.
         Copied::Unchanged => sink(StageEvent::info(
             ctx.run_id,
             Some(step::BUILD_HELPER),
@@ -171,11 +124,9 @@ pub async fn restage_helper(ctx: &StageCtx, sink: &EventSink) -> Result<FixRepor
         }
     }
 
-    // A dry run never actually wrote the file, so re-validating it here would
-    // always (wrongly) look like a failed restage. Skip the check and the
-    // "restaged" claim accordingly; the executor's plan already records what
-    // would have happened — including a mode-only repair, which the dry-run
-    // executor records as a `Copy` for exactly this reason.
+    // A dry run never wrote the file, so re-validating it would always look
+    // like a failed restage; the plan records the work instead, including a
+    // mode-only repair (tests::a_dry_run_plans_the_mode_repair_without_performing_it).
     if dry_run {
         let description = "encoder helper would be restaged (arm64)".to_string();
         sink(StageEvent::ok(ctx.run_id, Some(STEP), description.clone()));
@@ -207,8 +158,6 @@ mod tests {
     use std::sync::{Arc, Mutex as StdMutex};
     use tokio_util::sync::CancellationToken;
 
-    // ── parse_encoder_process / encoder_process_or_default ──────────────────
-
     #[test]
     fn parse_encoder_process_follows_the_runtime_semantics() {
         assert_eq!(
@@ -231,8 +180,7 @@ mod tests {
         assert_eq!(parse_encoder_process(""), "");
 
         // The runtime is table-blind and last-assignment-wins, so a shadowed
-        // earlier line is NOT the value the launched runtime uses. The `awk`
-        // recipe this used to copy took the first one.
+        // earlier line is NOT the value the launched runtime uses.
         assert_eq!(
             parse_encoder_process(
                 "encoder_process = \"inproc\"\n[streaming]\nencoder_process = \"native\"\n"
@@ -259,8 +207,6 @@ mod tests {
             "native"
         );
     }
-
-    // ── restage_helper ────────────────────────────────────────────────────
 
     fn scratch(tag: &str) -> PathBuf {
         std::env::temp_dir().join(format!("sabrage-helper-fix-{tag}-{}", std::process::id()))
@@ -375,11 +321,10 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// Byte-identical, but the staged copy lost its execute bit: the byte
-    /// compare behind `copy_if_changed` cannot see that and used to report
-    /// `Unchanged`, leaving the mode unrepaired and the re-validation failing
-    /// on every retry — a state neither this fix nor `./demo.sh build` could
-    /// get out of.
+    /// A byte-identical staged copy that lost its execute bit is repaired:
+    /// `copy_if_changed`'s byte compare cannot see the mode, so without the
+    /// repair re-validation fails on every retry and neither this fix nor
+    /// `./demo.sh build` can recover.
     #[tokio::test]
     async fn a_byte_identical_but_non_executable_staged_helper_is_repaired() {
         if !arm64_available() {
@@ -435,10 +380,9 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The same state under a dry run: the file is untouched, the removal is
-    /// planned rather than performed, and the report says a restage *would*
-    /// happen — which is now true, where before it was a claim the real apply
-    /// could not honour.
+    /// The same state under a dry run: the staged file is untouched, the mode
+    /// repair appears in the plan as a `Copy` rather than a skip, and the report
+    /// says a restage *would* happen.
     #[tokio::test]
     async fn a_dry_run_plans_the_mode_repair_without_performing_it() {
         if !arm64_available() {
