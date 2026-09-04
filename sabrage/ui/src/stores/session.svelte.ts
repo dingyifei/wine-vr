@@ -30,55 +30,40 @@ import {
 function createSessionStore() {
   let status = $state<SessionStatus>(IDLE_SESSION_STATUS);
 
-  // ── launch ───────────────────────────────────────────────────────────────
-  // Owned here (not by GateModal or the Session screen) because both need to
-  // observe the SAME in-flight launch: GateModal renders `launchRows` live,
-  // the Session screen's Stop button and status card read `launching`, and a
-  // Retry from a Fatal row calls `launch` again from whichever component the
-  // user is looking at.
+  // Launch state lives here because both GateModal and the Session screen
+  // observe the same in-flight launch: GateModal renders `launchRows` live,
+  // the Session screen reads `launching`, and Retry calls `launch` from
+  // either component.
 
   let launching = $state(false);
   let launchRows = $state<StageEvent[]>([]);
-  /** Wall-clock timestamp of the `"launched"` event, when one has arrived —
-   * `sabrage_core::events::StageEvent::Launched`'s own `startedAtUnixMs`,
-   * mirrored here for a consumer that wants "when did the game come up"
-   * without scanning `launchRows` itself (the Session screen currently reads
-   * the equivalent value off `status.startedAtUnixMs` instead, once the
-   * broadcast catches up — this is the earlier, launch-local signal). */
+  /** Wall-clock timestamp of this launch's `"launched"` event; null from the
+   * start of `launch()` until one arrives. The launch-local twin of
+   * `status.startedAtUnixMs`, available before the `session://status`
+   * broadcast catches up. */
   let launchedAt = $state<number | null>(null);
-  /** `"launched"`/`"fatal"`/`"stageStarted"` rows off THIS launch's own
-   * `launchRows`, captured as they arrive so a consumer (GateModal) reads an
-   * O(1) field instead of re-scanning the whole array on every single event
-   * — `launchRows` grows by one console/progress row at a time, so a
-   * `.find()` per render was an O(n) scan repeated O(n) times over one
-   * launch. */
+  /** The `"launched"`/`"fatal"`/`"stageStarted"` rows of this launch, captured
+   * as they arrive so consumers read an O(1) field instead of re-scanning
+   * `launchRows` on every event. */
   let launchedEv = $state<Extract<StageEvent, { kind: "launched" }> | null>(null);
   let fatalEv = $state<Extract<StageEvent, { kind: "fatal" }> | null>(null);
   let startedEv = $state<Extract<StageEvent, { kind: "stageStarted" }> | null>(null);
   let lastOutcome = $state<StageOutcome | null>(null);
-  /** Set only on an `invoke()` rejection — a genuine IPC-layer failure (repo
-   * root unresolved, a bad argument) rather than a reported `"fatal"` row,
-   * which already appears in `launchRows`. Callers that also render
-   * `launchRows` (GateModal) check for a `"fatal"` row first and treat this
-   * as the fallback, exactly like the non-run stage path's `invokeError`/
-   * `sawFatal` pair. */
+  /** Set only on an `invoke()` rejection — an IPC-layer failure rather than a
+   * reported `"fatal"` row, which appears in `launchRows`. Consumers that
+   * render `launchRows` check for a `"fatal"` row first and use this as the
+   * fallback. */
   let lastError = $state<string | null>(null);
-  /** The `gameId` this store's own most recent `launch()` call was given
-   * (Library's Run button passes one; the plain Session screen's launches
-   * omit it, leaving this `null`). `SessionStatus` has no `gameId` field —
-   * this is the one place a caller can ask "was THIS session started for
-   * that Library entry" without falling back to bottle-name equality, which
-   * conflates every entry sharing a bottle. Kept (not cleared) once the
-   * session ends, same as `status.bottle` staying populated through
-   * `"exited"` — a consumer comparing against a fresh `launch()` call's own
-   * `gameId` clears the ambiguity on its own. */
+  /** The `gameId` given to this store's most recent `launch()`, or null when
+   * omitted. `SessionStatus` has no `gameId`, so this is the only way to
+   * match a session to a Library entry without bottle-name equality, which
+   * conflates entries sharing a bottle. Not cleared when the session ends. */
   let launchedGameId = $state<string | null>(null);
 
-  /** The one place `status` is assigned. A session that turns live while no
-   * `launch()` of ours is in flight was started elsewhere (demo.sh, a
-   * re-attach at app start) — it cannot belong to the entry our last
-   * `launch()` was given, so forget that id rather than let a stale value
-   * pin "Running" on the wrong Library row. */
+  /** The one place `status` is assigned. Clears `launchedGameId` when a
+   * session turns live with no `launch()` of ours in flight: that session was
+   * started elsewhere, so a stale id would pin "Running" on the wrong Library
+   * row. */
   function applyStatus(next: SessionStatus): void {
     if (!launching && isLivePhase(next.phase) && !isLivePhase(status.phase)) {
       launchedGameId = null;
@@ -118,33 +103,13 @@ function createSessionStore() {
     }
   }
 
-  // ── stop / detach ────────────────────────────────────────────────────────
 
   /**
-   * Stop the session. Every known call site (the Pipeline menu, GateModal's
-   * Cancel, the Session screen's Stop button) already has a `SessionStatus`
-   * in view and none of them track a bottle name or a run id separately, so
-   * this is the one place that turns "stop whatever session is showing" into
-   * the right IPC call:
+   * Stop whatever session `status` is showing.
    *
-   * - While `status.phase` is `"preflight"` or `"launching"` (a `runId` is
-   *   set): `run_stage(Stage::Run)` still holds `OPERATION_LOCK` through that
-   *   whole window (`sabrage_core::stages`'s "Lock policy for `run`") and
-   *   only releases it once the wine child is up — `stopSession` would block
-   *   on that very lock until this same launch finishes on its own.
-   *   `cancelStage(runId)` fires the run's own cancellation token instead,
-   *   needing no lock at all — the same INT path GateModal's own Cancel
-   *   button already takes while launching (see that component's
-   *   `cancelRun`). The resolved `StageOutcome` here is synthetic, mirroring
-   *   `stop_session`'s own INT-parity value for a live session
-   *   (`exitCodeEquiv: 130`) — the still-pending `launch()` call is what
-   *   actually streams every resulting row, onto `launchRows`, not `onEvent`.
-   * - Otherwise: `stopSession(status.bottle, …)`, as before. `onEvent` is
-   *   optional here too: when a session this process is supervising is
-   *   already live (past `"launching"`), `stopSession` streams nothing new
-   *   anyway — the Session screen's own Stop button passes one purely to
-   *   show a local progress list next to the button for the *not*-supervised
-   *   case, where the `Stop` stage runs for real and does emit rows.
+   * During `"preflight"`/`"launching"` with a `runId`, `stopSession` would
+   * block on `run_stage`'s `OPERATION_LOCK`; `cancelStage(runId)` bypasses it.
+   * See `sabrage_core::session::tests::stop_plan_decides_from_the_status_alone`.
    */
   async function stop(onEvent?: (ev: StageEvent) => void): Promise<StageOutcome> {
     if ((status.phase === "preflight" || status.phase === "launching") && status.runId) {
@@ -154,32 +119,25 @@ function createSessionStore() {
     return ipcStopSession(status.bottle ?? null, onEvent ?? (() => {}));
   }
 
-  /** Detach from the live session — the app-quit "leave it running" answer,
-   * also reachable directly from the Session screen's Detach button.
-   * Refreshes `status` immediately afterward (rather than waiting for the
-   * next 1 Hz `session://status` tick) since `detach_session` flips
-   * `session-state.json`'s `detached` flag synchronously and the caller's
-   * next render should reflect `SessionPhase::Detached` without a visible
-   * lag. */
+  /** Detach from the live session, leaving it running. Refreshes `status`
+   * before returning so the next render shows `SessionPhase::Detached`
+   * without waiting for the 1 Hz `session://status` tick. */
   async function detach(): Promise<void> {
     await ipcDetachSession();
     await refreshStatus();
   }
 
-  /** Re-poll `status` outside the 1 Hz broadcast cadence — a best-effort
-   * refresh; a failure (no repo root resolved) just leaves whatever `status`
-   * already held, same as the mount-time seed below. */
+  /** Re-poll `status` outside the 1 Hz broadcast. Best-effort: a failure
+   * leaves the previous `status` in place. */
   async function refreshStatus(): Promise<void> {
     try {
       applyStatus(await getSessionStatus());
     } catch {
-      // best-effort — see doc comment above
+      // best-effort: keep the previous status.
     }
   }
 
-  // ── reconcile ────────────────────────────────────────────────────────────
-  // `report.kind` is intentionally not kept — no consumer has ever read it;
-  // only `rows` (the banner text) is.
+  // `report.kind` is not kept: only `rows` (the banner text) has a consumer.
 
   let reconcileRows = $state<string[]>([]);
 
@@ -189,7 +147,6 @@ function createSessionStore() {
     return report;
   }
 
-  // ── quit ─────────────────────────────────────────────────────────────────
 
   let quitRequested = $state(false);
 
@@ -197,18 +154,15 @@ function createSessionStore() {
     try {
       await ipcResolveQuit(choice);
     } finally {
-      // A no-op for "stop"/"keep" in practice — both exit the app from the
-      // Rust side before this line is likely to run — but harmless, and the
-      // one line that actually matters for "cancel".
+      // Matters only for "cancel"; for "stop"/"keep" the Rust side normally
+      // exits the app before this line runs.
       quitRequested = false;
     }
   }
 
-  // ── standing subscriptions ───────────────────────────────────────────────
   // Seed with one poll, then let the 1 Hz broadcast take over. A seed failure
-  // (no repo root resolved yet) just leaves the idle default in place — the
-  // broadcast corrects it the moment a root resolves, same as every other
-  // best-effort mount-time fetch in this codebase.
+  // (no repo root resolved yet) leaves the idle default in place; the
+  // broadcast corrects it once a root resolves.
   void getSessionStatus()
     .then((s) => {
       applyStatus(s);
@@ -234,8 +188,7 @@ function createSessionStore() {
     get launchedAt() {
       return launchedAt;
     },
-    /** This launch's own `"launched"` row, once it arrived — O(1); see the
-     * field's doc comment. */
+    /** This launch's own `"launched"` row, once it arrived — O(1). */
     get launchedEv() {
       return launchedEv;
     },
