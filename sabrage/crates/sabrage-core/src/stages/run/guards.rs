@@ -1,54 +1,14 @@
-//! The two guarded launch actions — the only mutations `run` undoes.
+//! The two guarded launch actions — audio routing and the ALVR dashboard —
+//! the only mutations `run` undoes. Reference: scripts/demo/run.sh
+//! (`launch-action: audio-route`, `launch-action: dashboard`); everything the
+//! script does before them is permanent (parity decision 17).
 //!
-//! run.sh installs three traps at lines 179–181, and what they cover is
-//! exactly this file:
-//!
-//! ```zsh
-//! trap 'stop_dashboard; stop_helper; restore_audio' EXIT
-//! trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - INT;  kill -INT  $$' INT
-//! trap 'print -r -- "-- terminated: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - TERM; kill -TERM $$' TERM
-//! ```
-//!
-//! Everything earlier in the script — the backend fix, the helper restage, the
-//! adb forwards, the Goldberg swap — is **permanent** and stays permanent
-//! (parity decision 17). Everything here is undone on every exit path.
-//!
-//! # The lifecycle, and why `Drop` is only a fallback
-//!
-//! ```text
-//! arm(ctx, facts, state)      →  persist first  (apply_switch mutates, never the reverse)
-//! release(self, ctx, state)   →  undo, set the flag, save    (the normal path)
-//! disarm(self)                →  forget without undoing      (detach only)
-//! Drop                        →  best-effort sync fallback, only if neither ran
-//! ```
-//!
-//! The orchestrator always calls the async `release`; `Drop` exists for the
-//! panic/early-return path, where an `.await` is impossible. It must therefore
-//! stay synchronous and best-effort, and it must do **nothing** once the guard
-//! has been released or disarmed (design-core §3.2).
-//!
-//! `disarm` is what makes detach honest: leaving the session running means
-//! leaving the audio device on BlackHole and the dashboard open, deliberately,
-//! with `session-state.json` still describing both so a later Sabrage can
-//! finish the job.
-//!
-//! # Persist-before-mutate
-//!
-//! `acquire` writes [`SessionState`] **before** performing its mutation — the
-//! previous audio device is recorded before `SwitchAudioSource -t output -s`
-//! runs, the dashboard's identity immediately after its spawn. See
-//! [`crate::session::state`]'s header for why the other order leaves an
-//! unrecoverable window.
-//!
-//! # `Drop` bypasses the executor, and must not fire under `--dry-run`
-//!
-//! The async `release` mutates through [`crate::executor::Executor`], so a dry
-//! run plans the undo instead of performing it. `Drop` cannot: it has no
-//! `.await` and therefore no access to the trait's boxed futures, so it
-//! shells out synchronously. Each guard remembers whether its run was a dry
-//! run and does nothing at all in that case — otherwise `--dry-run` would
-//! switch the user's audio device back on an early return, which is the exact
-//! opposite of what the flag promises.
+//! Each guard persists its record into [`SessionState`] before it mutates
+//! (see [`crate::session::state`]). `release` undoes the mutation, sets the
+//! flag and saves; `disarm` forgets without undoing (detach — `session-state.json`
+//! still describes the device and dashboard for a later Sabrage); `Drop` is a
+//! synchronous best-effort fallback for panics and early returns, inert once
+//! released, disarmed, or under `--dry-run`.
 
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -64,9 +24,7 @@ use crate::stages::{EventSink, StageCtx};
 use super::actions::BLACKHOLE_DEVICE;
 use super::PreflightFacts;
 
-// ── audio ─────────────────────────────────────────────────────────────────────
-
-/// Which of run.sh's four audio branches applies (lines 182–200).
+/// Which of run.sh's audio branches applies (`launch-action: audio-route`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum AudioEligibility {
     /// `--no-audio`: one `info` row, no guard.
@@ -78,13 +36,8 @@ pub(crate) enum AudioEligibility {
     Probe(PathBuf),
 }
 
-/// run.sh:182-184 as a pure decision.
-///
-/// ```zsh
-/// if   [ -n "${WINEVR_NO_AUDIO:-}" ]; then info "…"
-/// elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; then …
-/// fi
-/// ```
+/// run.sh's audio if/elif chain as a pure decision
+/// (`launch-action: audio-route`).
 pub(crate) fn audio_eligibility(
     no_audio: bool,
     protocol: &str,
@@ -109,11 +62,11 @@ pub(crate) fn blackhole_listed(list_stdout: &str) -> bool {
 // ── verbatim text (A1-3: `pub` so `sabrage-parity` can pin these against
 // `run.sh` by calling the real renderer rather than copying a substring) ────
 
-/// run.sh:183.
+/// run.sh's `--no-audio` info line, verbatim.
 pub const AUDIO_DISABLED_LINE: &str =
     "audio routing disabled (--no-audio) — sound stays on the Mac";
 
-/// run.sh:198.
+/// run.sh's BlackHole-not-present warn line, verbatim.
 pub fn blackhole_not_present_line() -> String {
     format!(
         "{BLACKHOLE_DEVICE} not present (brew install blackhole-2ch + reboot) — audio stays on \
@@ -126,19 +79,12 @@ pub fn blackhole_switch_failed_line() -> String {
     format!("could not switch output to {BLACKHOLE_DEVICE} — audio stays on the Mac")
 }
 
-/// `launch-action: audio-route` — run.sh lines 154–200.
+/// `launch-action: audio-route` — Reference: scripts/demo/run.sh.
 ///
-/// Skipped entirely (an `info` row, no guard state) when `--no-audio`, when
-/// `protocol != "alvr"`, when `SwitchAudioSource` is absent, or when
-/// `BlackHole 2ch` is not among the output devices. Otherwise: remember
-/// `SwitchAudioSource -c -t output`, switch to `BlackHole 2ch`, and set the
-/// device volume to 100 (BlackHole applies the device volume to the loopback
-/// samples, so anything less reaches the headset attenuated — and volume is
-/// per-device, so the speakers we restore are untouched).
-///
-/// Emits, verbatim:
-/// `audio: default output -> BlackHole 2ch (was: <dev>)` on success,
-/// `audio: restored output -> <dev>` on release.
+/// Routes the Mac's default output to `BlackHole 2ch` for the session and
+/// restores it on release. Inert for `--no-audio` (an `info` row), for
+/// `protocol != "alvr"` or a missing `SwitchAudioSource` (silent), and for a
+/// machine with no `BlackHole 2ch` output device (a `warn`).
 pub struct AudioGuard {
     /// The device to restore. `None` = nothing was switched, so `release` is a
     /// no-op (the `PREV_AUDIO_OUT=""` case, including the failed-switch branch
@@ -154,7 +100,8 @@ pub struct AudioGuard {
     carried: bool,
     run_id: RunId,
     sink: EventSink,
-    /// A dry run never mutates, so its `Drop` must not either.
+    /// A dry run never mutates, so its `Drop` must not either
+    /// (tests::a_dry_runs_guard_restores_nothing_when_dropped).
     dry_run: bool,
     released: bool,
     disarmed: bool,
@@ -261,16 +208,11 @@ impl AudioGuard {
     /// Take the guard, persisting `previous_output` into `state` **before**
     /// switching the device — but **without** switching it.
     ///
-    /// The split from [`AudioGuard::apply_switch`] is what lets the caller
-    /// install the armed guard in its held set *before* the one call that can
-    /// come back `Cancelled` (A8-3). Arming it inside `acquire` and returning
-    /// the switch's `Cancelled` through `?` dropped the guard on the floor:
-    /// `Drop` would then restore the device synchronously and say so, but —
-    /// having neither `&mut SessionState` nor an executor — it could not set
-    /// `guards.audio_restored` or save, so the teardown kept the record and
-    /// reported a guard still pending over a device that was already back.
-    /// Everything up to and including the pre-mutation save lives here; the
-    /// mutation itself lives there.
+    /// The split from [`AudioGuard::apply_switch`] lets the caller install the
+    /// armed guard in its held set before the one call that can come back
+    /// `Cancelled` (A8-3), so a cancelled switch unwinds through the ordinary
+    /// teardown — the only path that can set `guards.audio_restored` and save
+    /// (tests::a_cancelled_switch_leaves_the_guard_armed_for_the_teardown).
     pub async fn arm(
         ctx: &StageCtx,
         facts: &PreflightFacts,
@@ -284,7 +226,6 @@ impl AudioGuard {
             &facts.protocol,
             which("SwitchAudioSource"),
         ) {
-            // run.sh:183
             AudioEligibility::Disabled => {
                 st.info(AUDIO_DISABLED_LINE);
                 return Ok(guard);
@@ -307,7 +248,6 @@ impl AudioGuard {
         )
         .await?;
         if !blackhole_listed(&listing.stdout) {
-            // run.sh:198
             st.warn(blackhole_not_present_line());
             return Ok(guard);
         }
@@ -325,13 +265,10 @@ impl AudioGuard {
         // `$(…)` capture semantics: trailing newlines stripped, nothing else.
         let reading = crate::util::strip_trailing_newlines(&current.stdout).to_string();
 
-        // A device carried forward from an earlier session whose restore never
-        // finished (`run` seeds it from the kept record — see
-        // `stages::run::unfinished_audio_restore`) outranks the current
-        // reading, because in exactly that case the reading IS `BlackHole 2ch`:
-        // recording it would pin the loopback as the device to "restore" and
-        // lose the real one for good. Sabrage-only — run.sh has no record to
-        // carry anything forward from.
+        // A device carried forward from an earlier session's unfinished restore
+        // (`stages::run::unfinished_audio_restore`) outranks the current
+        // reading: in exactly that case the reading IS `BlackHole 2ch`, and
+        // recording it would lose the real device for good. Sabrage-only.
         let carried = state.prev_audio_output.is_some() && !state.guards.audio_restored;
         let previous = match state.prev_audio_output.clone() {
             Some(pending) if carried => pending,
@@ -343,14 +280,9 @@ impl AudioGuard {
         state.prev_audio_output = Some(previous.clone());
         state::save(&*ctx.executor, &ctx.paths.session_state_path(), state).await?;
 
-        // Arm the guard BEFORE the switch, not after it. `run_child` can report
-        // `Cancelled` for a child that already applied the CoreAudio change
-        // (`process::spawn_streamed_inner`'s select has no pre-spawn check and
-        // signals a child that may have finished), and returning that through
-        // `?` from a function that still owns the guard would drop it — the
-        // Mac left on BlackHole with the `Drop` fallback disabled. Armed here
-        // and handed back to the caller, the switch's cancellation unwinds
-        // through the ordinary teardown instead.
+        // Armed BEFORE the switch: `run_child` can report `Cancelled` for a child
+        // that already applied the CoreAudio change, and returning that through `?`
+        // here would drop the guard (A8-3; tests::a_cancelled_switch_leaves_the_guard_armed_for_the_teardown).
         guard.previous_output = Some(previous);
         guard.carried = carried;
         Ok(guard)
@@ -384,10 +316,10 @@ impl AudioGuard {
                 Some(step::RUN_AUDIO),
                 audio_switched_line(&previous),
             ));
-            // run.sh:192 — BlackHole applies the macOS device volume to the
-            // loopback samples; anything under 100% reaches the headset
-            // attenuated. Per-device, so the speakers we restore are untouched.
-            // Failure is swallowed exactly as the shell's `|| true` swallows it.
+            // BlackHole applies the macOS device volume to loopback samples, so
+            // anything under 100% reaches the headset attenuated. Volume is
+            // per-device (speakers untouched), and failure is swallowed as
+            // run.sh's `|| true` does.
             let volume = ctx
                 .child("osascript", step::RUN_AUDIO)
                 .arg("-e")
@@ -395,8 +327,8 @@ impl AudioGuard {
                 .env_path(process::default_child_path());
             let _ = ctx.executor.run_child(&volume).await;
         } else {
-            // run.sh:194-195 — warn, and clear the remembered device again so
-            // the exit trap restores nothing.
+            // run.sh's failed-switch branch: warn, and clear the remembered
+            // device again so the teardown restores nothing.
             st.warn(blackhole_switch_failed_line());
             self.previous_output = None;
             // …but never clear a device this run only inherited: that record is
@@ -412,18 +344,15 @@ impl AudioGuard {
 
     /// Restore the device, set `guards.audio_restored`, and save.
     ///
-    /// A guard that never switched writes nothing: `prev_audio_output` is
-    /// `None`, so [`SessionState::has_pending_guards`] is already false and a
-    /// save would only create a state file for a run that never touched audio.
+    /// A guard that never switched writes nothing — no state file for a run
+    /// that never touched audio.
     ///
-    /// When the recorded device is **gone** — Bluetooth headphones that
-    /// disconnected mid-session — the switch back exits non-zero and the Mac
-    /// is left on `BlackHole 2ch`, i.e. silent. That is not an outcome to
-    /// swallow, so this falls back to the built-in output
+    /// When the recorded device is gone, falls back to the built-in output
     /// ([`crate::session::fallback_output_device`]) and says so, or prints the
-    /// remedy and leaves `guards.audio_restored` **false** so the record
-    /// survives for a later restore. Either way it is rows only: a clean quit's
-    /// exit code is wine's, and a device that will not switch cannot change it.
+    /// remedy and leaves `guards.audio_restored` false so the record survives.
+    /// Either outcome is rows only, never a failed stage
+    /// (tests::a_recorded_device_that_vanished_falls_back_to_the_built_in_output,
+    /// tests::an_unrestorable_device_prints_the_remedy_and_leaves_the_guard_pending).
     pub async fn release(self, ctx: &StageCtx, state: &mut SessionState) -> Result<()> {
         let bin = self.switch_bin.clone();
         self.release_with(ctx, state, move || async move {
@@ -541,9 +470,7 @@ impl Drop for AudioGuard {
     }
 }
 
-// ── dashboard ─────────────────────────────────────────────────────────────────
-
-/// Which of run.sh's four dashboard branches applies (lines 207–217).
+/// Which of run.sh's dashboard branches applies (`launch-action: dashboard`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DashboardEligibility {
     /// `--no-dashboard`: one `info` row.
@@ -556,7 +483,8 @@ pub(crate) enum DashboardEligibility {
     Spawn,
 }
 
-/// run.sh:207-217 as a pure decision.
+/// run.sh's dashboard if/elif chain as a pure decision
+/// (`launch-action: dashboard`).
 pub(crate) fn dashboard_eligibility(
     no_dashboard: bool,
     protocol: &str,
@@ -575,9 +503,9 @@ pub(crate) fn dashboard_eligibility(
 
 /// `[ -x "$ALVR_DASHBOARD_BIN" ]`.
 ///
-/// Duplicates `paths::is_executable`, which is private to its module and
-/// outside this file's ownership (PARITY.md's `is_executable` note applies to
-/// both: mode bits `0o111`, not effective access).
+/// Duplicates `paths::is_executable`, which is private to its module; both
+/// follow PARITY.md § Doctor / checks, "`is_executable` tests mode bits
+/// `0o111`, not effective access".
 fn is_executable(p: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
     std::fs::metadata(p)
@@ -585,25 +513,17 @@ fn is_executable(p: &Path) -> bool {
         .unwrap_or(false)
 }
 
-/// `launch-action: dashboard` — run.sh lines 202–217.
+/// `launch-action: dashboard` — Reference: scripts/demo/run.sh.
 ///
-/// Skipped (an `info` row) for `--no-dashboard`; silent for
-/// `protocol != "alvr"`; a warn when `alvr_dashboard` is not built
-/// (`./demo.sh build` — continuing without the dashboard). Otherwise spawned
-/// detached with both pipes on `/dev/null`
-/// ([`crate::executor::DetachedStdio::Null`], the shell's `>/dev/null 2>&1 &`).
-/// Launching it before the game is fine: it polls `127.0.0.1:8082` until the
-/// embedded server appears.
+/// Spawns the ALVR dashboard detached with pipes on `/dev/null`
+/// ([`crate::executor::DetachedStdio::Null`]) and closes it on release. Inert
+/// for `--no-dashboard` (an `info` row), for `protocol != "alvr"` (silent),
+/// and for an unbuilt `alvr_dashboard` (a warn). Safe to launch before the
+/// game: it polls `127.0.0.1:8082` until the embedded server appears.
 ///
-/// Emits `dashboard: ALVR server dashboard opening (connects once the game is
-/// up)` on acquire and `dashboard: closed` on release, both verbatim.
-///
-/// The spawned [`crate::executor::DetachedChild`] is **not** kept in the
-/// guard: it is moved into a small task that `wait()`s on it, so a dashboard
-/// the user closes themselves is reaped instead of becoming a zombie
-/// (`spawn_detached` sets `kill_on_drop(false)`). What the guard keeps is the
-/// identity, which is what `release` needs and what survives into
-/// `session-state.json`.
+/// The guard keeps the child's identity, not the child: the child is moved
+/// into a task that `wait()`s on it, so a user-closed dashboard is reaped
+/// instead of becoming a zombie (`spawn_detached` sets `kill_on_drop(false)`).
 pub struct DashboardGuard {
     /// Its identity, mirrored into [`SessionState`] so a later process can
     /// close it by identity rather than by bare pid.
@@ -619,9 +539,9 @@ pub struct DashboardGuard {
 pub const DASHBOARD_OPENING_LINE: &str =
     "dashboard: ALVR server dashboard opening (connects once the game is up)";
 pub const DASHBOARD_CLOSED_LINE: &str = "dashboard: closed";
-/// run.sh:208.
+/// run.sh's `--no-dashboard` info line, verbatim.
 pub const DASHBOARD_DISABLED_LINE: &str = "ALVR dashboard disabled (--no-dashboard)";
-/// run.sh:216.
+/// run.sh's unbuilt-dashboard warn line, verbatim.
 pub const DASHBOARD_NOT_BUILT_LINE: &str =
     "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)";
 
@@ -652,14 +572,12 @@ impl DashboardGuard {
             &facts.protocol,
             is_executable(&ctx.paths.alvr_dashboard),
         ) {
-            // run.sh:208
             DashboardEligibility::Disabled => {
                 st.info(DASHBOARD_DISABLED_LINE);
                 return Ok(guard);
             }
-            // run.sh:209-210 — the bare `:`.
+            // The shell's bare `:` — nothing is printed at all.
             DashboardEligibility::Skip => return Ok(guard),
-            // run.sh:216
             DashboardEligibility::NotBuilt => {
                 st.warn(DASHBOARD_NOT_BUILT_LINE);
                 return Ok(guard);
@@ -698,9 +616,9 @@ impl DashboardGuard {
 
     /// Close the dashboard, set `guards.dashboard_closed`, and save.
     ///
-    /// The kill is guarded by [`ProcInfo::is_same_process`] — pid **and**
-    /// start time — where the shell only has `kill -0`. A recycled pid is
-    /// never signalled.
+    /// The kill is guarded by [`ProcInfo::is_same_process`] — pid **and** start
+    /// time, where the shell only has `kill -0` — so a recycled pid is never
+    /// signalled (tests::release_never_signals_an_identity_that_no_longer_matches).
     pub async fn release(mut self, ctx: &StageCtx, state: &mut SessionState) -> Result<()> {
         self.released = true;
         let Some(identity) = self.identity.take() else {
@@ -809,8 +727,6 @@ mod tests {
             .collect()
     }
 
-    // ── pure decisions ───────────────────────────────────────────────────────
-
     #[test]
     fn audio_eligibility_is_run_shs_if_elif_chain() {
         let bin = || Some(PathBuf::from("/opt/homebrew/bin/SwitchAudioSource"));
@@ -875,8 +791,6 @@ mod tests {
         );
         assert_eq!(DASHBOARD_CLOSED_LINE, "dashboard: closed");
     }
-
-    // ── audio guard ──────────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn no_audio_yields_an_inert_guard_and_one_info_row() {
@@ -1206,11 +1120,10 @@ mod tests {
         }
     }
 
-    /// The device of the 2026-08-29 finding: recorded at launch, disconnected
-    /// before the session was torn down.
+    /// A device recorded at launch and disconnected before teardown.
     const AIRPODS: &str = "Yifei\u{2019}s AirPods Pro";
 
-    /// `SwitchAudioSource -a -t output` on that machine, verbatim and in order.
+    /// One machine's `SwitchAudioSource -a -t output`, verbatim and in order.
     fn live_outputs() -> Vec<String> {
         [
             "BlackHole 2ch",
@@ -1282,9 +1195,9 @@ mod tests {
         let (mut ctx, seen) = dry_ctx(&root, StageOptions::default());
         ctx.executor = FailSwitchTo::around(ctx.executor.clone(), AIRPODS);
         let mut state = fresh_state();
-        // What `acquire` recorded before it switched: the record and the guard
-        // name the same device, which is what makes the pending flag below
-        // mean anything to `teardown`.
+        // What `arm` recorded before the switch: the record and the guard name
+        // the same device, which is what makes the pending flag below mean
+        // anything to `teardown`.
         state.prev_audio_output = Some(AIRPODS.to_string());
 
         AudioGuard::armed_for_test(&ctx, AIRPODS, "/opt/homebrew/bin/SwitchAudioSource")
@@ -1322,8 +1235,6 @@ mod tests {
         );
         std::fs::remove_dir_all(&root).unwrap();
     }
-
-    // ── dashboard guard ──────────────────────────────────────────────────────
 
     #[tokio::test]
     async fn no_dashboard_yields_an_inert_guard_and_one_info_row() {
