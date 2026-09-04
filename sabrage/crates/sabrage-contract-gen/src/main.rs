@@ -1,10 +1,7 @@
 //! Thin `--write` / `--check` shim over [`sabrage_contract_gen`].
 //!
-//! ```text
-//! sabrage-contract-gen --check [--repo-root <dir>]   # exit 1 if out of sync
-//! sabrage-contract-gen --write [--repo-root <dir>]   # regenerate in place
-//! ```
-//!
+//! `--check` regenerates in memory and exits 1 when the committed
+//! `scripts/demo/contract.gen.sh` differs; `--write` regenerates it in place.
 //! `scripts/dev/parity.sh --regen` drives `--write`; the tier-1 parity test
 //! drives the library directly.
 
