@@ -1,32 +1,12 @@
-//! Group `network` — doctor.sh section 16, 16b: streaming ports and stale adb forwards.
+//! Doctor evaluators for the `network` group: `net.ports` and
+//! `net.adb-forwards`, bound in contract order by [`defs`]. Message and
+//! remedy strings track `scripts/demo/doctor.sh` sections 16/16b verbatim
+//! (see [`super`] for why). Reference: scripts/demo/doctor.sh.
 //!
-//! Slugs owned here, in contract order:
-//!
-//! * `net.ports` — nothing already listening on the `[ports] stream` pair.
-//!   Volatile
-//! * `net.adb-forwards` — no `tcp:9943`/`tcp:9944` in `adb forward --list` —
-//!   legitimate only for a `--wired` launch; left behind they squat the ports
-//!   and break WiFi discovery. Volatile; silent-when-clean in zsh (`tap
-//!   net.adb-forwards ok`)
-//!
-//! Every evaluator is `fn(&CheckCtx) -> CheckOutcome`: a **read-only probe**.
-//! Message and remedy strings must match `scripts/demo/doctor.sh` verbatim,
-//! with one recorded exception (below).
-//!
-//! ## `net.adb-forwards` failed-probe divergence (A4-4)
-//!
-//! doctor.sh discards adb's stderr and ignores its exit status
-//! (`FWD="$("$ADB" forward --list 2>/dev/null | awk …)"`), so a probe that
-//! *failed* produces an empty `$FWD` and taps `ok` — "no stale forwards" —
-//! silently. [`net_adb_forwards`] Warns instead: a failed query is not
-//! evidence that `tcp:9943`/`tcp:9944` are absent, and left behind they break
-//! WiFi discovery. That makes the two doctors disagree on this slug's tap
-//! channel (`ok` vs `warn`) for one machine state — adb present, its server
-//! unreachable — which `scripts/dev/parity.sh` tier-2 diffs, and prints a
-//! console row doctor.sh never emits. Needs either a matching
-//! `scripts/demo/doctor.sh` change (an exit-status test on the `adb forward
-//! --list` pipeline) or a `sabrage/PARITY.md` row declaring the divergence
-//! (cross-area — this module cannot make either edit).
+//! One declared divergence (A4-4 / A3b packet): a failed `adb forward --list`
+//! probe Warns here and taps `ok` in zsh. PARITY.md § Declared by the
+//! 2026-08-30 adversarial review (round 1 fixes), "**`net.adb-forwards` on a
+//! failed probe.**"
 
 use std::collections::BTreeSet;
 use std::path::Path;
@@ -38,19 +18,15 @@ use super::{CheckCtx, CheckOutcome, CheckStatus, SkipReason};
 
 const PROBES_DISABLED: &str = "adb probing disabled (Sabrage setting)";
 
-// ── section 16: stale streaming listeners ────────────────────────────────────
-
-/// `lsof -nP -iUDP:9944 -iTCP:9943` — the exact literal ports doctor.sh's
-/// (non-generated) reference passes; they are also `contract().ports.stream`
-/// today (`[9943, 9944]`), but this call is pinned to doctor.sh's own literal
-/// text rather than re-derived, since doctor.sh itself does not derive it.
+/// The exact literal ports `scripts/demo/doctor.sh` section 16 passes. Pinned
+/// to doctor.sh's text rather than derived from `contract().ports.stream`
+/// (`[9943, 9944]` today), because doctor.sh does not derive it either.
 const LSOF_ARGS: [&str; 3] = ["-nP", "-iUDP:9944", "-iTCP:9943"];
 
-/// `awk 'NR>1{print $1"("$2")"}' | sort -u | tr '\n' ' '` over `lsof`'s
-/// output: for every row after the header, `COMMAND(PID)`, deduplicated,
-/// sorted, space-joined **with a trailing space** when non-empty — the same
-/// trailing-space quirk `cfg.session-pins` reproduces, so the caller can
-/// concatenate this directly before an em dash with no extra space.
+/// `COMMAND(PID)` for every `lsof` row on the streaming ports: deduplicated,
+/// sorted, space-joined **with a trailing space** when non-empty (the caller
+/// concatenates directly before doctor.sh's em dash). Empty when nothing is
+/// listening or `lsof` cannot be spawned.
 fn stale_listeners() -> String {
     let out = match Command::new("lsof").args(LSOF_ARGS).output() {
         Ok(o) => o,
@@ -72,12 +48,9 @@ fn stale_listeners() -> String {
     out
 }
 
-/// doctor.sh section 16:
-/// ```sh
-/// STALE="$(lsof -nP -iUDP:9944 -iTCP:9943 2>/dev/null | awk '…' | sort -u | tr '\n' ' ')"
-/// if [ -n "$STALE" ]; then chk warn net.ports "ports 9943/9944 busy: $STALE— a previous session may still be running"
-/// else chk ok net.ports "streaming ports free"; fi
-/// ```
+/// `net.ports`: Warn naming the busy listeners, Pass when the streaming
+/// ports are free. Reference: scripts/demo/doctor.sh section 16.
+/// tests::net_ports_matches_a_direct_lsof_probe
 fn net_ports(_ctx: &CheckCtx) -> CheckOutcome {
     let stale = stale_listeners();
     if stale.is_empty() {
@@ -90,19 +63,12 @@ fn net_ports(_ctx: &CheckCtx) -> CheckOutcome {
     }
 }
 
-// ── section 16b: stale adb forwards ──────────────────────────────────────────
-
-/// `"$ADB" forward --list 2>/dev/null | awk '{print $2}'` — the local side
-/// (`tcp:<port>`) of every forward, one per line of `adb forward --list`'s
-/// `<serial> <local> <remote>` rows.
+/// The local side (`tcp:<port>`) of every `adb forward --list` row.
 ///
-/// `Err` means the probe itself failed (couldn't spawn `adb`, or `adb`
-/// exited non-zero) — distinct from `Ok(vec![])`, which means the probe
-/// ran cleanly and genuinely found no forwards. Callers must not fold the
-/// two together: a failed probe is not evidence of a clean state (A4-4 /
-/// A3b packet — the previous `Vec::new()`-on-any-error return made an ADB
-/// query failure indistinguishable from "no forwards", so `net_adb_forwards`
-/// reported Pass on a broken probe).
+/// # Errors
+/// `Err` when `adb` cannot be spawned or exits non-zero — distinct from
+/// `Ok(vec![])` (no forwards). Callers must not fold the two (A4-4).
+/// tests::adb_forward_local_specs_reports_nonzero_exit_as_err
 fn adb_forward_local_specs(adb: &Path) -> Result<Vec<String>, String> {
     let out = Command::new(adb)
         .args(["forward", "--list"])
@@ -122,15 +88,11 @@ fn adb_forward_local_specs(adb: &Path) -> Result<Vec<String>, String> {
         .collect())
 }
 
-/// doctor.sh section 16b:
-/// ```sh
-/// if [ -n "$ADB" ]; then
-///   FWD="$("$ADB" forward --list 2>/dev/null | awk '{print $2}')"
-///   if print -r -- "$FWD" | grep -qx 'tcp:9943' || print -r -- "$FWD" | grep -qx 'tcp:9944'; then
-///     chk warn net.adb-forwards …
-///   else tap net.adb-forwards ok; fi
-/// else tap net.adb-forwards skipped; fi
-/// ```
+/// `net.adb-forwards`: Skipped when adb probes are disabled or no adb is
+/// found, Warn when `tcp:9943`/`tcp:9944` are forwarded or the probe failed,
+/// Pass otherwise — a row zsh does not print (PARITY.md § Doctor / checks,
+/// "`net.adb-forwards` renders a green"). Reference:
+/// scripts/demo/doctor.sh section 16b.
 fn net_adb_forwards(ctx: &CheckCtx) -> CheckOutcome {
     if !ctx.opts.allow_adb_probes {
         return CheckOutcome::skipped("net.adb-forwards", SkipReason::new(PROBES_DISABLED));
@@ -140,9 +102,9 @@ fn net_adb_forwards(ctx: &CheckCtx) -> CheckOutcome {
     };
     let specs = match adb_forward_local_specs(adb) {
         Ok(specs) => specs,
-        // A4-4 / A3b packet: a failed probe is not "no stale forwards" —
-        // stale tcp:9943/tcp:9944 forwards may still be present and would
-        // silently break WiFi discovery, so this must not resolve to Pass.
+        // A4-4 / A3b packet: a failed probe is not "no stale forwards"; stale
+        // tcp:9943/9944 would silently break WiFi discovery, so never Pass here.
+        // tests::net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb
         Err(e) => {
             return CheckOutcome::warn(
                 "net.adb-forwards",
@@ -165,7 +127,6 @@ fn net_adb_forwards(ctx: &CheckCtx) -> CheckOutcome {
              tcp:9943 (and tcp:9944), or just a normal ./demo.sh run",
         )
     } else {
-        // Silent `tap … ok` in the shell.
         CheckOutcome::pass("net.adb-forwards", "no stale adb port forwards")
     }
 }
@@ -191,8 +152,6 @@ mod tests {
         )
     }
 
-    // ── net.ports ────────────────────────────────────────────────────────────
-
     #[test]
     fn net_ports_matches_a_direct_lsof_probe() {
         let o = net_ports(&ctx());
@@ -208,8 +167,6 @@ mod tests {
             );
         }
     }
-
-    // ── net.adb-forwards ─────────────────────────────────────────────────────
 
     #[test]
     fn probes_disabled_skips_net_adb_forwards() {
@@ -248,7 +205,7 @@ mod tests {
         }
     }
 
-    // ── A4-4 / A3b packet: a failed adb probe must not read as "clean" ────────
+    /// A4-4: failed adb probe must not read as "clean". tests::net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb
 
     #[test]
     fn net_adb_forwards_warns_not_passes_when_the_probe_cannot_spawn_adb() {
