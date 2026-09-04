@@ -72,7 +72,7 @@ and is cited, not copied [1].
 design note to explain why the code is the way it is; the *reason* belongs in the code, not only in
 the commit log [1 ch. 16]. It may not narrate what the code used to do, who changed it, or when;
 version control records that at finer grain and does not go stale [7, 10]. One exception: a regression
-test's own doc comment states the defect it pins (the A14-3 test in `process.rs`, the A8-4 test in `logs.rs`), because that is
+test's own doc comment states the defect it pins (the A14-3 test in `process/tests.rs`, the A8-4 test in `logs/tests.rs`), because that is
 the test's specification. The exception is limited to the labelled assertion of 3.6; production code
 says what is true now and cites the id for the rest.
 
@@ -169,7 +169,7 @@ assertion elsewhere.
 
 **3.6 Regression rule.** Every bug fix and every accepted review finding ships with **exactly one**
 assertion that failed before the fix and passes after it, labelled in the shape the tree already uses,
-`/// <id> regression: <one line>` (the A3b-1 test in `checks/config.rs`), or as the table-row label string. Round 1
+`/// <id> regression: <one line>` (the A3b-1 test in `checks/config/tests.rs`), or as the table-row label string. Round 1
 and round 2 share an id space (`sabrage/docs/reviews/2026-08-30-codex-round1.md` and `-round2.md` both
 define `A1-1`), so **new** labels for any id that exists in more than one round carry the round:
 `r2:A14-3`. Existing bare labels are not rewritten; a bare id resolves through `sabrage/docs/reviews/`.
@@ -196,8 +196,8 @@ scanner ships with the fixture that would have caught the old behaviour.
 **3.8 Tier-1 tests are hermetic and deterministic.** Tier 1 is everything `cargo test` runs; tier 2 is
 the live differ in `scripts/dev/parity.sh`, which needs a machine and a bottle and never runs in CI.
 Tier-1 tests use scratch directories under `temp_dir()` named uniquely per process (`std::process::id()`
-plus a uuid, as the `scratch()` helper in `privilege.rs` does) and removed at entry as well as exit, so a panicked run cannot
-poison the next; a `Drop` guard (`impl Drop for Fixture` in `stages/run/preflight.rs`) when the test mutates process-global
+plus a uuid, as the `scratch()` helper in `privilege/tests.rs` does) and removed at entry as well as exit, so a panicked run cannot
+poison the next; a `Drop` guard (`impl Drop for Fixture` in `stages/run/preflight/tests.rs`) when the test mutates process-global
 state. Never the real `HOME`, never real `adb` / `wine` / `osascript`, no waiting on the clock. Tests
 that need a real subprocess spawn `/bin/sleep` or the test binary itself and kill what they spawned;
 spawning `sleep` is not sleeping. These are *medium* tests in [21 ch. 11]'s taxonomy (they touch disk
@@ -209,6 +209,17 @@ one-line reason and a tier-2 entry point; never leave it slow and unmarked [21 c
 **3.9 Smells that block review** [23, 22]: assertion roulette (many unlabelled asserts, no way to tell
 which failed); entry-point mirrors (the same fixture and assertions re-run through a second entry point
 that merely delegates to the first); and the violations of 3.1, 3.3 and 3.8.
+
+**3.10 Tests live in a sibling module file, never inline.** A unit `foo.rs` declares `#[cfg(test)] mod tests;`
+where the inline block used to be, and the body lives in `foo/tests.rs`; a `mod.rs`, `lib.rs` or `main.rs`
+parent declares the same and the body lives in a sibling `tests.rs`. A second test module keeps its own name
+and file (`executor/detached_tests.rs`, `process/identity_tests.rs`), so every test's module path is
+unchanged by the layout. Test-only production hooks — `#[cfg(test)]` items outside the module, such as
+`stages::materialize_compiled_contract` or `session::lock_session_globals` — stay in the production file,
+where the code they hook lives. Directories the layout creates may collide with a gitignore rule
+(`build/`, `logs/`): the rule gets a negation, the test file never moves elsewhere. A split is verified
+mechanically, never by eye: the child must equal rustfmt applied to the block cut verbatim from the
+pre-split parent, byte for byte, and the `cargo test -- --list` name set must not change.
 
 ## 4. Applying this to existing code
 
