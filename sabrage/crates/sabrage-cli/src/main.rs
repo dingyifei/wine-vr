@@ -1,62 +1,23 @@
 //! `sabrage` — the native Sabrage pipeline CLI.
 //!
-//! Phase 1 shipped `sabrage doctor`. Phase 2 added the four mutating stages —
-//! `setup`, `build`, `install`, `stop` — as thin renderers over
-//! [`sabrage_core::stages::run_stage`]. Phase 3 adds `run` (the same renderer,
-//! over [`sabrage_core::stages::run::run`], which is real — a running
-//! `sabrage run` launches wine and the game exactly as `./demo.sh run` does;
-//! `cmd_stage`'s own doc explains why that already-real body still stays out
-//! of this file's unit tests) and `all` (a caller-level loop over
-//! [`sabrage_core::Stage::ALL_CHAIN`] — never a sixth [`Stage`], mirroring
-//! `demo.sh`'s own `for stage in setup build install run` re-exec loop). This
-//! file owns argument parsing and turning a [`sabrage_core::StageEvent`]
-//! stream into the exact console text its `demo.sh` equivalent prints,
-//! nothing more (the stage bodies themselves live in `sabrage-core`).
-//! Anything else on the command line still falls through to the usage text,
-//! exit 2 — the same fallback `demo.sh`'s own `case` uses for an unrecognized
-//! `CMD`.
+//! Owns argument parsing and turning a [`sabrage_core::StageEvent`] stream into
+//! the exact console text the equivalent `demo.sh` stage prints; the stage
+//! bodies themselves live in `sabrage-core`. `all` is a caller-level loop over
+//! [`sabrage_core::Stage::ALL_CHAIN`], never a sixth [`Stage`]. Anything else on
+//! the command line falls through to the usage text, exit 2.
 //!
-//! # Argument parsing
+//! `demo.sh`'s flag loop runs before `case "$CMD"`, so every subcommand accepts
+//! all six `WINEVR_*` flags even though only `run` (and `all`) reads the last
+//! four; row shapes follow `scripts/demo/{doctor,setup,build,install,stop}.sh`.
+//! `--tap`, `--dry-run` and `--quiet` are sabrage-only; colors are gated on
+//! isatty + `NO_COLOR` where the shell emits ANSI unconditionally (PARITY.md
+//! § CLI / GUI, "`--dry-run` / `--quiet` flags"; PARITY.md § Doctor / checks,
+//! "Console colors gated on isatty").
 //!
-//! Hand-parsed, deliberately not `clap` (see the comment in
-//! `sabrage-cli/Cargo.toml`), to match `demo.sh`'s own loop byte-for-byte —
-//! and that loop parses the same six flags for **every** subcommand
-//! (`demo.sh`'s flag `while` runs before the `case "$CMD"` dispatch, lines
-//! 30-42), so `setup`/`build`/`install`/`stop` all accept
-//! `--bottle`/`--bs-dir`/`--no-audio`/`--no-dashboard`/`--wired`/`--verbose`
-//! too, even though only `run` (and, by inheriting `run`, `all`) reads the
-//! last four:
-//!
-//! ```zsh
-//! while [ $# -gt 0 ]; do
-//!   case "$1" in
-//!     --bottle) [ $# -ge 2 ] || { echo "error: --bottle needs a name" >&2; exit 2; }
-//!               export WINEVR_BOTTLE="$2"; shift 2 ;;
-//!     --bs-dir) [ $# -ge 2 ] || { echo "error: --bs-dir needs a path" >&2; exit 2; }
-//!               export WINEVR_BS_DIR="$2"; shift 2 ;;
-//!     --no-audio) export WINEVR_NO_AUDIO=1; shift ;;
-//!     --no-dashboard) export WINEVR_NO_DASHBOARD=1; shift ;;
-//!     --wired)    export WINEVR_WIRED=1; shift ;;
-//!     --verbose)  export WINEVR_VERBOSE=1; shift ;;
-//!     *) echo "error: unknown argument '$1'" >&2; exit 2 ;;
-//!   esac
-//! done
-//! ```
-//!
-//! `--tap <file>` (doctor only) and `--dry-run`/`--quiet` (the four stage
-//! commands) have no `demo.sh` counterpart — sabrage's own additions, parsed
-//! with the same "boolean, no value" or "needs a value or exit 2" shapes.
-//!
-//! # Human output
-//!
-//! Doctor mirrors `scripts/demo/doctor.sh`'s rendering (via `lib.sh`'s
-//! `ok`/`warn`/`fail`/`info`); the four stage commands mirror
-//! `scripts/demo/{setup,build,install,stop}.sh` the same way, reusing the
-//! identical row layout (see `ok_row`/`warn_row`/`fail_row`/`info_row`) over
-//! [`sabrage_core::StageEvent::Line`] instead of
-//! [`sabrage_core::checks::CheckOutcome`]. One deliberate divergence carries
-//! over to both: colors are gated on `isatty(stdout)` and `NO_COLOR`, where
-//! the shell emits ANSI codes unconditionally.
+//! Argument and output parity is pinned by
+//! tests::{stage_parses_every_reserved_and_sabrage_only_flag,
+//! doctor_outcome_rows_match_lib_sh_verbatim,
+//! closing_line_matches_each_stage_script_verbatim}.
 
 use std::env;
 use std::io::IsTerminal;
@@ -156,40 +117,32 @@ async fn main() {
     }
 }
 
-/// Finding A14-4: what the `_` arm above does with an unrecognized first
-/// token, factored into a pure helper so it is testable without `exit`.
+/// The `_` arm's decision for an unrecognized first token, factored into a pure
+/// helper so it is testable without `exit` (A14-4).
 ///
-/// `demo.sh` shifts `CMD="${1:-}"` off unconditionally *before* its flag
-/// `while` loop runs (lines 30-42 of this file's module doc), so when the
-/// first token is a flag rather than a real subcommand — `--bottle Steam
-/// run` — the loop parses the *remaining* tokens (`Steam run`) and reports
-/// the first one it does not recognize (`Steam`, since `--bottle`'s value
-/// was consumed as `CMD` instead of by the flag) before ever reaching its
-/// `case "$CMD"` dispatch. Mirror that sequencing: treat `args[0]` as the
-/// shell's `CMD` (already consumed, never re-examined) and parse `args[1..]`
-/// with the same grammar the six flags share. `Ok(())` means the shell would
-/// have fallen through to its unknown-`CMD` `case` arm instead — this file's
-/// usage-text-then-exit-2 fallback.
+/// `demo.sh` consumes `CMD="${1:-}"` unconditionally before its flag loop runs,
+/// so `args[0]` is treated as already-consumed and `args[1..]` is parsed with
+/// the six shared flags. `Err` is the shell's own first-bad-argument message;
+/// `Ok(())` means the shell would have fallen through to its unknown-`CMD` arm
+/// instead — this file's usage-text-then-exit-2 fallback. Pinned by
+/// tests::unknown_command_outcome_mirrors_the_shells_shift_then_parse.
 fn unknown_command_outcome(args: &[String]) -> Result<(), String> {
     parse_stage_args(&args[1..]).map(|_| ())
 }
 
-// ── shared bootstrap ─────────────────────────────────────────────────────────
-
-/// Repo-root resolution fails before any [`StageCtx`]/[`EventSink`] exists
-/// (doctor has no `StageCtx` at all), so it has no `StageEvent::Fatal` or
-/// `die()` line to ride on. Render it in the same `error: <msg>` shape the
-/// argument-parsing errors already use, plus [`SabrageError`]'s remedy line
-/// when there is one — a plain addition, since finding the repo root has no
-/// shell equivalent to match (`paths.rs`'s module doc).
+/// Print a bootstrap failure as `error: <msg>`, plus [`SabrageError`]'s remedy
+/// line when it carries one.
+///
+/// Sabrage-only: repo-root and `HOME` resolution run before any
+/// [`StageCtx`]/[`EventSink`] exists (doctor has no `StageCtx` at all), so there
+/// is no `StageEvent::Fatal` or `die()` line to ride on and no shell text to
+/// match — finding the repo root has no shell equivalent (`paths.rs`'s doc).
 fn print_bootstrap_error(e: &SabrageError) {
     eprintln!("error: {e}");
     if let Some(remedy) = e.remedy() {
         eprintln!("       remedy: {remedy}");
     }
 }
-
-// ── `sabrage doctor` ─────────────────────────────────────────────────────────
 
 /// Parsed `doctor` arguments, before merging onto the `WINEVR_*` environment.
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -205,10 +158,8 @@ struct DoctorArgs {
 
 /// The six `demo.sh`-verbatim flags every stage script (and `doctor`) shares:
 /// `--bottle`/`--bs-dir`/`--no-audio`/`--no-dashboard`/`--wired`/`--verbose`.
-/// Factored out of [`parse_doctor_args`]/[`parse_stage_args`] (finding
-/// S-C3-cli-ipc: the two hand-rolled loops repeated these six arms
-/// identically, including the exact `demo.sh`-verbatim error text) so each
-/// error string lives in exactly one place.
+/// Shared by `parse_doctor_args`/`parse_stage_args` so each `demo.sh`-verbatim
+/// error string lives in exactly one place (S-C3-cli-ipc).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CommonArgs {
     bottle: Option<String>,
@@ -219,14 +170,13 @@ struct CommonArgs {
     verbose: bool,
 }
 
-/// Try to consume one of the six [`CommonArgs`] flags at `args[i]`.
+/// Try to consume one of the six `CommonArgs` flags at `args[i]`.
 ///
 /// `Ok(Some(next_i))` — recognized and consumed, resume the caller's loop at
-/// `next_i`. `Ok(None)` — `args[i]` is not one of the six; the caller tries
-/// its own extra flags (`--tap`, `--dry-run`, `--quiet`) before falling back
-/// to the shared "unknown argument" error. `Err` — a value-taking flag with
-/// no value, the same first-bad-argument-wins short-circuit both callers
-/// already relied on.
+/// `next_i`. `Ok(None)` — `args[i]` is not one of the six; the caller tries its
+/// own extra flags (`--tap`, `--dry-run`, `--quiet`) before the shared "unknown
+/// argument" error. `Err` — a value-taking flag with no value; first bad
+/// argument wins, no aggregation.
 fn parse_common_flag(
     out: &mut CommonArgs,
     args: &[String],
@@ -302,17 +252,14 @@ fn parse_doctor_args(args: &[String]) -> Result<DoctorArgs, String> {
     })
 }
 
-/// Merge parsed `doctor` flags onto the env-derived base — `doctor`'s
-/// counterpart of [`merge_stage_options`], same precedence rule
-/// (`WINEVR_*` is the base, flags override), factored out for the same
-/// reason: directly testable without resolving a repo root or building a
-/// [`CheckCtx`].
+/// Merge parsed `doctor` flags onto the env-derived base — `WINEVR_*` is the
+/// base, flags override — `merge_stage_options`'s `doctor` counterpart,
+/// separate so it is testable without a repo root or a [`CheckCtx`].
 ///
-/// Finding A14-1: an explicit empty `--bottle`/`--bs-dir` must clear the
-/// env-derived value rather than override it with `Some("")` — see
-/// [`merge_stage_options`]'s matching comment for the full rationale
-/// (`demo.sh`'s `${WINEVR_BOTTLE:-}`/`${WINEVR_BS_DIR:-<default>}` both treat
-/// an empty export as absent).
+/// A14-1: an explicit empty `--bottle`/`--bs-dir` clears the env-derived value
+/// rather than overriding it with `Some("")`, because `demo.sh`'s
+/// `${WINEVR_BOTTLE:-}` treats an empty export as absent. Pinned by
+/// tests::merge_doctor_options_empty_cli_values_clear_a_preset_env_base.
 fn merge_doctor_options(env_opts: CheckOptions, parsed: &DoctorArgs) -> CheckOptions {
     let mut opts = env_opts;
     if let Some(b) = &parsed.bottle {
@@ -353,15 +300,10 @@ fn cmd_doctor(args: &[String]) -> ! {
         }
     };
 
-    // WINEVR_BOTTLE / WINEVR_BS_DIR (and the other WINEVR_* flags) are the base;
-    // CLI flags override — the same precedence `demo.sh` gets from exporting
-    // over whatever the caller's shell already had set.
     let opts = merge_doctor_options(CheckOptions::from_env(), &parsed);
     let verbose = opts.verbose;
 
     let ctx = CheckCtx::new(Paths::new(&repo_root), opts);
-    // Doctor only ever writes to stdout — no stderr rows exist in its output
-    // — so it keeps using a single bool, the way it always has.
     let colors = use_colors().stdout;
 
     println!("{BANNER}");
@@ -378,9 +320,9 @@ fn cmd_doctor(args: &[String]) -> ! {
     );
 
     if let Some(tap_path) = &parsed.tap {
-        // "truncate first": std::fs::write creates-or-truncates then writes the
-        // whole payload in one shot — never zsh's incremental `>>` (that channel
-        // is `tap::append_tap`, a renderer primitive this CLI does not use here).
+        // "truncate first" (the `--help` text): `fs::write` creates-or-truncates
+        // and writes the payload in one shot, never `tap::append_tap`'s
+        // incremental `>>` channel.
         if let Err(e) = std::fs::write(tap_path, render_tap(&report.outcomes)) {
             eprintln!(
                 "warning: could not write --tap file {}: {e}",
@@ -390,8 +332,7 @@ fn cmd_doctor(args: &[String]) -> ! {
     }
 
     // doctor.sh: `[ -n "${WINEVR_DOCTOR_SOFT:-}" ] || exit "$FAILCOUNT"` — a
-    // non-empty WINEVR_DOCTOR_SOFT short-circuits the exit entirely, so the
-    // process's own exit code is 0 (the successful `[ -n ... ]` test).
+    // non-empty value short-circuits the exit, so the process exits 0.
     if env_flag("WINEVR_DOCTOR_SOFT") {
         exit(0);
     }
@@ -403,8 +344,6 @@ fn cmd_doctor(args: &[String]) -> ! {
 fn env_flag(name: &str) -> bool {
     env::var_os(name).is_some_and(|v| !v.is_empty())
 }
-
-// ── rendering (shared by doctor and the stage commands) ─────────────────────
 
 /// `lib.sh`'s `ok()` row: `"  ${_G}OK${_N}   $*"`.
 fn ok_row(text: &str, colors: bool) -> String {
@@ -435,17 +374,15 @@ fn info_row(text: &str) -> String {
 
 /// `lib.sh`'s `ok`/`warn`/`fail`/`info`, transcribed onto a [`CheckOutcome`].
 ///
-/// `Skipped`/`NotImplemented` return `None` — those statuses only ever reach
-/// zsh's silent `tap()` channel, never stdout. So do `quiet` passes: rows
-/// doctor.sh taps (`tap <slug> ok`) without printing a console line.
+/// Returns `None` for `Skipped`/`NotImplemented` and for a `quiet` pass — rows
+/// that only ever reach doctor.sh's silent `tap` channel, never stdout.
 ///
-/// `verbose` (A3b-3, round 2) gates one extra continuation line —
-/// `       detail: <d>` — appended when the row has a
-/// [`CheckOutcome::detail`] and the caller asked for it: `detail` is the
-/// "sabrage-only explainability field" (`checks/mod.rs`'s doc comment) that
-/// zsh's own `ok`/`warn`/`fail`/`info` have no slot for, so with `verbose`
-/// false (doctor's default) this function's output stays exactly what it was
-/// before `detail` existed — shell-parity byte-identical.
+/// `verbose` (A3b-3) appends one `       detail: <d>` continuation for a row
+/// carrying a [`CheckOutcome::detail`], the sabrage-only explainability field
+/// zsh's row helpers have no slot for; with `verbose` false (doctor's default)
+/// the output stays byte-identical to the shell's. Pinned by
+/// tests::{doctor_outcome_rows_match_lib_sh_verbatim,
+/// detail_is_hidden_by_default_and_shown_only_when_verbose}.
 fn format_outcome(o: &CheckOutcome, colors: bool, verbose: bool) -> Option<String> {
     if o.quiet {
         return None;
@@ -480,29 +417,22 @@ fn format_line_event(severity: Severity, text: &str, remedy: Option<&str>, color
     }
 }
 
-/// `lib.sh`'s `die()`: `"${_R}FATAL${_N} $*"` — no leading spaces (unlike
+/// `lib.sh`'s `die()`: `"${_R}FATAL${_N} $*"` — no leading indent (unlike
 /// `ok`/`warn`/`fail`/`info`, which all indent two) and no separate `remedy:`
-/// line. A `die` call's remedy, when it has one, is folded into the message
-/// text itself at the call site (see `require_bottle`'s two-line message for
-/// the canonical example) rather than carried as structured data the way
-/// `fail`'s is — this mirrors that, rather than inventing a line `die()`
-/// never printed.
+/// line. A `die` call folds its remedy into the message text at the call site
+/// (`require_bottle`'s two-line message is the canonical example), so this
+/// prints no line `die()` never printed.
 fn fatal_line(message: &str, colors: bool) -> String {
     format!("{} {}", label("FATAL", ANSI_RED, colors), message)
 }
 
-/// [`fatal_line`] plus a `       remedy: <r>` continuation when the event
-/// carries one.
+/// `fatal_line` plus a `       remedy: <r>` continuation when the event carries
+/// one, at `fail_row`'s own indent.
 ///
-/// **Sabrage-only** (declared in `sabrage/PARITY.md`, "CLI"): `lib.sh`'s `die`
-/// has no remedy slot, so there is no shell text this can diverge from. It
-/// exists because two `Fatal`s are emitted by [`sabrage_core::privilege`]
-/// rather than by a `die`-shaped call site — the App Management refusal and
-/// the declined authorization dialog — and both put the only actionable
-/// instruction the user gets (the `x-apple.systempreferences:` deep link, the
-/// relaunch requirement) in `remedy`. Dropping it left CLI users with a
-/// diagnosis and no fix, while the GUI got both over the channel. The
-/// indent is `fail_row`'s, so a remedy reads identically wherever it appears.
+/// Sabrage-only: `lib.sh`'s `die` has no remedy slot, so this adds text where the
+/// shell prints none — PARITY.md § CLI / GUI, "A `FATAL` row may be followed by".
+/// Two `Fatal`s come from [`sabrage_core::privilege`] rather than a `die`-shaped
+/// call site and carry their only actionable instruction in `remedy`.
 fn fatal_lines(message: &str, remedy: Option<&str>, colors: bool) -> Vec<String> {
     let mut lines = vec![fatal_line(message, colors)];
     if let Some(remedy) = remedy {
@@ -511,18 +441,15 @@ fn fatal_lines(message: &str, remedy: Option<&str>, colors: bool) -> Vec<String>
     lines
 }
 
-/// doctor.sh's footer:
+/// doctor.sh's footer line: `doctor: all checks passed — ./demo.sh run --bottle
+/// <label>` when `fail_count` is 0, else `doctor: <n> check(s) failed — remedies
+/// above`.
 ///
-/// ```zsh
-/// print ""
-/// if [ "$FAILCOUNT" -eq 0 ]; then print -r -- "doctor: ${_G}all checks passed${_N} — ./demo.sh run --bottle $WINEVR_BOTTLE"
-/// else print -r -- "doctor: ${_R}$FAILCOUNT check(s) failed${_N} — remedies above"; fi
-/// ```
-///
-/// The caller prints the blank line separately (`println!()`); this returns
-/// just the message line. `fail_count` here is the *uncapped* tally — the 255
-/// cap in [`sabrage_core::checks::DoctorReport::exit_code`] is a CLI exit-code
-/// concern, not a display one.
+/// The caller prints the preceding blank line itself. `fail_count` is the
+/// *uncapped* tally; the 255 cap in
+/// [`sabrage_core::checks::DoctorReport::exit_code`] is an exit-code concern, not
+/// a display one. Pinned by
+/// tests::footer_matches_doctor_sh_verbatim_both_branches.
 fn format_footer(fail_count: usize, bottle_label: &str, colors: bool) -> String {
     if fail_count == 0 {
         format!(
@@ -538,13 +465,13 @@ fn format_footer(fail_count: usize, bottle_label: &str, colors: bool) -> String 
 }
 
 /// The blank-line-prefixed "next:" banner each stage script ends with on
-/// success — verbatim from `scripts/demo/{setup,build,install}.sh`'s closing
-/// `print "\n... complete — next: ..."` line (`stop.sh` has none: `None`).
-/// `bottle_label` is only used by `install`'s line, and only once `install`
-/// has actually succeeded — by which point `require_bottle` has already
-/// guaranteed a real bottle name, never the `<name>` placeholder. `build`'s
-/// line quotes the literal placeholder too — build.sh's own text does, since
-/// `build` never resolves a bottle at all.
+/// success, verbatim from `scripts/demo/{setup,build,install}.sh`'s closing
+/// `print` line; `None` for `stop` and `run`, which print none.
+///
+/// `bottle_label` is used only by `install`'s line, by which point
+/// `require_bottle` has guaranteed a real name; `build`'s line quotes the literal
+/// `<name>` placeholder because build.sh's own text does. Pinned by
+/// tests::closing_line_matches_each_stage_script_verbatim.
 fn closing_line(stage: Stage, bottle_label: &str) -> Option<String> {
     match stage {
         Stage::Setup => Some("\nsetup complete — next: ./demo.sh build".to_string()),
@@ -568,24 +495,22 @@ fn label(text: &str, color: &str, colors: bool) -> String {
 
 /// Per-stream color eligibility: `isatty(<stream>) && !NO_COLOR`.
 ///
-/// Finding A14-5: a stage's `Fatal` row goes to stderr, but coloring it was
-/// gated on *stdout*'s terminal-ness alone — with stdout attached to a
-/// terminal and stderr redirected to a file, ANSI escapes leaked into the
-/// error file; with stdout piped and stderr on a terminal, `Fatal` lost
-/// color it should have had. Each stream now gets its own `is_terminal()`
-/// read, both still short-circuited by `NO_COLOR` (the one deliberate
-/// divergence from `lib.sh`, which emits its `$'\e[32m'`-style codes
-/// unconditionally — native output is more likely to be piped/captured, by
-/// the GUI or a `--tap` consumer, so it earns the gate the shell script
-/// never needed).
+/// Each stream gets its own `is_terminal()` read (A14-5), because a stage's
+/// `Fatal` row goes to stderr while every other row goes to stdout and the two
+/// are redirected independently. The gate itself is the deliberate divergence
+/// from `lib.sh`, which emits its ANSI codes unconditionally — PARITY.md
+/// § Doctor / checks, "Console colors gated on isatty". Pinned by
+/// tests::{colors_from_gates_each_stream_on_its_own_tty_unless_no_color,
+/// fatal_uses_stderr_colors_while_a_line_event_uses_stdout_colors}.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 struct Colors {
     stdout: bool,
     stderr: bool,
-    /// Raw `isatty()`, independent of `NO_COLOR` — A14-3 needs this to decide
-    /// whether a `\r`-terminated [`StageEvent::Output`] chunk repaints the
-    /// terminal line or falls back to newline-per-chunk (a non-tty consumer,
-    /// e.g. a log file or `--tap` pipe, has no "current line" to repaint).
+    /// Raw `isatty()`, independent of `NO_COLOR`: A14-3 decides from this whether
+    /// a `\r`-terminated [`StageEvent::Output`] chunk repaints the terminal line
+    /// or falls back to newline-per-chunk (a non-tty consumer — a log file, a
+    /// `--tap` pipe — has no "current line" to repaint). Pinned by
+    /// tests::cr_chunk_repaints_only_on_a_real_terminal.
     stdout_tty: bool,
     stderr_tty: bool,
 }
@@ -625,8 +550,6 @@ fn use_colors() -> Colors {
         std::io::stderr().is_terminal(),
     )
 }
-
-// ── `sabrage setup|build|install|stop` ──────────────────────────────────────
 
 /// Parsed arguments for the four stage commands.
 ///
@@ -681,18 +604,13 @@ fn parse_stage_args(args: &[String]) -> Result<StageArgs, String> {
     })
 }
 
-/// One line [`stage_event_lines`] wants printed, tagged with the stream it
+/// One line `stage_event_lines` wants printed, tagged with the stream it
 /// belongs on.
 ///
-/// A plain value type purely so "this event prints nothing" — [`Check`],
-/// [`Launched`], [`AutoFixed`], [`Progress`] — is something a test can assert
-/// on directly (`stage_event_lines(...) == vec![]`) instead of a `println!`
-/// side effect it would otherwise have to intercept.
-///
-/// [`Check`]: StageEvent::Check
-/// [`Launched`]: StageEvent::Launched
-/// [`AutoFixed`]: StageEvent::AutoFixed
-/// [`Progress`]: StageEvent::Progress
+/// A plain value type rather than a `println!` side effect, so "this event prints
+/// nothing" — [`StageEvent::Check`], [`StageEvent::Launched`],
+/// [`StageEvent::AutoFixed`], [`StageEvent::Progress`] — is directly assertable
+/// (tests::structured_only_events_render_no_console_line).
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RenderedLine {
     Stdout(String),
@@ -737,11 +655,9 @@ fn stage_event_lines(
             if quiet {
                 vec![]
             } else {
-                // A bare `\r` (a progress-bar repaint) only gets the
-                // no-newline treatment when the destination is a real
-                // terminal; a non-tty consumer (redirected to a file, piped,
-                // or `--tap`) has no "current line" to overwrite, so it keeps
-                // today's one-newline-per-chunk behavior — same as `Lf`/`Eof`.
+                // A `\r` repaint only skips the newline on a real terminal — a
+                // non-tty consumer has no current line to overwrite, so it keeps
+                // one newline per chunk (tests::cr_chunk_repaints_only_on_a_real_terminal).
                 let repaint = matches!(end, sabrage_core::process::ChunkEnd::Cr)
                     && match stream {
                         Stream::Stdout => colors.stdout_tty,
@@ -758,10 +674,9 @@ fn stage_event_lines(
         // Nothing extra: ninja's "[n/m]" and curl's progress bar already
         // arrive as `Output` chunks straight from the child.
         StageEvent::Progress { .. } => vec![],
-        // Every fix already emits its own shell-verbatim `ok`/`warn` row (a
-        // `Line`) onto this same sink — printing this too would double the
-        // row on the console. `AutoFixed` stays a structured signal the GUI
-        // renders (which fix ran); the console has nothing to add.
+        // Every fix already emits its own shell-verbatim `ok`/`warn` row onto
+        // this sink; `AutoFixed` is a structured signal for the GUI, so printing
+        // it here would double the console row.
         StageEvent::AutoFixed { .. } => vec![],
         StageEvent::NeedsAdmin { reason, .. } => vec![RenderedLine::Stdout(info_row(reason))],
         // A raw `print -r --` line: verbatim, no marker, no indent of our
@@ -816,27 +731,19 @@ fn render_stage_event(ev: &StageEvent, bottle_label: &str, colors: Colors, quiet
 
 /// Merge parsed CLI flags onto the env-derived base — `WINEVR_*` is the base,
 /// flags override, exactly [`StageOptions::from_env`]'s own precedence rule
-/// (`demo.sh` exporting over whatever the caller's shell already had set)
-/// applied to all six flags in one place. `--dry-run` has no env counterpart,
-/// so `parsed.dry_run` wins outright rather than only-if-true.
+/// applied to all six flags in one place. `--dry-run` has no env counterpart, so
+/// `parsed.dry_run` wins outright rather than only-if-true.
 ///
-/// Factored out of [`cmd_stage`]/[`cmd_all`] so the forwarding of
-/// `--wired`/`--no-audio`/`--no-dashboard` — parsed since Phase 2 for
-/// grammar parity, but silently dropped on the floor until now because
-/// `StageOptions` carried no field for them — is directly testable without
-/// resolving a repo root or building a [`StageCtx`].
+/// Separate from `cmd_stage`/`cmd_all` so the forwarding is testable without
+/// a repo root or a [`StageCtx`]: pinned by
+/// tests::{merge_stage_options_forwards_all_six_flags_onto_the_env_base,
+/// merge_stage_options_env_base_survives_when_no_flag_overrides_it}.
 fn merge_stage_options(env_opts: StageOptions, parsed: &StageArgs) -> StageOptions {
     let mut opts = env_opts;
     if let Some(b) = &parsed.bottle {
-        // Finding A14-1: an explicit `--bottle ""` (a wrapper that always
-        // interpolates the flag, even when its own variable is unset) must
-        // NOT survive as `Some("")` — that resolves to a different
-        // missing-bottle path than "no override at all". `demo.sh` never
-        // sees this ambiguity: `export WINEVR_BOTTLE=""` then `[ -n
-        // "${WINEVR_BOTTLE:-}" ]` (lib.sh) is false, so the shell treats an
-        // empty export exactly like an unset one. Mirror that here: an empty
-        // CLI value clears whatever `StageOptions::from_env` already put in
-        // `bottle_name`, rather than overriding it with an empty string.
+        // A14-1: an explicit `--bottle ""` must clear the env-derived value, never
+        // survive as `Some("")` — `demo.sh` treats an empty export as unset. Pinned
+        // by tests::merge_stage_options_empty_cli_values_clear_a_preset_env_base.
         opts.bottle_name = (!b.is_empty()).then(|| b.clone());
     }
     if let Some(d) = &parsed.bs_dir {
@@ -860,21 +767,16 @@ fn merge_stage_options(env_opts: StageOptions, parsed: &StageArgs) -> StageOptio
     opts
 }
 
-/// Run one stage and return the process exit code (never calls `exit` itself,
-/// so `main` stays the only place that does).
+/// Run one stage and return the process exit code (never calls `exit` itself, so
+/// `main` stays the only place that does).
 ///
-/// `setup`/`build`/`install`/`stop`'s bodies are real as of Phase 2, and
-/// [`Stage::Run`]'s (`sabrage_core::stages::run::run`) is real as of Phase 3
-/// — it actually launches wine and the game. That makes all five stage
-/// bodies equally off-limits for this file's unit tests (this task's hard
-/// rules: no launching the game, no touching the machine), so `cmd_stage`'s
-/// tests may drive `cmd_stage(Stage::Run, …)` (and the other four stages)
-/// end-to-end **only** up to the point this function resolves a repo root
-/// and builds a [`StageCtx`]: an argument error, a `resolve_repo_root`
-/// failure, or a `Paths::new_checked` failure (an unusable `HOME`) returns
-/// before any of that and is exercised directly; anything past that boundary
-/// is exercised through the pure helpers instead ([`merge_stage_options`],
-/// [`stage_event_lines`], [`report_stage_result`]).
+/// All five stage bodies really touch the machine — [`Stage::Run`] launches wine
+/// and the game — so this function is driven end-to-end only up to the point it
+/// resolves a repo root and builds a [`StageCtx`]: an argument error, a
+/// `resolve_repo_root` failure, or a `Paths::new_checked` failure returns before
+/// any of that (tests::run_stage_rejects_a_bad_argument_before_touching_anything).
+/// Everything past that boundary is covered through the pure helpers
+/// (`merge_stage_options`, `stage_event_lines`, `report_stage_result`).
 async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     let parsed = match parse_stage_args(args) {
         Ok(p) => p,
@@ -892,13 +794,9 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
         }
     };
 
-    // Cross-area packet (from A2-8): `setup`/`build`/`install`/`run`/`stop`
-    // all write under `~/Library/Application Support/{OXRSys,Sabrage}` —
-    // an unset, empty, or relative `HOME` must fail closed here, before any
-    // of that, rather than silently redirecting those writes under the
-    // process's working directory (empty `HOME`) or a root-owned path
-    // (unset `HOME`'s `/` fallback, `Paths::new`'s own doc comment). Doctor
-    // keeps `Paths::new` — it only ever reads/probes, never writes.
+    // A2-8: every stage writes under `~/Library/Application Support`, so an unset,
+    // empty, or relative `HOME` fails closed here rather than silently redirecting
+    // those writes (sabrage_core::paths::tests::home_is_required_to_be_absolute_and_non_empty).
     let paths = match Paths::new_checked(&repo_root) {
         Ok(p) => p,
         Err(e) => {
@@ -929,15 +827,10 @@ async fn cmd_stage(stage: Stage, args: &[String]) -> i32 {
     let is_dry_run = ctx.executor.is_dry_run();
     let result = run_stage(stage, &ctx).await;
 
-    // Finding #13: `DryRunExecutor::planned()` recorded a real plan from
-    // Phase 2 onward, but nothing ever printed it — `--dry-run`'s own
-    // `--help` text ("plan the stage's writes/spawns without touching
-    // anything") was a promise the console renderer never kept. Trailing,
-    // after every narrative row a real run would also have printed (this
-    // stays keyed on the executor, `ctx.executor.is_dry_run()`, not the raw
-    // `--dry-run` flag — the same source-of-truth precedent `is_dry_run()`
-    // callers elsewhere in this crate already follow), so a non-dry run's
-    // output is untouched byte-for-byte.
+    // The dry-run plan prints trailing, after every narrative row a real run would
+    // also print, and is keyed on the executor (`is_dry_run()`) rather than the raw
+    // `--dry-run` flag, so a non-dry run's output is untouched byte-for-byte
+    // (finding #13; PARITY.md § CLI / GUI, "A dry run ends with a trailing").
     if is_dry_run {
         for line in render_dry_run_plan(&ctx.executor.planned()) {
             println!("{line}");
@@ -956,16 +849,9 @@ fn report_stage_result(result: std::result::Result<StageOutcome, SabrageError>) 
     match result {
         Ok(outcome) => outcome.exit_code_equiv,
         Err(e) => {
-            // Every error whose *condition* already emitted a `Fatal` event
-            // is suppressed here — otherwise the user reads the FATAL row and
-            // then a second, differently-worded line for the same thing.
-            // That is not only `SabrageError::Fatal`: `upgrade_write_error`
-            // emits the App Management `Fatal` and returns `TccDenied`, and
-            // `elevate_osascript` does the same before returning
-            // `AdminDeclined` (both documented as "the caller must propagate,
-            // not re-emit"). Every remaining variant has no shell equivalent
-            // to reproduce and would otherwise vanish silently — design-core
-            // §6.6, "no swallowed diagnostics".
+            // Suppressed for every error whose condition already emitted a
+            // `Fatal` (see `error_already_reported_as_fatal`); every remaining
+            // variant has no shell equivalent and would otherwise vanish.
             if !error_already_reported_as_fatal(&e) {
                 eprintln!("error: {e}");
                 for line in e.tail() {
@@ -977,44 +863,27 @@ fn report_stage_result(result: std::result::Result<StageOutcome, SabrageError>) 
     }
 }
 
-/// True when this error's condition already emitted a [`StageEvent::Fatal`],
-/// so printing `error: {e}` after it would double-report one failure.
+/// True when this error's condition already emitted a [`StageEvent::Fatal`], so
+/// printing `error: {e}` after it would double-report one failure.
 ///
-/// [`SabrageError::Fatal`] is the `die`-shaped case (emitted by
-/// [`sabrage_core::StageCtx::fatal`] itself). The other two are
-/// [`sabrage_core::privilege`]'s: `upgrade_write_error` emits the App
-/// Management explanation and returns `TccDenied`; `elevate_osascript` emits
-/// the declined-authorization row and returns `AdminDeclined`. Both document
-/// that the caller must propagate rather than re-emit — which makes them
-/// exactly as "already reported" as a `Fatal`, and the reason this is a
-/// predicate over the condition instead of a single-variant `matches!`.
-///
-/// [`SabrageError::Cancelled`] is here for a different reason: it is the
-/// user's own Ctrl-C (or `kill`). The run stage already printed run.sh's
-/// `-- interrupted: stopping wine` section on that path, a build stage's
-/// child simply stops, and `demo.sh` itself prints nothing after its
-/// INT/TERM trap re-raises the signal — a trailing `error: cancelled` would be
-/// the one line the shell never shows. Exit 130 remains the signal.
-///
-/// A thin CLI-flavored name over [`SabrageError::already_reported`], which
-/// carries the actual rule (and its own test) once for both front-ends — the
-/// GUI needs the identical predicate to decide whether a failure banner would
-/// double up the `Fatal` row already in its run log.
+/// A CLI-flavored name over [`SabrageError::already_reported`], which carries the
+/// rule once for both front-ends (the GUI needs the identical predicate to decide
+/// whether a failure banner would double the `Fatal` already in its run log) —
+/// see sabrage_core::error::tests::already_reported_covers_the_variants_that_emit_their_own_row
+/// and PARITY.md § CLI / GUI, "`error: <e>` is suppressed for every error".
 fn error_already_reported_as_fatal(e: &SabrageError) -> bool {
     e.already_reported()
 }
 
-/// The trailing "-- plan (dry run)" section's lines: the section header (same
-/// `"-- <title>"` shape [`StageEvent::Section`] renders), then one line per
-/// recorded [`PlannedAction`], each indented like an `info` row.
+/// The trailing "-- plan (dry run)" section's lines: the section header in
+/// [`StageEvent::Section`]'s own `"-- <title>"` shape, then one `info`-indented
+/// line per recorded [`PlannedAction`].
 ///
-/// The title and the body come from `sabrage-core`
-/// ([`sabrage_core::DRY_RUN_PLAN_TITLE`], [`sabrage_core::dry_run_plan_body`]),
-/// not from string literals here: the GUI renders the same plan as a section
-/// plus `info` rows in its run log, and the two front-ends must say the same
-/// thing word for word. This function is only the CLI's console *shape* around
-/// that shared text — kept separate from the `println!`s at its one call site
-/// so tests can assert on it without capturing stdout.
+/// Title and body come from [`sabrage_core::DRY_RUN_PLAN_TITLE`] /
+/// [`sabrage_core::dry_run_plan_body`], never from literals here, so the CLI and
+/// the GUI cannot word the same plan differently — PARITY.md § CLI / GUI, "A dry
+/// run ends with a trailing". Pinned by
+/// tests::dry_run_plan_has_a_header_then_one_line_per_action_in_order.
 fn render_dry_run_plan(plan: &[PlannedAction]) -> Vec<String> {
     let mut lines = vec![format!("-- {}", sabrage_core::DRY_RUN_PLAN_TITLE)];
     lines.extend(
@@ -1025,33 +894,21 @@ fn render_dry_run_plan(plan: &[PlannedAction]) -> Vec<String> {
     lines
 }
 
-// ── `sabrage all` ────────────────────────────────────────────────────────────
-//
-// `demo.sh`'s `all)` case is a caller-level loop that re-execs itself once per
-// stage (`for stage in setup build install run; do … "$ROOT/demo.sh" "$stage"
-// || exit $?; done`), after one `require_bottle` up front "to fail fast before
-// the expensive fetch/build stages". `Stage` deliberately has no `All` member
-// (see its own doc comment) — this is that same loop, native-side, over
-// [`Stage::ALL_CHAIN`].
-//
-// One divergence, declared here for `sabrage/PARITY.md`: `demo.sh` prints
-// `"\n##### demo.sh: $stage #####"` before re-exec'ing each stage; `sabrage
-// all` does not reproduce that separator, because every stage already
-// announces itself on the same sink via its own `StageStarted` banner
-// (`"== wine-vr demo <stage> =="`, rendered by `stage_event_lines` exactly as
-// it is for a standalone `sabrage <stage>`) — printing both would say which
-// stage is starting twice.
+// `sabrage all` is `demo.sh`'s `all)` loop, native-side: one `require_bottle` up
+// front so it fails before the expensive fetch/build stages, then
+// `Stage::ALL_CHAIN` in order (`Stage` deliberately has no `All` member — see its
+// own doc). Divergences, including the dropped `##### demo.sh: <stage> #####`
+// separator each stage's own `StageStarted` banner already covers:
+// PARITY.md § Run (launch), "`sabrage all` chains".
 
-/// Run `stages` in order via `run_one`, stopping at the first stage whose
-/// exit code is non-zero and returning that code (or `0` once every stage in
-/// `stages` has exited `0`) — `demo.sh`'s own `|| exit $?`.
+/// Run `stages` in order via `run_one`, stopping at the first stage whose exit
+/// code is non-zero and returning that code, else `0` — `demo.sh`'s own
+/// `|| exit $?`.
 ///
-/// Factored out of [`run_all`] so a test can substitute a fake `run_one` and
-/// assert "stops at the first failure" without going anywhere near
-/// [`run_stage`]: every one of `Stage::Setup`/`Build`/`Install`/`Run`'s
-/// bodies really does touch the machine (`Run` launches wine and the game),
-/// and none of them is something a unit test may invoke (this task's hard
-/// rules).
+/// `run_one` is a parameter so a test can substitute a fake and assert the
+/// stop-at-first-failure rule without invoking a real stage body
+/// (tests::{run_chain_stops_at_the_first_nonzero_exit_code,
+/// run_chain_runs_every_stage_when_all_of_them_succeed}).
 async fn run_chain<F, Fut>(stages: &[Stage], mut run_one: F) -> i32
 where
     F: FnMut(Stage) -> Fut,
@@ -1066,26 +923,22 @@ where
     0
 }
 
-/// The core of `all`, split from [`cmd_all`] so it can be driven with a
-/// caller-built `paths`/`opts` pair — never [`StageOptions::from_env`] —
-/// which is what makes this deterministic in a test regardless of the *real*
-/// `WINEVR_BOTTLE`/CrossOver state on whatever machine runs this suite (hard
-/// rule: a test must never depend on, let alone mutate, real machine state).
+/// The core of `all`: requires a bottle up front via [`require_bottle`] (lib.sh's
+/// own die text), then chains [`Stage::ALL_CHAIN`] through [`run_stage`] via
+/// `run_chain`.
 ///
-/// Requires a bottle up front via [`require_bottle`] — lib.sh's own die text,
-/// through the exact `StageCtx`-shaped path that function expects — then
-/// chains [`Stage::ALL_CHAIN`] through [`run_stage`] via [`run_chain`],
-/// building a **fresh** [`StageCtx`] per stage (fresh `run_id`, fresh
-/// executor — [`StageCtx::new`] mints both) but the same `paths`/`opts`/
-/// `sink`, and one cancellation token shared across every stage so a single
-/// Ctrl-C reaches whichever stage is currently running. `--dry-run` applies
-/// uniformly because every per-stage `StageCtx` inherits `opts.dry_run`, each
-/// printing its own trailing dry-run plan exactly as a standalone
-/// `sabrage <stage> --dry-run` would.
+/// Each stage gets a **fresh** [`StageCtx`] — fresh `run_id`, fresh executor —
+/// over the same `paths`/`opts`/`sink`, plus one cancellation token shared across
+/// every stage so a single Ctrl-C reaches whichever stage is running. `--dry-run`
+/// applies uniformly because every per-stage context inherits `opts.dry_run` and
+/// prints its own trailing plan. Taking `paths`/`opts` as arguments — never
+/// [`StageOptions::from_env`] — is what keeps
+/// tests::run_all_requires_a_bottle_before_touching_run_stage independent of the
+/// real machine's `WINEVR_BOTTLE`.
 async fn run_all(paths: &Paths, opts: &StageOptions, sink: &EventSink) -> i32 {
-    // Doubles as the source of the `CancellationToken` every per-stage
-    // `StageCtx` below shares — `StageCtx`'s own field, so this file never has
-    // to name the type (see the Ctrl-C section's comment on that).
+    // Doubles as the source of the `CancellationToken` every per-stage `StageCtx`
+    // below shares — reached through `StageCtx`'s own field, so this file never
+    // names `tokio_util`'s type.
     let precheck = StageCtx::new(
         paths.clone(),
         opts.clone(),
@@ -1139,9 +992,9 @@ async fn cmd_all(args: &[String]) -> i32 {
         }
     };
 
-    // See `cmd_stage`'s matching check: `all` chains setup/build/install/run,
-    // every one of which writes into the user store, so it fails closed on
-    // an unusable `HOME` the same way, before any of those stages run.
+    // `all` chains setup/build/install/run, all of which write into the user
+    // store, so it fails closed on an unusable `HOME` the same way `cmd_stage`
+    // does (sabrage_core::paths::tests::home_is_required_to_be_absolute_and_non_empty).
     let paths = match Paths::new_checked(&repo_root) {
         Ok(p) => p,
         Err(e) => {
@@ -1164,85 +1017,30 @@ async fn cmd_all(args: &[String]) -> i32 {
     run_all(&paths, &opts, &sink).await
 }
 
-// ── Ctrl-C / SIGTERM handling ─────────────────────────────────────────────
+// Ctrl-C / SIGTERM
 //
-// `tokio::signal::ctrl_c()` needs the `signal` feature; sabrage-cli's `tokio`
-// dependency only has `rt-multi-thread`/`macros` (see `Cargo.toml`'s own
-// comment), and this crate may not edit Cargo manifests (Frame-owned — see
-// this task's hard rules). A raw signal trap plus a polling `std::thread`
-// needs neither: every Rust binary already links the C runtime that provides
-// `signal(2)`, and each handler does the one thing that is
-// async-signal-safe here — two relaxed atomic stores — leaving the actual
-// cancellation (`sabrage_core`'s `CancellationToken::cancel()`, which is what
-// makes `process::spawn_streamed`'s `killpg(SIGTERM)`→`SIGKILL` escalation
-// fire for a running cmake/ninja/curl child) to a plain OS thread.
+// A raw `signal(2)` trap plus a polling `std::thread`, not `tokio::signal`:
+// sabrage-cli's tokio carries only `rt-multi-thread`/`macros` (see its
+// Cargo.toml). Each handler does only async-signal-safe work — one relaxed store
+// (`LAST_SIGNAL`) and one relaxed `fetch_add` (`SIGNAL_COUNT`) — leaving the
+// cancellation itself to the thread. `watch_termination_signals`/`watch_flag`
+// take a plain `FnOnce` so this file never has to name `tokio_util`'s
+// `CancellationToken`.
 //
-// `watch_termination_signals`/`watch_flag` are generic over a plain `FnOnce`
-// callback rather than over the cancellation type itself, so this file never
-// has to name `tokio_util::sync::CancellationToken` — sabrage-cli has no
-// direct dependency on `tokio-util` (only `sabrage-core` does; see its
-// Cargo.toml). `cmd_stage`/`run_all` supply it pre-captured in a closure
-// instead.
+// SIGINT and SIGTERM share one counter and one state machine, matching run.sh's
+// identical `INT`/`TERM` traps: the first delivery of either cancels, and every
+// later one — of either kind — restores `SIG_DFL` for both and re-raises whichever
+// signal actually arrived, so the kernel picks the exit code (130 or 143) instead
+// of this file. A *completed* cancellation always exits 130 whichever signal
+// started it: PARITY.md § CLI / GUI, "SIGTERM is trapped like SIGINT". Pinned by
+// tests::{watcher_keeps_polling_past_the_first_fire_so_a_second_signal_is_reachable,
+// two_signals_inside_one_poll_interval_are_not_collapsed_into_one,
+// a_second_signal_of_a_different_kind_is_still_fatal_and_reraises_that_kind}.
 //
-// `demo.sh`'s `run.sh` traps *both* `INT` and `TERM` (lines 180-181) with the
-// same teardown body — stop wine, close the dashboard, reap the encoder
-// helper, restore audio — so `kill <pid>` on a running `./demo.sh run` takes
-// the identical path a Ctrl-C does. `sabrage run` matches that: `SIGINT` and
-// `SIGTERM` share one state machine here, not two independent ones, so
-// either kind reaches the same cancellation.
-//
-// The watcher must not go one-shot after the first signal: a second signal —
-// of *either* kind — has to be able to kill the process even while the first
-// one's cancellation is still winding down a child (or during a phase with
-// no child at all, e.g. `stop`'s non-executor code paths) — the same
-// "impatient user, no more Mr. Nice trap" escape hatch a `./demo.sh`
-// invocation gets for free from the shell's own default disposition. So the
-// loop keeps running past the first fire: the first delivery of either
-// SIGINT or SIGTERM runs `on_signal` once (unchanged), every later one of
-// *either* kind restores `SIG_DFL` for *both* signals and re-raises
-// whichever one was actually received, so the *kernel's* default action
-// (terminate) applies — the process dies "killed by SIGINT" (exit 130) or
-// "killed by SIGTERM" (exit 143) depending on what the second delivery was,
-// rather than us picking either number by hand. The handler counts
-// deliveries rather than setting a flag, so two signals arriving inside one
-// poll interval still read as two.
-//
-// # A second signal of a *different* kind is still fatal
-//
-// `SIGINT` and `SIGTERM` increment the *same* `SIGNAL_COUNT` — there is no
-// separate "SIGINT slot" and "SIGTERM slot" for the watcher to fall behind on
-// independently. A `SIGINT` first, `SIGTERM` second (or the reverse) is
-// exactly as fatal as two of the same kind: the first of either cancels, the
-// second of either — regardless of which one arrived first — restores both
-// dispositions and re-raises itself. `LAST_SIGNAL` records which signal
-// number the *most recent* delivery was, written by each handler immediately
-// before it bumps the shared counter, so the fatal action re-raises the one
-// the user actually just sent rather than always SIGINT.
-//
-// # A signal during `run` (and `all`, while its chain is on `Run`)
-//
-// The first signal — SIGINT or SIGTERM — cancels the token `cmd_stage`/
-// `run_all` handed to the stage's `StageCtx`, which is `run`'s own
-// cancellation path: it stops wine, restores audio, and returns
-// `Err(SabrageError::Cancelled)` — `report_stage_result` maps that to exit
-// 130 through the ordinary error tail (`sabrage_core::error`'s
-// `exit_code()`), **regardless of which signal triggered the cancellation**.
-// That is a declared divergence from `demo.sh`: `run.sh`'s own TERM trap
-// re-raises TERM after its teardown and so exits 143 on a TERM-initiated
-// shutdown, while `sabrage run` collapses both signals onto the same
-// "cancelled" outcome and always exits 130 for a *completed* cancellation —
-// the signal's identity only survives long enough to pick the exit code of
-// an *impatient* second signal (see `sabrage/PARITY.md`). A second signal
-// does **not** wait for that teardown to finish: per the state machine above
-// it restores `SIG_DFL` for both signals and re-raises whichever one just
-// arrived, so `sabrage` itself dies immediately. Because the wine child is
-// spawned *detached* — its own process group, never `kill_on_drop(true)` —
-// an impatient double-tap during `run` leaves wine (and the game) running
-// unsupervised: the audio device may still be routed to BlackHole, the ALVR
-// dashboard may still be open, and `session-state.json` still describes
-// both. Nothing left in this process can finish that teardown once the
-// second signal lands — the next `sabrage run` or `sabrage stop` for that
-// bottle is what reconciles the guards (`sabrage_core::session::reconcile`).
+// Landmine: a second signal skips teardown and wine is spawned detached, so an
+// impatient double-tap leaves the game, audio and dashboard up until the next
+// `sabrage run`/`stop` reconciles (PARITY.md § Run (launch), "The wine child is
+// spawned in its"; `sabrage_core::session::reconcile`).
 
 /// Poll interval for the signal watcher thread — frequent enough that a
 /// human doesn't perceive the delay, infrequent enough to cost nothing idle.
@@ -1252,20 +1050,16 @@ const CTRL_C_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SIGINT: i32 = 2;
 
 /// `SIGTERM`'s signal number — 15 on every platform this ships to (macOS).
-/// `run.sh`'s line 181 traps this one too, with the same teardown as its
-/// `INT` trap — see the module doc above.
+/// `run.sh` traps it with the same teardown as its `INT` trap.
 const SIGTERM: i32 = 15;
 
 /// How many `SIGINT`/`SIGTERM` deliveries the handlers have seen, combined.
-/// A **count**, not a flag: two signals delivered inside one
-/// [`CTRL_C_POLL_INTERVAL`] (a fast double-tap, or the `kill` pair an
-/// automated test sends) collapsed into a single observation under a
-/// `swap(false, ..)`'d `AtomicBool`, so the second signal was silently lost
-/// and the process stayed in its "cancelling" state — the one gap left in "a
-/// second signal is always fatal". `fetch_add` on an `AtomicUsize` is as
-/// async-signal-safe as the store it replaces. Shared by both signals on
-/// purpose (see the module doc's "second signal of a different kind" note):
-/// there is one state machine here, not two.
+///
+/// A **count**, not a flag: two deliveries inside one `CTRL_C_POLL_INTERVAL`
+/// must still read as two, or the second is lost and the process stays merely
+/// "cancelling" (tests::two_signals_inside_one_poll_interval_are_not_collapsed_into_one).
+/// `fetch_add` on an `AtomicUsize` is as async-signal-safe as a plain store. Both
+/// signals share it on purpose: one state machine here, not two.
 static SIGNAL_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// Which of `SIGINT`/`SIGTERM` the *most recent* delivery was — read only by
@@ -1319,15 +1113,14 @@ fn watch_termination_signals(on_signal: impl FnOnce() + Send + 'static) {
 }
 
 /// Restore both `SIGINT`'s and `SIGTERM`'s default disposition and re-raise
-/// whichever one was actually received (`LAST_SIGNAL`), so the kernel's own
-/// default action (terminate) applies and the process dies under the
-/// signal's own name — "killed by SIGTERM" (exit 143) for a second `kill
-/// <pid>`, "killed by SIGINT" (exit 130) for a second Ctrl-C/`kill -INT` —
-/// rather than us picking either number by hand. This is the real production
-/// second-signal action (both traps installed by [`watch_termination_signals`]
-/// share it); tests exercise [`watch_flag_with_second_action`] with a fake in
-/// its place, since a real second SIGINT/SIGTERM during a test run would
-/// otherwise kill the test binary.
+/// whichever one was actually received (`LAST_SIGNAL`), so the process dies
+/// under that signal's own name — exit 143 for a second `kill <pid>`, 130 for a
+/// second Ctrl-C — rather than this file picking a number.
+///
+/// The production second-signal action both traps share; tests drive
+/// `watch_flag_with_second_action` with a fake instead, since a real second
+/// signal would kill the test binary
+/// (tests::a_second_signal_of_a_different_kind_is_still_fatal_and_reraises_that_kind).
 fn terminate_via_default_disposition_of_last_signal() {
     unsafe {
         signal(SIGINT, SIG_DFL);
@@ -1348,19 +1141,16 @@ fn watch_flag(counter: &'static AtomicUsize, on_signal: impl FnOnce() + Send + '
     );
 }
 
-/// `watch_flag`'s full generality: keeps polling `counter` for as long as the
-/// process runs, calling `on_first_signal` (once) the first time it observes a
-/// delivery, and `on_second_signal` on any delivery after that — so a caller
-/// who never Ctrl-C's twice never runs the second action, and one who does
-/// gets a live watcher for it rather than a one-shot that went quiet after the
-/// first fire (the bug this replaces: `on_signal` used to `return` right after
-/// firing, leaving nobody reading the flag for any later SIGINT).
+/// `watch_flag`'s full generality: polls `counter` for as long as the process
+/// runs, calling `on_first_signal` once on the first delivery it observes and
+/// `on_second_signal` on any delivery after that, then returning.
 ///
-/// It reads a monotone **count** and remembers how much of it it has already
-/// consumed, rather than swapping a flag back to `false`: a burst delivered
-/// inside one [`CTRL_C_POLL_INTERVAL`] is one observation but two deliveries,
-/// and a flag cannot tell those apart — so a fast double-tap used to leave the
-/// process merely "cancelling" instead of dead.
+/// It reads a monotone **count** and remembers how much of it it has consumed
+/// rather than swapping a flag back to `false`: a burst delivered inside one
+/// `CTRL_C_POLL_INTERVAL` is one observation but two deliveries, and a flag
+/// cannot tell those apart. Pinned by
+/// tests::{watcher_keeps_polling_past_the_first_fire_so_a_second_signal_is_reachable,
+/// two_signals_inside_one_poll_interval_are_not_collapsed_into_one}.
 fn watch_flag_with_second_action(
     counter: &'static AtomicUsize,
     on_first_signal: impl FnOnce() + Send + 'static,
@@ -1393,8 +1183,6 @@ mod tests {
     // plain flag for "did this callback fire".
     use std::sync::atomic::AtomicBool;
     use std::sync::Mutex as StdMutex;
-
-    // ── doctor arg parsing ───────────────────────────────────────────────────
 
     fn args(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
@@ -1470,13 +1258,11 @@ mod tests {
         }
     }
 
-    // ── A14-4: flags before the command ──────────────────────────────────────
-
-    // demo.sh's `CMD="${1:-}"; shift` consumes the first token unconditionally,
-    // so the flag loop only ever sees the tail: `--bottle Steam run` reports
-    // `Steam` and never routes through `--bottle`'s "needs a name" branch. An
-    // `Ok(())` means the shell would have fallen through to its unknown-`CMD`
-    // `case` arm, whose text the caller's `_` arm prints — not this helper.
+    /// A14-4: demo.sh's `CMD="${1:-}"; shift` consumes the first token, so
+    /// the flag loop only sees the tail — `--bottle Steam run` reports `Steam`
+    /// and never reaches `--bottle`'s "needs a name" branch. `Ok(())` means
+    /// the shell fell through to its unknown-`CMD` `case` arm, whose text the
+    /// caller's `_` arm prints, not this helper.
     #[test]
     fn unknown_command_outcome_mirrors_the_shells_shift_then_parse() {
         let cases: &[(&str, &[&str], Result<(), &str>)] = &[
@@ -1500,8 +1286,6 @@ mod tests {
             );
         }
     }
-
-    // ── doctor rendering ─────────────────────────────────────────────────────
 
     #[test]
     fn doctor_outcome_rows_match_lib_sh_verbatim() {
@@ -1622,8 +1406,6 @@ mod tests {
         );
     }
 
-    // ── stage arg parsing ────────────────────────────────────────────────────
-
     #[test]
     fn stage_parses_bottle_bs_dir_and_dry_run() {
         let a = args(&["--bottle", "Steam", "--bs-dir", "/games/bs", "--dry-run"]);
@@ -1667,9 +1449,9 @@ mod tests {
 
     #[test]
     fn stage_unknown_argument_is_the_exit_2_path() {
-        // `--tap` is doctor-only; every other stage command must still reject
-        // it (`sabrage doctor`'s own addition, not part of demo.sh's shared
-        // flag grammar), exactly like any other unrecognized flag.
+        // `--tap` is a doctor-only sabrage addition (demo.sh has no such flag),
+        // so every stage command must reject it exactly like any other
+        // unrecognized flag.
         assert_eq!(
             parse_stage_args(&args(&["--tap", "/tmp/x"])).unwrap_err(),
             "error: unknown argument '--tap'"
@@ -1689,14 +1471,11 @@ mod tests {
         );
     }
 
-    // ── merge_stage_options ──────────────────────────────────────────────────
-
     #[test]
     fn merge_stage_options_forwards_all_six_flags_onto_the_env_base() {
-        // The bug this closes: `--wired`/`--no-audio`/`--no-dashboard` were
-        // parsed (so the shell's own grammar was matched byte-for-byte) but
-        // then silently dropped — `StageOptions` carried no field for them at
-        // the time, and nothing ever set the three that were added since.
+        // Matching demo.sh's flag grammar is not enough: each flag that has a
+        // `StageOptions` field must actually reach it rather than being parsed
+        // and dropped (`--quiet` is CLI-rendering only and has no field).
         let parsed = StageArgs {
             bottle: Some("Steam".to_string()),
             bs_dir: Some(PathBuf::from("/games/bs")),
@@ -1739,14 +1518,12 @@ mod tests {
         assert!(!opts.dry_run);
     }
 
-    // ── A14-1: empty CLI values clear an env-derived preset ─────────────────
-
     #[test]
     fn merge_stage_options_empty_cli_values_clear_a_preset_env_base() {
-        // `--bottle ""`/`--bs-dir ""` (a wrapper that always interpolates the
-        // flag, even with its own variable unset) must behave exactly like
-        // `${WINEVR_BOTTLE:-}`/`${WINEVR_BS_DIR:-<default>}` treating an
-        // empty export as absent — not like an override to the empty string.
+        // A14-1: `--bottle ""`/`--bs-dir ""` (from a wrapper interpolating
+        // the flag even when its variable is unset) must behave like
+        // `${WINEVR_BOTTLE:-}`/`${WINEVR_BS_DIR:-<default>}`: empty = absent,
+        // not an override to the empty string.
         let env_opts = StageOptions {
             bottle_name: Some("Steam".to_string()),
             bs_dir_override: Some(PathBuf::from("/preset")),
@@ -1803,8 +1580,6 @@ mod tests {
         assert_eq!(opts.bottle_name, None);
         assert_eq!(opts.bs_dir_override, None);
     }
-
-    // ── stage rendering ──────────────────────────────────────────────────────
 
     #[test]
     fn stage_line_rendering_matches_the_doctor_row_shapes() {
@@ -1867,11 +1642,9 @@ mod tests {
         assert_eq!(closing_line(Stage::Run, "Steam"), None);
     }
 
-    // ── stage_event_lines (Phase 3: run) ─────────────────────────────────────
-    //
-    // Pure projection, so "renders to nothing" is a value these assert on
-    // directly instead of a `println!` side effect they would have to
-    // intercept.
+    // `stage_event_lines` is a pure projection, so "renders to nothing" is a
+    // value these tests assert on directly rather than an intercepted
+    // `println!`.
 
     #[test]
     fn text_event_prints_verbatim_including_empty_and_leading_spaces() {
@@ -2097,8 +1870,6 @@ mod tests {
             "Eof never repaints even on a tty"
         );
 
-        // `--quiet` suppresses a Cr chunk exactly like any other Output,
-        // regardless of tty-ness.
         assert_eq!(
             stage_event_lines(&stdout_cr, "<name>", tty, true),
             vec![],
@@ -2114,9 +1885,9 @@ mod tests {
             remedy: Some("fix it".to_string()),
             fix: None,
         };
-        // Finding #4: `render_stage_event` dropped `Fatal.remedy` entirely, so
-        // the App Management deep link — the whole point of finding #6's
-        // `upgrade_write_error` — never reached a CLI user.
+        // Finding #4: `Fatal.remedy` must reach a CLI user — it carries the
+        // App Management deep link that finding #6's
+        // `privilege::upgrade_write_error` puts on the `Fatal` it emits.
         assert_eq!(
             stage_event_lines(&fatal, "<name>", Colors::OFF, false),
             vec![
@@ -2163,7 +1934,7 @@ mod tests {
         );
     }
 
-    // ── A14-5: color gating is per-stream ────────────────────────────────────
+    // A14-5: color is gated per stream, not once for the process.
 
     #[test]
     fn colors_from_gates_each_stream_on_its_own_tty_unless_no_color() {
@@ -2210,11 +1981,9 @@ mod tests {
 
     #[test]
     fn fatal_uses_stderr_colors_while_a_line_event_uses_stdout_colors() {
-        // Finding A14-5: `Fatal` rows go to stderr but color was previously
-        // gated on stdout's terminal-ness alone. With stdout piped (no
-        // color) and stderr a terminal (colored), `Fatal` must still come
-        // out colored — and an ordinary `Line` in the same call must stay
-        // uncolored, since it renders on stdout.
+        // A14-5: `Fatal` gates its color on stderr's terminal-ness and an
+        // ordinary `Line` on stdout's, so with stdout piped and stderr a
+        // terminal the `Fatal` row is colored and the `Line` row is not.
         let colors = Colors {
             stdout: false,
             stderr: true,
@@ -2267,8 +2036,6 @@ mod tests {
         );
     }
 
-    // ── dry-run plan rendering ───────────────────────────────────────────────
-
     #[test]
     fn dry_run_plan_has_a_header_then_one_line_per_action_in_order() {
         use sabrage_core::executor::PlannedKind;
@@ -2309,18 +2076,9 @@ mod tests {
         );
     }
 
-    // ── `sabrage run` / `sabrage all` wiring ─────────────────────────────────
-    //
-    // `Stage::Run`'s body (`sabrage_core::stages::run::run`) is real as of
-    // Phase 3 — it actually launches wine and the game — and `Stage::Setup`/
-    // `Build`/`Install`'s bodies really do touch the machine too; none of the
-    // four may be reached from a unit test (this task's hard rules). Every
-    // test below stays on the safe side of that boundary: an argument error
-    // returns before `resolve_repo_root` is even called, and `run_all`'s
-    // bottle precheck (driven with a hand-built `opts`, never
-    // `StageOptions::from_env()`, so it is deterministic regardless of the
-    // *real* machine's `WINEVR_BOTTLE`/CrossOver state) dies before
-    // `run_chain`/`run_stage` are ever reached.
+    // No test below may reach a stage body: setup/build/install/run touch the
+    // real machine. Argument errors return before `resolve_repo_root`, and
+    // `run_all`'s bottle precheck (hand-built `opts`) dies before `run_chain`.
 
     fn capturing_sink() -> (EventSink, Arc<StdMutex<Vec<StageEvent>>>) {
         let seen = Arc::new(StdMutex::new(Vec::new()));
@@ -2412,8 +2170,6 @@ mod tests {
             .all(|e| !matches!(e, StageEvent::StageStarted { .. })));
     }
 
-    // ── Ctrl-C / SIGTERM watcher ─────────────────────────────────────────────
-
     #[test]
     fn watch_flag_invokes_the_callback_once_the_flag_is_set() {
         // A private static, never touched by `watch_termination_signals`'s
@@ -2435,13 +2191,10 @@ mod tests {
 
     #[test]
     fn watcher_keeps_polling_past_the_first_fire_so_a_second_signal_is_reachable() {
-        // Finding #7: the old `watch_flag` returned right after its one
-        // callback fired, so nothing was left reading the flag for a second
-        // Ctrl-C. Exercised here via the injectable second action
-        // (`watch_flag_with_second_action`) rather than
-        // `watch_flag`/`terminate_via_default_disposition_of_last_signal`
-        // directly — that path really does `raise()` on the calling process,
-        // which would kill this test binary.
+        // Finding #7: the watcher keeps polling past its first callback, so a
+        // second Ctrl-C is observed. Uses `watch_flag_with_second_action`
+        // because the real path (`terminate_via_default_disposition_of_last_signal`)
+        // `raise()`s on this process and would kill the test binary.
         static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
         let first_calls = Arc::new(AtomicUsize::new(0));
         let second_calls = Arc::new(AtomicUsize::new(0));
@@ -2466,8 +2219,6 @@ mod tests {
             "second action must not fire on the first signal"
         );
 
-        // The bug: after the first `return`, nobody was polling any more, so
-        // this second delivery would never be observed at all.
         TEST_COUNT.fetch_add(1, Ordering::Relaxed);
         std::thread::sleep(CTRL_C_POLL_INTERVAL * 4);
         assert_eq!(
@@ -2480,12 +2231,9 @@ mod tests {
 
     #[test]
     fn two_signals_inside_one_poll_interval_are_not_collapsed_into_one() {
-        // Finding #6: the watcher used to consume the flag with
-        // `swap(false, ..)`, so a burst delivered between two polls — a fast
-        // double-tap, or the `kill -INT` pair an automated test sends — read
-        // as a single Ctrl-C and left the process merely "cancelling" instead
-        // of dead. Both deliveries land here before the watcher's first poll
-        // can possibly run, which is exactly the collapsing window.
+        // Finding #6: a burst inside one poll interval (a fast double-tap, or
+        // `kill -INT` pair) counts as two signals and is fatal. Both deliveries
+        // land before the watcher's first poll — the collapsing window.
         static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
         TEST_COUNT.fetch_add(1, Ordering::Relaxed);
         TEST_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -2515,16 +2263,11 @@ mod tests {
 
     #[test]
     fn a_second_signal_of_a_different_kind_is_still_fatal_and_reraises_that_kind() {
-        // Production shares one `SIGNAL_COUNT` between the real `SIGINT` and
-        // `SIGTERM` handlers, with `LAST_SIGNAL` recording which signal
-        // number the *most recent* delivery was (see the module doc above):
-        // the first delivery of *either* kind cancels, and the second — of
-        // either kind, not necessarily the same one — is fatal and re-raises
-        // whichever one actually just arrived. Reproduced here with
-        // process-local fakes standing in for the two real handlers and
-        // `LAST_SIGNAL`, for the same reason the tests above avoid installing
-        // a real trap: a real second SIGINT/SIGTERM during a test run would
-        // kill the test binary.
+        // Production shares one `SIGNAL_COUNT` between `SIGINT` and `SIGTERM`
+        // handlers, with `LAST_SIGNAL` holding the most recent delivery: first
+        // of either kind cancels, second of either kind is fatal and re-raises
+        // whichever just arrived. Process-local fakes stand in because a real
+        // second signal would kill the test binary.
         static TEST_COUNT: AtomicUsize = AtomicUsize::new(0);
         static TEST_LAST_KIND: AtomicI32 = AtomicI32::new(0);
 
