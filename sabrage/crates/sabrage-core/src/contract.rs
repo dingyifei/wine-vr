@@ -1,32 +1,22 @@
 //! The shared parity contract, compiled in.
 //!
-//! `contract/pipeline.toml` is the single source for pins, the depot triple, the
-//! host-manifest path, the DXMT artifact set, the port lists, and — most
-//! importantly for this crate — the **ordered check registry** and the
-//! launch-action registry. The zsh side consumes the same data through the
-//! GENERATED `scripts/demo/contract.gen.sh`; sabrage-core parses the TOML
-//! directly.
+//! `contract/pipeline.toml` is the single source for pins, the depot triple,
+//! the host-manifest path, the DXMT artifact set, the port lists, the
+//! **ordered check registry**, and the launch-action registry. The zsh side
+//! consumes it through the GENERATED `scripts/demo/contract.gen.sh`;
+//! sabrage-core parses the TOML directly.
 //!
-//! ## Why `include_str!` and not a runtime read
+//! The three contract files are baked in with `include_str!` rather than read
+//! from `repo_root`: `Sabrage.app` is installed somewhere unrelated to the
+//! repo and `repo_root` is user-configurable, so the check registry is part
+//! of the binary's identity, not of machine state. Editing a contract file
+//! retriggers a rebuild, which is the tripwire the parity design wants.
+//! [`crate::util::contract_hash`] reads the three files from `repo_root` at
+//! runtime because `meta.contract-sync` compares the *on-disk* contract
+//! against the *on-disk* generated shell file.
 //!
-//! `Sabrage.app` is installed somewhere unrelated to the repo, and `repo_root` is
-//! user-configurable at runtime. The *check registry* must not depend on which
-//! repo the user pointed at — it is part of the binary's identity, not of the
-//! machine state. So the three contract files are baked in at compile time.
-//! Editing any of them retriggers a rebuild (`include_str!` registers a build
-//! dependency), which is exactly the tripwire the parity design wants.
-//!
-//! [`crate::util::contract_hash`] deliberately does the opposite (reads the three
-//! files from `repo_root` at runtime) because the `meta.contract-sync` check has
-//! to compare the *on-disk* contract against the *on-disk* generated shell file.
-//!
-//! ## Include-path depth
-//!
-//! This file lives at `sabrage/crates/sabrage-core/src/contract.rs`, and
-//! `include_str!` resolves relative to the including file's directory, so the
-//! repo root is four levels up (`src/` → `sabrage-core/` → `crates/` →
-//! `sabrage/` → repo root). All three includes live in this one module so the
-//! depth is stated exactly once.
+//! All three includes live in this one module so the repo-root depth is
+//! stated exactly once.
 
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -199,9 +189,9 @@ pub struct Contract {
     pub paths: ContractPaths,
     pub ports: Ports,
     pub dxmt: Dxmt,
-    /// Ordered check registry. **Order is load-bearing** — it is doctor.sh's
-    /// order, in which section 3 resolves the bottle context that later checks
-    /// consume, and run-only preflights come last.
+    /// Ordered check registry; order is doctor.sh's and load-bearing (section 3
+    /// resolves bottle context later checks consume; run-only preflights last).
+    /// Pinned by `sabrage-parity::tests::slug_coverage::doctor_slug_coverage_matches_the_contract`.
     #[serde(default, rename = "check")]
     pub checks: Vec<CheckSpec>,
     /// Ordered launch-action registry.
@@ -241,8 +231,8 @@ impl Contract {
 
     /// The `DepotDownloader …` remedy string doctor's `game.present` row prints.
     ///
-    /// Byte-identical to lib.sh's `DEPOT_CMD` / doctor.sh's `$DEPOT_CMD`,
-    /// including the quoting of `-dir`.
+    /// Byte-identical to lib.sh's `DEPOT_CMD` / doctor.sh's `$DEPOT_CMD`, including
+    /// the quoting of `-dir`; pinned by `tests::depot_command_matches_lib_sh`.
     pub fn depot_command(&self, bs_dir: &Path) -> String {
         format!(
             "DepotDownloader -app {} -depot {} -manifest {} -username <steam-user> -dir \"{}\"",
@@ -272,21 +262,13 @@ pub fn contract() -> &'static Contract {
 /// and the same value `scripts/demo/contract.gen.sh` records in its
 /// `# contract-sha256:` header.
 ///
-/// # Why this exists
-///
-/// The on-disk half of `meta.contract-sync` compares the checkout's
-/// `contract/` against the checkout's own generated shell file. It says
-/// nothing about the binary doing the comparing: an installed `Sabrage.app`
-/// (or a `sabrage` CLI on `$PATH`) built from checkout X, pointed at a
-/// perfectly self-consistent checkout Y via `repo_root`, satisfies that half
-/// while still executing **X's** registry, pins, ports, and templates — and
-/// the parity harness cannot see it either, because tier 2 always rebuilds
-/// the CLI from the checkout it diffs.
-///
-/// Comparing this against `util::contract_hash(repo_root)` is what detects
-/// that skew, and `meta.contract-sync` does exactly that once the checkout is
-/// internally consistent: equal means the binary and the checkout are the
-/// same contract; different is a Fail, pinned by
+/// The on-disk half of `meta.contract-sync` only proves a checkout is
+/// self-consistent: a binary built from checkout X, pointed at checkout Y via
+/// `repo_root`, still executes **X's** registry, pins, ports, and templates.
+/// The parity harness cannot see this either because tier 2 rebuilds the CLI
+/// from the checkout it diffs. `meta.contract-sync` compares this value
+/// against `util::contract_hash(repo_root)` to detect the skew; different is
+/// a Fail, pinned by
 /// `checks::meta::tests::fails_when_the_binary_was_compiled_from_a_different_contract`.
 pub static COMPILED_CONTRACT_SHA256: LazyLock<String> = LazyLock::new(|| {
     crate::util::contract_sha256_from(&[
@@ -302,8 +284,8 @@ mod tests {
 
     #[test]
     fn contract_parses_and_include_path_resolves() {
-        // If the include path were wrong this would not compile at all; the
-        // assertions below pin the values the rest of the crate hard-codes.
+        // The include path is proven by compiling; these assertions pin the
+        // values the rest of the crate hard-codes.
         let c = contract();
         assert_eq!(c.game.appid, 620980);
         assert_eq!(c.game.depot, 620981);
@@ -354,8 +336,7 @@ mod tests {
         );
     }
 
-    /// The repo root, four levels above this crate's manifest — the checkout
-    /// this binary was compiled from.
+    /// The repo root — the checkout this binary was compiled from.
     fn repo_root() -> std::path::PathBuf {
         std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../..")
@@ -365,8 +346,6 @@ mod tests {
 
     #[test]
     fn compiled_contract_sha256_matches_the_checkout_it_was_built_from() {
-        // Also pins that the in-memory recipe and the on-disk recompute agree:
-        // same three files, same order, same digest.
         let on_disk = crate::util::contract_hash(&repo_root()).expect("contract files readable");
         assert_eq!(*COMPILED_CONTRACT_SHA256, on_disk);
         assert_eq!(COMPILED_CONTRACT_SHA256.len(), 64);
