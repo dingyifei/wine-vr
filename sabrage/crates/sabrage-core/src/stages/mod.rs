@@ -1,89 +1,32 @@
 //! Stage orchestration: the context every stage runs in, the operation lock, and
-//! the dispatcher.
+//! the dispatcher. One stage is one `./demo.sh <verb>`, a plain `async fn`
+//! readable next to the script it mirrors.
 //!
-//! A stage is one `./demo.sh <verb>`. Each is a plain `async fn run(&StageCtx)`
-//! rather than a trait impl: there is exactly one implementation of each, they
-//! share no behaviour worth abstracting, and a free function keeps the whole
-//! stage readable top-to-bottom next to the shell script it mirrors.
+//! [`OPERATION_LOCK`] plus an advisory file lock ([`OPERATION_LOCK_FILE_NAME`])
+//! admit one mutating operation at a time across every Sabrage process; doctor is
+//! read-only and never takes it, only annotates with [`operation_in_progress`].
+//! demo.sh does not participate (PARITY.md § Declared by the 2026-08-30
+//! adversarial review (round 1 fixes), "Cross-process operation lock.").
 //!
-//! # Serialization
+//! `setup`/`build`/`install` refuse while [`live_session_block`] sees a session,
+//! and every stage but `stop` refuses on contract skew
+//! (`deny_on_contract_skew`); both refusals run before the lock wait and again
+//! with the lock held. `all` is a caller-level loop over [`Stage::ALL_CHAIN`]
+//! with a fresh [`StageCtx`] per stage, not a sixth stage.
+//! See tests::{run_stage_refuses_setup_build_and_install_while_a_session_is_live,
+//! a_queued_stage_is_refused_when_a_session_goes_live_during_the_wait,
+//! every_mutating_stage_refuses_a_checkout_the_binary_was_not_built_from,
+//! a_queued_stage_announces_itself_and_cancels_out_of_the_wait}.
 //!
-//! [`OPERATION_LOCK`] admits one mutating operation at a time. Doctor is
-//! read-only and runs concurrently; it may *annotate* rows with
-//! [`operation_in_progress`] so a row that fails because a build is halfway
-//! through says so.
+//! # Lock policy for `run`
 //!
-//! The lock is acquired by the outermost entry points — [`run_stage`] and
-//! [`crate::fixes::apply`] — and by nothing below them. Callers already inside a
-//! held lock (a launch preflight applying an auto-fix that is itself a whole
-//! stage) use [`run_stage_holding_lock`] / [`crate::fixes::apply_holding_lock`]:
-//! `tokio::sync::Mutex` is not reentrant, and taking it twice on one task
+//! `run` releases the lock once the wine child is up, so `stop` and every fix
+//! stay reachable during a session: [`run::run`] takes the guard by value and
+//! drops it at the launch boundary; [`run_stage_holding_lock`] passes `None`.
+//!
+//! `tokio::sync::Mutex` is not reentrant: a caller already holding the lock must
+//! use [`run_stage_holding_lock`] / [`crate::fixes::apply_holding_lock`], or it
 //! deadlocks in silence.
-//!
-//! A `tokio::sync::Mutex` is a *per-process* primitive, and Sabrage has two
-//! native front-ends (the GUI and the `sabrage` CLI) that write the same
-//! artifacts. [`acquire_operation_lock`] therefore takes a second, **advisory
-//! file lock** ([`OPERATION_LOCK_FILE_NAME`]) in the same call, so a CLI build
-//! cannot overwrite `build-x64/` while the GUI's install is copying out of it.
-//! Both halves are released together when the [`OperationGuard`] drops —
-//! including at `run`'s launch boundary below. demo.sh deliberately does **not**
-//! participate (PARITY.md): the shell pipeline stays a zero-dependency script,
-//! so a concurrent `./demo.sh build` is still unserialized.
-//!
-//! # Live sessions
-//!
-//! Serialization is not the whole policy: `setup`, `build` and `install` replace
-//! the very artifacts a *running* session has open, so [`run_stage`] refuses
-//! them outright while [`live_session_block`] can see a session. `run` and
-//! `stop` are exempt — `run` has its own reconciliation, and `stop` is the way
-//! out. [`crate::fixes::apply`] applies the same policy to every fix whose
-//! registry entry is `forbidden_while_session_live`.
-//!
-//! Both doors refuse **twice**: once before waiting on the operation lock (fast,
-//! so a queued operation is not admitted only to be refused later) and once with
-//! the lock in hand, because a `run` that acquired first publishes its live
-//! session and then gives the lock back at the launch boundary.
-//!
-//! # Contract identity
-//!
-//! [`deny_on_contract_skew`] is the second half of the same policy: every stage
-//! that writes contract-derived bytes (`setup`, `build`, `install`, `run` — not
-//! `stop`, the way out) refuses when the contract compiled into this binary is
-//! not the one the checkout at `paths.root` describes
-//! ([`crate::checks::meta::assert_binary_matches_checkout`]). `meta.contract-sync`
-//! reports the same skew as a doctor row; this is the enforcement, so an
-//! X-built binary cannot install X's pins into checkout Y just because nobody
-//! ran doctor first.
-//!
-//! # Lock policy for `run` (the one exception)
-//!
-//! [`run_stage`]`(`[`Stage::Run`]`)` holds [`OPERATION_LOCK`] through
-//! **preflight + prepare + guards + spawn**, and **releases it the moment the
-//! wine child is up** — before Supervise. A session lasts hours: holding the
-//! lock for its duration would mean `stop`, every fix, and every other stage
-//! block until the user quits Beat Saber, which is precisely when they are
-//! most likely to reach for Stop.
-//!
-//! Mechanically: [`run_stage`] takes the guard and hands it to
-//! [`run::run`]`(ctx, Some(guard))`, which drops it at the launch boundary.
-//! [`run_stage_holding_lock`] passes `None` — the guard it inherits is never
-//! released, which is correct for a caller that already owns the lock and
-//! wrong for a real session, so that door is for tests and for whole-stage
-//! auto-fixes only.
-//!
-//! What this costs: between the release and the wine child exiting, a second
-//! operation *can* start. That is deliberate — `stop` during a live session is
-//! the whole point — and the run stage's teardown is written to tolerate a
-//! `stop` having already killed its child.
-//!
-//! # `all`
-//!
-//! `./demo.sh all` re-executes the dispatcher once per stage so each gets a
-//! fresh process. The native equivalent is a caller-level loop over
-//! [`Stage::ALL_CHAIN`] building a **fresh [`StageCtx`] per stage** (fresh
-//! `run_id`, fresh executor), aborting on the first failure with that stage's
-//! exit code, with `require_bottle` checked once up front (fail-fast parity).
-//! It is not a sixth stage.
 
 pub mod build;
 pub mod install;
@@ -111,12 +54,10 @@ use crate::process::ChildSpec;
 
 /// Where a stage's events go.
 ///
-/// A plain callback rather than an `mpsc::Sender`, because every producer is
-/// synchronous at the point of emission (a check resolving, a line being
-/// printed, a pump forwarding a chunk) and a channel would force either an
-/// `.await` in those places or a `try_send` that can silently drop a row. The
-/// Tauri layer wraps `app_handle.emit`; the CLI wraps its renderer; tests wrap a
-/// `Vec`. A consumer that *wants* a channel makes the sink `tx.blocking_send`.
+/// A plain callback rather than an `mpsc::Sender`: every producer is synchronous
+/// at the point of emission (a check resolving, a line being printed, a pump
+/// forwarding a chunk), so a channel would force either an `.await` in those
+/// places or a `try_send` that can silently drop a row.
 ///
 /// Sinks are called from arbitrary tasks (both output pumps of every child), so
 /// they must be `Send + Sync` and cheap.
@@ -127,15 +68,12 @@ pub fn null_sink() -> EventSink {
     Arc::new(|_| {})
 }
 
-// ── options ───────────────────────────────────────────────────────────────────
-
 /// The stage-relevant slice of the `WINEVR_*` mirror — all six flags demo.sh
 /// accepts, plus Sabrage's own `dry_run`.
 ///
-/// `no_audio` / `no_dashboard` / `wired` are read only by [`Stage::Run`] (and
-/// by the `run.wired-adb` preflight, which is why [`StageCtx::check_ctx`]
-/// forwards them), exactly as demo.sh reads `WINEVR_NO_AUDIO` /
-/// `WINEVR_NO_DASHBOARD` / `WINEVR_WIRED` only inside `run.sh`.
+/// `no_audio` / `no_dashboard` / `wired` are read only by [`Stage::Run`] and by
+/// the `run.wired-adb` preflight, which is why [`StageCtx::check_ctx`] forwards
+/// them. See tests::check_ctx_forwards_every_launch_flag.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct StageOptions {
     /// `WINEVR_BOTTLE` / `--bottle`.
@@ -178,8 +116,6 @@ impl StageOptions {
         }
     }
 }
-
-// ── context ───────────────────────────────────────────────────────────────────
 
 /// Everything a stage is allowed to touch.
 #[derive(Clone)]
@@ -259,19 +195,15 @@ impl StageCtx {
     }
 
     /// A self-contained fixture context: [`null_sink`], a fresh
-    /// [`CancellationToken`], and always a [`DryRunExecutor`] regardless of
-    /// `opts.dry_run` — so a caller can never accidentally mutate the
-    /// machine through it. Forces `opts.dry_run = true` for the same reason
-    /// [`StageOptions::from_env`]'s own doc names: it has no shell
-    /// counterpart, and a fixture that quietly picked [`RealExecutor`] would
-    /// be exactly the kind of test that only fails on someone else's machine.
+    /// [`CancellationToken`], and always a [`DryRunExecutor`] — `opts.dry_run` is
+    /// forced true regardless of the caller, so a fixture can never mutate the
+    /// machine.
     ///
-    /// For a text-rendering function that never touches `ctx.executor` at all
-    /// (`sabrage-parity`'s A1-3 pins over `stages::run::actions::banner_events`,
-    /// `bs_win_path`, `preflight::block_die`, `preflight::post_fix_die`, …),
-    /// so a downstream crate that needs only *a* `StageCtx` — never a
-    /// `tokio_util::sync::CancellationToken` of its own — has one call to
-    /// reach for instead of depending on `tokio_util` just to build a fixture.
+    /// Exists for a downstream crate that needs only *a* `StageCtx` to drive a
+    /// text-rendering function (`sabrage-parity`'s A1-3 pins over
+    /// `stages::run::actions::banner_events`, `bs_win_path`,
+    /// `preflight::block_die`, `preflight::post_fix_die`, …) and should not have to
+    /// depend on `tokio_util` to build one.
     pub fn for_fixture(paths: Paths, mut opts: StageOptions) -> StageCtx {
         opts.dry_run = true;
         StageCtx::new(paths, opts, null_sink(), CancellationToken::new())
@@ -286,10 +218,6 @@ impl StageCtx {
                 bottle_name: self.opts.bottle_name.clone(),
                 bs_dir_override: self.opts.bs_dir_override.clone(),
                 verbose: self.opts.verbose,
-                // The launch preflight's own gating reads these: `wired`
-                // decides whether `run.wired-adb` is evaluated at all, and the
-                // other two mirror demo.sh's flags so a preflight row can say
-                // the same thing run.sh's would.
                 wired: self.opts.wired,
                 no_audio: self.opts.no_audio,
                 no_dashboard: self.opts.no_dashboard,
@@ -388,27 +316,17 @@ impl StepEmitter<'_> {
     }
 }
 
-// ── require_bottle ────────────────────────────────────────────────────────────
-
-/// `lib.sh`'s `require_bottle`, message text verbatim:
+/// `lib.sh`'s `require_bottle`, message text verbatim.
 ///
-/// ```zsh
-/// require_bottle() {
-///   [ -n "${WINEVR_BOTTLE:-}" ] || die "CrossOver bottle name required: pass --bottle <name> or set WINEVR_BOTTLE.
-///        Existing bottles: $(ls "$HOME/Library/Application Support/CrossOver/Bottles" 2>/dev/null | tr '\n' ' ')"
-///   …
-///   [ -f "$PREFIX/cxbottle.conf" ] || die "bottle '$WINEVR_BOTTLE' not found at $PREFIX — create it in CrossOver (win11_64) first"
-/// }
-/// ```
+/// # Errors
 ///
-/// Both messages are single `die` strings; the first is two lines, the second
-/// one. The bottle list keeps the shell's trailing space (`tr '\n' ' '` appends
-/// one per name) — an empty list therefore renders as `Existing bottles: ` with
-/// nothing after it.
-///
-/// Note this is **not** the same text as doctor's `bottle.exists` row
-/// ([`Bottle::resolve`]), which splits message and remedy; a stage aborting
-/// must read exactly like the shell aborting.
+/// Two `die` strings. The missing-name one is two lines and ends with the bottle
+/// list, which keeps the shell's trailing space (`tr '\n' ' '` appends one per
+/// name), so an empty list renders as `Existing bottles: ` with nothing after it;
+/// the not-found one is a single line. Deliberately **not** the text of doctor's
+/// `bottle.exists` row ([`Bottle::resolve`]), which splits message and remedy — a
+/// stage aborting must read exactly like the shell aborting.
+/// See tests::require_bottle_reproduces_lib_sh_die_text.
 pub fn require_bottle(ctx: &StageCtx) -> Result<&Bottle> {
     let Some(name) = ctx.opts.bottle_name.as_deref() else {
         let listed = crate::paths::list_bottles()
@@ -437,37 +355,22 @@ pub fn require_bottle(ctx: &StageCtx) -> Result<&Bottle> {
     }
 }
 
-// ── wineserver budgets ────────────────────────────────────────────────────────
-
 /// `run`'s wineserver-reset budget: **5 s, fatal on timeout**.
 ///
-/// run.sh spells it as a poll loop over the backgrounded `wineserver -w`:
+/// Reference: scripts/demo/run.sh, the poll loop over the backgrounded
+/// `wineserver -w` that warns "wineserver still alive after 5s" and then dies.
 ///
-/// ```zsh
-/// for _i in {1..50}; do kill -0 $_wpid 2>/dev/null || break; sleep 0.1; done
-/// if kill -0 $_wpid 2>/dev/null; then
-///   kill $_wpid 2>/dev/null
-///   warn "wineserver still alive after 5s: $(pgrep -lf wineserver | tr '\n' ' ')"
-///   die "kill the listed wineserver(s) manually, then re-run"
-/// fi
-/// ```
-///
-/// Deliberately **distinct** from [`STOP_WINESERVER_WAIT`] — 5 s fatal here,
-/// 4 s advisory there (design-core §10, parity decision 18; PARITY.md's
-/// "wineserver budgets (5 s fatal / 4 s soft)"). Collapsing them into one
-/// constant would silently change one of the two behaviours.
+/// Deliberately distinct from [`STOP_WINESERVER_WAIT`] — 5 s fatal here, 4 s
+/// soft there. Never unify them; collapsing the two constants silently changes
+/// one of the behaviours. See tests::the_two_wineserver_budgets_stay_distinct.
 pub const RUN_WINESERVER_WAIT: Duration = Duration::from_secs(5);
 
 /// `stop`'s wineserver-wait budget: **4 s, never fatal**.
 ///
-/// `lib.sh`'s `stop_wine` polls `for _i in {1..40}; do … sleep 0.1; done` and
-/// then simply gives up (`kill $_wp 2>/dev/null || true`). See
-/// [`RUN_WINESERVER_WAIT`] for why the two budgets stay apart.
-///
-/// Re-exported as `stages::stop::STOP_WINESERVER_WAIT`, where it used to live.
+/// Reference: scripts/demo/lib.sh, `stop_wine` — it polls, then gives up
+/// (`kill $_wp 2>/dev/null || true`). See [`RUN_WINESERVER_WAIT`] for why the two
+/// budgets stay apart. Re-exported as `stages::stop::STOP_WINESERVER_WAIT`.
 pub const STOP_WINESERVER_WAIT: Duration = Duration::from_secs(4);
-
-// ── operation lock ────────────────────────────────────────────────────────────
 
 /// One mutating operation at a time — stage or fix. The **in-process** half.
 ///
@@ -476,9 +379,10 @@ pub static OPERATION_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(())
 
 /// The cross-process half's file name, under Sabrage's own support directory.
 ///
-/// Sabrage-only on purpose: `demo.sh` does not take it (PARITY.md), so this
-/// serializes the GUI against the `sabrage` CLI and against a second GUI
-/// instance, not against the shell pipeline.
+/// Sabrage-only: `demo.sh` does not take it, so this serializes the GUI against
+/// the `sabrage` CLI and against a second GUI instance, not against the shell
+/// pipeline (PARITY.md § Declared by the 2026-08-30 adversarial review
+/// (round 1 fixes), "Cross-process operation lock.").
 pub const OPERATION_LOCK_FILE_NAME: &str = "operation.lock";
 
 /// How often [`acquire_operation_lock`] retries the advisory file lock while
@@ -528,9 +432,8 @@ pub async fn acquire_operation_lock() -> OperationGuard {
 /// `None` means "cancelled while waiting" — the caller must not proceed. Both
 /// halves are cancellable: the in-process mutex (another stage in this process)
 /// and the advisory file lock (a `sabrage` CLI build in another process, which
-/// can hold it for minutes). Without this, Stop could not reach a queued stage
-/// at all: the poll loop in [`acquire_lock_file`] never yielded to anything but
-/// the lock becoming free.
+/// can hold it for minutes), so the user's Stop can reach a queued stage.
+/// See tests::the_file_lock_wait_gives_up_when_the_token_fires.
 pub async fn acquire_operation_lock_cancellable(
     cancel: &CancellationToken,
 ) -> Option<OperationGuard> {
@@ -666,22 +569,15 @@ fn operation_lock_file_busy() -> bool {
     matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
 }
 
-// ── live-session policy ───────────────────────────────────────────────────────
-
 /// Why a mutating operation must not start right now, or `None` when nothing on
 /// this machine looks like a live session.
 ///
-/// A thin alias for [`crate::session::live_session_reason`] — the session
-/// layer owns the policy, and this name is kept because it is the one every
-/// stage and fix refusal reads
-/// ([`deny_stage_while_session_live`], [`crate::fixes`]'s `deny_if_session_live`,
-/// [`crate::fixes::adb::remove_adb_forwards`]).
-///
-/// It used to be a fourth, weaker copy of that predicate — missing the
-/// `Unverifiable` classification and the foreign-owner window — which meant the
-/// doors that mutate (`setup`/`build`/`install` and every gated fix) were
-/// guarded by *less* than the doors that only refuse. One predicate, one
-/// policy: see [`crate::session::session_block_at`] for the seven signals.
+/// A thin alias for [`crate::session::live_session_reason`]: the session layer
+/// owns the policy, and this is the name every stage and fix refusal reads
+/// (`deny_stage_while_session_live`, [`crate::fixes`]'s `deny_if_session_live`,
+/// [`crate::fixes::adb::remove_adb_forwards`]). Do not reintroduce a weaker local
+/// copy: the doors that mutate must be guarded by no less than the doors that
+/// only refuse. See [`crate::session::session_block_at`] for A4-1's seven signals.
 pub fn live_session_block(paths: &Paths) -> Option<String> {
     crate::session::live_session_reason(paths)
 }
@@ -716,8 +612,6 @@ fn deny_stage_while_session_live(stage: Stage, ctx: &StageCtx) -> Result<()> {
         )),
     }
 }
-
-// ── contract identity policy ──────────────────────────────────────────────────
 
 /// Write the contract **this test binary was compiled from** into `root`, so a
 /// scratch checkout is contract-identical to the binary under test and
@@ -788,8 +682,6 @@ fn deny_before_dispatch(stage: Stage, ctx: &StageCtx) -> Result<()> {
     deny_stage_on_contract_skew(stage, ctx)
 }
 
-// ── dispatch ──────────────────────────────────────────────────────────────────
-
 /// What a stage invocation amounted to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -839,38 +731,25 @@ impl StageOutcome {
 /// Run one stage, taking [`OPERATION_LOCK`] for its duration.
 ///
 /// Emits [`StageEvent::StageStarted`] first and [`StageEvent::StageFinished`]
-/// last — on the failure path too, with the error's `exit_code_equiv` — so a UI
-/// that only listens to events never sees a stage that started and never ended.
+/// last — on the failure path too — so a UI never sees an unfinished stage.
 ///
-/// `StageStarted` is emitted **before** the operation lock is taken, not after.
-/// That event is the front-end's only source of the run id, and the run id is
-/// what enables Cancel: a stage queued behind another Sabrage process's build
-/// can wait minutes, and it used to do so with no row and a disabled Cancel
-/// button, then mutate the machine when its turn came. Waiting is now a visible,
-/// cancellable part of the run — [`acquire_operation_lock_cancellable`] returns
-/// the moment `ctx.cancel` fires, and the stage ends as
-/// [`SabrageError::Cancelled`] (exit 130) without having touched anything.
+/// `StageStarted` is emitted **before** the lock: that event is the front-end's
+/// only source of the run id, making the wait behind another process's build
+/// visible and cancellable. A cancelled wait ends as [`SabrageError::Cancelled`]
+/// (exit 130) with nothing touched. The live-session refusal stays *before* the
+/// event, matching demo.sh which dies before printing a stage banner.
 ///
-/// The live-session refusal stays *before* the event: it is an immediate,
-/// argument-shaped rejection, and demo.sh's equivalent dies before printing a
-/// stage banner too.
-///
-/// # Refused twice, on purpose
-///
-/// [`deny_before_dispatch`] runs **again** after the operation lock is in hand.
-/// The wait is unbounded (another Sabrage process's build, minutes long) and the
-/// world moves during it: a queued `install` admitted while the machine was idle
-/// used to lose the race to a concurrent `run`, which publishes its live handle
-/// and then deliberately *releases* the lock at the launch boundary — so the
-/// install acquired the lock a moment later and replaced the artifacts of a game
-/// that was by then streaming. The second refusal is the same predicate on the
-/// same state; only its timing (after the wait, before the first mutation)
-/// matters. It goes through [`finish_stage`] because `StageStarted` has already
-/// been emitted by then.
+/// `deny_before_dispatch` runs **again** once the lock is in hand: the wait is
+/// unbounded, and a `run` admitted meanwhile publishes its live session and then
+/// releases the lock at the launch boundary, so an install could otherwise
+/// replace the artifacts of a streaming game. The second refusal goes through
+/// `finish_stage`, `StageStarted` having already been emitted.
+/// See tests::{run_stage_brackets_the_stage_with_events_even_when_it_fails,
+/// a_queued_stage_announces_itself_and_cancels_out_of_the_wait,
+/// a_queued_stage_is_refused_when_a_session_goes_live_during_the_wait}.
 pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
-    // Before the lock, not after: waiting for a build to finish only to refuse
-    // is worse than refusing straight away, and the operation lock is free for
-    // the whole of a live session by design (see "Lock policy for `run`").
+    // Before the lock, not after: waiting minutes for another process's build
+    // only to refuse is worse than refusing straight away.
     deny_before_dispatch(stage, ctx)?;
     ctx.emit(StageEvent::StageStarted {
         run_id: ctx.run_id,
@@ -888,10 +767,9 @@ pub async fn run_stage(stage: Stage, ctx: &StageCtx) -> Result<StageOutcome> {
         return finish_stage(stage, ctx, Err(e));
     }
     if stage == Stage::Run {
-        // The one stage that gives the lock back early — see this module's
-        // "Lock policy for `run`". The guard is *moved into* the stage, which
-        // drops it once the wine child is up; `run_stage` must not keep one of
-        // its own or the release would be a no-op.
+        // The one stage that gives the lock back early: the guard is *moved
+        // into* the stage, which drops it once the wine child is up. `run_stage`
+        // must not keep one of its own, or the release would be a no-op.
         let result = run::run(ctx, Some(guard)).await;
         return finish_stage(stage, ctx, result);
     }
@@ -1066,7 +944,9 @@ mod tests {
 
     #[test]
     fn the_two_wineserver_budgets_stay_distinct() {
-        // PARITY.md: 5 s fatal (run) vs 4 s soft (stop). Never unify.
+        // PARITY.md § Invariants that must NOT change (byte/behavior parity),
+        // "wineserver budgets (5 s fatal / 4 s soft)": 5 s fatal (run) vs
+        // 4 s soft (stop). Never unify.
         assert_eq!(RUN_WINESERVER_WAIT, Duration::from_secs(5));
         assert_eq!(STOP_WINESERVER_WAIT, Duration::from_secs(4));
         assert_ne!(RUN_WINESERVER_WAIT, STOP_WINESERVER_WAIT);
@@ -1100,13 +980,9 @@ mod tests {
         drop(guard);
     }
 
-    /// The in-process mutex is only half of the lock: two Sabrage processes
-    /// (GUI and CLI) have one `OPERATION_LOCK` each, so the exclusion that
-    /// actually protects `build-x64/` is the advisory file lock.
-    ///
-    /// `flock` is per open file description, so a second `File` on the same
-    /// path — even in this same process — is exactly what a second process
-    /// sees.
+    /// The advisory file lock, not `OPERATION_LOCK`, excludes a second Sabrage
+    /// process. `flock` is per open file description, so a second `File` on the
+    /// same path in this process sees exactly what another process sees.
     #[tokio::test]
     async fn the_advisory_file_lock_excludes_a_second_holder_and_releases_on_drop() {
         let path = std::env::temp_dir().join(format!(
@@ -1348,13 +1224,11 @@ mod tests {
         std::fs::remove_dir_all(&root).ok();
     }
 
-    /// The refusal is checked before the operation lock **and again after it**.
-    ///
-    /// The window it closes: a stage admitted while the machine was idle waits
-    /// (minutes, behind another Sabrage process's build), a `run` acquires
-    /// first, publishes its live session and hands the lock back at its launch
-    /// boundary — and the queued stage used to walk straight into `dispatch`
-    /// and replace the artifacts of a game that was by then streaming.
+    /// The live-session refusal is checked before the operation lock **and
+    /// again after it**: a stage admitted while idle can wait minutes behind
+    /// another process's build, and a `run` that wins the lock race publishes
+    /// its session and releases the lock at launch — so the queued stage must
+    /// be re-refused or it replaces the artifacts of a streaming game.
     #[tokio::test]
     async fn a_queued_stage_is_refused_when_a_session_goes_live_during_the_wait() {
         let _g = crate::session::lock_session_globals();
