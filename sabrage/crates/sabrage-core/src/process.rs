@@ -1,16 +1,15 @@
 //! Child processes: spawn, stream, cancel, and the reap primitive.
 //!
-//! # Scope warning — build tools only
+//! # Scope warning - build tools only
 //!
-//! [`spawn_streamed`] sets `kill_on_drop(true)` and puts the child in its own
-//! process group so cancellation can signal the whole tree. That is correct for
-//! `git`, `cmake`, `ninja`, `cargo`, `curl`, `tar`, `adb`, `wineserver` — and
-//! **wrong for the wine launch in Phase 3**. Cancelling `run` means the
-//! INT-trap path: `wineserver -k` plus a bounded `-w` wait, never a SIGKILL of
-//! the game, and the log is a file fd the child writes to directly rather than a
-//! pipe this process pumps. The run stage must therefore build its own
-//! `tokio::process::Command` with `kill_on_drop(false)` and a file-fd redirect;
-//! it must not call [`spawn_streamed`].
+//! [`spawn_streamed`] sets `kill_on_drop(true)` and assigns its own process
+//! group for tree-wide cancellation. That is correct for `git`, `cmake`,
+//! `ninja`, `cargo`, `curl`, `tar`, `adb`, `wineserver` - and **wrong for the
+//! wine launch**: cancelling `run` means `wineserver -k` plus a bounded `-w`
+//! wait (never SIGKILL), and the log is a file fd, not a pipe. The run stage
+//! therefore builds its own `tokio::process::Command` with `kill_on_drop(false)`
+//! and a file-fd redirect ([`crate::executor::Executor::spawn_detached`]); it
+//! must not call [`spawn_streamed`].
 //!
 //! # Output splitting
 //!
@@ -22,11 +21,11 @@
 //!
 //! [`find_processes_by_exe`] matches on the **resolved executable path**, not on
 //! an argv substring. `lib.sh`'s `reap_stray` uses `pgrep -f "$path"` /
-//! `pkill -f`, which will happily match an unrelated process that merely
-//! mentions the path on its command line (a `tail -f` of the log, an editor, the
-//! very shell running doctor). This is a declared divergence — PARITY.md,
-//! "Stop"; design-core §10.7 — and the GUI shows what will
-//! be killed before killing it.
+//! `pkill -f`, which matches any process that merely mentions the path on its
+//! command line. Declared divergence - PARITY.md
+//! § Stop, "Each reap (leftover encoder helper, leftover ALVR dashboard)
+//! matches by"; design-core §10.7 - and the GUI shows what will be killed
+//! before killing it.
 
 use std::collections::VecDeque;
 use std::ffi::OsString;
@@ -56,8 +55,6 @@ pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(5);
 /// The point is a bound at all, so a wedged probe cannot hold the operation
 /// lock forever.
 pub const DEFAULT_PROBE_TIMEOUT: Duration = Duration::from_secs(10);
-
-// ── spec ──────────────────────────────────────────────────────────────────────
 
 /// Everything needed to spawn one child.
 ///
@@ -182,21 +179,18 @@ pub fn default_child_path() -> String {
     parts.join(":")
 }
 
-// ── output splitting ──────────────────────────────────────────────────────────
-
-/// How a chunk was terminated — the byte(s) a faithful passthrough has to put
+/// How a chunk was terminated - the byte(s) a faithful passthrough has to put
 /// back.
 ///
 /// A progress writer's `\r` and a line's `\n` are not interchangeable: printing
 /// a repaint with `println!` turns curl's one self-overwriting line into
 /// hundreds of permanent ones, and appending a newline to the final
-/// unterminated chunk invents output the child never wrote.
+/// unterminated chunk invents output the child never wrote
+/// (tests::chunks_carry_their_terminator).
 ///
-/// `Serialize`/`Deserialize` with `Lf` as [`Default`] so
-/// [`crate::events::StageEvent::Output::end`] can carry it over IPC with
-/// `#[serde(default)]` — a consumer that has not been taught the field yet
-/// (or an event built before A14-3) reads as a plain newline-terminated line,
-/// which is what every emitter meant before this field existed.
+/// `Lf` is [`Default`] so [`crate::events::StageEvent::Output`]'s
+/// `#[serde(default)]` `end` field reads as a plain newline-terminated line
+/// for consumers that omit it (A14-3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub enum ChunkEnd {
@@ -216,11 +210,11 @@ pub enum ChunkEnd {
 /// at EOF. Empty chunks are preserved (a blank line in build output is real
 /// output), except for the phantom one `\r\n` would otherwise produce.
 ///
-/// [`ChunkSplitter::push_with`] additionally reports each chunk's [`ChunkEnd`],
-/// which is what a byte-faithful renderer needs. A chunk ending in `\r` is held
-/// until the next byte decides whether it was a bare CR or half of a CRLF — the
-/// chunk *sequence* is identical either way, only that one chunk's delivery
-/// waits for the byte behind it (or for [`ChunkSplitter::finish`]).
+/// [`ChunkSplitter::push_with`] additionally reports each chunk's [`ChunkEnd`].
+/// A `\r`-terminated chunk is delivered only once the byte behind it - or
+/// [`ChunkSplitter::finish`] - has settled bare-CR versus CRLF: delivery
+/// timing differs, the chunk sequence does not
+/// (tests::chunks_carry_their_terminator).
 #[derive(Debug, Default)]
 pub struct ChunkSplitter {
     buf: Vec<u8>,
@@ -280,8 +274,6 @@ impl ChunkSplitter {
     }
 }
 
-// ── spawn ─────────────────────────────────────────────────────────────────────
-
 /// The last [`CHILD_TAIL_LINES`] output chunks, shared by both pumps.
 type Tail = Arc<Mutex<VecDeque<String>>>;
 
@@ -301,9 +293,9 @@ pub async fn spawn_streamed(
     sink: &EventSink,
     cancel: &CancellationToken,
 ) -> Result<ExitStatus> {
-    // No caller here reads the tail (see `run_ok`), so the pumps are told not
-    // to clone every chunk into it — real savings on a chatty build tool
-    // (curl's progress bar, cargo's output) whose tail nobody ever looks at.
+    // `false`: no caller of `spawn_streamed` reads the tail, so the pumps skip
+    // cloning every chunk of a chatty build tool into a buffer nobody looks at
+    // (tests::spawn_streamed_does_not_populate_a_tail_nobody_reads).
     let (status, _tail) = spawn_streamed_inner(spec, sink, cancel, false).await?;
     Ok(status)
 }
@@ -386,9 +378,6 @@ async fn spawn_streamed_inner(
             ))
         })?;
 
-    // `run_ok` needs the tail to explain a failure; `spawn_streamed`'s callers
-    // never read it, so a build tool's chatty progress output (curl, cargo)
-    // is not cloned into a buffer nobody looks at.
     let tail: Option<Tail> =
         capture_tail.then(|| Arc::new(Mutex::new(VecDeque::with_capacity(CHILD_TAIL_LINES))));
     let mut pumps = Vec::new();
@@ -434,14 +423,9 @@ async fn spawn_streamed_inner(
                         .map_err(|e| SabrageError::io(PathBuf::from(&spec.program), e))?
                 }
             };
-            // The leader exiting is not the tree exiting, and the pipes are no
-            // witness either: a descendant that ignored the SIGTERM *and*
-            // redirected its own stdout/stderr lets both pumps reach EOF while
-            // it keeps running, so an escalation conditioned on the drain
-            // timing out never fires. Cancellation means the whole tool tree
-            // stops — so liveness is measured on the **group**, for the
-            // configured `kill_grace`, and whatever is still in it at the
-            // deadline is SIGKILLed unconditionally.
+            // A descendant that ignored the SIGTERM and redirected its own
+            // stdout/stderr survives both the leader's exit and pipe EOF, so
+            // liveness is measured on the group (tests::cancellation_escalates_when_a_descendant_outlives_the_leader).
             while group_alive(pgid) && tokio::time::Instant::now() < deadline {
                 tokio::time::sleep(GROUP_POLL_INTERVAL).await;
             }
@@ -452,24 +436,20 @@ async fn spawn_streamed_inner(
         }
     };
 
-    // The pipes close when the child **and every descendant holding them** is
-    // gone — which is not the same thing as the leader being reaped. A build
-    // tool that leaves a daemon behind (wine's `reg add` starts wineserver), or
-    // a descendant that ignored the SIGTERM the leader obeyed, keeps the write
-    // end open; waiting for EOF unconditionally hangs the stage.
+    // The pipes stay open while any descendant still holds them (wine's
+    // `reg add` leaves wineserver behind), so waiting for EOF unconditionally
+    // would hang the stage (tests::a_backgrounded_descendant_does_not_wedge_the_stage).
     if !drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await {
         if cancelled {
-            // Belt and braces: the cancelled arm above already SIGKILLed the
-            // group at the `kill_grace` deadline, so reaching here means the
-            // group looked empty (or unsignalable) while something still holds
-            // the pipe. Escalate on the group once more, not on the leader.
+            // Belt and braces: the group looked empty (or unsignalable) while
+            // something still holds the pipe. Escalate on the group, not the
+            // leader (tests::cancellation_kills_a_descendant_that_ignored_term_and_released_the_pipes).
             let _ = killpg(pgid, Signal::SIGKILL);
             let _ = drain_pumps(&mut pumps, PUMP_DRAIN_GRACE).await;
         }
-        // Whatever still holds the pipe outlives us: stop reading rather than
-        // wedge the operation lock. No SIGKILL on the uncancelled path — there
-        // the surviving descendant is usually one the pipeline *wanted*
-        // (wineserver, started by install's `reg add`).
+        // Whatever still holds the pipe outlives us: stop reading rather than wedge
+        // the operation lock. No SIGKILL on the uncancelled path - that survivor is
+        // usually one the pipeline wanted, e.g. wineserver (tests::a_backgrounded_descendant_does_not_wedge_the_stage).
         for p in &pumps {
             p.abort();
         }
@@ -534,13 +514,9 @@ async fn pump<R>(
 {
     let mut splitter = ChunkSplitter::new();
     let mut buf = [0u8; 8192];
-    // A14-3: `end` is the chunk's terminator ([`ChunkEnd`]), carried on the
-    // event so a byte-faithful renderer (the CLI, writing to a real tty) can
-    // repaint a `\r`-terminated chunk in place instead of `println!`-ing it —
-    // which is what turns curl's/cargo's progress repaints into permanent spam.
-    // `tail` is `None` for a caller that never reads it ([`spawn_streamed`]) —
-    // skip the clone-per-chunk entirely rather than fill a buffer nobody
-    // looks at.
+    // A14-3: `end` carries each chunk's terminator so a byte-faithful renderer
+    // repaints a `\r` chunk in place instead of `println!`-ing curl's and
+    // cargo's progress spam (tests::output_events_carry_their_chunk_terminator).
     let mut emit = |chunk: String, end: ChunkEnd| {
         if let Some(tail) = &tail {
             if let Ok(mut t) = tail.lock() {
@@ -568,15 +544,14 @@ async fn pump<R>(
     splitter.finish_with(&mut emit);
 }
 
-// ── reaping ───────────────────────────────────────────────────────────────────
-
 /// One matched process.
 ///
 /// Serializable because it is the **process identity** persisted in
-/// `session-state.json` ([`crate::session::state::SessionState`]): after a
-/// crash, `pid` alone cannot say whether the wine process still running under
-/// that number is *the* wine process this Sabrage launched, and signalling a
-/// recycled pid is the one unrecoverable mistake the reconcile path can make.
+/// `session-state.json` ([`crate::session::state::SessionState`]): `pid` alone
+/// cannot say whether the wine process running under that number is *the* one
+/// this Sabrage launched, and signalling a recycled pid is the one
+/// unrecoverable mistake the reconcile path can make
+/// (tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProcInfo {
@@ -614,20 +589,18 @@ impl ProcInfo {
 
     /// Is the process this identity names **still the same process**?
     ///
-    /// True iff the pid is alive *and* the pid observed right now reports the
-    /// same `start_time`. That pair is the recycled-pid guard: pids wrap, start
-    /// times do not.
+    /// True iff the pid is alive *and* reports the same `start_time` as when
+    /// spawned. Pids wrap; start times do not.
     ///
-    /// `exe` is deliberately **not** compared. CrossOver's `wine` launcher
-    /// `exec`s into the real loader, which replaces the executable image —
-    /// same pid, same start time, a different `exe` path — so an exe equality
-    /// test would classify every live session as "not mine" a few hundred
-    /// milliseconds after launch.
+    /// `exe` is deliberately **not** compared: CrossOver's `wine` launcher
+    /// `exec`s into the real loader, so a live session's `exe` path changes a
+    /// few hundred milliseconds after launch while pid and start time stay
+    /// constant.
     ///
     /// A `start_time` of 0 is the "could not observe at spawn" fallback
-    /// [`crate::executor::Executor::spawn_detached`] records; it can never
-    /// equal a real start time, so such an identity reports `false` here — the
-    /// conservative answer (treat it as an identity mismatch, never signal it).
+    /// [`crate::executor::Executor::spawn_detached`] records; it never equals
+    /// a real start time, so such an identity always reports `false`
+    /// (tests::identity_rejects_a_recycled_pid_and_the_unobservable_fallback).
     pub fn is_same_process(&self) -> bool {
         if !is_alive(self.pid) {
             return false;
@@ -654,39 +627,34 @@ pub fn find_processes_by_exe(path: &Path) -> Vec<ProcInfo> {
     ProcessScan::scan().by_exe(path)
 }
 
-/// True when any element of `cmd` — or the whitespace-joined command line as a
-/// whole, the shape `pgrep -f` scans — contains `needle`.
+/// True when any element of `cmd` - or the whitespace-joined command line as a
+/// whole, the shape `pgrep -f` scans - contains `needle`.
 ///
 /// Wine puts the game's own path on the command line as a single `Z:\...`
 /// Windows-path argument (e.g. `Z:\repo\…\Beat Saber.exe`), so per-element and
 /// whole-line matching agree in the real case; both are checked so a
-/// hypothetical split across two argv elements still matches.
-///
-/// Lives here (rather than beside its first caller in
-/// [`crate::stages::stop`]) because Phase 3 needs the same shape twice more:
-/// run.sh's wineserver-timeout warning quotes `pgrep -lf wineserver`, and the
-/// cancellation teardown probes for survivors the same way.
+/// hypothetical split across two argv elements still matches
+/// (tests::cmdline_matching_is_the_pgrep_f_shape).
 pub fn cmdline_contains(cmd: &[String], needle: &str) -> bool {
     cmd.iter().any(|arg| arg.contains(needle)) || cmd.join(" ").contains(needle)
 }
 
 /// Every running process whose command line matches [`cmdline_contains`] for
-/// `needle`, pid-ordered — the argv-based match `pgrep -f` performs, unlike
+/// `needle`, pid-ordered - the argv-based match `pgrep -f` performs, unlike
 /// [`find_processes_by_exe`]'s exact exe-path equality (used by the reap
-/// steps). See this module's header, and PARITY.md "Stop", for why the two
-/// probes make opposite trade-offs on purpose. A single-needle convenience
-/// over [`ProcessScan::scan`] — see [`find_processes_by_exe`]'s doc for when a
-/// caller should scan once instead.
+/// steps). Opposite trade-offs on purpose - see this module's header and
+/// PARITY.md § Stop, "The Beat Saber survivor probe scans live processes'
+/// argv". A single-needle convenience over [`ProcessScan::scan`] - see
+/// [`find_processes_by_exe`]'s doc for when a caller should scan once instead.
 pub fn find_processes_by_cmdline(needle: &str) -> Vec<ProcInfo> {
     ProcessScan::scan().by_cmdline(needle)
 }
 
 /// One full-table process scan, with both `exe` and `cmd` refreshed, kept
 /// around so a caller that needs several different needles against the same
-/// instant pays for exactly one process walk. `stop` used to run one fresh
-/// scan per probe — the survivor check, each of its two reap steps, and its
-/// foreign-helper scan — four full walks of the process table for one
-/// invocation; they now share one [`ProcessScan`].
+/// instant pays for exactly one process walk: `stop`'s survivor check, each of
+/// its two reap steps, and its foreign-helper scan share one [`ProcessScan`]
+/// instead of walking the process table four times.
 pub struct ProcessScan {
     procs: Vec<(ProcInfo, Vec<String>)>,
 }
@@ -771,8 +739,6 @@ impl ProcessScan {
     }
 }
 
-// ── read-only probes ──────────────────────────────────────────────────────────
-
 /// What [`capture`] came back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Captured {
@@ -790,37 +756,32 @@ impl Captured {
 
 /// Run a **read-only probe** and capture both pipes.
 ///
-/// For the handful of run-stage probes whose *output* is the point and whose
-/// effect is nil: `adb devices`, `adb forward --list`,
-/// `SwitchAudioSource -a -t output`, `SwitchAudioSource -c -t output`. Those
-/// are the same class of thing the check layer already shells out to directly,
-/// and streaming them as [`StageEvent::Output`] would print machine-readable
-/// noise the shell never prints.
+/// For run-stage probes whose *output* is the point and whose effect is nil:
+/// `adb devices`, `adb forward --list`, `SwitchAudioSource -a -t output`,
+/// `SwitchAudioSource -c -t output`. Streaming those as [`StageEvent::Output`]
+/// would print machine-readable noise the shell never prints.
 ///
-/// "Effect is nil" has one asterisk, shared with the shell: the first `adb`
-/// command after a reboot forks the adb *server*. `demo.sh` does exactly the
-/// same thing from its own probes, so this is parity rather than a Sabrage
-/// hole — but it does mean a `--dry-run` that probes adb can leave a server
-/// process behind that the plan does not mention.
+/// "Effect is nil" has one asterisk: the first `adb` after a reboot forks the
+/// adb *server*, so `--dry-run` can leave a server behind the plan does not
+/// mention. `demo.sh` does the same, so this is parity.
 ///
 /// **Mutations must never come through here.** `adb forward`,
 /// `adb forward --remove`, `adb reverse --remove-all`,
-/// `SwitchAudioSource -t output -s …`, `wineserver -k` and every other write
-/// go through [`crate::executor::Executor::run_child`], which is what makes
+/// `SwitchAudioSource -t output -s …`, `wineserver -k` and every other write go
+/// through [`crate::executor::Executor::run_child`], which is what makes
 /// `--dry-run` plan them instead of performing them. A probe routed through
-/// this function is invisible to the plan — correct for a probe, a silent
+/// this function is invisible to the plan - correct for a probe, a silent
 /// dry-run hole for anything else.
 ///
 /// stdin is `/dev/null`, and `spec.env_path` is applied so a Finder-launched
 /// `.app` still finds `adb` (see [`default_child_path`]).
 ///
-/// **Bounded.** These all answer in milliseconds — but a wedged `adb` (a server
-/// that stopped answering, a device in a bad state) used to block the caller,
-/// and with it the process-wide operation lock, forever, with Cancel unable to
-/// interrupt it. A probe therefore gets [`DEFAULT_PROBE_TIMEOUT`] and its own
-/// process group; on expiry the group is killed and the probe fails like a
-/// missing binary does (`kind() == "io"`), which every caller already handles.
-/// Use [`capture_with`] to attach the operation's cancellation token.
+/// **Bounded.** A wedged `adb` would otherwise hold the operation lock with
+/// Cancel unable to interrupt it, so a probe gets [`DEFAULT_PROBE_TIMEOUT`] and
+/// its own process group; on expiry the group is killed and the probe fails like
+/// a missing binary (`kind() == "io"`), which every caller already handles
+/// (tests::a_probe_that_never_answers_times_out_instead_of_hanging). Use
+/// [`capture_with`] to attach the operation's cancellation token.
 pub async fn capture(spec: &ChildSpec) -> Result<Captured> {
     capture_with(spec, &CancellationToken::new(), DEFAULT_PROBE_TIMEOUT).await
 }
@@ -953,7 +914,6 @@ mod tests {
     fn splits_on_lf_and_cr() {
         // curl's progress bar: CR-separated repaints, no trailing newline.
         assert_eq!(split(&[b"10%\r50%\r100%"]), vec!["10%", "50%", "100%"]);
-        // Blank lines survive.
         assert_eq!(split(&[b"a\n\nb\n"]), vec!["a", "", "b"]);
         assert_eq!(split(&[b"partial"]), vec!["partial"]);
         assert!(split(&[b""]).is_empty());
@@ -1062,13 +1022,10 @@ mod tests {
         );
     }
 
-    /// A14-3: `pump`'s `emit` closure used to compute each chunk's
-    /// [`ChunkEnd`] and then drop it — `StageEvent::Output` had nowhere to
-    /// carry it. Now the terminator rides the event itself, so a `\r`
-    /// progress repaint, a `\n`-terminated line and the final unterminated
-    /// chunk are all distinguishable downstream (a byte-faithful CLI
-    /// renderer needs exactly this to repaint curl's bar in place instead of
-    /// spamming a `println!` per tick).
+    /// A14-3 pins that `StageEvent::Output` carries each chunk's
+    /// [`ChunkEnd`] rather than computing and discarding it: a `\r` progress
+    /// repaint, a `\n`-terminated line and the final unterminated chunk
+    /// ([`ChunkEnd::Eof`]) must stay distinguishable downstream.
     #[tokio::test]
     async fn output_events_carry_their_chunk_terminator() {
         let run_id = Uuid::new_v4();
@@ -1164,10 +1121,10 @@ mod tests {
         assert_eq!(err.exit_code(), 130);
     }
 
-    /// The SIGKILL escalation must watch the process *group*, not the leader:
-    /// a descendant that ignores SIGTERM (an ignored disposition survives
-    /// `exec`) keeps the pipes open long after the leader is reaped, and the
-    /// drain that follows used to wait for that EOF with no deadline.
+    /// The SIGKILL escalation watches the process *group*, not the leader: a
+    /// descendant that ignores SIGTERM (an ignored disposition survives
+    /// `exec`) keeps the pipes open long after the leader is reaped, so
+    /// `spawn_streamed` must not block on that EOF.
     #[tokio::test]
     async fn cancellation_escalates_when_a_descendant_outlives_the_leader() {
         let run_id = Uuid::new_v4();
@@ -1326,13 +1283,12 @@ mod tests {
             found.iter().any(|p| p.pid == me),
             "own pid {me} not found among {found:?}"
         );
-        // An exe path nothing runs from matches nothing.
         assert!(find_processes_by_exe(Path::new("/nonexistent/sabrage/helper")).is_empty());
     }
 
-    /// `find_processes_by_exe`/`find_processes_by_cmdline` are now thin
-    /// wrappers over one [`ProcessScan`]; a caller sharing a scan across
-    /// several needles (`stages::stop`) must see exactly the same matches the
+    /// `find_processes_by_exe`/`find_processes_by_cmdline` are thin wrappers
+    /// over one [`ProcessScan`]; a caller sharing a scan across several
+    /// needles (`stages::stop`) must see exactly the same matches the
     /// single-needle convenience functions would.
     #[test]
     fn process_scan_agrees_with_the_single_needle_convenience_functions() {
@@ -1344,15 +1300,12 @@ mod tests {
             .by_exe(Path::new("/nonexistent/sabrage/helper"))
             .is_empty());
 
-        // The convenience functions run their **own** scan, so any difference
-        // is either a filter disagreement (what this test is about) or the
-        // process table having changed between the two walks (what it is not).
-        // The second is routine under `cargo test`: every child a concurrent
-        // test spawns is briefly a copy of *this* exe, between the fork and the
-        // exec, and a handful of those come and go inside one scan's duration.
-        // So the comparison is only made across a window the table sat still
-        // for — bracketed by two scans that agree — and inside that window the
-        // filters must agree exactly.
+        // The convenience functions run their **own** scan, so a difference is
+        // either a filter disagreement (what this test is about) or the process
+        // table changing between the two walks (what it is not): under `cargo
+        // test` every child a concurrent test spawns is briefly a copy of this
+        // exe, between fork and exec. So the comparison is only made across a
+        // window two bracketing scans agree on, and there the filters must match.
         for _ in 0..50 {
             let before = ProcessScan::scan();
             let fresh_exe = find_processes_by_exe(&exe);
@@ -1446,7 +1399,6 @@ mod identity_tests {
         };
         assert!(!fallback.is_same_process());
 
-        // A dead pid is not the same process either.
         let dead = ProcInfo {
             pid: u32::MAX - 1,
             start_time: 1,
