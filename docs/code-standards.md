@@ -147,10 +147,11 @@ crate, run locally on macOS (it is not wired into CI, which is ubuntu and cannot
 kills the same mutants before and after the deletion; (b) *reading*: the deleter names, in the commit
 message, the surviving test that carries each fact of the deleted one, *about the same unit*. (b) is
 mandatory; when (a) cannot be run, the deletion needs the owner's sign-off. Equal mutant kills never
-justify a deletion on their own: `checks::config::parse_protocol` (doctor.sh's last-match `awk`) and
-`stages::setup::parse_protocol_awk` (setup.sh's first-match `awk`) have tests that share eight literals
-and differ in exactly one assertion (`"second"` vs `"first"`), so they look like duplicates and pin
-opposite semantics of two different units.
+justify a deletion on their own: until 2026-09-04 `checks::config::parse_protocol` (doctor.sh's
+last-match `awk`) and a setup-stage twin (setup.sh's then first-match `awk`) had tests that shared eight
+literals and differed in exactly one assertion (`"second"` vs `"first"`), so they looked like duplicates
+and pinned opposite semantics of two different units. (The twin went away only when the shell reads were
+unified behind lib.sh's `toml_string_value`, a behaviour change, not a redundancy deletion.)
 
 **3.5 Layers: one owner per byte-fact, and it is `sabrage-parity` when CI can hold it.** CI runs
 `-p sabrage-parity -p sabrage-contract-gen` on ubuntu (`.github/workflows/parity.yml`); local tier 1

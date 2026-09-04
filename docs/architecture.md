@@ -48,22 +48,18 @@ Rosetta, so the manifest points at an x86_64 build of the runtime, loaded
 in-process.
 
 By default (`encoder_process = "auto"`, effectively `"native"`), encoding
-happens out of process on a native arm64 helper (`oxrsys-encoder-helper`),
-which the x86_64 Wine parent launches once via `posix_spawn`. The parent keeps
-compose (3 IOSurface-backed BGRA slots) and every `alvr_*` call; only the
-IOSurfaces cross, and only once per generation, as Mach send rights — the
-parent does a `bootstrap_check_in` and the child a matching
-`bootstrap_look_up` (not the special-port route: `libxpc` latches the
-bootstrap port at `libSystem` init, so that route is dead for a
-`posix_spawn`ed child). The helper runs VideoToolbox HW HEVC Main with
-low-latency rate control natively on arm64 — no Rosetta, no chroma bug — and
-returns Annex-B NALs to the parent over an inherited socketpair; the helper
-exits cleanly on socket EOF. Crash handling is budgeted: at most one automatic
-respawn per 30 s, and after two failures in one connected session `auto` pins
-to in-process H.264 until the next reconnect (`native` fails loudly instead).
-Live recovery numbers (2026-08-04): SIGKILL→HEVC-ready 398 ms (515 ms
-mid-soak), second-failure pin engaged in 13 ms, parent kill-9 → helper
-EOF-exit in 0.32 s.
+happens out of process on a native arm64 helper (`oxrsys-encoder-helper`)
+spawned by the x86_64 Wine parent. The parent keeps compose (3
+IOSurface-backed BGRA slots) and every `alvr_*` call; only the IOSurfaces
+cross the process boundary, once per generation, and the helper encodes
+VideoToolbox HW HEVC Main with low-latency rate control natively on arm64 —
+no Rosetta, no chroma bug. The spawn/rendezvous/wire mechanism lives with the
+runtime: see `ext/oxrsys/docs/architecture.md`. Crash handling is budgeted:
+at most one automatic respawn per 30 s, and after two failures in one
+connected session `auto` pins to in-process H.264 until the next reconnect
+(`native` fails loudly instead). Live recovery numbers (2026-08-04):
+SIGKILL→HEVC-ready 398 ms (515 ms mid-soak), second-failure pin engaged in
+13 ms, parent kill-9 → helper EOF-exit in 0.32 s.
 
 Latency, by transport (3008x1664@72, 80 Mbps, all p50 unless noted):
 

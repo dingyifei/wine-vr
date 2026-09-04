@@ -46,25 +46,6 @@ fn lines(seen: &Arc<StdMutex<Vec<StageEvent>>>) -> Vec<(Severity, String)> {
         .collect()
 }
 
-#[test]
-fn parse_protocol_awk_matches_the_shell_recipe() {
-    assert_eq!(parse_protocol_awk("protocol = \"alvr\"\n"), "alvr");
-    assert_eq!(parse_protocol_awk("  protocol=\"oxrsys\"\n"), "oxrsys");
-    assert_eq!(parse_protocol_awk("# protocol = \"alvr\"\n"), "");
-    assert_eq!(parse_protocol_awk("protocol_extra = \"alvr\"\n"), "");
-    assert_eq!(parse_protocol_awk("protocol=alvr\n"), "");
-    assert_eq!(parse_protocol_awk(""), "");
-    assert_eq!(
-        parse_protocol_awk("video_codec = \"h264\"\nprotocol = \"alvr\"\n"),
-        "alvr"
-    );
-    // First matching line wins.
-    assert_eq!(
-        parse_protocol_awk("protocol = \"first\"\nprotocol = \"second\"\n"),
-        "first"
-    );
-}
-
 #[tokio::test]
 async fn game_check_is_skipped_without_bottle_or_bs_dir() {
     let fixture = scratch("game-skip");

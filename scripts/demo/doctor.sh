@@ -178,8 +178,7 @@ else chk fail host.manifest "$HOST_XR_JSON missing" "./demo.sh install --bottle 
 
 # 13. runtime config
 if [ -f "$TOML" ]; then
-  # last assignment wins, like the runtime's parser (Config.cpp)
-  PROTO="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{v=$2} END{print v}' "$TOML")"
+  PROTO="$(toml_string_value "$TOML" protocol)"
   if [ "$PROTO" = "alvr" ]; then
     chk ok cfg.protocol.supported "oxrsys-runtime.toml: protocol=alvr"
     tap cfg.protocol.legacy-oxrsys ok

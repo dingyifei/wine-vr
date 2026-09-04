@@ -32,14 +32,16 @@ enum ProtocolState {
     Other(String),
 }
 
-/// The `protocol` value doctor.sh's last-match `awk` recipe would resolve,
-/// or the empty string when no line assigns a quoted one.
+/// The `protocol` value the shell's `toml_string_value` (lib.sh) would
+/// resolve, or the empty string when no line assigns a quoted one.
 ///
 /// Table-blind and last-assignment-wins, matching the runtime's line-oriented
-/// reader and the `awk` form doctor.sh and run.sh share; `#`-commented lines
-/// and keys like `protocol_foo` never match; an unquoted assignment resolves
-/// to the empty string. Pinned by tests::parse_protocol_matches_the_awk_recipe.
-fn parse_protocol(toml_text: &str) -> String {
+/// reader and the one `awk` form doctor.sh, run.sh and setup.sh share;
+/// `#`-commented lines and keys like `protocol_foo` never match; an unquoted
+/// assignment resolves to the empty string. Pinned by
+/// tests::parse_protocol_matches_the_awk_recipe; the setup stage's
+/// existing-config row reads through it too.
+pub(crate) fn parse_protocol(toml_text: &str) -> String {
     let mut value = String::new();
     for line in toml_text.lines() {
         let after_leading_ws = line.trim_start();

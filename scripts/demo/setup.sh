@@ -42,7 +42,7 @@ fi
 # 3. runtime config (~/Library/Application Support/OXRSys) — never clobber an existing file
 mkdir -p "$OXR_APPSUP"
 if [ -f "$TOML" ]; then
-  PROTO="$(awk -F'"' '/^[[:space:]]*protocol[[:space:]]*=/{print $2; exit}' "$TOML")"
+  PROTO="$(toml_string_value "$TOML" protocol)"
   if [ "$PROTO" = "alvr" ]; then info "config present: $TOML (protocol=alvr)"
   else warn "config present with protocol='"$PROTO"' — the demo needs protocol = \"alvr\"; edit $TOML yourself (not overwriting)"; fi
 else

@@ -261,12 +261,14 @@ async fn setup_config(ctx: &StageCtx) -> Result<()> {
 /// Emits the row for a config this run did not write: `info` when its
 /// `protocol` is already `alvr`, otherwise the `warn` that reproduces
 /// setup.sh's "not overwriting" text verbatim —
-/// tests::config_warns_verbatim_when_protocol_is_not_alvr.
+/// tests::config_warns_verbatim_when_protocol_is_not_alvr. `protocol` is read
+/// with the same last-match recipe as doctor.sh and run.sh (lib.sh's
+/// `toml_string_value`).
 ///
 /// Reference: `scripts/demo/setup.sh`.
 fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) {
     let text = std::fs::read_to_string(toml_path).unwrap_or_default();
-    let proto = parse_protocol_awk(&text);
+    let proto = crate::checks::config::parse_protocol(&text);
     if proto == "alvr" {
         st.info(format!(
             "config present: {} (protocol=alvr)",
@@ -278,29 +280,6 @@ fn report_existing_config(st: crate::stages::StepEmitter<'_>, toml_path: &Path) 
             toml_path.display()
         ));
     }
-}
-
-/// The `protocol` value from an `oxrsys-runtime.toml`: the first matching
-/// line wins, and an absent or unquoted value yields the empty string —
-/// tests::parse_protocol_awk_matches_the_shell_recipe.
-///
-/// Reference: `scripts/demo/setup.sh`. [`crate::checks::config`]'s
-/// `parse_protocol` mirrors doctor.sh's last-match semantics instead, so the
-/// two are not one helper.
-fn parse_protocol_awk(toml_text: &str) -> String {
-    for line in toml_text.lines() {
-        let after_leading_ws = line.trim_start();
-        let Some(rest) = after_leading_ws.strip_prefix("protocol") else {
-            continue;
-        };
-        if !rest.trim_start().starts_with('=') {
-            continue;
-        }
-        let mut fields = line.split('"');
-        let _before_first_quote = fields.next();
-        return fields.next().unwrap_or("").to_string();
-    }
-    String::new()
 }
 
 async fn setup_game(ctx: &StageCtx) -> Result<()> {
