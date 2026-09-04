@@ -10,8 +10,7 @@
     /** Disables the Fix button — set while a fix for THIS row is in flight. */
     busy?: boolean;
     /** Non-null disables the Fix button and explains why via its `title`
-     * (e.g. a live session — every fix is refused server-side while one is
-     * running; this is the early, explained version of that refusal). */
+     * (e.g. a live session, where a fix would be refused server-side anyway). */
     disabledReason?: string | null;
     /** Present only when `row.fix` resolves to a modelled `FixAction`
      * (`contractFixIdToAction`); omit to render no Fix button at all. */
@@ -42,10 +41,9 @@
       <div class="text-muted remedy">{row.remedy}</div>
     {/if}
     {#if row.detail}
-      <!-- The native check's own diagnostic (e.g. "read error"/"JSON parse
-           error") — `message`/`remedy` alone can misdiagnose a failure mode
-           the native code path cannot actually hit (see the "broken python3?"
-           finding); this is the truthful detail underneath. -->
+      <!-- The check's own diagnostic (e.g. "read error"/"JSON parse error"): remedy is fixed per slug
+           and can misblame a cause the native evaluator never hit (A3b-3,
+           checks::config::tests::malformed_json_warns, checks::config::tests::unreadable_session_json_warns), so detail is truthful. -->
       <div class="text-muted detail">{row.detail}</div>
     {/if}
   </div>
