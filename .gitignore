@@ -4,6 +4,9 @@ third_party/
 
 # Build outputs
 build/
+# …but not the source directories that hold a `build.rs` module's extracted tests (sibling-module layout, code-standards §3.9)
+!sabrage/crates/sabrage-core/src/checks/build/
+!sabrage/crates/sabrage-core/src/stages/build/
 *.exe
 *.dll
 *.so
