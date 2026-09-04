@@ -1,4 +1,8 @@
 <script lang="ts">
+  // The Doctor screen — drives `doctorStore` (every check pass goes through
+  // `runChecks()`) and owns bottle selection plus Fix-in-flight state.
+  // Whole-stage fixes share StagesPanel's single GateModal
+  // (`stageStore.openGate`); `sessionStore` blocks every mutation while live.
   import { onMount } from "svelte";
   import { cap, errMsg, titleCase } from "../lib/text";
   import BottleSelect from "../components/BottleSelect.svelte";
@@ -20,13 +24,10 @@
   const AUTORUN_STALE_MS = 60_000;
 
   interface Props {
-    /** Bumped by App.svelte on every Pipeline ▸ Run Doctor menu firing
-     * (⌘D) — mirrors Session's `launchRequest`. Unlike a plain navigation,
-     * this must always trigger a fresh pass: whether Doctor is already the
-     * open screen (`navigate` alone is then a no-op, so nothing would ever
-     * remount and re-fire `onMount`'s pass) or was just re-navigated to with
-     * `AUTORUN_STALE_MS` still fresh (which `onMount` would otherwise skip),
-     * an explicit command must never be silently swallowed. */
+    /** Bumped by App.svelte on every Pipeline ▸ Run Doctor (⌘D) firing;
+     * mirrors Session's `launchRequest`. Each new value forces a fresh pass,
+     * even when Doctor is already the open screen or its last run is still
+     * within `AUTORUN_STALE_MS`. */
     doctorRequest?: number;
   }
   let { doctorRequest = 0 }: Props = $props();
@@ -49,24 +50,16 @@
   let fixError = $state<FixError | null>(null);
   let confirmFix = $state<{ slug: string; action: FixAction } | null>(null);
   /**
-   * Per-slug notice from the LAST fix run against that slug, keyed so it
-   * survives the `runChecks()` repaint every `runFix` triggers in its
-   * `finally` — a fix can emit a `warn` line (e.g. `RemoveAdbForwards` when
-   * `adb forward --list` itself failed to query) or resolve `changed: false`
-   * with an explanatory description while the *check* it is meant to fix
-   * still reports the same (possibly falsely green) status; without this the
-   * warning is visible for one tick and then overwritten by the very repaint
-   * that was supposed to reflect it. Cleared the instant a new fix run
-   * starts for that slug (`dismissFixNotice`, called from `runFix`'s top) —
-   * a stale notice must never linger behind a fresh attempt — or when the
-   * user dismisses it explicitly via the row's Dismiss control. */
+   * Per-slug notice from the last fix run. Keyed so it survives the
+   * `runChecks()` repaint `runFix` fires in its `finally`: a fix can emit a
+   * `warn` or resolve `changed: false` while the check still reports the same
+   * status. Cleared when a new run starts (`dismissFixNotice`) or on dismiss. */
   let fixNotices = $state<Record<string, string>>({});
 
-  /** Drops slug's notice, if any — the row's Dismiss control calls this
-   * directly, and `runFix` calls it before doing anything else so a notice
-   * from a previous attempt never survives into a fresh one still in
-   * flight (it only re-appears if the new run itself warns or resolves
-   * unchanged). */
+  /** Drops slug's notice, if any. Called by the row's Dismiss control and by
+   * `runFix` before a new attempt, so a notice from a previous attempt never
+   * survives into a fresh one; it re-appears only if the new run warns or
+   * resolves unchanged. */
   function dismissFixNotice(slug: string) {
     if (!(slug in fixNotices)) return;
     const { [slug]: _dropped, ...rest } = fixNotices;
@@ -75,12 +68,10 @@
 
   let lastHandledDoctorRequest = $state(0);
   let doctorRequestNotice = $state<string | null>(null);
-  /** Set once this mount's own `onMount` has made its freshness-based
-   * autorun decision — the request-replay effect below must not act before
-   * then (mirrors Session's `bottlePrefillDone`): reading `doctorStore.running`
-   * or calling `runChecks()` earlier could race the very decision it needs
-   * to respect (see the effect's doc comment for the ordering this relies
-   * on). */
+  /** True once this mount's `onMount` has made its freshness-based autorun
+   * decision. The request-replay effect below waits on it so it cannot read
+   * `doctorStore.running` or start a pass before that decision is made
+   * (mirrors Session's `bottlePrefillDone`). */
   let doctorAutorunDecided = $state(false);
 
   function pickDefaultBottle(bottles: string[], preferred: string | null): string {
@@ -91,27 +82,20 @@
   onMount(async () => {
     await doctorStore.loadBottles();
     selectedBottle = pickDefaultBottle(doctorStore.bottles, doctorStore.defaultBottle);
-    // Skip the automatic pass when the last run is still fresh (e.g. flipping
-    // to another screen and back) — "Run checks" is always available as the
-    // explicit forced refresh.
     const fresh =
       doctorStore.hasRun &&
       doctorStore.lastRunAtMs != null &&
       Date.now() - doctorStore.lastRunAtMs < AUTORUN_STALE_MS;
     if (!fresh) void runChecks();
-    // Only now — `runChecks()` above, if it fired, has already
-    // (synchronously, before its own first `await`) set `doctorStore.running`
-    // — does the request-replay effect become eligible to act, so it can
-    // never start a second concurrent pass on top of this decision.
+    // Set only after the decision above: `runChecks()`, if it fired, already
+    // set `doctorStore.running` synchronously before its first await, so the
+    // request-replay effect can never start a second concurrent pass.
     doctorAutorunDecided = true;
   });
 
   // A menu-triggered Run Doctor (⌘D) always forces a fresh pass, bypassing
-  // `AUTORUN_STALE_MS` — both when Doctor was already the open screen
-  // (`navigate("doctor")` alone is a no-op then, so nothing above ever
-  // remounts to re-run `onMount`'s pass) and when it wasn't but the just-
-  // remounted screen's cache is still fresh. See `doctorAutorunDecided`'s
-  // doc comment for why this waits on it.
+  // `AUTORUN_STALE_MS` — including when Doctor is already the open screen, where
+  // nothing remounts to re-run `onMount`'s pass. Waits on `doctorAutorunDecided`.
   $effect(() => {
     const reqId = doctorRequest;
     if (reqId === lastHandledDoctorRequest) return;
@@ -125,38 +109,31 @@
     void runChecks();
   });
 
-  /** May Doctor mutate the machine right now? Every Fix is refused by the
-   * backend while a session is live (`fixes::apply` -> `deny_if_session_live`)
-   * — this only disables the button early so the user learns why before
-   * clicking, instead of after a failed IPC round trip pulls a live session's
-   * active adb forwards or clobbers a running install. */
+  /** May Doctor mutate the machine right now? The backend refuses every Fix
+   * while a session is live (`fixes::apply` -> `deny_if_session_live`); this
+   * only disables the button early so the user learns why before clicking. */
   const sessionLive = $derived(blocksMutation(sessionStore.status.phase));
 
-  /** A whole-stage fix opens the shared GateModal (`stageStore.openGate`),
-   * the same singleton StagesPanel's Run/Dry-run drive — if one is already
-   * running (possibly Hidden, so `stageStore.gate` reads `null` again) a
-   * second whole-stage Fix here would silently queue behind it and only
-   * display once the modal reopens, mislabelled. See the GateModal fix this
-   * pairs with. */
+  /** Whether a pipeline stage is already running — `stageStore.running`, not
+   * `stageStore.gate`, which reads `null` once the modal is Hidden. Whole-stage
+   * fixes share that one GateModal (`stageStore.openGate`), so a second would
+   * queue behind the first and display mislabelled when the modal reopens. */
   const stageRunning = $derived(stageStore.running);
 
   async function runChecks() {
     await doctorStore.run({ bottle: selectedBottle || null });
   }
 
-  /** Handles a CheckRow's Fix button. Whole-stage fixes (`run-setup` /
-   * `run-build` / `run-install`) open the shared GateModal so the run streams
-   * exactly like a Pipeline-panel invocation; the rest run in place via
-   * `fix()` and re-run doctor afterward — a destructive one confirms first. */
+  /** Handles a CheckRow's Fix button: resolves the contract fix id to a
+   * `FixAction` and dispatches it. An unrecognised id is ignored. */
   function handleFixRequest(slug: string, fixId: string) {
     const action = contractFixIdToAction(fixId);
     if (!action) return;
     dispatchFix(slug, action);
   }
 
-  /** The part of `handleFixRequest` that only needs an already-resolved
-   * `FixAction` — shared with the error banner's "try the suggested fix"
-   * button, whose `FixAction` comes straight off a `Fatal` event rather than
+  /** Dispatches an already-resolved `FixAction` — shared with the error
+   * banner's retry button, whose action comes off a `Fatal` event rather than
    * a contract id string. */
   function dispatchFix(slug: string, action: FixAction) {
     if (sessionLive) {
@@ -206,23 +183,16 @@
     fixError = null;
     confirmFix = null;
     dismissFixNotice(slug);
-    // A failing fix announces itself as a `Fatal` event on this same stream
-    // (message + structured remedy + a possible follow-up fix id) before the
-    // `applyFix` promise ever rejects — capture it so the error state below
-    // can show the same detail the GateModal shows for a stage's own Fatal,
-    // instead of only the rejected promise's bare message.
+    // A failing fix emits a `Fatal` event on this stream (message + remedy +
+    // follow-up fix id) before `applyFix` rejects; the catch below reports
+    // that, not the bare rejection message.
     let fatal: FatalInfo | null = null;
-    // A fix can warn without failing outright (e.g. `RemoveAdbForwards` when
-    // `adb forward --list` itself couldn't be queried) — the check it is
-    // meant to fix may keep reporting the same status regardless, so this is
-    // the only place that ever learns something is still wrong.
+    // A fix can warn without failing outright, and the check it is meant to
+    // fix may keep reporting the same status, so these warnings are the only
+    // signal that something is still wrong.
     const warnings: string[] = [];
     try {
       const report = await applyFix(action, { bottle: selectedBottle || null }, true, (ev) => {
-        // Every `StageEvent` carries `runId` — the first one to arrive is
-        // this fix's own (see `applyFix`'s doc comment), captured once so a
-        // Cancel affordance can target it even while still queued behind
-        // another Sabrage operation.
         if (fixRunId === null) fixRunId = ev.runId;
         if (ev.kind === "fatal") {
           fatal = { message: ev.message, remedy: ev.remedy, fix: ev.fix };
@@ -230,21 +200,15 @@
           warnings.push(ev.text);
         }
       });
-      // `dismissFixNotice` above already cleared any stale notice for this
-      // slug, so — unlike the `catch` branch below — there's no third case
-      // to handle here: a clean, changed result simply leaves it cleared.
       if (warnings.length > 0) {
         fixNotices = { ...fixNotices, [slug]: warnings.join(" ") };
       } else if (!report.changed) {
         fixNotices = { ...fixNotices, [slug]: report.description };
       }
     } catch (e) {
-      // `fatal` is only ever reassigned inside the callback above, so
-      // TypeScript's control-flow narrowing — which can't prove that
-      // callback ran before this line — types every read of it here as the
-      // initializer's literal `null`, not the declared union. The cast back
-      // to the declared type is what the runtime already knows to be true;
-      // the truthiness check below still does the actual branching.
+      // TypeScript narrows `fatal` to the initializer's `null` here — it cannot
+      // prove the callback above ran — so the cast restores the declared union;
+      // the truthiness check below still does the branching.
       const captured = fatal as FatalInfo | null;
       fixError = captured
         ? { slug, message: captured.message, remedy: captured.remedy, fix: captured.fix }
@@ -271,10 +235,9 @@
   }
 
   const summaryText = $derived.by(() => {
-    // A rerun that rejected before reporting every slug must not read as
-    // "Running checks…" forever — that text otherwise survives verbatim once
-    // `running` flips false, with nothing else in the header saying doctor
-    // actually failed.
+    // A rerun that rejected before reporting every slug must not keep reading
+    // "Running checks…": that text otherwise survives once `running` flips
+    // false, with nothing else in the header saying doctor failed.
     if (doctorStore.error && !doctorStore.running) return "Doctor failed to complete";
     const s = doctorStore.summary;
     if (!s) {
@@ -463,10 +426,9 @@
   .rows > .group-header:first-child {
     margin-top: 0;
   }
-  /* Warning styling, deliberately distinct from `.fix-error-banner`'s Fatal
-     treatment below — a stale-adb-forwards notice is advisory, not a failed
-     fix, so it uses the same neutral tone as the `warn` StatusIcon rather
-     than the error banner's accent color. */
+  /* Advisory tone, deliberately distinct from `.fix-error-banner`'s Fatal
+     treatment below: a fix notice is not a failed fix, so it matches the
+     `warn` StatusIcon rather than the error banner's accent color. */
   .fix-notice {
     display: flex;
     align-items: center;
