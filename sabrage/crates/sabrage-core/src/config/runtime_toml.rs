@@ -1,67 +1,26 @@
 //! `oxrsys-runtime.toml` — typed read, format-preserving patch, backed-up write.
 //!
-//! This is the one place Sabrage edits a file `demo.sh` treats as **write-once**
-//! (`scripts/demo/setup.sh` writes the shared template when the file is absent
-//! and never touches it again; its "protocol is not alvr" branch tells the user
-//! to *edit it themselves*). design-core §4.1 makes that a deliberate, narrow
-//! override rather than a divergence in the pipeline: create-if-absent from
-//! [`crate::util::toml_template`] byte-for-byte, then in-place value edits with
-//! a rolling backup, and never a regeneration or a migration.
+//! Sabrage edits the six streaming keys of a file `scripts/demo/setup.sh` writes
+//! once and never touches again; design-core §4.1 makes that a narrow override:
+//! create an absent file from [`crate::util::toml_template`] byte-for-byte, then
+//! edit values in place with a rolling backup, never regenerate, never migrate.
 //!
-//! # Why the edits are so fussy
+//! The consumer is not a TOML library. `ext/oxrsys/runtime/src/Config.cpp` reads
+//! lines: `"`-aware `#` comments, `[table]` headers ignored so a key counts
+//! wherever it sits, split on the first `=`, one pair of double quotes off a
+//! string value, last *accepted* assignment wins. Values therefore always come
+//! from [`read_lines_like_the_runtime`] and never from `toml_edit`, which answers
+//! a different question — see PARITY.md § Declared by the 2026-08-30
+//! adversarial review (round 1 fixes), "Config readers: doctor emulates `awk`"
+//! and tests::{the_comment_stripper_matches_config_cpp,
+//! effective_accepted_agrees_with_the_line_reader_on_the_shadowed_fixtures}.
 //!
-//! The consumer is not a TOML library. `ext/oxrsys/runtime/src/Config.cpp` is a
-//! line-oriented reader (verified 2026-08-30):
-//!
-//! * `#` starts a comment and the rest of the line is discarded, unless a `"`
-//!   opened a string first. **Only `"` toggles string context**
-//!   (`StripTomlComment`) — `'` is an ordinary character and there is no escape
-//!   handling anywhere in that parser;
-//! * blank lines and `[table]` headers are skipped — **tables are ignored
-//!   entirely**, so a key counts wherever it sits;
-//! * the line is split on its first `=`, both halves trimmed;
-//! * a string value loses **one pair of double quotes** and nothing else
-//!   (`ParseString`): `'alvr'` stays `'alvr'` and matches no accepted value;
-//! * a later *accepted* assignment overwrites an earlier one — **last valid
-//!   wins**;
-//! * a value outside the accepted set is *silently ignored* and whatever the
-//!   previous accepted assignment (or the compiled-in default) left behind
-//!   stays — Config.cpp's "Ignore malformed values and keep the last
-//!   valid/default setting".
-//!
-//! Three consequences shape this module:
-//!
-//! 1. the key the runtime honors is the **last** occurrence in the file, in
-//!    physical order, whatever table it is in — that is the one
-//!    [`apply_patch`] edits, and the others are reported in `shadowed`;
-//! 2. a same-line `# comment` is moved onto its own line above the key. Runtime
-//!    builds before the 2026-08 parser fix mis-parsed same-line comments
-//!    (`docs/troubleshooting.md`, Config rows), and a user can still be running
-//!    one. Sabrage never authors a trailing comment and never leaves one on a
-//!    line it rewrote;
-//! 3. every other byte is preserved. The file is hand-maintained — the deployed
-//!    copy carries a four-line provenance header about a Catch2 run that once
-//!    clobbered it — so a reformat would destroy real user notes.
-//!
-//! # One reader, one editor
-//!
-//! **Values always come from [`read_lines_like_the_runtime`]** — the port of
-//! `ParseConfigToml` — because the only question the Settings screen ever asks
-//! is "what will the runtime use?". `toml_edit` answers a different question
-//! (what does a TOML *implementation* see), and the two genuinely disagree:
-//! `protocol = 'alvr'` is a valid TOML string and a value the runtime throws
-//! away; a `"""…"""` block is one string to `toml_edit` and a run of live
-//! assignments to the runtime. Showing the TOML answer is how the GUI ends up
-//! reporting ALVR for a file that streams over the legacy path.
-//!
-//! `toml_edit` is kept for the other half of the job: deciding whether the file
-//! can be *rewritten* safely, and doing the rewrite.
-//! [`RuntimeConfigView::parse_error`] carries that verdict — it is set when
-//! `toml_edit` cannot parse the file at all, and also when the physical lines
-//! and the parsed document disagree about where an editable key lives (the
-//! multiline-string case above), because an edit would then land on a line the
-//! runtime does not read. Writes are refused in both states: never rewrite a
-//! file you cannot round-trip.
+//! `toml_edit` decides whether the file can be rewritten safely and performs the
+//! rewrite. Every other byte is preserved — the file is hand-maintained — and a
+//! same-line `#` comment on a rewritten line is relocated above the key because
+//! runtime builds before the 2026-08 parser fix mis-read trailing comments; see
+//! tests::{a_key_inside_a_multiline_string_reads_live_and_refuses_the_write,
+//! a_same_line_comment_moves_to_its_own_line_above_the_key}.
 
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -111,8 +70,6 @@ pub const BITRATE_RANGE: (u32, u32) = (1, 200);
 
 /// Inclusive `resolution_scale` bounds.
 pub const RESOLUTION_SCALE_RANGE: (f64, f64) = (0.25, 1.0);
-
-// ── typed values ─────────────────────────────────────────────────────────────
 
 /// `protocol` — which streaming backend the runtime instantiates.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -296,8 +253,6 @@ pub struct BackupInfo {
     pub size: u64,
 }
 
-// ── read ─────────────────────────────────────────────────────────────────────
-
 /// Read the file. Never fails: an absent file, an unreadable one and one
 /// `toml_edit` cannot parse are all *states of the view*, not errors — the
 /// Settings screen must be able to render every one of them.
@@ -342,12 +297,10 @@ impl RuntimeConfigView {
 /// Why this file must not be rewritten, if it must not be — the value
 /// [`RuntimeConfigView::parse_error`] carries and [`write`] refuses on.
 ///
-/// Two reasons, both meaning "an edit would not land where the runtime looks":
-///
-/// 1. `toml_edit` cannot parse it at all, so [`apply_patch`] has no document;
-/// 2. it parses, but the physical lines and the parsed document disagree about
-///    how many assignments of an editable key exist — see
-///    [`line_document_mismatch`].
+/// `Some` when `toml_edit` cannot parse the text at all, or when the physical
+/// lines and the parsed document disagree about an editable key
+/// (`line_document_mismatch`); either way an edit would not land where the
+/// runtime looks.
 fn round_trip_error(text: &str) -> Option<String> {
     let body = strip_bom(text);
     let doc = match body.parse::<DocumentMut>() {
@@ -357,25 +310,16 @@ fn round_trip_error(text: &str) -> Option<String> {
     line_document_mismatch(&doc, text)
 }
 
-/// The second half of [`round_trip_error`], over an already-parsed document, so
+/// The second half of `round_trip_error`, over an already-parsed document, so
 /// [`apply_patch`] can consult it without parsing the file twice.
 ///
-/// Both directions of the disagreement are a refusal, because both mean "an
-/// edit would not land where the runtime looks":
-///
-/// * **more physical than parsed** — a `"""…"""` (or `'''…'''`) block whose
-///   content looks like `protocol = "oxrsys"`. The runtime reads that line;
-///   `toml_edit` sees string content, so an edit would rewrite some *other*
-///   line and the runtime would keep obeying the one inside the string;
-/// * **more parsed than physical** — an editable key `toml_edit` can see and
-///   the runtime's line reader cannot. The only shape that produces it is a
-///   byte-order mark sitting on the key's own line (`\u{feff}protocol = …`):
-///   `toml_edit` is handed the BOM-stripped body, while
-///   [`raw_assignments`] scans the original bytes and `str::trim` does not
-///   remove U+FEFF — and neither does `Config.cpp`, which sees the same byte.
-///   Editing that line would report a change the runtime never observes, so it
-///   is refused rather than "fixed" by stripping the BOM from the key (which
-///   would be a byte Sabrage does not own).
+/// `Some` when an editable key's physical assignment count differs from the
+/// parsed one, in either direction: a key inside a `"""…"""` block is live to
+/// the runtime and invisible to `toml_edit`, and a key behind a byte-order mark
+/// is the reverse. Both are refused rather than repaired — the BOM is a byte
+/// Sabrage does not own. See
+/// tests::{a_key_inside_a_multiline_string_reads_live_and_refuses_the_write,
+/// a_bom_on_a_root_key_is_not_round_trippable}.
 fn line_document_mismatch(doc: &DocumentMut, text: &str) -> Option<String> {
     let seen: Vec<(&str, &str)> = raw_assignments(text).collect();
     for key in EDITABLE_KEYS {
@@ -411,8 +355,6 @@ fn modified_unix_ms(path: &Path) -> Option<u64> {
         .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
         .map(|d| d.as_millis() as u64)
 }
-
-// ── the six settings, once ───────────────────────────────────────────────────
 
 /// One accepted assignment of one editable key.
 ///
@@ -633,16 +575,14 @@ fn in_bitrate_range(n: i64) -> bool {
     n >= i64::from(BITRATE_RANGE.0) && n <= i64::from(BITRATE_RANGE.1)
 }
 
-/// `Config.cpp:367-372`'s bounds check, at `Config.cpp`'s precision:
-/// `float val = std::stof(value); if (val >= 0.25f && val <= 1.0f)`.
+/// `Config.cpp`'s bounds check at `Config.cpp`'s precision: `std::stof` yields a
+/// C++ `float`, so `1.00000001` *is* `1.0f` to the runtime and is accepted.
 ///
-/// The narrowing to `f32` is the load-bearing part. `std::stof` produces a
-/// C++ `float`, so `1.00000001` *is* `1.0f` to the runtime and is accepted;
-/// comparing the `f64` Rust parsed would reject it and the Settings screen
-/// would then show the `0.75` default for a file the runtime reads as `1.0`.
-/// The bounds themselves are exactly representable, so the two comparisons
-/// agree everywhere except within one `f32` ulp of an endpoint — which is the
-/// whole point.
+/// Comparing the `f64` Rust parsed would reject it, and the Settings screen would
+/// then show the default for a file the runtime reads as `1.0`. The bounds are
+/// exactly representable, so the two comparisons agree everywhere except within
+/// one `f32` ulp of an endpoint. See
+/// tests::the_scale_bounds_are_checked_at_the_runtimes_float_precision.
 fn in_scale_range(f: f64) -> bool {
     let narrowed = f as f32;
     narrowed.is_finite()
@@ -650,14 +590,11 @@ fn in_scale_range(f: f64) -> bool {
         && f64::from(narrowed) <= RESOLUTION_SCALE_RANGE.1
 }
 
-// ── the reader (the runtime's own semantics) ─────────────────────────────────
-
 /// Every `key = value` the runtime's line reader sees, in physical order.
 ///
-/// `ext/oxrsys/runtime/src/Config.cpp`'s `ParseConfigToml` loop, ported: strip
-/// the `"`-aware `#` comment, skip blanks and `[table]` headers, split on the
-/// first `=`, trim both halves. Tables are not tracked because the runtime does
-/// not track them — a key counts wherever it sits.
+/// `ext/oxrsys/runtime/src/Config.cpp`'s `ParseConfigToml` loop, ported. Tables
+/// are not tracked because the runtime does not track them — a key counts
+/// wherever it sits (tests::the_line_reader_agrees_with_parse_config_toml).
 fn raw_assignments(text: &str) -> impl Iterator<Item = (&str, &str)> {
     text.lines().filter_map(|line| {
         let line = strip_comment(line).trim();
@@ -669,17 +606,15 @@ fn raw_assignments(text: &str) -> impl Iterator<Item = (&str, &str)> {
     })
 }
 
-/// What the runtime would use, read the way the runtime reads it.
+/// What the runtime would use, read the way the runtime reads it — the
+/// **primary** reader (see the module header), used whether or not `toml_edit`
+/// can also parse the file.
 ///
-/// This is the **primary** reader (see the module header): every value the GUI
-/// shows comes from here, whether or not `toml_edit` can also parse the file.
-///
-/// Folds each key's occurrences in physical order and keeps the last one the
-/// runtime would *accept* — Config.cpp assigns only inside its whitelist and
-/// its `catch` block "ignore[s] malformed values and keep[s] the last
-/// valid/default setting", so a valid assignment followed by a junk one still
-/// leaves the valid value in force. Every rejected occurrence is reported in
-/// `invalid`; a key assigned more than once is reported in `shadowed`.
+/// Returns the last *accepted* assignment of each editable key, so a junk
+/// assignment after a valid one leaves the valid value in force, plus every
+/// rejected occurrence (`invalid`) and every key assigned more than once
+/// (`shadowed`). See
+/// tests::a_later_invalid_assignment_does_not_erase_an_earlier_valid_one.
 pub fn read_lines_like_the_runtime(
     text: &str,
 ) -> (RuntimeConfigValues, Vec<InvalidValue>, Vec<String>) {
@@ -711,18 +646,16 @@ pub fn read_lines_like_the_runtime(
 }
 
 /// The value the runtime would end up with for **any** key, as a plain string,
-/// with no accepted-set filtering.
+/// with no accepted-set filtering: the last assignment wins, whatever table it
+/// sits in, with one pair of double quotes removed. `None` means the key is never
+/// assigned, so the caller's own default applies (`${…:-auto}` in the shell).
 ///
-/// The runtime's own rule for the keys Sabrage does not model: last assignment
-/// in the file wins, whatever table it sits in, with one pair of double quotes
-/// removed. `None` means the key is never assigned, so the caller's own default
-/// applies (`${…:-auto}` in the shell).
-///
-/// This exists so the doctor checks, the helper fixes and the run preflight
-/// stop each carrying their own approximation of `ParseConfigToml` — those
-/// hand-rolled `awk`/split parsers are first-match-wins and quote-blind, which
-/// is a different file than the one the runtime reads. Deliberately free of
-/// `toml_edit`: it answers what the runtime does, not what TOML says.
+/// Deliberately free of `toml_edit` — it answers what the runtime does, not what
+/// TOML says — so the run preflight reads the file the way `Config.cpp` does
+/// instead of carrying its own quote-blind, first-match split. The doctor checks
+/// do *not* share it: PARITY.md § Declared by the 2026-08-30 adversarial
+/// review (round 1 fixes), "Config readers: doctor emulates `awk`". See
+/// tests::effective_string_is_last_wins_table_blind_and_double_quote_only.
 pub fn effective_string(text: &str, key: &str) -> Option<String> {
     raw_assignments(text)
         .filter(|(k, _)| *k == key)
@@ -734,22 +667,13 @@ pub fn effective_string(text: &str, key: &str) -> Option<String> {
 /// the last assignment it would *accept*, in the key's canonical spelling.
 ///
 /// [`effective_string`] answers "what does the last line say"; this answers
-/// "what is the runtime holding", and the two differ exactly where `Config.cpp`
-/// throws a value away: its whitelist/range check runs per assignment and its
-/// `catch` block keeps the previous accepted value, so
-/// `protocol = "alvr"` followed by `protocol = "banana"` leaves ALVR in force.
-/// Reading that file with the raw last-wins helper reports `banana` and blocks
-/// a launch the runtime would have run — which is the whole reason this exists.
-///
-/// `None` means *no occurrence of this key was accepted* (including "the key is
-/// absent" and "this key is not one of [`EDITABLE_KEYS`]"), so the caller's own
-/// default applies — the same contract [`effective_string`] has, and the reason
-/// callers that only need last-raw semantics for keys Sabrage does not model
-/// keep using that one.
-///
-/// This is [`read_lines_like_the_runtime`]'s fold, narrowed to one key and
-/// rendered back as a string: same [`Setting::read_raw`], so the two cannot
-/// disagree about what the runtime accepts.
+/// "what is the runtime holding", and the two differ where `Config.cpp` throws a
+/// value away — `protocol = "alvr"` followed by `protocol = "banana"` leaves
+/// ALVR in force, and reading that file with the raw helper would block a launch
+/// the runtime would have run. `None` means no occurrence was accepted (including
+/// an absent key and a key outside [`EDITABLE_KEYS`]), so the caller's own default
+/// applies. See tests::{effective_accepted_keeps_the_last_value_the_runtime_would_accept,
+/// effective_accepted_agrees_with_the_line_reader_on_the_shadowed_fixtures}.
 pub fn effective_accepted(text: &str, key: &str) -> Option<String> {
     raw_assignments(text)
         .filter(|(k, _)| *k == key)
@@ -792,8 +716,6 @@ fn unquote(raw: &str) -> &str {
     }
 }
 
-// ── validate ─────────────────────────────────────────────────────────────────
-
 /// The runtime's own bounds, applied to a patch before anything touches disk.
 ///
 /// The enums are unrepresentable-when-wrong; only the three numeric keys can
@@ -807,8 +729,6 @@ pub fn validate(patch: &RuntimeConfigPatch) -> Vec<InvalidValue> {
         .filter_map(Setting::out_of_range)
         .collect()
 }
-
-// ── occurrence walk ──────────────────────────────────────────────────────────
 
 /// One step of the path from the document root to a table.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -829,10 +749,9 @@ struct Occurrence {
 
 /// Every assignment of `key` in the document, in physical order.
 ///
-/// **Dotted tables are skipped on purpose.** `streaming.protocol = "alvr"` is
-/// one physical line whose key text is `streaming.protocol`, so the runtime's
-/// line reader does *not* see it as `protocol`. Descending into it would make
-/// Sabrage edit a line the runtime ignores.
+/// **Dotted tables are skipped on purpose**: `streaming.protocol = "alvr"` is one
+/// physical line whose key text is `streaming.protocol`, which the runtime's line
+/// reader does not see as `protocol` (tests::a_dotted_key_is_not_an_occurrence).
 fn occurrences_of(root: &Table, key: &str) -> Vec<Occurrence> {
     let mut out = Vec::new();
     walk(root, -1, &mut Vec::new(), key, &mut out);
@@ -840,16 +759,14 @@ fn occurrences_of(root: &Table, key: &str) -> Vec<Occurrence> {
     out
 }
 
-/// Whether the document's spelling of `key` is the bare one the runtime's
-/// reader recognises.
+/// Whether the document's spelling of `key` is the bare one the runtime's reader
+/// recognises. A key Sabrage synthesised has no repr yet; it renders bare.
 ///
-/// Same reasoning as the dotted-table skip above: the runtime splits the line
-/// on its first `=` and trims, so the key text of `"protocol" = "oxrsys"` is
-/// literally `"protocol"` — quotes included — and matches nothing. `toml_edit`
-/// decodes it to `protocol`, so without this check Sabrage would read, edit and
-/// report success on a line the runtime ignores.
-///
-/// A key we synthesised ourselves has no repr yet; it renders bare.
+/// The runtime splits the line on its first `=` and trims, so the key text of
+/// `"protocol" = "oxrsys"` is literally `"protocol"` and matches nothing, while
+/// `toml_edit` decodes it to `protocol` — without this check Sabrage would edit a
+/// line the runtime ignores. See tests::{a_quoted_key_is_not_an_occurrence,
+/// a_key_that_exists_only_as_a_quoted_key_is_refused}.
 fn key_is_bare(table: &Table, key: &str) -> bool {
     match table
         .key(key)
@@ -900,8 +817,6 @@ fn table_at_mut<'a>(root: &'a mut Table, path: &[Seg]) -> Option<&'a mut Table> 
     Some(cur)
 }
 
-// ── apply_patch ──────────────────────────────────────────────────────────────
-
 /// Apply a patch to the document text, preserving every byte it does not have
 /// to change.
 ///
@@ -927,12 +842,9 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
         ))
     })?;
 
-    // The other half of [`round_trip_error`], enforced here rather than only in
-    // [`RuntimeConfigView::parse_error`]: the GUI checks the view before it
-    // offers Save, but `write`, `edit_protocol` and the golden tests all come
-    // through this function, and a file whose physical lines disagree with the
-    // parsed document is one where an edit lands on a line the runtime does not
-    // read. Reporting success for that is worse than refusing.
+    // Enforced here and not only in [`RuntimeConfigView::parse_error`]: `write`,
+    // `edit_protocol` and the golden tests all come through this function, and
+    // reporting success for an edit the runtime never reads is worse than refusing.
     if let Some(why) = line_document_mismatch(&doc, text) {
         return Err(SabrageError::InvalidInput(format!(
             "refusing to rewrite oxrsys-runtime.toml: {why}"
@@ -968,17 +880,9 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
         }
     }
 
-    // Rule 6 taken literally: when no key was edited, hand back the input
-    // bytes. `doc.to_string()` is a re-render, and `toml_edit` normalises CRLF
-    // to LF, drops a leading BOM and appends a missing trailing newline — so on
-    // a file that is not already LF + newline-terminated an *empty* patch would
-    // come back different from its input, and [`write`] would back the file up
-    // and rewrite it whole while reporting `changed_keys: []`. "Nothing
-    // changed" means no key changed, never "the re-render happens to match".
-    //
-    // A *real* edit goes through the same re-render, so those three
-    // normalisations have to be undone explicitly ([`ByteShape`]) — Sabrage
-    // owns six values, not the file's line endings.
+    // "Nothing changed" means no key changed, never "the re-render happens to match":
+    // `doc.to_string()` normalises CRLF, drops a BOM and adds a final newline, which
+    // `ByteShape` undoes for a real edit (tests::an_empty_patch_is_the_identity_on_every_input_shape).
     let text = if changed_keys.is_empty() {
         text.to_string()
     } else {
@@ -992,18 +896,13 @@ pub fn apply_patch(text: &str, patch: &RuntimeConfigPatch) -> Result<Patched> {
     })
 }
 
-/// The three bytes-level properties `toml_edit`'s renderer does not preserve.
+/// The three byte-level properties `toml_edit`'s renderer does not preserve: a
+/// CRLF file, a leading BOM, and the absence of a final newline. Captured before
+/// parsing and restored after rendering, because Sabrage owns six values and not
+/// the file's shape.
 ///
-/// `DocumentMut::to_string()` always emits LF, never a BOM, and always a final
-/// newline. Sabrage's contract is narrower than that (`config`'s module header:
-/// *the six streaming keys' values and nothing else*), so a one-value edit must
-/// not silently convert a CRLF file, strip the BOM an editor put there, or add
-/// a trailing newline the user did not have. Captured before parsing, restored
-/// after rendering.
-///
-/// Mixed line endings are the one shape not preserved: there is no "the file's"
-/// ending to restore, and any choice reformats something. Such a file is
-/// rendered LF, which is what it already was for most of its lines.
+/// Mixed line endings are the one shape not preserved — there is no "the file's"
+/// ending to restore — so such a file is rendered LF.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct ByteShape {
     bom: bool,
@@ -1068,10 +967,11 @@ fn string_value(s: &str) -> Value {
 /// Replace the value of an existing key, keeping the key, its own decor and the
 /// `=` spacing. Returns whether anything changed.
 ///
-/// A key already carrying the wanted value is left **completely** untouched —
-/// including a same-line comment. Rule 5 relocates the comment on a line this
-/// function rewrites; it is not a licence to reformat a line the patch did not
-/// need to touch, which is what makes "an unchanged patch writes nothing" hold.
+/// A key already carrying the wanted value is left **completely** untouched,
+/// including a same-line comment: design-core §4.1 rule 2 relocates a comment on a
+/// line this function rewrites, and reformatting a line the patch did not need to
+/// touch would break "an unchanged patch writes nothing"
+/// (tests::setting_every_key_to_its_current_value_changes_nothing).
 fn edit_in_place(table: &mut Table, key: &str, new: Value) -> bool {
     let Some(old) = table.get(key).and_then(Item::as_value).cloned() else {
         return false;
@@ -1083,8 +983,9 @@ fn edit_in_place(table: &mut Table, key: &str, new: Value) -> bool {
         return false;
     }
 
-    // Rule 5: a same-line comment on the line we are about to rewrite moves to
-    // its own line above the key, at the key's own indentation.
+    // design-core §4.1 rule 2: a same-line comment on a line Sabrage rewrites moves above
+    // the key, at the key's own indentation — runtime builds before the 2026-08 parser fix
+    // mis-read trailing comments (tests::a_same_line_comment_moves_to_its_own_line_above_the_key).
     let trailing_comment = suffix.contains('#').then(|| suffix.trim().to_string());
     if let Some(comment) = &trailing_comment {
         if let Some(mut k) = table.key_mut(key) {
@@ -1117,15 +1018,12 @@ fn edit_in_place(table: &mut Table, key: &str, new: Value) -> bool {
 /// Whether the runtime would read the same value out of both, i.e. whether
 /// rewriting the line would be a pure reformat.
 ///
-/// Textual equality of the value's own bytes, and nothing looser. It is the
-/// runtime, not `toml_edit`, that has to agree with us: `0x50` and `80` are the
-/// same integer to `toml_edit` and *not* to the runtime, which parses the raw
-/// line text; a `'alvr'` literal string is a valid TOML value the runtime does
-/// **not** unquote (its `ParseString` takes double quotes only), so it is junk
-/// there and must be rewritten as `"alvr"`; and a multiline or escaped string
-/// does not survive its one-layer unquote either. Every spelling the runtime
-/// would misread is therefore a change, which is exactly what makes saving one
-/// fix it.
+/// Textual equality of the value's own bytes, and nothing looser: it is the
+/// runtime, not `toml_edit`, that has to agree. `0x50` and `80` are one integer to
+/// `toml_edit` and two different values to the runtime, and a `'alvr'` literal
+/// string is valid TOML the runtime does not unquote. Every spelling the runtime
+/// would misread therefore counts as a change, which is what makes saving one fix
+/// it (tests::a_literal_quoted_string_is_invalid_and_gets_rewritten).
 fn same_to_the_runtime(old: &Value, new: &Value) -> bool {
     value_repr(old) == value_repr(new)
 }
@@ -1197,32 +1095,27 @@ fn insert_into_streaming(doc: &mut DocumentMut, key: &str, new: Value) -> Result
     Ok(true)
 }
 
-// ── write ────────────────────────────────────────────────────────────────────
-
-/// Patch the file on disk, creating it from the shared template first when it
-/// is absent and backing up the previous contents when it is not.
+/// Patch the file on disk, creating it from the shared template first when it is
+/// absent and backing up the previous contents when it is not.
 ///
-/// DIVERGENCE (PARITY.md, "Config"): `setup.sh` writes `oxrsys-runtime.toml`
-/// once and never again — its non-alvr branch prints "edit it yourself".
-/// Sabrage edits the six streaming keys in place instead, which is the whole
-/// point of the Settings screen. The write-once invariant is preserved where it
-/// is load-bearing: a file that does not exist is created with
-/// [`crate::util::toml_template`] byte-for-byte (never a rendering of the
-/// patch), so the two front-ends still agree on first-write bytes, and the
-/// patch is applied to those bytes afterwards.
+/// The write-once override of design-core §4.1: an absent file is created with
+/// [`crate::util::toml_template`] byte-for-byte, never a rendering of the patch,
+/// so both front-ends still agree on first-write bytes — PARITY.md § Invariants
+/// that must NOT change (byte/behavior parity), "Write-once `oxrsys-runtime.toml`
+/// creation". Every mutation goes through `executor`, so a
+/// [`crate::DryRunExecutor`] plans the create, the backup, the prune and the write
+/// without touching disk.
 ///
-/// Every mutation goes through `executor`, so a [`crate::DryRunExecutor`] plans
-/// the create, the backup, the prune and the write without touching disk.
+/// # Errors
 ///
-/// Two refusals guard the replacement, both because the file has other owners:
-///
-/// * a **live session** ([`blocking_session`]) — the runtime re-reads this file
-///   every 250 ms and rebuilds the encoder when the values it keys on move, so
-///   a save mid-stream is a live reconfiguration, not a next-launch setting;
-/// * a **concurrent edit** ([`still_safe_to_replace`]) — the bytes on disk must
-///   still be the ones the patch was computed against, or the backup would
-///   describe a state that no longer exists and the replacement would drop
-///   somebody else's work.
+/// Refuses a patch the runtime would ignore, a file that cannot be round-tripped,
+/// a live session ([`blocking_session`]: the runtime re-reads this file every
+/// 250 ms and rebuilds the encoder, so a save mid-stream is a live
+/// reconfiguration) and a concurrent edit (`still_safe_to_replace`: the bytes on
+/// disk must still be the ones the patch was computed against). See
+/// tests::{write_creates_from_the_template_byte_identically_then_patches,
+/// write_refuses_while_a_session_is_live_and_touches_nothing,
+/// the_replacement_refuses_when_the_file_changed_underneath}.
 pub async fn write(
     executor: &dyn Executor,
     toml_path: &Path,
@@ -1246,27 +1139,18 @@ pub async fn write(
         return Err(live_session_refusal(toml_path, &block));
     }
 
-    // A10-1: serializes this whole read-patch-backup-write sequence across
-    // *processes* — [`Paths::toml_lock_path`]'s own doc names exactly this
-    // call site. Best-effort like [`crate::session::state`]'s record lock: a
-    // machine that cannot lock must still be able to save Settings, and
-    // [`still_safe_to_replace`]'s compare-and-swap is the safety net this only
-    // makes rare rather than relied upon. A dry run takes no lock — it writes
-    // nothing to serialize.
+    // A10-1: serializes read-patch-backup-write across processes at the documented lock path
+    // (tests::write_takes_the_cross_process_lock_at_the_documented_path); best-effort, since
+    // `still_safe_to_replace`'s compare-and-swap is the net. A dry run has nothing to lock.
     let _lock = if executor.is_dry_run() {
         None
     } else {
         lock_toml(toml_path).await
     };
 
-    // The existence probe and the create are two syscalls apart, so the absent
-    // branch is a TOCTOU by construction. The window is narrowed as far as it
-    // can be from here — probed again after the awaited `create_dir_all`, and
-    // every path guarded by the compare-and-swap below — and `A10-1` closes it
-    // the rest of the way: [`Executor::create_new`] (`O_EXCL`) rather than
-    // [`Executor::write_atomic`] (an unconditional rename) for the template
-    // create, so a second writer that created the file in this exact window is
-    // never clobbered by this one.
+    // A10-1: the probe and the create are two syscalls apart, so this branch uses
+    // [`Executor::create_new`] (`O_EXCL`) and never `write_atomic`'s unconditional rename — a
+    // file created in that window survives (tests::write_never_clobbers_a_file_created_in_the_toctou_window).
     let mut exists = toml_path.is_file();
     if !exists {
         if let Some(parent) = toml_path.parent() {
@@ -1281,12 +1165,9 @@ pub async fn write(
         if executor.create_new(toml_path, template.as_bytes()).await? {
             template.to_string()
         } else {
-            // Lost the create race: something else (another Sabrage, `sabrage
-            // setup`) put a file there between the probe above and this call.
-            // Read what it actually wrote instead of overwriting it, and treat
-            // the rest of `write` exactly as the ordinary "file already
-            // existed" path — including the compare-and-swap below, which
-            // still protects against a THIRD writer landing after this read.
+            // Lost the create race: read what the other writer put there rather
+            // than overwriting it, and continue on the "file already existed"
+            // path, whose compare-and-swap still guards against a third writer.
             exists = true;
             std::fs::read_to_string(toml_path).map_err(|e| SabrageError::io(toml_path, e))?
         }
@@ -1302,15 +1183,9 @@ pub async fn write(
     };
 
     if patched.changed_keys.is_empty() {
-        // Nothing to write, so nothing to back up either. An existing file is
-        // not even opened for writing — no mtime bump, no backup churn from a
-        // Settings screen that saved without changing anything.
-        //
-        // The test is "no key changed", NOT `patched.text == base`: `apply_patch`
-        // guarantees the identity in that case anyway, and comparing rendered
-        // text used to rewrite (and back up) any file whose bytes `toml_edit`
-        // would normalise — CRLF, a BOM, a missing final newline — on a patch
-        // that changed nothing.
+        // Nothing to write, so nothing to back up: an existing file is not even
+        // opened, and the test is "no key changed", never `patched.text == base`
+        // (tests::a_no_op_write_leaves_the_file_and_backups_untouched).
         return Ok(report);
     }
 
@@ -1334,19 +1209,9 @@ pub async fn write(
         reserved = Some(backup);
     }
 
-    // A10-2: everything from here to the rename is undone on failure, so an
-    // aborted save is a complete no-op — the recovery history a user reaches
-    // for after a failed save must still be the one they had before it. The new
-    // backup has to exist *before* the destination moves (it describes `base`),
-    // but nothing older may be dropped until there is a new state to keep
-    // history for, and the reservation itself is unlinked if the commit never
-    // happens. Without that, the compare-and-swap's "nothing was written" was
-    // a lie: three backups were already gone.
-    //
-    // The check itself runs again immediately before the replacement: the
-    // backup write above is the widest part of the window a concurrent editor
-    // can land in, and the backup we just took describes `base`, not whatever
-    // is there now.
+    // A10-2: everything from here to the rename is undone on failure — the reservation is
+    // unlinked, nothing older is dropped before the commit — and the compare-and-swap runs again
+    // because the backup write is the widest window (tests::a_failed_write_prunes_nothing_and_leaves_no_reservation).
     let committed = match still_safe_to_replace(executor, toml_path, &session_state, &base) {
         Ok(()) => {
             executor
@@ -1365,40 +1230,28 @@ pub async fn write(
         return Err(e);
     }
 
-    // Best-effort, and deliberately not `?`: the commit above already
-    // happened. A prune failure (an unlinkable stale backup, a Stop landing
-    // between the rename and this loop) reported as `Err` told the caller the
-    // save had failed over a file that already holds the new bytes — the
-    // Settings screen then re-rendered the *old* values with a dirty draft
-    // while the runtime, which re-reads the file every 250 ms, had taken the
-    // new ones, and `fixes::edit_protocol` reported a fix as cancelled after
-    // it had set `protocol = "alvr"`. A backup that outlives its window is a
-    // stray copy of bytes that are still recoverable; a lie about whether the
-    // config was written is not.
+    // A10-2: best-effort and deliberately not `?`. The commit already happened, so an `Err` here
+    // would report a failed save over a file that holds the new bytes; a stray backup is
+    // recoverable, a lie about the write is not (tests::an_unprunable_stale_backup_still_reports_a_committed_save).
     for old in stale {
         let _ = executor.remove_file(Path::new(&old.path)).await;
     }
     Ok(report)
 }
 
-/// The session that must be stopped before this file may be rewritten, or
-/// `None` when nothing is streaming.
+/// The session that must be stopped before this file may be rewritten, or `None`
+/// when nothing is streaming.
 ///
-/// One line, delegating to [`crate::session::session_block_at`]: this used to be
-/// a local predicate over [`crate::session::live_session`] plus
-/// `session-state.json`'s wine pid, which is strictly weaker than the one the
-/// stage and Doctor refusals use — it missed a launch that had not spawned yet,
-/// a record another front-end owns, and the fresh `runtime_status.json` that is
-/// the *only* trace a `./demo.sh run` session leaves. Every "not while the game
-/// is running" door now asks the same question.
+/// Delegates to [`crate::session::session_block_at`] so that every "not while the
+/// game is running" door asks the same question — PARITY.md § Declared by the
+/// 2026-08-30 adversarial review (round 1 fixes), "External sessions".
 ///
-/// Why the door exists at all: the runtime does **not** read
-/// `oxrsys-runtime.toml` once at game start. `Config::GetValues()` refreshes it
-/// whenever the mtime moved, at most every 250 ms, and
-/// `AlvrStreamingBackend::EnsureEncoder` reads `encoder_process`/`video_codec`
-/// per frame and retires the encoder when the identity drifts — so a Settings
-/// save mid-stream rebuilds the encoder, and selecting `native` with no staged
-/// helper drops frames for the rest of the session.
+/// The door exists because the runtime does not read `oxrsys-runtime.toml` once at
+/// game start: `Config::GetValues()` refreshes it whenever the mtime moved, at
+/// most every 250 ms, and `AlvrStreamingBackend::EnsureEncoder` retires the
+/// encoder when `encoder_process`/`video_codec` drift — so a save mid-stream
+/// rebuilds the encoder, and selecting `native` with no staged helper drops frames
+/// for the rest of the session.
 pub fn blocking_session(
     session_state_path: &Path,
     runtime_status_path: &Path,
@@ -1429,11 +1282,9 @@ fn live_session_refusal(toml_path: &Path, block: &SessionBlock) -> SabrageError 
 
 /// Where `session-state.json` sits, given the backups directory.
 ///
-/// `backups_dir` is always `<sabrage_appsup>/backups` ([`crate::paths::Paths`]),
-/// so its parent is the directory that record lives in. Deriving it rather than
-/// adding a fifth parameter keeps [`write`]'s callers unchanged and — the part
-/// that matters — keeps the guard hermetic under test: a test that points
-/// `backups_dir` at a temp dir gets a temp session path with it, never the
+/// `backups_dir` is always `<sabrage_appsup>/backups` ([`crate::paths::Paths`]), so
+/// its parent is the directory that record lives in. Deriving it keeps the guard
+/// hermetic under test: a temp `backups_dir` yields a temp session path, never the
 /// developer's real running session.
 fn session_state_beside(backups_dir: &Path) -> PathBuf {
     backups_dir
@@ -1450,17 +1301,15 @@ const TOML_LOCK_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
 /// Poll interval inside [`TOML_LOCK_WAIT`].
 const TOML_LOCK_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 
-/// Takes the advisory lock at [`Paths::toml_lock_path`] — derived here from
-/// `toml_path`'s parent directory rather than threading a whole [`Paths`]
-/// through, since [`Paths::toml_path`] and [`Paths::toml_lock_path`] always
-/// share one (`<oxr_appsup>`).
+/// Takes the advisory lock at [`Paths::toml_lock_path`], derived from
+/// `toml_path`'s parent because [`Paths::toml_path`] and [`Paths::toml_lock_path`]
+/// always share one directory. Held by the returned `File`; dropping it releases
+/// the `flock`.
 ///
 /// A separate dotfile, not a lock on the config itself, so it survives
-/// [`Executor::write_atomic`]'s rename. Held by the returned `File`; dropping
-/// it releases the `flock`. `None` on any failure — including a holder that
-/// will not let go — exactly like [`crate::session::state::lock_record`]:
-/// this narrows the window `still_safe_to_replace` guards, it does not
-/// replace it.
+/// [`Executor::write_atomic`]'s rename. `None` on any failure, including a holder
+/// that will not let go: this narrows the window `still_safe_to_replace` guards,
+/// it does not replace it.
 ///
 /// [`Paths`]: crate::paths::Paths
 async fn lock_toml(toml_path: &Path) -> Option<std::fs::File> {
@@ -1545,13 +1394,12 @@ fn next_backup_path(backups_dir: &Path, secs: u64) -> PathBuf {
 /// A10-1: reserves `<backups_dir>/oxrsys-runtime.toml.<secs>[-n]` and writes
 /// `bytes` into it via [`Executor::create_new`] (`O_EXCL`).
 ///
-/// [`next_backup_path`]'s `!exists()` probe is itself a check-then-create race
-/// between two Sabrage processes backing up in the same second — the loser's
-/// `write_atomic` would silently overwrite the winner's backup with `base`
-/// from a different run. Retrying the whole probe on a lost race (rather than
-/// just bumping the suffix locally) is deliberate: the directory listing has
-/// changed underneath, and re-scanning it is what finds the next name that is
-/// actually free.
+/// `next_backup_path`'s `!exists()` probe is itself a check-then-create race
+/// between two Sabrage processes backing up in the same second. A lost race
+/// retries the whole probe rather than bumping the suffix locally, because the
+/// directory listing has changed underneath. See
+/// tests::{concurrent_backups_in_the_same_second_each_keep_their_own_bytes,
+/// a_same_second_backup_collision_gets_a_numeric_suffix}.
 async fn reserve_backup_path(
     executor: &dyn Executor,
     backups_dir: &Path,
@@ -1602,8 +1450,6 @@ pub fn list_backups(backups_dir: &Path) -> Vec<BackupInfo> {
     out.sort_by(|a, b| b.0.cmp(&a.0).then(b.1.cmp(&a.1)));
     out.into_iter().map(|(_, _, info)| info).collect()
 }
-
-// ── fix.edit-protocol ────────────────────────────────────────────────────────
 
 const EDIT_PROTOCOL_STEP: StepId = "fix.edit-protocol";
 
@@ -1719,8 +1565,6 @@ mod tests {
         DryRunExecutor::new(uuid::Uuid::new_v4(), null_sink(), CancellationToken::new())
     }
 
-    // ── fixtures ─────────────────────────────────────────────────────────────
-
     fn fixture(name: &str) -> String {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("tests/fixtures/phase4")
@@ -1772,8 +1616,6 @@ mod tests {
             .map(|(x, y)| (x.to_string(), y.to_string()))
             .collect()
     }
-
-    // ── rule 6: identity ─────────────────────────────────────────────────────
 
     /// Re-setting every key to what the file already says must not move a byte —
     /// this is what makes "Save with nothing dirty writes nothing" true even
@@ -1835,15 +1677,14 @@ mod tests {
         assert!(out.changed_keys.is_empty(), "{:?}", out.changed_keys);
     }
 
-    /// A value the file spells with **literal** quotes is a value the runtime
-    /// throws away: `ParseString` strips a pair of double quotes and nothing
-    /// else, so `'alvr'` fails the whitelist and `streamingProtocol` keeps its
-    /// `oxrsys` default. It reads as invalid, and re-saving it is a real change
-    /// that rewrites the line in the spelling the runtime does read.
+    /// A value spelled with **literal** quotes is one the runtime throws
+    /// away: `ParseString` strips double quotes only, so `'alvr'` fails the
+    /// whitelist and `streamingProtocol` keeps its `oxrsys` default.
+    /// Re-saving rewrites the line in the spelling the runtime does read.
     ///
-    /// (Before 2026-08-30 both `unquote` and `same_to_the_runtime` accepted
-    /// either quote flavour, so Settings showed ALVR with no warning and Save
-    /// reported success while leaving the dead line on disk.)
+    /// The defect this pins: accepting either quote flavour in `unquote` and
+    /// `same_to_the_runtime` shows ALVR with no warning and reports Save as
+    /// a success while the dead line stays on disk.
     #[test]
     fn a_literal_quoted_string_is_invalid_and_gets_rewritten() {
         let text = "[streaming]\nprotocol = 'alvr'\n";
@@ -1878,11 +1719,11 @@ mod tests {
     }
 
     /// A quoted key is a different key to the runtime's line reader (its key
-    /// text keeps the quotes), so `toml_edit`'s decoded view must not be
-    /// allowed to disagree with it — same rule as the dotted key above. Here
-    /// the quoted spelling is the LAST one in the document, so before the fix
-    /// it was both the value `read` reported and the line `apply_patch` edited,
-    /// while the runtime only ever saw the bare one in `[streaming]`.
+    /// text keeps the quotes), so `toml_edit`'s decoded view must not
+    /// disagree — same rule as the dotted key above. The quoted spelling is
+    /// the LAST in the document: the defect this pins reports its value from
+    /// `read` and edits its line from `apply_patch`, while the runtime only
+    /// ever sees the bare one in `[streaming]`.
     #[test]
     fn a_quoted_key_is_not_an_occurrence() {
         let text = "[streaming]\nprotocol = \"alvr\"\n\n[extra]\n\"protocol\" = \"oxrsys\"\n";
@@ -1939,8 +1780,6 @@ mod tests {
         view
     }
 
-    // ── rule 4/6: the golden one-line edit ───────────────────────────────────
-
     #[test]
     fn editing_the_bitrate_changes_exactly_one_line() {
         let text = deployed();
@@ -1992,8 +1831,6 @@ mod tests {
         assert_eq!(out.text, "[streaming]\n  bitrate_mbps   =    60\n");
     }
 
-    // ── rule 3: insertion ────────────────────────────────────────────────────
-
     #[test]
     fn an_absent_key_is_inserted_under_streaming_after_its_last_key() {
         let text = deployed();
@@ -2036,8 +1873,6 @@ mod tests {
         }
     }
 
-    // ── rule 5: same-line comment relocation ─────────────────────────────────
-
     #[test]
     fn a_same_line_comment_moves_to_its_own_line_above_the_key() {
         let text = "[streaming]\nbitrate_mbps = 80 # was 42\n";
@@ -2066,8 +1901,6 @@ mod tests {
         // The other same-line comment, on a key we did not touch, stays put.
         assert!(out.text.contains("refresh_rate_hz = 90 # Quest 3 panel\n"));
     }
-
-    // ── rule 2: shadowing ────────────────────────────────────────────────────
 
     #[test]
     fn a_duplicate_key_across_tables_edits_the_last_and_reports_it() {
@@ -2123,8 +1956,6 @@ mod tests {
         assert!(err.to_string().contains("dotted key group"), "{err}");
     }
 
-    // ── rules 1 and 7: refusals ──────────────────────────────────────────────
-
     #[test]
     fn a_parse_failure_refuses_to_rewrite() {
         let text = fixture("oxrsys-runtime.broken.toml");
@@ -2172,8 +2003,6 @@ mod tests {
         })
         .is_empty());
     }
-
-    // ── read ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn read_of_the_deployed_file_matches_what_the_runtime_would_use() {
@@ -2397,11 +2226,11 @@ mod tests {
         assert!(err.contains("multiline string"), "{err}");
     }
 
-    /// A10-3/A10-4: the refusal above lived only in the *view*, so every caller
-    /// that does not render Settings first — `write`, `edit_protocol`, the CLI
-    /// — rewrote the outer line, reported success, and left the runtime obeying
-    /// the line inside the string. The refusal belongs to [`apply_patch`], which
-    /// all of them go through.
+    /// A10-3/A10-4: the refusal belongs to [`apply_patch`], which every caller
+    /// goes through, not to the *view* alone — a caller that does not render
+    /// Settings first (`write`, `edit_protocol`, the CLI) would otherwise
+    /// rewrite the outer line, report success, and leave the runtime obeying
+    /// the line inside the string.
     #[tokio::test]
     async fn the_multiline_shadow_is_refused_by_apply_patch_write_and_edit_protocol() {
         let _g = crate::session::lock_session_globals();
@@ -2438,7 +2267,7 @@ mod tests {
         assert!(!backups.exists(), "no backup churn from a refused write");
         let _ = std::fs::remove_dir_all(&dir);
 
-        // …and so does the fix, which used to print `set protocol = "alvr"`.
+        // …and so does the fix, which must not claim it set protocol.
         let dir = scratch("multiline-shadow-fix");
         let ctx = fix_ctx(&dir, false);
         std::fs::create_dir_all(&ctx.paths.oxr_appsup).unwrap();
@@ -2565,8 +2394,6 @@ mod tests {
             view.invalid
         );
     }
-
-    // ── effective_string (the one reader the other modules share) ────────────
 
     #[test]
     fn effective_string_is_last_wins_table_blind_and_double_quote_only() {
@@ -2711,8 +2538,6 @@ mod tests {
         }
     }
 
-    // ── rule 6, continued: an edit owns six values, not the file's bytes ─────
-
     /// `toml_edit`'s renderer normalises CRLF to LF, drops a BOM and appends a
     /// final newline. A no-op patch already avoided that by returning the input
     /// bytes; a *real* edit went through the renderer and rewrote every line of
@@ -2742,8 +2567,6 @@ mod tests {
         }
     }
 
-    // ── write ────────────────────────────────────────────────────────────────
-
     #[tokio::test]
     async fn write_creates_from_the_template_byte_identically_then_patches() {
         let _g = crate::session::lock_session_globals();
@@ -2770,11 +2593,9 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// A10-1: the absent-file branch used to be `is_file()` then
-    /// `write_atomic` — an unconditional rename that clobbers whatever a
-    /// second writer put there in between. It now goes through
-    /// [`Executor::create_new`] (`O_EXCL`), so a file that appears in that
-    /// exact window is read back instead of overwritten.
+    /// A10-1: the absent-file branch goes through [`Executor::create_new`]
+    /// (`O_EXCL`), never an unconditional rename, so a file that appears
+    /// between the probe and the create is read back instead of clobbered.
     #[tokio::test]
     async fn write_never_clobbers_a_file_created_in_the_toctou_window() {
         let _g = crate::session::lock_session_globals();
@@ -3241,8 +3062,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── the live-session guard ───────────────────────────────────────────────
-
     /// A `session-state.json` naming a wine process that is still alive. The
     /// pid is this test process, which is exactly what makes `is_same_process`
     /// true without launching anything.
@@ -3313,13 +3132,9 @@ mod tests {
             "the shell pipeline writes no session record"
         );
         let now = crate::session::now_unix_ms();
-        // A live `process_id` as well as a fresh stamp: that is the pair
-        // `SessionMonitor` requires before it derives `SessionPhase::External`
-        // (`session/watcher.rs`), and the door the Settings screen renders has
-        // to agree with the phase that screen shows — a status naming a dead
-        // pid renders "Idle" with Save enabled. (`session_block_at` is looser
-        // today: it blocks on freshness alone. A10-8 is filed against that
-        // divergence; this test asserts the shape both predicates agree on.)
+        // A live `process_id` and a fresh stamp together: that is
+        // `watcher::runtime_status_live`, the single predicate both this door and
+        // the phase the Session screen renders go through (A10-8).
         let pid = std::process::id();
         std::fs::write(
             dir.join("runtime_status.json"),
@@ -3395,8 +3210,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── the compare-and-swap ─────────────────────────────────────────────────
-
     /// `write` reads, patches in memory, backs up and only then replaces. If
     /// anything moved the file in between — the `sabrage` CLI, `setup.sh`, a
     /// human with an editor — the replacement would drop their work and the
@@ -3430,12 +3243,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // ── fix.edit-protocol ────────────────────────────────────────────────────
-
     /// A context whose `toml_path` and `sabrage_appsup` both live under a
-    /// scratch directory — the real ones are never touched by a test (a Catch2
-    /// suite once clobbered the user's live config; see the deployed fixture's
-    /// own header).
+    /// scratch directory: no test may touch the real ones, which a
+    /// config-writing suite would otherwise overwrite (see the deployed
+    /// fixture's own header).
     fn fix_ctx(dir: &Path, dry_run: bool) -> StageCtx {
         let mut paths = Paths::new(dir);
         paths.oxr_appsup = dir.join("OXRSys");
@@ -3539,8 +3350,6 @@ mod tests {
         assert!(!ctx.executor.planned().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
-
-    // ── the enums ────────────────────────────────────────────────────────────
 
     #[test]
     fn the_enums_serialize_as_the_toml_spellings() {
