@@ -5,7 +5,7 @@ set -o pipefail
 print "== wine-vr demo run =="
 require_bottle
 
-# ---- preflight (fail fast with remedies instead of a black window) -------------
+# Fail fast with a remedy instead of a black window.
 # preflight: game.present
 [ -f "$BS_DIR/Beat Saber.exe" ] || die "Beat Saber not found at $BS_DIR
        download 1.29.4: $DEPOT_CMD
@@ -31,9 +31,8 @@ grep -q 'ActiveRuntime.*openxr.*wineopenxr64.json' "$PREFIX/system.reg" 2>/dev/n
 # preflight: overlay.dxmt-d3d11
 cmp -s "$DXMT_ART/x86_64-windows/d3d11.dll" "$CX/lib/dxmt/x86_64-windows/d3d11.dll" || \
   die "CrossOver DXMT overlay stale (CrossOver update?) — ./demo.sh install --bottle $WINEVR_BOTTLE"
-# The bottle's Graphics Backend setting overrides the CX_GRAPHICS_BACKEND env var; the
-# CrossOver GUI writes "" (= auto) which no longer selects DXMT — the game then spins
-# forever before D3D11 device creation (no DXMT banner, no session, no streamer).
+# The bottle's Graphics Backend overrides CX_GRAPHICS_BACKEND; the CrossOver GUI's
+# "" (= auto) does not select DXMT, so the game spins before D3D11 device creation.
 # preflight-autofix: bottle.gfx-dxmt
 CXCONF="$PREFIX/cxbottle.conf"
 if ! grep -q '^"CX_GRAPHICS_BACKEND" = "dxmt"$' "$CXCONF" 2>/dev/null; then
@@ -93,14 +92,11 @@ case "$ENCODER_PROC" in
     ensure_helper_staged ;;
 esac
 
-# ---- wired (USB) streaming: adb owns the tcp:9943/tcp:9944 forwards -------------
-# USB-wired ALVR streaming needs the client's stream ports forwarded from the Quest
-# over adb; left behind after the session ends, the same forwards silently break
-# WiFi discovery on a later non-wired run (the client just shows "searching for
-# streamer"). --wired creates them here; a normal run clears exactly these two.
+# Wired ALVR needs two adb forwards; left behind, they break WiFi discovery on a
+# non-wired run ("searching for streamer"). --wired creates them; a normal run clears
+# exactly these two. WIRED_PORTS comes from the contract (contract.gen.sh, sourced via lib.sh).
 # preflight: run.wired-adb
 # launch-action: adb-forward-hygiene
-# WIRED_PORTS comes from the contract (contract.gen.sh, sourced via lib.sh)
 WIRED_SER=""
 [ -n "$ADB" ] && WIRED_SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
 if [ -n "${WINEVR_WIRED:-}" ]; then
@@ -126,7 +122,7 @@ elif [ -n "$ADB" ]; then
   done
 fi
 
-# ---- reset the bottle's wineserver (stale servers + steam locks hang startup) ---
+# Stale wineservers and steam locks hang startup, so reset the bottle's server first.
 # launch-action: wineserver-reset
 print -r -- "-- resetting wineserver for bottle '$WINEVR_BOTTLE'"
 WINEPREFIX="$PREFIX" "$WINESERVER" -k 2>/dev/null || true
@@ -140,7 +136,7 @@ if kill -0 $_wpid 2>/dev/null; then
 fi
 ok "wineserver down"
 
-# ---- Goldberg steam emulator (no real Steam at runtime; avoids the Meta gate) ---
+# Goldberg emulates the Steam API offline, so no real Steam runs at any point.
 # launch-action: goldberg-stage
 print -r -- "-- Goldberg"
 API="$BS_DIR/Beat Saber_Data/Plugins/x86_64/steam_api64.dll"
@@ -154,7 +150,7 @@ printf '%s' "$BS_APPID" > "$APIDIR/steam_appid.txt" || die "writing steam_appid.
 GSET="$APIDIR/steam_settings"; mkdir -p "$GSET"
 : > "$GSET/offline.txt"; : > "$GSET/disable_networking.txt"; : > "$GSET/disable_overlay.txt"
 
-# ---- audio: route the Mac output into BlackHole so ALVR streams it ---------------
+# Route the Mac's default output into BlackHole so ALVR streams the game audio.
 # launch-action: audio-route
 PREV_AUDIO_OUT=""
 restore_audio() {
@@ -176,9 +172,7 @@ stop_dashboard() {
 stop_helper() {
   reap_stray "$OXR_HELPER_BIN" && print "encoder helper: reaped (left over from the runtime)"
 }
-# INT/TERM: tear the game down (wineserver -k) and restore audio, then resignal so
-# the script exits with the right status. Wine runs as a background job below and
-# the script waits on it, so zsh delivers these traps immediately on a signal.
+# INT/TERM tear the game down and restore audio, then resignal for the right exit status.
 trap 'stop_dashboard; stop_helper; restore_audio' EXIT
 trap 'print ""; print -r -- "-- interrupted: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - INT;  kill -INT  $$' INT
 trap 'print -r -- "-- terminated: stopping wine"; stop_wine; stop_dashboard; stop_helper; restore_audio; trap - TERM; kill -TERM $$' TERM
@@ -202,10 +196,8 @@ elif [ "$PROTOCOL" = "alvr" ] && command -v SwitchAudioSource >/dev/null 2>&1; t
   fi
 fi
 
-# ---- ALVR server dashboard ------------------------------------------------------
-# The embedded alvr_server_core hosts the dashboard API on 127.0.0.1:8082 inside
-# the game process; the stock dashboard polls until it appears, so launching it
-# before the game is fine. Closed again by the exit/signal traps above.
+# alvr_server_core hosts the dashboard on 127.0.0.1:8082 in-process; the stock UI
+# polls until it appears (safe to launch before the game). Closed by the traps above.
 # launch-action: dashboard
 if [ -n "${WINEVR_NO_DASHBOARD:-}" ]; then
   info "ALVR dashboard disabled (--no-dashboard)"
@@ -219,7 +211,6 @@ else
   warn "alvr_dashboard not built — ./demo.sh build (continuing without the dashboard)"
 fi
 
-# ---- headset client -----------------------------------------------------------
 # launch-action: adb-reverse-cleanup
 SER=""
 [ -n "$ADB" ] && SER="$("$ADB" devices 2>/dev/null | awk 'NR>1 && $2=="device"{print $1; exit}')"
@@ -239,7 +230,6 @@ else
   fi
 fi
 
-# ---- launch ---------------------------------------------------------------------
 # launch-action: launch-wine
 BS_WIN="$(win_path "$BS_DIR/Beat Saber.exe")"
 export XR_RUNTIME_JSON="$OXR_RUNTIME_JSON"

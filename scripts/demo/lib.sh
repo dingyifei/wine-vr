@@ -3,19 +3,15 @@
 
 ROOT="$WINEVR_ROOT"
 
-# ---- shared contract (pins, depot triple, ports, artifact lists) ----------------
-# Generated from contract/pipeline.toml — edit the contract, then regenerate
-# (scripts/dev/parity.sh --regen). Never edit contract.gen.sh by hand.
+# contract.gen.sh is generated from contract/pipeline.toml: edit the contract, then
+# regenerate (scripts/dev/parity.sh --regen). Never edit contract.gen.sh by hand.
 source "$ROOT/scripts/demo/contract.gen.sh"
 
-# ---- user-tunable environment ------------------------------------------------
-# WINEVR_BOTTLE   (required by doctor/install/run) CrossOver bottle name, e.g. Steam
-# WINEVR_BS_DIR   Beat Saber 1.29.4 install dir (DepotDownloader output).
-#                 Default (resolved once the bottle is known): the bottle's
-#                 standard Steam library — <bottle>/drive_c/Program Files (x86)/
-#                 Steam/steamapps/common/Beat Saber 1294
+# WINEVR_BOTTLE   (--bottle) CrossOver bottle name, e.g. Steam. install/run/stop and
+#                 `all` die without it; doctor FAILs bottle.named and carries on.
+# WINEVR_BS_DIR   (--bs-dir) Beat Saber 1.29.4 install dir (DepotDownloader output);
+#                 defaults to the bottle's standard Steam library once the bottle is known.
 
-# ---- derived paths -------------------------------------------------------------
 for _cx in "$HOME/Applications/CrossOver.app" "/Applications/CrossOver.app"; do
   [ -d "$_cx" ] && CX_APP="$_cx" && break
 done
@@ -51,7 +47,7 @@ ALVR_DASHBOARD_BIN="$ALVR/target/release/alvr_dashboard"
 ADB="$HOME/Library/Android/sdk/platform-tools/adb"
 command -v "$ADB" >/dev/null 2>&1 || ADB="$(command -v adb 2>/dev/null || true)"
 
-# ---- output helpers (print -r: never mangle backslashes in windows paths) -------
+# print -r throughout: echo mangles the backslashes in windows paths.
 _G=$'\e[32m'; _Y=$'\e[33m'; _R=$'\e[31m'; _N=$'\e[0m'
 FAILCOUNT=0
 info() { print -r -- "  $*"; }
@@ -60,12 +56,11 @@ warn() { print -r -- "  ${_Y}WARN${_N} $*"; }
 fail() { print -r -- "  ${_R}FAIL${_N} $1"; [ $# -gt 1 ] && print -r -- "       remedy: $2"; FAILCOUNT=$((FAILCOUNT+1)); }
 die()  { print -r -- "${_R}FATAL${_N} $*" >&2; exit 1; }
 
-# ---- check slugs (parity with the native Sabrage pipeline) ----------------------
-# Every doctor row has a stable slug shared with sabrage-core's check registry.
-# tap: emit "<slug> <status>" to $WINEVR_DOCTOR_TAP when set (parity differ channel,
-# opt-in like WINEVR_DOCTOR_SOFT). chk: print exactly like ok/warn/fail/info AND tap.
-# Both must always return 0: lib.sh is sourced by set -e stages (setup/build/install),
-# and a bare `[ -n ... ] && ...` tail would return 1 whenever the tap is off.
+# Check slugs — each has a stable slug shared with sabrage-core's check registry.
+# tap: append "<slug> <status>" to $WINEVR_DOCTOR_TAP when set (opt-in parity channel).
+# chk: print like ok/warn/fail/info AND tap. Both must return 0: lib.sh is sourced by
+# set -e stages and a bare `[ -n ... ] && ...` tail returns 1 with the tap off
+# (sabrage-parity::tests::lib_sh_tap_and_chk_return_zero_when_tap_disabled).
 tap() { # slug status
   [ -n "${WINEVR_DOCTOR_TAP:-}" ] && print -r -- "$1 $2" >> "$WINEVR_DOCTOR_TAP"
   :
@@ -87,15 +82,12 @@ bs_version() { # best-effort Beat Saber version: marker file, else the Unity bui
     "$BS_DIR/Beat Saber_Data/globalgamemanagers" 2>/dev/null || echo '?'
 }
 
-# ---- shared helpers -------------------------------------------------------------
 require_bottle() {
   [ -n "${WINEVR_BOTTLE:-}" ] || die "CrossOver bottle name required: pass --bottle <name> or set WINEVR_BOTTLE.
        Existing bottles: $(ls "$HOME/Library/Application Support/CrossOver/Bottles" 2>/dev/null | tr '\n' ' ')"
   PREFIX="$HOME/Library/Application Support/CrossOver/Bottles/$WINEVR_BOTTLE"
   SYS32="$PREFIX/drive_c/windows/system32"
   [ -f "$PREFIX/cxbottle.conf" ] || die "bottle '$WINEVR_BOTTLE' not found at $PREFIX — create it in CrossOver (win11_64) first"
-  # Beat Saber location: --bs-dir/WINEVR_BS_DIR override, else the bottle's
-  # standard Steam library path.
   BS_DIR="${WINEVR_BS_DIR:-$PREFIX/drive_c/Program Files (x86)/Steam/steamapps/common/$BS_DIR_LEAF}"
   DEPOT_CMD="DepotDownloader -app $BS_APPID -depot $BS_DEPOT -manifest $BS_MANIFEST -username <steam-user> -dir \"$BS_DIR\""
 }
@@ -127,8 +119,8 @@ win_path() { # unix absolute path -> windows path: C:\ inside the bottle's drive
   fi
 }
 
-# DXMT_FILES comes from the contract; presence gates key on ALL of them plus the
-# .sha256 provenance marker written by setup after extraction.
+# DXMT_FILES comes from the contract; the .sha256 provenance marker is written by
+# setup after extraction.
 dxmt_files_ok() { local f; for f in $DXMT_FILES; do [ -f "$DXMT_ART/$f" ] || return 1; done }
 dxmt_ok() { [ "$(cat "$DXMT_ART/.sha256" 2>/dev/null)" = "$DXMT_TGZ_SHA256" ] && dxmt_files_ok }
 
@@ -141,11 +133,9 @@ stop_wine() { # kill the bottle's wineserver (and with it the game) and wait for
   kill $_wp 2>/dev/null || true
 }
 
-reap_stray() { # bin_path [found_msg] [not_found_msg] -> if a stray process matching bin_path
-  # (pgrep -f) is running, pkill -f it (errors swallowed — pgrep already confirmed something was
-  # there) and report found_msg via ok() when given; otherwise report not_found_msg via ok() when
-  # given. Returns 0 if a stray was found (kill attempted), 1 if none was running. Shared by every
-  # "reap a leftover helper/dashboard process" site in stop.sh/run.sh.
+reap_stray() { # bin_path [found_msg] [not_found_msg]
+  # Returns 0 if a stray was found (kill attempted), 1 if none running; optional messages
+  # reported via ok(). Shared by the reap sites in stop.sh/run.sh.
   if pgrep -f "$1" >/dev/null 2>&1; then
     pkill -f "$1" 2>/dev/null || true
     [ -n "${2:-}" ] && ok "$2"
