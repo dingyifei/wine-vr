@@ -1,4 +1,14 @@
 <script lang="ts">
+  /**
+   * The single gate modal, mounted once at the app root. Owns the transcript
+   * for one pipeline operation (rows, console, progress, outcome, fix state)
+   * and drives `stageStore`: reads `.gate` via the `request` prop and holds
+   * `.setRunning` for setup/build/install/stop runs, which it starts via
+   * `runStage`. In run mode it starts nothing — `sessionStore.launch(...)` was
+   * already called by the opener, and this component only renders
+   * `sessionStore.launchRows` (the same store Session.svelte reads, so the
+   * transcript survives closing the modal and mid-launch navigation).
+   */
   import { onMount } from "svelte";
   import { cap, errMsg } from "../lib/text";
   import StatusIcon from "./StatusIcon.svelte";
@@ -28,9 +38,8 @@
   }
   let { request, onClose, onNavigate }: Props = $props();
 
-  // Extracted from the imported union so the new payload shapes never drift
-  // from events.rs by hand — this is `Extract<StageEvent, {kind:"check"}>`
-  // etc., not a separately hand-typed mirror.
+  // Extracted from the imported union so the payload shape cannot drift from
+  // events.rs by hand.
   type CheckEv = Extract<StageEvent, { kind: "check" }>;
 
   type Row =
@@ -45,9 +54,7 @@
 
   /** One `StageEvent` -> the row it renders as, or `null` for the four kinds
    * that drive other UI (progress bar, console pane, runId, finished banner)
-   * instead of a row of their own. Shared between the two rendering paths
-   * below: the accumulating `rows` array for setup/build/install/stop, and
-   * the pure `$derived` mapping over `sessionStore.launchRows` for run. */
+   * instead of a row of their own. */
   function toRow(ev: StageEvent): Row | null {
     switch (ev.kind) {
       case "section":
@@ -71,16 +78,11 @@
     }
   }
 
-  // ── non-run modes (setup/build/install/stop): this component drives runStage itself ──
 
   let runId = $state<string | null>(null);
-  /** This request's runId announced by `stage://queued` — arrives (if at all)
+  /** This request's runId announced by `stage://queued` - arrives (if at all)
    * while the run is still waiting on `OPERATION_LOCK`, before its own
-   * `stageStarted` row exists. Without this, a run queued behind a build had
-   * no id Cancel could act on: the button stayed disabled for the whole wait,
-   * then mutated the machine the moment its turn came with nothing left to
-   * cancel it. See `onStageQueued`'s doc comment — cancelling this id works
-   * even before the stage starts. */
+   * `stageStarted` row exists, so Cancel has a target during that wait. */
   let queuedRunId = $state<string | null>(null);
   let rows = $state<Row[]>([]);
   let consoleLines = $state<string[]>([]);
@@ -89,19 +91,15 @@
   let running = $state(false);
   let finished = $state<StageOutcome | null>(null);
   let invokeError = $state<string | null>(null);
-  // Set when a `fatal` event already rendered the condition as a row; the
-  // rejected promise that follows carries the same text (`SabrageError::Fatal`
-  // displays as its message verbatim), so it must not be shown twice — the
-  // same "already reported as FATAL" predicate the CLI applies. Genuine
-  // invoke-layer rejections (repo-root resolution, serde) never set it.
+  // Set when a `fatal` event already rendered the condition as a row: the
+  // rejected promise that follows carries the same text verbatim, so showing
+  // it again duplicates it. Invoke-layer rejections never set it.
   let sawFatal = $state(false);
   let confirmFix = $state<FixAction | null>(null);
   let fixBusy = $state(false);
-  /** The in-flight fix's own run id, off the first `StageEvent` `applyFix`
-   * streams — distinct from `runId` above (the stage's own run, which a fix
-   * applied from a Fatal row does not touch). `fixes::apply` emits it before
-   * waiting for the operation lock, so a fix queued behind another Sabrage
-   * operation still has a live `cancelStage` target. */
+  /** The in-flight fix's run id, from `applyFix`'s first `StageEvent`.
+   * Emitted before the operation lock, so a queued fix has a `cancelStage`
+   * target. Distinct from `runId` above, the stage's own run. */
   let fixRunId = $state<string | null>(null);
   let fixCancelling = $state(false);
   let fixError = $state<string | null>(null);
@@ -113,15 +111,11 @@
   let rowsEl: HTMLDivElement | null = $state(null);
   let consoleEl: HTMLPreElement | null = $state(null);
   /**
-   * The request actually driving `rows`/`runId`/`sessionStore.launchRows` —
-   * as opposed to `request` (the prop), which is whatever `stageStore.gate`
-   * currently holds and can be replaced by a fresh `openGate(...)` call
-   * (e.g. StagesPanel's Run button, or a Doctor whole-stage Fix) while this
-   * one is still running and merely hidden (Hide clears `gate` without
-   * touching `running`/`runId`). The template renders from `displayRequest`
-   * below, never from `request` directly, so a queued replacement cannot
-   * relabel the in-flight operation's title/rows/Cancel target — see the
-   * "Hiding a gate lets Cancel target the previous stage" fix.
+   * The request actually driving `rows`/`runId`/`sessionStore.launchRows`.
+   * The `request` prop reflects `stageStore.gate`, which a new `openGate(...)`
+   * can replace while this one is still running and merely hidden. The template
+   * renders `displayRequest`, never `request`, so a queued replacement cannot
+   * relabel the in-flight operation's title, rows, or Cancel target.
    */
   let activeRequest = $state<GateRequest | null>(null);
   /** Falls back to `request` only when nothing has started yet (first paint
@@ -131,12 +125,9 @@
   const isRunMode = $derived(displayRequest?.stage === "run");
 
   // Fresh `openGate(...)` calls always hand in a new object, so identity
-  // comparison is enough to detect "a new run was requested" — including a
-  // Fix button re-opening the same modal for a different stage. Run mode
-  // never calls `start()`: `sessionStore.launch(...)` was already invoked by
-  // whoever opened this gate, and this component only observes it. A
-  // replacement request that arrives while `running` is true is deliberately
-  // left un-started (and un-displayed) until the current one settles.
+  // comparison detects "a new run was requested". Run mode never calls
+  // `start()`: `sessionStore.launch(...)` already ran and this component only
+  // observes. A replacement arriving while `running` is deliberately deferred.
   $effect(() => {
     const r = request;
     if (r && r !== activeRequest && !running) {
@@ -162,11 +153,10 @@
     if (consoleOpen && consoleEl) consoleEl.scrollTop = consoleEl.scrollHeight;
   });
 
-  // One modal instance, mounted once at the app root — a `stage://queued`
-  // event always belongs to whichever request is currently open, since the
-  // process-wide operation lock means at most one stage is running or
-  // waiting at a time and every caller (Doctor, StagesPanel, Session) routes
-  // through this same modal to start one.
+  // One modal instance, mounted once at the app root, and every opener
+  // (Doctor, StagesPanel, Session) routes through it: with the process-wide
+  // operation lock allowing at most one stage running or waiting, a
+  // `stage://queued` event always belongs to whichever request is open.
   onMount(() => {
     let unlisten: (() => void) | undefined;
     void onStageQueued((q) => {
@@ -213,9 +203,8 @@
     reset();
     running = true;
     // Mirrored on the store so other openers (StagesPanel's Run/Dry-run,
-    // Doctor's whole-stage Fix) can disable themselves instead of racing a
-    // second `openGate(...)` against this still-in-flight one — see that
-    // flag's doc comment in stage.svelte.ts.
+    // Doctor's whole-stage Fix) disable themselves instead of racing a second
+    // `openGate(...)` against this in-flight one.
     stageStore.setRunning(true);
     try {
       finished = await runStage(
@@ -296,10 +285,8 @@
         { bottle: displayRequest?.bottle, bsDir: displayRequest?.bsDir },
         true,
         (ev) => {
-          // The first event of this fix's own stream carries its run id —
-          // capture it once, before delegating to the shared row renderer,
-          // so Cancel can target this fix (not the stage's `runId` above)
-          // even while it is still queued behind another operation.
+          // The first event of this fix's own stream carries its run id;
+          // capture it once so Cancel targets the fix, not the stage's `runId`.
           if (fixRunId === null) fixRunId = ev.runId;
           handleEvent(ev);
         },
@@ -331,7 +318,6 @@
     }
   }
 
-  // ── run mode: sessionStore already started the launch, this component only observes ──
 
   const runRows = $derived.by((): Row[] => {
     if (!isRunMode) return [];
@@ -343,21 +329,14 @@
     return out;
   });
   // `sessionStore.launchedEv`/`fatalEv`/`startedEv` are O(1) fields the store
-  // itself captures as its own `launch()` callback sees each event — this
-  // used to be a `.find()` scan over the whole `launchRows` array per event
-  // (four of them, including `runRows` above), redone on every single new
-  // row. See that store's doc comments.
+  // captures in its own `launch()` callback, so these `$derived`s cost no scan
+  // over `launchRows`. See that store's doc comments.
   const runLaunchedEv = $derived(isRunMode ? sessionStore.launchedEv : undefined);
   const runFatalEv = $derived(isRunMode ? sessionStore.fatalEv : undefined);
-  // The launch's own `runId`, off its first `stageStarted` row — the id
-  // `cancelStage` takes. `sabrage_core::stages::run_stage` takes
-  // `OPERATION_LOCK` for `Stage::Run` from `stageStarted` through `launched`
-  // (see that module's "Lock policy for `run`"); calling `sessionStore.stop()`
-  // — which runs the `stop` *stage* when nothing is in `live_session()` yet —
-  // during that window would block on the same lock until this very launch
-  // finishes on its own, and would also race a still-empty `status.bottle`.
-  // `cancelStage(runId)` fires the run's own cancel token instead, which
-  // needs no lock at all.
+  // The launch's own `runId`, the id `cancelStage` takes.
+  // Never `sessionStore.stop()` in this window: run holds `OPERATION_LOCK`
+  // from `stageStarted` through `launched` (sabrage-core `stages`, "Lock
+  // policy for `run`"), so a stop would block until this launch finishes.
   const runStartedEv = $derived(isRunMode ? sessionStore.startedEv : undefined);
   // A dry run (or any launch that settles with neither a `launched` nor a
   // `fatal` row) still needs a terminal state once the invocation resolves.
@@ -368,24 +347,19 @@
     cancelling = true;
     try {
       if (runLaunchedEv) {
-        // The Cancel button (see the template) is never shown once
-        // `runLaunchedEv` exists — replaced by "Open Session" — but keep this
-        // branch as the correct fallback if that ever changes: past Launched,
-        // the run itself is what's live, not a stage waiting on the lock.
+        // Unreachable while the template swaps Cancel for "Open Session" past
+        // `launched`; kept as the correct fallback, since past Launched the run
+        // itself is live, not a stage waiting on the lock.
         await sessionStore.stop();
       } else if (runStartedEv) {
         await cancelStage(runStartedEv.runId);
       } else if (queuedRunId) {
-        // Queued behind another operation — no `stageStarted` row exists yet,
-        // but `stage://queued` already announced this run's id and cancelling
-        // it works even before the stage starts (see `queuedRunId`'s doc
-        // comment).
+        // Queued behind another operation: no `stageStarted` row exists yet,
+        // but `stage://queued` already announced this run's id.
         await cancelStage(queuedRunId);
       }
-      // else: no `stageStarted`/`stage://queued` event has arrived yet (the
-      // invoke() call is still in flight) and the run hasn't launched either
-      // — there is nothing safe to cancel yet; the button's `disabled` guard
-      // below keeps this branch from being reachable in practice.
+      // else: no run id has arrived and the run hasn't launched - nothing safe
+      // to cancel; the button's `disabled` guard keeps this unreachable.
     } finally {
       cancelling = false;
     }
@@ -462,11 +436,10 @@
   {:else if row.kind === "needsAdmin"}
     <div class="admin-note">
       {@render lockIcon()}
-      <!-- `reason` (privilege.rs's `needs_admin_reason`) already names both the
-           mechanism actually picked (macOS's authorization dialog, or sudo
-           waiting in the terminal that launched Sabrage — the latter can be
-           true for a `cargo tauri dev` GUI, in which case "macOS will ask for
-           your password" would contradict it and read as hung) and why. -->
+      <!-- `reason` (privilege.rs's `needs_admin_reason`) already names the
+           mechanism picked and why - macOS authorization dialog or sudo in the
+           launching terminal - so no static prompt text here: under sudo,
+           reachable from `cargo tauri dev`, it would be wrong. -->
       <div>{row.reason}</div>
     </div>
   {:else if row.kind === "check"}
